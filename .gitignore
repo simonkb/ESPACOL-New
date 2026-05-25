@@ -1,0 +1,6 @@
+.DS_Store
+.claude/settings.json
+*.png
+*.jpeg
+
+**/__pycache__/
