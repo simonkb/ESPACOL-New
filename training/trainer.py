@@ -28,7 +28,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
 from configs.config import TrainConfig
-from losses.combined import HybridContrastiveOrdinalLoss, compute_class_weights
+from losses.combined import HybridContrastiveOrdinalLoss
 from utils.checkpoint import save_checkpoint
 from utils.metrics import evaluate_predictions, confusion_stats
 
@@ -72,7 +72,7 @@ class Trainer:
         val_loader: DataLoader,
         cfg: TrainConfig,
         run_dir: str,
-        train_labels: list[int],     # all training labels (for class-weight computation)
+        train_labels: list[int],     # kept for API compatibility; weights now computed per-batch
         device: Optional[torch.device] = None,
         fold: int = 0,
     ):
@@ -102,12 +102,6 @@ class Trainer:
             beta=cfg.beta,
             temperature=cfg.temperature,
         )
-
-        # Class weights for SCOLw (computed from training set)
-        self.class_weights = compute_class_weights(
-            train_labels, cfg.n_classes, device=self.device
-        )
-        logger.info(f"Class weights: {self.class_weights.tolist()}")
 
         # LR scheduler: ReduceLROnPlateau factor=0.2, patience=5, tracking val_loss
         self.scheduler = ReduceLROnPlateau(
@@ -225,8 +219,15 @@ class Trainer:
 
             z_pcol, z_scolw, pred = self.model(x)
 
+            # Per-batch class weights — rebuttal: "computed for each batch using
+            # inverse class frequency" (w[c] = N_batch / (n_classes * count_c_in_batch))
+            unique_cls, counts = torch.unique(y, return_counts=True)
+            batch_weights = torch.zeros(self.cfg.n_classes, device=self.device)
+            for cls, cnt in zip(unique_cls, counts):
+                batch_weights[cls] = y.shape[0] / (self.cfg.n_classes * cnt.float())
+
             loss, comps = self.criterion(
-                z_pcol, z_scolw, pred, y, self.class_weights
+                z_pcol, z_scolw, pred, y, batch_weights
             )
             loss.backward()
             # Gradient clipping for stability (not specified; standard practice)

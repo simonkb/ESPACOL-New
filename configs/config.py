@@ -34,7 +34,7 @@ class TrainConfig:
 
     # LR scheduler (ReduceLROnPlateau)
     lr_factor: float = 0.2           # paper: "reduced by a factor of 0.2"
-    lr_patience: int = 5             # paper: "after 5 epochs of no improvement"
+    lr_patience: int = 8             # paper says 5 but val_loss on 156 images is still noisy; 8 gives more time at each LR
     lr_min: float = 1e-6
 
     # Early stopping
