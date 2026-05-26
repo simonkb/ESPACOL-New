@@ -25,8 +25,26 @@ from torchvision import transforms
 # Common transforms (paper: resize 300x300, normalize to [0,1])
 # ----------------------------
 def build_transform(img_size: int = 300) -> Callable:
+    """Evaluation transform: resize + ToTensor only (no augmentation)."""
     return transforms.Compose([
         transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),  # scales to [0,1]
+    ])
+
+
+def build_train_transform(img_size: int = 300) -> Callable:
+    """Training transform: augmentation + resize + ToTensor.
+
+    Augmentations are mild and clinically safe for ultrasound/fundus images:
+    horizontal/vertical flips preserve diagnostic content, small rotations
+    and slight brightness/contrast shifts simulate acquisition variability.
+    """
+    return transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.RandomRotation(degrees=10),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1),
         transforms.ToTensor(),  # scales to [0,1]
     ])
 

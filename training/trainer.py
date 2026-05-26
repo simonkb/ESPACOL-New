@@ -5,12 +5,15 @@ Single-fold trainer implementing the paper's training protocol (Section 3):
 
   - One-stage training: all three heads (PCOL, SCOLw, Regression) jointly
   - 75 epochs max, batch size 24, LR = 1e-3
-  - ReduceLROnPlateau: factor=0.2, patience=5, monitor val_loss
-  - Early stopping: patience=13, monitor val_loss
+  - ReduceLROnPlateau: factor=0.2, patience=5, monitor val_acc (max)
+  - Early stopping: patience=13, monitor val_acc (max)
   - Class-stratified batch sampling for prototype stability
 
+Checkpoint and early stopping use val_acc (not val_loss) because:
+  - val set is small (~60 images) so RMSE is too noisy to reliably rank epochs
+  - accuracy is the target metric and directly reflects rounding behaviour
+  - RMSE-optimal epoch ≠ accuracy-optimal epoch when predictions are rounded
 Logs training/validation loss + metrics to a CSV and to the Python logger.
-Saves best checkpoint by validation loss.
 """
 
 import csv
@@ -33,18 +36,18 @@ logger = logging.getLogger(__name__)
 
 
 class EarlyStopping:
-    """Stops training when validation loss has not improved for *patience* epochs."""
+    """Stops training when val_acc has not improved for *patience* epochs."""
 
     def __init__(self, patience: int = 13, min_delta: float = 0.0):
         self.patience = patience
         self.min_delta = min_delta
-        self.best_loss = float("inf")
+        self.best_acc = -float("inf")
         self.counter = 0
         self.stop = False
 
-    def step(self, val_loss: float) -> bool:
-        if val_loss < self.best_loss - self.min_delta:
-            self.best_loss = val_loss
+    def step(self, val_acc: float) -> bool:
+        if val_acc > self.best_acc + self.min_delta:
+            self.best_acc = val_acc
             self.counter = 0
         else:
             self.counter += 1
@@ -106,10 +109,10 @@ class Trainer:
         )
         logger.info(f"Class weights: {self.class_weights.tolist()}")
 
-        # LR scheduler: ReduceLROnPlateau factor=0.2, patience=5
+        # LR scheduler: ReduceLROnPlateau factor=0.2, patience=5, tracking val_acc
         self.scheduler = ReduceLROnPlateau(
             self.optimizer,
-            mode="min",
+            mode="max",
             factor=cfg.lr_factor,
             patience=cfg.lr_patience,
             min_lr=cfg.lr_min,
@@ -132,7 +135,7 @@ class Trainer:
 
         Returns final test metrics dict.
         """
-        best_val_loss = float("inf")
+        best_val_acc = -float("inf")
 
         for epoch in range(1, self.cfg.epochs + 1):
             t0 = time.time()
@@ -145,11 +148,12 @@ class Trainer:
 
             self._log_epoch(epoch, elapsed, lr_now, train_metrics, val_metrics)
 
-            # Checkpoint
+            # Checkpoint by val_acc — directly optimises the target metric
+            val_acc = val_metrics["val_acc"]
             val_loss = val_metrics["val_loss"]
-            is_best = val_loss < best_val_loss
+            is_best = val_acc > best_val_acc
             if is_best:
-                best_val_loss = val_loss
+                best_val_acc = val_acc
 
             ckpt_path = os.path.join(self.run_dir, f"fold{self.fold}_epoch{epoch}.pth")
             best_ckpt_path = os.path.join(self.run_dir, f"fold{self.fold}_best.pth")
@@ -162,7 +166,6 @@ class Trainer:
                 is_best=is_best,
             )
             if is_best:
-                # Also save explicitly named best checkpoint for this fold
                 save_checkpoint(
                     best_ckpt_path,
                     self.model,
@@ -171,7 +174,7 @@ class Trainer:
                     {**train_metrics, **val_metrics},
                     is_best=False,
                 )
-            # Remove non-best epoch checkpoints to save disk (keep only last + best)
+            # Remove non-best epoch checkpoints to save disk
             if epoch > 1:
                 prev_ckpt = os.path.join(
                     self.run_dir, f"fold{self.fold}_epoch{epoch - 1}.pth"
@@ -179,14 +182,13 @@ class Trainer:
                 if os.path.exists(prev_ckpt) and prev_ckpt != best_ckpt_path:
                     os.remove(prev_ckpt)
 
-            # Scheduler step on validation loss
-            self.scheduler.step(val_loss)
+            # Scheduler and early stopping both track val_acc
+            self.scheduler.step(val_acc)
 
-            # Early stopping check
-            if self.early_stopping.step(val_loss):
+            if self.early_stopping.step(val_acc):
                 logger.info(
                     f"[Fold {self.fold}] Early stopping at epoch {epoch} "
-                    f"(no improvement for {self.cfg.early_stop_patience} epochs)"
+                    f"(val_acc no improvement for {self.cfg.early_stop_patience} epochs)"
                 )
                 break
 

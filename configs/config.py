@@ -29,7 +29,7 @@ class TrainConfig:
     epochs: int = 75
     batch_size: int = 24
     lr: float = 1e-3
-    weight_decay: float = 1e-4       # not specified; standard choice
+    weight_decay: float = 1e-4        # not specified in paper; no regularization we traid with 1e-4 and worked
     seed: int = 42
 
     # LR scheduler (ReduceLROnPlateau)
@@ -41,13 +41,13 @@ class TrainConfig:
     early_stop_patience: int = 13    # paper: "patience of 13 epochs"
 
     # Loss weights  (paper Eq. 3: L = alpha*PCOL + beta*SCOLw + RMSE)
-    alpha: float = 1.0               # not specified; equal weighting
-    beta: float = 1.0                # not specified; equal weighting
+    alpha: float = 0.01               # not specified; equal weighting I think best alpha should be 0.01
+    beta: float = 0.1                # not specified; equal weighting I think best beta should be 0.1
 
     # Contrastive loss temperature
     # tau=0.07 is SupCon standard; ordinal distances are raw |y_a - y_n|
     # If ordinal terms dominate, increase tau or set normalize_ordinal=True
-    temperature: float = 0.07
+    temperature: float = 0.2 #tried with 0.2 before and kind worked 
 
     # Projection head dimensions (paper: "1280 and 128 neurons")
     proj_hidden_dim: int = 1280

@@ -33,6 +33,7 @@ from Datasets.dataloaders import (
     ImageLabelDataset,
     StratifiedBatchSampler,
     build_transform,
+    build_train_transform,
 )
 from models.framework import build_model
 from training.cross_val import BUSICrossValidator
@@ -82,7 +83,8 @@ def load_all_busi_items(busi_root: str) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_loaders(train_items, val_items, test_items, cfg: BUSIConfig, device=None):
-    tfm = build_transform(cfg.img_size)
+    train_tfm = build_train_transform(cfg.img_size)   # augmented for training
+    eval_tfm = build_transform(cfg.img_size)           # clean for val/test
 
     # MPS (Apple Silicon) does not support pin_memory and has issues with
     # forked DataLoader workers — use 0 workers and no pin_memory on MPS.
@@ -90,9 +92,9 @@ def make_loaders(train_items, val_items, test_items, cfg: BUSIConfig, device=Non
     num_workers = 0 if use_mps else cfg.num_workers
     pin_memory = False if use_mps else cfg.pin_memory
 
-    train_ds = ImageLabelDataset(train_items, transform=tfm)
-    val_ds = ImageLabelDataset(val_items, transform=tfm)
-    test_ds = ImageLabelDataset(test_items, transform=tfm)
+    train_ds = ImageLabelDataset(train_items, transform=train_tfm)
+    val_ds = ImageLabelDataset(val_items, transform=eval_tfm)
+    test_ds = ImageLabelDataset(test_items, transform=eval_tfm)
 
     if cfg.stratified:
         train_labels = [y for _, y in train_items]
