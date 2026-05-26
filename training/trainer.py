@@ -36,18 +36,18 @@ logger = logging.getLogger(__name__)
 
 
 class EarlyStopping:
-    """Stops training when val_acc has not improved for *patience* epochs."""
+    """Stops training when val_loss has not improved for *patience* epochs."""
 
     def __init__(self, patience: int = 13, min_delta: float = 0.0):
         self.patience = patience
         self.min_delta = min_delta
-        self.best_acc = -float("inf")
+        self.best_loss = float("inf")
         self.counter = 0
         self.stop = False
 
-    def step(self, val_acc: float) -> bool:
-        if val_acc > self.best_acc + self.min_delta:
-            self.best_acc = val_acc
+    def step(self, val_loss: float) -> bool:
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
             self.counter = 0
         else:
             self.counter += 1
@@ -109,10 +109,10 @@ class Trainer:
         )
         logger.info(f"Class weights: {self.class_weights.tolist()}")
 
-        # LR scheduler: ReduceLROnPlateau factor=0.2, patience=5, tracking val_acc
+        # LR scheduler: ReduceLROnPlateau factor=0.2, patience=5, tracking val_loss
         self.scheduler = ReduceLROnPlateau(
             self.optimizer,
-            mode="max",
+            mode="min",
             factor=cfg.lr_factor,
             patience=cfg.lr_patience,
             min_lr=cfg.lr_min,
@@ -135,7 +135,7 @@ class Trainer:
 
         Returns final test metrics dict.
         """
-        best_val_acc = -float("inf")
+        best_val_loss = float("inf")
 
         for epoch in range(1, self.cfg.epochs + 1):
             t0 = time.time()
@@ -148,12 +148,12 @@ class Trainer:
 
             self._log_epoch(epoch, elapsed, lr_now, train_metrics, val_metrics)
 
-            # Checkpoint by val_acc — directly optimises the target metric
+            # Checkpoint by val_loss (RMSE) — paper: "optimized based on validation loss"
             val_acc = val_metrics["val_acc"]
             val_loss = val_metrics["val_loss"]
-            is_best = val_acc > best_val_acc
+            is_best = val_loss < best_val_loss
             if is_best:
-                best_val_acc = val_acc
+                best_val_loss = val_loss
 
             ckpt_path = os.path.join(self.run_dir, f"fold{self.fold}_epoch{epoch}.pth")
             best_ckpt_path = os.path.join(self.run_dir, f"fold{self.fold}_best.pth")
@@ -182,13 +182,13 @@ class Trainer:
                 if os.path.exists(prev_ckpt) and prev_ckpt != best_ckpt_path:
                     os.remove(prev_ckpt)
 
-            # Scheduler and early stopping both track val_acc
-            self.scheduler.step(val_acc)
+            # Scheduler and early stopping both track val_loss (RMSE)
+            self.scheduler.step(val_loss)
 
-            if self.early_stopping.step(val_acc):
+            if self.early_stopping.step(val_loss):
                 logger.info(
                     f"[Fold {self.fold}] Early stopping at epoch {epoch} "
-                    f"(val_acc no improvement for {self.cfg.early_stop_patience} epochs)"
+                    f"(val_loss no improvement for {self.cfg.early_stop_patience} epochs)"
                 )
                 break
 

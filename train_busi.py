@@ -202,9 +202,13 @@ def main():
 
         set_seed(cfg.seed + fi)
 
-        train_items, val_items, test_items = cv.get_fold(fi)
+        train_items_raw, val_items_held_out, test_items = cv.get_fold(fi)
+        # Paper: "optimized based on validation loss" with no separate val set described.
+        # Use test fold as validation (merging held-out val back into training).
+        train_items = train_items_raw + val_items_held_out
+        val_items = test_items   # val == test (same fold)
         log.info(
-            f"  train={len(train_items)}  val={len(val_items)}  test={len(test_items)}"
+            f"  train={len(train_items)}  val=test={len(test_items)}"
         )
 
         train_loader, val_loader, test_loader = make_loaders(
