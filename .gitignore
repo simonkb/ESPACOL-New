@@ -8,3 +8,5 @@ MICCAI 2025 code for MBZUAI group.ipynb
 /runs/
 .env
 /wandb
+/Datasets/DR/train.zip.download
+Datasets/DR/train.zip
