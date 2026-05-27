@@ -14,8 +14,7 @@ Paper (Section 3 - Implementation details):
   - Total loss: alpha*PCOL + beta*SCOLw + RMSE
 """
 
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 
 @dataclass
@@ -28,26 +27,25 @@ class TrainConfig:
     # Training
     epochs: int = 75
     batch_size: int = 24
-    lr: float = 1e-3
+    lr: float = 5e-4
     weight_decay: float = 1e-4        # not specified in paper; no regularization we traid with 1e-4 and worked
     seed: int = 42
 
     # LR scheduler (ReduceLROnPlateau)
     lr_factor: float = 0.2           # paper: "reduced by a factor of 0.2"
-    lr_patience: int = 8             # paper says 5 but val_loss on 156 images is still noisy; 8 gives more time at each LR
+    lr_patience: int = 5             # paper: "after 5 epochs of no improvement"
     lr_min: float = 1e-6
 
     # Early stopping
     early_stop_patience: int = 13    # paper: "patience of 13 epochs"
 
     # Loss weights  (paper Eq. 3: L = alpha*PCOL + beta*SCOLw + RMSE)
-    alpha: float = 0.01               # not specified; equal weighting I think best alpha should be 0.01
-    beta: float = 0.1                # not specified; equal weighting I think best beta should be 0.1
+    alpha: float = 0.00337            # sweep best: fold0 93.63% acc
+    beta: float = 0.0929             # sweep best: fold0 93.63% acc
 
     # Contrastive loss temperature
-    # tau=0.07 is SupCon standard; ordinal distances are raw |y_a - y_n|
-    # If ordinal terms dominate, increase tau or set normalize_ordinal=True
-    temperature: float = 0.2 #tried with 0.2 before and kind worked 
+    # tau=0.05 helped fold0 but hurt fold1; tau=0.1 is a compromise
+    temperature: float = 0.1
 
     # Projection head dimensions (paper: "1280 and 128 neurons")
     proj_hidden_dim: int = 1280

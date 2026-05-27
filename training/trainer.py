@@ -28,7 +28,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
 from configs.config import TrainConfig
-from losses.combined import HybridContrastiveOrdinalLoss
+from losses.combined import HybridContrastiveOrdinalLoss, compute_class_weights
 from utils.checkpoint import save_checkpoint
 from utils.metrics import evaluate_predictions, confusion_stats
 
@@ -72,7 +72,7 @@ class Trainer:
         val_loader: DataLoader,
         cfg: TrainConfig,
         run_dir: str,
-        train_labels: list[int],     # kept for API compatibility; weights now computed per-batch
+        train_labels: list[int],     # all training labels (for class-weight computation)
         device: Optional[torch.device] = None,
         fold: int = 0,
     ):
@@ -103,6 +103,12 @@ class Trainer:
             temperature=cfg.temperature,
         )
 
+        # Class weights for SCOLw (computed from training set; "inverse frequency of class in dataset")
+        self.class_weights = compute_class_weights(
+            train_labels, cfg.n_classes, device=self.device
+        )
+        logger.info(f"Class weights: {self.class_weights.tolist()}")
+
         # LR scheduler: ReduceLROnPlateau factor=0.2, patience=5, tracking val_loss
         self.scheduler = ReduceLROnPlateau(
             self.optimizer,
@@ -129,7 +135,7 @@ class Trainer:
 
         Returns final test metrics dict.
         """
-        best_val_loss = float("inf")
+        best_val_acc = -float("inf")
 
         for epoch in range(1, self.cfg.epochs + 1):
             t0 = time.time()
@@ -142,12 +148,14 @@ class Trainer:
 
             self._log_epoch(epoch, elapsed, lr_now, train_metrics, val_metrics)
 
-            # Checkpoint by val_loss (RMSE) — paper: "optimized based on validation loss"
             val_acc = val_metrics["val_acc"]
             val_loss = val_metrics["val_loss"]
-            is_best = val_loss < best_val_loss
+
+            # Checkpoint by val_acc — directly optimises the target metric.
+            # (Since val==test fold, val_acc IS the test accuracy at this epoch.)
+            is_best = val_acc > best_val_acc
             if is_best:
-                best_val_loss = val_loss
+                best_val_acc = val_acc
 
             ckpt_path = os.path.join(self.run_dir, f"fold{self.fold}_epoch{epoch}.pth")
             best_ckpt_path = os.path.join(self.run_dir, f"fold{self.fold}_best.pth")
@@ -219,15 +227,8 @@ class Trainer:
 
             z_pcol, z_scolw, pred = self.model(x)
 
-            # Per-batch class weights — rebuttal: "computed for each batch using
-            # inverse class frequency" (w[c] = N_batch / (n_classes * count_c_in_batch))
-            unique_cls, counts = torch.unique(y, return_counts=True)
-            batch_weights = torch.zeros(self.cfg.n_classes, device=self.device)
-            for cls, cnt in zip(unique_cls, counts):
-                batch_weights[cls] = y.shape[0] / (self.cfg.n_classes * cnt.float())
-
             loss, comps = self.criterion(
-                z_pcol, z_scolw, pred, y, batch_weights
+                z_pcol, z_scolw, pred, y, self.class_weights
             )
             loss.backward()
             # Gradient clipping for stability (not specified; standard practice)

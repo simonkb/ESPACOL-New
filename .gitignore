@@ -7,3 +7,5 @@
 MICCAI 2025 code for MBZUAI group.ipynb
 /runs
 /runs
+.env
+/wandb
