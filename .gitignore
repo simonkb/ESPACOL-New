@@ -5,7 +5,6 @@
 
 **/__pycache__/
 MICCAI 2025 code for MBZUAI group.ipynb
-/runs
-/runs
+/runs/
 .env
 /wandb
