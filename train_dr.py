@@ -41,6 +41,7 @@ from Datasets.dataloaders import (
     ImageLabelDataset,
     StratifiedBatchSampler,
     build_transform,
+    build_train_transform,
 )
 from models.framework import build_model
 from training.cross_val import DRCrossValidator
@@ -92,12 +93,17 @@ def load_all_dr_items(dr_root: str, train_csv: str) -> list:
 # Build DataLoaders for one fold
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_loaders(train_items, val_items, test_items, cfg: DRConfig):
-    tfm = build_transform(cfg.img_size)
+def make_loaders(train_items, val_items, test_items, cfg: DRConfig, device=None):
+    train_tfm = build_train_transform(cfg.img_size)
+    eval_tfm = build_transform(cfg.img_size)
 
-    train_ds = ImageLabelDataset(train_items, transform=tfm)
-    val_ds = ImageLabelDataset(val_items, transform=tfm)
-    test_ds = ImageLabelDataset(test_items, transform=tfm)
+    use_mps = device is not None and device.type == "mps"
+    num_workers = 0 if use_mps else cfg.num_workers
+    pin_memory = False if use_mps else cfg.pin_memory
+
+    train_ds = ImageLabelDataset(train_items, transform=train_tfm)
+    val_ds = ImageLabelDataset(val_items, transform=eval_tfm)
+    test_ds = ImageLabelDataset(test_items, transform=eval_tfm)
 
     if cfg.stratified:
         train_labels = [y for _, y in train_items]
@@ -107,16 +113,16 @@ def make_loaders(train_items, val_items, test_items, cfg: DRConfig):
         train_loader = DataLoader(
             train_ds,
             batch_sampler=sampler,
-            num_workers=cfg.num_workers,
-            pin_memory=cfg.pin_memory,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
         )
     else:
         train_loader = DataLoader(
             train_ds,
             batch_size=cfg.batch_size,
             shuffle=True,
-            num_workers=cfg.num_workers,
-            pin_memory=cfg.pin_memory,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
             drop_last=True,
         )
 
@@ -124,15 +130,15 @@ def make_loaders(train_items, val_items, test_items, cfg: DRConfig):
         val_ds,
         batch_size=cfg.batch_size,
         shuffle=False,
-        num_workers=cfg.num_workers,
-        pin_memory=cfg.pin_memory,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
     )
     test_loader = DataLoader(
         test_ds,
         batch_size=cfg.batch_size,
         shuffle=False,
-        num_workers=cfg.num_workers,
-        pin_memory=cfg.pin_memory,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
     )
 
     return train_loader, val_loader, test_loader
@@ -210,9 +216,12 @@ def main():
 
         set_seed(cfg.seed + fi)
 
-        train_items, val_items, test_items = cv.get_fold(fi)
+        train_items_raw, val_items_held_out, test_items = cv.get_fold(fi)
+        # Same val=test strategy as BUSI: merge held-out val back into training
+        train_items = train_items_raw + val_items_held_out
+        val_items = test_items
         log.info(
-            f"  train={len(train_items)}  val={len(val_items)}  test={len(test_items)}"
+            f"  train={len(train_items)}  val=test={len(test_items)}"
         )
 
         # Class distribution in this fold's training set
@@ -220,7 +229,7 @@ def main():
         log.info(f"  Train class dist: {dict(sorted(dist_fold.items()))}")
 
         train_loader, val_loader, test_loader = make_loaders(
-            train_items, val_items, test_items, cfg
+            train_items, val_items, test_items, cfg, device=device
         )
 
         fold_dir = os.path.join(args.run_dir, f"fold{fi}")
