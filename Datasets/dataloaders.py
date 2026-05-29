@@ -19,6 +19,7 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader, Sampler
 from torchvision import transforms
+from torchvision.transforms.functional import to_pil_image
 
 
 # ----------------------------
@@ -507,6 +508,65 @@ def make_busi_loaders(
 
 
 # ----------------------------
+# DR image pre-loader (cache all images in RAM before fold loop)
+# ----------------------------
+def preload_dr_images(
+    items: List[Tuple[str, int]],
+    img_size: int = 300,
+    n_threads: int = 16,
+    cache_dir: Optional[str] = None,
+) -> Dict[str, torch.Tensor]:
+    """
+    Load all DR images into RAM as resized uint8 tensors.
+
+    If cache_dir is given:
+      - First call: decode JPEGs, resize, save as .pt files in cache_dir (~30 min).
+      - Later calls: load .pt files directly (~30 sec). Survives process restarts.
+    Without cache_dir: always decodes from source (no disk persistence).
+
+    Returns {path: uint8 tensor (C, H, W)}.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+
+    resize = transforms.Resize((img_size, img_size))
+    paths = list(dict.fromkeys(path for path, _ in items))
+    n = len(paths)
+    cache: Dict[str, torch.Tensor] = {}
+
+    def _pt_path(src_path: str) -> str:
+        stem = os.path.splitext(os.path.basename(src_path))[0]
+        return os.path.join(cache_dir, f"{stem}.pt")  # type: ignore[arg-type]
+
+    def _load(path: str):
+        if cache_dir:
+            pt = _pt_path(path)
+            if os.path.exists(pt):
+                return path, torch.load(pt, weights_only=True)
+        img = _pil_loader(path, rgb=True)
+        img = resize(img)
+        t = torch.from_numpy(np.array(img)).permute(2, 0, 1).contiguous()
+        if cache_dir:
+            torch.save(t, _pt_path(path))
+        return path, t
+
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        futures = {pool.submit(_load, p): p for p in paths}
+        done = 0
+        for future in as_completed(futures):
+            path, tensor = future.result()
+            cache[path] = tensor
+            done += 1
+            if done % 5000 == 0 or done == n:
+                approx_gb = done * img_size * img_size * 3 / 1e9
+                print(f"  Caching DR images: {done}/{n}  (~{approx_gb:.1f} GB in RAM)")
+
+    return cache
+
+
+# ----------------------------
 # Generic dataset for CV splits
 # ----------------------------
 class ImageLabelDataset(Dataset):
@@ -514,6 +574,9 @@ class ImageLabelDataset(Dataset):
     Minimal dataset that accepts a pre-built list of (path, label) tuples.
     Used by the cross-validation splits (training/cross_val.py) instead of
     the class-folder / CSV datasets above, which assume fixed train/test splits.
+
+    Pass img_cache (from preload_dr_images) to skip per-epoch JPEG decode.
+    Workers read the shared cache read-only (CoW on Linux fork) — no RAM copies.
     """
 
     def __init__(
@@ -521,17 +584,25 @@ class ImageLabelDataset(Dataset):
         items: List[Tuple[str, int]],
         transform: Optional[Callable] = None,
         rgb: bool = True,
+        img_cache: Optional[Dict[str, torch.Tensor]] = None,
     ):
         self.items = items
         self.transform = transform or build_transform(300)
         self.rgb = rgb
+        self._img_cache = img_cache
 
     def __len__(self) -> int:
         return len(self.items)
 
     def __getitem__(self, idx: int):
         img_path, label = self.items[idx]
-        img = _pil_loader(img_path, rgb=self.rgb)
+        if self._img_cache is not None and img_path in self._img_cache:
+            # Cached path: uint8 tensor -> PIL -> transform (augmentation included).
+            # to_pil_image is zero-copy on uint8; the Resize in transform is a no-op
+            # since the image is already at img_size × img_size.
+            img = to_pil_image(self._img_cache[img_path])
+        else:
+            img = _pil_loader(img_path, rgb=self.rgb)
         x = self.transform(img)
         y = torch.tensor(label, dtype=torch.long)
         return x, y

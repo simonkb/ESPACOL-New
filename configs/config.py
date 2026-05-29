@@ -21,7 +21,7 @@ from dataclasses import dataclass
 class TrainConfig:
     # Data
     img_size: int = 300
-    num_workers: int = 4
+    num_workers: int = 12
     pin_memory: bool = True
 
     # Training
@@ -60,6 +60,9 @@ class TrainConfig:
     # Whether to use pretrained ImageNet weights for backbone
     pretrained: bool = True
 
+    # Automatic Mixed Precision — enabled on CUDA only (T4/A10 Tensor Cores → ~2× speed)
+    amp: bool = True
+
 
 @dataclass
 class BUSIConfig(TrainConfig):
@@ -79,7 +82,10 @@ class DRConfig(TrainConfig):
     n_folds: int = 10                # paper: 10-fold CV
     val_fraction: float = 0.1        # 10% of train folds for validation
     run_dir: str = "runs/dr"
-    # DR has ordinal distances 0-4 (vs BUSI's 0-2); tau=0.1 causes exp(4/0.1)=exp(40)
-    # which makes SCOLw numerically unstable and dominate the loss. tau=0.5 keeps
-    # the ordinal penalty (max 4/0.5=8) in a numerically safe range.
-    temperature: float = 0.5
+    # tau=1.0: max SCOLw logit = (1+4)/1.0=5 → exp(5)=148, gradient is balanced
+    # across all 5 class pairs. tau=0.5 gave exp(8)=3000, which made class-0 vs
+    # class-4 dominate the gradient completely and prevented SCOLw from converging.
+    # With tau=1.0 + beta=0.0929, SCOLw contributes ~56% of total loss — same
+    # healthy balance that drove BUSI to 91%.
+    temperature: float = 1.0
+    lr_patience: int = 8   # DR needs longer warmup; LR dropped too early at patience=5

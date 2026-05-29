@@ -42,6 +42,7 @@ from Datasets.dataloaders import (
     StratifiedBatchSampler,
     build_transform,
     build_train_transform,
+    preload_dr_images,
 )
 from models.framework import build_model
 from training.cross_val import DRCrossValidator
@@ -93,17 +94,19 @@ def load_all_dr_items(dr_root: str, train_csv: str) -> list:
 # Build DataLoaders for one fold
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_loaders(train_items, val_items, test_items, cfg: DRConfig, device=None):
+def make_loaders(train_items, val_items, test_items, cfg: DRConfig, device=None, img_cache=None):
     train_tfm = build_train_transform(cfg.img_size)
     eval_tfm = build_transform(cfg.img_size)
 
     use_mps = device is not None and device.type == "mps"
     num_workers = 0 if use_mps else cfg.num_workers
     pin_memory = False if use_mps else cfg.pin_memory
+    # prefetch_factor requires num_workers > 0
+    pf_kwargs = {"prefetch_factor": 4} if num_workers > 0 else {}
 
-    train_ds = ImageLabelDataset(train_items, transform=train_tfm)
-    val_ds = ImageLabelDataset(val_items, transform=eval_tfm)
-    test_ds = ImageLabelDataset(test_items, transform=eval_tfm)
+    train_ds = ImageLabelDataset(train_items, transform=train_tfm, img_cache=img_cache)
+    val_ds   = ImageLabelDataset(val_items,   transform=eval_tfm,  img_cache=img_cache)
+    test_ds  = ImageLabelDataset(test_items,  transform=eval_tfm,  img_cache=img_cache)
 
     if cfg.stratified:
         train_labels = [y for _, y in train_items]
@@ -115,6 +118,8 @@ def make_loaders(train_items, val_items, test_items, cfg: DRConfig, device=None)
             batch_sampler=sampler,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            persistent_workers=(num_workers > 0),
+            **pf_kwargs,
         )
     else:
         train_loader = DataLoader(
@@ -124,6 +129,8 @@ def make_loaders(train_items, val_items, test_items, cfg: DRConfig, device=None)
             num_workers=num_workers,
             pin_memory=pin_memory,
             drop_last=True,
+            persistent_workers=(num_workers > 0),
+            **pf_kwargs,
         )
 
     val_loader = DataLoader(
@@ -132,6 +139,7 @@ def make_loaders(train_items, val_items, test_items, cfg: DRConfig, device=None)
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        **pf_kwargs,
     )
     test_loader = DataLoader(
         test_ds,
@@ -139,6 +147,7 @@ def make_loaders(train_items, val_items, test_items, cfg: DRConfig, device=None)
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        **pf_kwargs,
     )
 
     return train_loader, val_loader, test_loader
@@ -167,6 +176,14 @@ def main():
         help="Comma-separated fold indices to run (e.g. '0,1,2') or 'all'"
     )
     parser.add_argument("--no_pretrained", action="store_true")
+    parser.add_argument(
+        "--no_cache", action="store_true",
+        help="Disable RAM image cache (use if RAM < 12 GB free)"
+    )
+    parser.add_argument(
+        "--cache_dir", type=str, default="Datasets/DR/train_cache",
+        help="Directory for pre-decoded .pt files (built on first run, reused after)"
+    )
     args = parser.parse_args()
 
     if args.train_csv is None:
@@ -207,6 +224,23 @@ def main():
     )
     log.info(f"Device: {device}")
 
+    # Load all images into RAM once — shared across all folds (CoW fork, no copies).
+    # ~9.5 GB for 35K × 300×300 uint8. Skip with --no_cache if RAM is tight.
+    img_cache = None
+    if not args.no_cache:
+        # 16 threads regardless of core count — loading is I/O-bound (JPEG decode),
+        # so oversubscription is safe and drops load time from ~24 min to ~2-5 min.
+        n_threads = 16
+        cache_dir = args.cache_dir if args.cache_dir else None
+        log.info(
+            f"Pre-loading all DR images into RAM ({n_threads} threads) ... "
+            f"{'(disk cache: ' + cache_dir + ')' if cache_dir else '(no disk cache)'}"
+        )
+        img_cache = preload_dr_images(
+            all_items, img_size=cfg.img_size, n_threads=n_threads, cache_dir=cache_dir
+        )
+        log.info(f"Image cache ready: {len(img_cache)} images")
+
     fold_results = []
 
     for fi in fold_indices:
@@ -229,7 +263,7 @@ def main():
         log.info(f"  Train class dist: {dict(sorted(dist_fold.items()))}")
 
         train_loader, val_loader, test_loader = make_loaders(
-            train_items, val_items, test_items, cfg, device=device
+            train_items, val_items, test_items, cfg, device=device, img_cache=img_cache
         )
 
         fold_dir = os.path.join(args.run_dir, f"fold{fi}")

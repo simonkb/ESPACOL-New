@@ -24,6 +24,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
@@ -88,6 +89,15 @@ class Trainer:
             "cpu"
         )
         self.model.to(self.device)
+
+        # cuDNN auto-tuner: profiles kernels on first batch, then reuses fastest.
+        # Safe because input size is always 300×300 throughout training.
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+
+        # AMP: enabled on CUDA only (Tensor Cores). Disabled on MPS/CPU.
+        self.use_amp = cfg.amp and self.device.type == "cuda"
+        self.scaler = GradScaler(device="cuda", enabled=self.use_amp)
 
         # Optimizer (Adam is the standard; paper says "optimized based on validation loss")
         self.optimizer = torch.optim.Adam(
@@ -216,24 +226,28 @@ class Trainer:
         total_loss = total_pcol = total_scolw = total_rmse = 0.0
         n_batches = 0
 
+        # non_blocking=True is safe with CUDA + pinned memory: overlaps CPU→GPU
+        # copy with the previous GPU kernel. On MPS this would produce garbage values.
+        nb = self.device.type == "cuda"
+
         for x, y in self.train_loader:
-            # non_blocking=True is only safe with CUDA + pinned memory.
-            # MPS reads the tensor before the async transfer completes, producing
-            # garbage values. Use blocking transfers unconditionally.
-            x = x.to(self.device)
-            y = y.to(self.device)
+            x = x.to(self.device, non_blocking=nb)
+            y = y.to(self.device, non_blocking=nb)
 
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
 
-            z_pcol, z_scolw, pred = self.model(x)
+            with autocast(device_type=self.device.type, enabled=self.use_amp):
+                z_pcol, z_scolw, pred = self.model(x)
+                loss, comps = self.criterion(
+                    z_pcol, z_scolw, pred, y, self.class_weights
+                )
 
-            loss, comps = self.criterion(
-                z_pcol, z_scolw, pred, y, self.class_weights
-            )
-            loss.backward()
-            # Gradient clipping for stability (not specified; standard practice)
+            self.scaler.scale(loss).backward()
+            # Unscale before clip so the gradient norm is in the original fp32 scale.
+            self.scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
             total_loss += comps["loss_total"]
             total_pcol += comps["loss_pcol"]
@@ -257,17 +271,20 @@ class Trainer:
         total_rmse = 0.0
         n_batches = 0
 
+        nb = self.device.type == "cuda"
+
         for x, y in loader:
-            x = x.to(self.device)
-            y = y.to(self.device)
+            x = x.to(self.device, non_blocking=nb)
+            y = y.to(self.device, non_blocking=nb)
 
             # Only the regression head is used at inference (paper Section 2.1).
             # Contrastive losses require stratified batches (≥2 classes present)
             # which is NOT guaranteed on validation/test loaders — computing them
             # here produces degenerate −1e9 values that break early stopping and
             # checkpoint selection.  Use RMSE-only as the validation criterion.
-            pred = self.model.predict(x)
-            rmse = torch.sqrt(nn.functional.mse_loss(pred, y.float()))
+            with autocast(device_type=self.device.type, enabled=self.use_amp):
+                pred = self.model.predict(x)
+                rmse = torch.sqrt(nn.functional.mse_loss(pred, y.float()))
 
             total_rmse += rmse.item()
             n_batches += 1
