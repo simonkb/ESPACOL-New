@@ -21,7 +21,7 @@ from dataclasses import dataclass
 class TrainConfig:
     # Data
     img_size: int = 300
-    num_workers: int = 12
+    num_workers: int = 4
     pin_memory: bool = True
 
     # Training
@@ -82,10 +82,18 @@ class DRConfig(TrainConfig):
     n_folds: int = 10                # paper: 10-fold CV
     val_fraction: float = 0.1        # 10% of train folds for validation
     run_dir: str = "runs/dr"
-    # tau=1.0: max SCOLw logit = (1+4)/1.0=5 → exp(5)=148, gradient is balanced
-    # across all 5 class pairs. tau=0.5 gave exp(8)=3000, which made class-0 vs
-    # class-4 dominate the gradient completely and prevented SCOLw from converging.
-    # With tau=1.0 + beta=0.0929, SCOLw contributes ~56% of total loss — same
-    # healthy balance that drove BUSI to 91%.
+    # Full-dataset sweep (35K images): lr=1e-4 wins every time; lr=5e-4 fails (50-68%).
+    # With 31K training samples and 1300+ batches/epoch the gradient is dense —
+    # a lower LR avoids overshooting the contrastive loss landscape.
+    lr: float = 1e-4
+    # alpha/beta tuned to full 35K dataset: contrastive losses act as mild
+    # regularization when RMSE already has strong signal from 31K samples.
+    # beta=0.0929 (base default) is too high; drives SCOLw to dominate over RMSE.
+    alpha: float = 0.005
+    beta: float = 0.037
+    # tau=1.0: max SCOLw logit = 4/1.0=4 → exp(4)=54, balanced across all 5 class
+    # pairs. tau=0.5 gives exp(8)=3000 which lets class-0 vs class-4 monopolise gradient.
     temperature: float = 1.0
-    lr_patience: int = 8   # DR needs longer warmup; LR dropped too early at patience=5
+    # lr_patience=5: LR drops at epoch ~10-15, leaving 60 epochs for fine-tuning
+    # within the 75-epoch budget. patience=8 delays the drop past the useful window.
+    lr_patience: int = 5
