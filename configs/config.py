@@ -89,11 +89,14 @@ class DRConfig(TrainConfig):
     # alpha/beta tuned to full 35K dataset: contrastive losses act as mild
     # regularization when RMSE already has strong signal from 31K samples.
     # beta=0.0929 (base default) is too high; drives SCOLw to dominate over RMSE.
-    alpha: float = 0.005
-    beta: float = 0.037
+    alpha: float = 0.05
+    beta: float = 0.073
     # tau=1.0: max SCOLw logit = 4/1.0=4 → exp(4)=54, balanced across all 5 class
     # pairs. tau=0.5 gives exp(8)=3000 which lets class-0 vs class-4 monopolise gradient.
     temperature: float = 1.0
     # lr_patience=5: LR drops at epoch ~10-15, leaving 60 epochs for fine-tuning
     # within the 75-epoch budget. patience=8 delays the drop past the useful window.
     lr_patience: int = 5
+    # v2 hit 72.29% at epoch 11 then early-stopped at epoch 24 (only 32% of budget).
+    # patience=20 gives 50+ epochs of fine-tuning after the LR drop.
+    early_stop_patience: int = 20
