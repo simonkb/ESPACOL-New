@@ -369,7 +369,11 @@ class StratifiedBatchSampler(Sampler[List[int]]):
         self.per_class = max(1, self.batch_size // self.n_classes)
 
     def __iter__(self):
-        rng = random.Random(self.seed)
+        # Vary seed per epoch so batch composition changes across epochs.
+        # A fixed seed would produce the identical 1317-batch sequence every epoch
+        # (only augmentation would differ), limiting gradient diversity.
+        self._epoch = getattr(self, "_epoch", -1) + 1
+        rng = random.Random(self.seed + self._epoch)
 
         pools: Dict[int, List[int]] = {}
         for c in self.classes:

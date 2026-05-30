@@ -82,21 +82,11 @@ class DRConfig(TrainConfig):
     n_folds: int = 10                # paper: 10-fold CV
     val_fraction: float = 0.1        # 10% of train folds for validation
     run_dir: str = "runs/dr"
-    # Full-dataset sweep (35K images): lr=1e-4 wins every time; lr=5e-4 fails (50-68%).
-    # With 31K training samples and 1300+ batches/epoch the gradient is dense —
-    # a lower LR avoids overshooting the contrastive loss landscape.
-    lr: float = 1e-4
-    # alpha/beta tuned to full 35K dataset: contrastive losses act as mild
-    # regularization when RMSE already has strong signal from 31K samples.
-    # beta=0.0929 (base default) is too high; drives SCOLw to dominate over RMSE.
-    alpha: float = 0.05
-    beta: float = 0.073
-    # tau=1.0: max SCOLw logit = 4/1.0=4 → exp(4)=54, balanced across all 5 class
-    # pairs. tau=0.5 gives exp(8)=3000 which lets class-0 vs class-4 monopolise gradient.
+    # Paper uses lr=1e-3 for all experiments. Previous 1e-4 was a workaround for
+    # gradient instability caused by using dataset-level SCOLw class weights.
+    # With batch-level weights (per author response), 1e-3 is correct.
+    lr: float = 1e-3
+    # tau=1.0: 5-class DR has max ordinal distance 4. With tau=0.1 (base),
+    # exp(4/0.1)=exp(40) overflows and monopolises gradient on class-0 vs class-4.
+    # tau=1.0 gives exp(4)=54 — tractable and balanced across all 5 class pairs.
     temperature: float = 1.0
-    # lr_patience=5: LR drops at epoch ~10-15, leaving 60 epochs for fine-tuning
-    # within the 75-epoch budget. patience=8 delays the drop past the useful window.
-    lr_patience: int = 5
-    # v2 hit 72.29% at epoch 11 then early-stopped at epoch 24 (only 32% of budget).
-    # patience=20 gives 50+ epochs of fine-tuning after the LR drop.
-    early_stop_patience: int = 20

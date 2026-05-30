@@ -236,10 +236,18 @@ class Trainer:
 
             self.optimizer.zero_grad(set_to_none=True)
 
+            # Paper (author response): weights computed per-batch using inverse
+            # class frequency of the current mini-batch, not dataset-level.
+            # With stratified sampling (4 per class) this gives ~uniform weights
+            # (~1.2 each), avoiding the 36× gradient imbalance that dataset-level
+            # weights would produce between rare (grade-4) and common (grade-0).
+            batch_weights = compute_class_weights(
+                y.cpu().tolist(), self.cfg.n_classes, device=self.device
+            )
             with autocast(device_type=self.device.type, enabled=self.use_amp):
                 z_pcol, z_scolw, pred = self.model(x)
                 loss, comps = self.criterion(
-                    z_pcol, z_scolw, pred, y, self.class_weights
+                    z_pcol, z_scolw, pred, y, batch_weights
                 )
 
             self.scaler.scale(loss).backward()
