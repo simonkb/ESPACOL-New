@@ -85,8 +85,9 @@ class DRConfig(TrainConfig):
     # Paper uses lr=1e-3 for all experiments. Previous 1e-4 was a workaround for
     # gradient instability caused by using dataset-level SCOLw class weights.
     # With batch-level weights (per author response), 1e-3 is correct.
-    lr: float = 1e-3
-    # tau=1.0: 5-class DR has max ordinal distance 4. With tau=0.1 (base),
-    # exp(4/0.1)=exp(40) overflows and monopolises gradient on class-0 vs class-4.
-    # tau=1.0 gives exp(4)=54 — tractable and balanced across all 5 class pairs.
-    temperature: float = 1.0
+    # lr=1e-4: empirically required — lr=1e-3 causes catastrophic instability
+    # (v4: 52.93%; proxy run 25 with lr=1e-3: 42.36%). Proxy run 24 (lr=1e-4): 75.12%.
+    lr: float = 1e-4
+    # tau=0.7: proxy best runs 21 and 24 (both 72-75%) both use tau=0.7.
+    # tau=0.1 overflows (exp(4/0.1)=exp(40)); tau=0.7 gives exp(4/0.7)≈316 — tractable.
+    temperature: float = 0.7
