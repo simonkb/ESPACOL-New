@@ -37,7 +37,9 @@ class TrainConfig:
     lr_min: float = 1e-6
 
     # Early stopping
-    early_stop_patience: int = 13    # paper: "patience of 13 epochs"
+    early_stop_patience: int = 20    # increased from paper's 13: 5-class contrastive needs
+                                     # more recovery time after LR drop (v5 stopped at ep29,
+                                     # only 6 epochs after LR reduction, acc still rising)
 
     # Loss weights  (paper Eq. 3: L = alpha*PCOL + beta*SCOLw + RMSE)
     alpha: float = 0.00337            # sweep best: fold0 93.63% acc
@@ -82,12 +84,13 @@ class DRConfig(TrainConfig):
     n_folds: int = 10                # paper: 10-fold CV
     val_fraction: float = 0.1        # 10% of train folds for validation
     run_dir: str = "runs/dr"
-    # Paper uses lr=1e-3 for all experiments. Previous 1e-4 was a workaround for
-    # gradient instability caused by using dataset-level SCOLw class weights.
-    # With batch-level weights (per author response), 1e-3 is correct.
-    # lr=1e-4: empirically required — lr=1e-3 causes catastrophic instability
+    # lr=1e-4: empirically required despite paper stating 1e-3.
+    # lr=1e-3 causes catastrophic instability with batch-level weights
     # (v4: 52.93%; proxy run 25 with lr=1e-3: 42.36%). Proxy run 24 (lr=1e-4): 75.12%.
     lr: float = 1e-4
+    # lr_patience=8: DR's 5-class contrastive landscape needs more time at high LR
+    # before reduction. v5 reduced at ep22 (too early), cutting off recovery.
+    lr_patience: int = 8
     # tau=0.7: proxy best runs 21 and 24 (both 72-75%) both use tau=0.7.
     # tau=0.1 overflows (exp(4/0.1)=exp(40)); tau=0.7 gives exp(4/0.7)≈316 — tractable.
     temperature: float = 0.7
