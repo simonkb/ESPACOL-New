@@ -90,12 +90,15 @@ class DRConfig(TrainConfig):
     # lr_patience=8: DR's 5-class contrastive landscape needs more time at high LR
     # before reduction. v5 reduced at ep22 (too early), cutting off recovery.
     lr_patience: int = 8
-    # tau=1.0: proxy sweep runs 26 (76.11%) and 31 (75.86%) both use tau=1.0.
-    # tau=0.7 consistently loses to tau=1.0 when alpha is high (run 28: 72.17%).
-    # With tau=1.0 and high alpha, PCOL contributes ~16% of total loss (vs 1% before).
+    # tau=1.0: prevents exp overflow with 5-class ordinal distances.
+    # tau=0.7 gives exp((1+4)/0.7)=1261 in denominators — manageable but larger.
+    # tau=1.0 gives exp(5)=148 — more balanced gradients across all class pairs.
     temperature: float = 1.0
-    # alpha=0.20: proxy runs 26 and 31 (best results) use alpha=0.19-0.21.
-    # High alpha makes PCOL meaningful — prototype alignment shapes the feature space.
-    alpha: float = 0.20
-    # beta=0.09: middle of run26 (0.086) and run31 (0.109) range.
-    beta: float = 0.09
+    # alpha=0.00337: PCOL needs small alpha on the full 35K dataset.
+    # With 640 grade-4 images, batch prototypes (4 samples) are noisy.
+    # alpha=0.2 (proxy-tuned) amplifies that noise into 42% of total gradient
+    # and HURTS on the full dataset (v6-new: 72.71% vs v6-old: 75.78%).
+    # Proxy result (82.27%) is misleading: 406-image test set has high variance
+    # and the proxy model heavily overfits (train_rmse=0.05, val_rmse=0.53).
+    alpha: float = 0.00337
+    beta: float = 0.0929
