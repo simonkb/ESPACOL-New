@@ -42,8 +42,8 @@ class TrainConfig:
                                      # only 6 epochs after LR reduction, acc still rising)
 
     # Loss weights  (paper Eq. 3: L = alpha*PCOL + beta*SCOLw + RMSE)
-    alpha: float = 0.00337            # sweep best: fold0 93.63% acc
-    beta: float = 0.0929             # sweep best: fold0 93.63% acc
+    alpha: float = 0.00337            # sweep best: fold0 93.63% acc (BUSI)
+    beta: float = 0.0929             # sweep best: fold0 93.63% acc (BUSI)
 
     # Contrastive loss temperature
     # tau=0.05 helped fold0 but hurt fold1; tau=0.1 is a compromise
@@ -85,12 +85,17 @@ class DRConfig(TrainConfig):
     val_fraction: float = 0.1        # 10% of train folds for validation
     run_dir: str = "runs/dr"
     # lr=1e-4: empirically required despite paper stating 1e-3.
-    # lr=1e-3 causes catastrophic instability with batch-level weights
-    # (v4: 52.93%; proxy run 25 with lr=1e-3: 42.36%). Proxy run 24 (lr=1e-4): 75.12%.
+    # lr=1e-3 causes catastrophic instability (v4: 52.93%; proxy run 25: 42.36%).
     lr: float = 1e-4
     # lr_patience=8: DR's 5-class contrastive landscape needs more time at high LR
     # before reduction. v5 reduced at ep22 (too early), cutting off recovery.
     lr_patience: int = 8
-    # tau=0.7: proxy best runs 21 and 24 (both 72-75%) both use tau=0.7.
-    # tau=0.1 overflows (exp(4/0.1)=exp(40)); tau=0.7 gives exp(4/0.7)≈316 — tractable.
-    temperature: float = 0.7
+    # tau=1.0: proxy sweep runs 26 (76.11%) and 31 (75.86%) both use tau=1.0.
+    # tau=0.7 consistently loses to tau=1.0 when alpha is high (run 28: 72.17%).
+    # With tau=1.0 and high alpha, PCOL contributes ~16% of total loss (vs 1% before).
+    temperature: float = 1.0
+    # alpha=0.20: proxy runs 26 and 31 (best results) use alpha=0.19-0.21.
+    # High alpha makes PCOL meaningful — prototype alignment shapes the feature space.
+    alpha: float = 0.20
+    # beta=0.09: middle of run26 (0.086) and run31 (0.109) range.
+    beta: float = 0.09
