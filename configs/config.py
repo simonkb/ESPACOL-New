@@ -84,9 +84,7 @@ class DRConfig(TrainConfig):
     n_folds: int = 10                # paper: 10-fold CV
     val_fraction: float = 0.1        # 10% of train folds for validation
     run_dir: str = "runs/dr"
-    # 100 epochs: v6-old hit the 75-epoch cap still improving (best at ep70),
-    # and early stopping now fires on val_acc (more stable) so we need headroom.
-    epochs: int = 100
+    epochs: int = 75
     # lr=1e-4: empirically required despite paper stating 1e-3.
     # lr=1e-3 causes catastrophic instability (v4: 52.93%; proxy run 25: 42.36%).
     lr: float = 1e-4
