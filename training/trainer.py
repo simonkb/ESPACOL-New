@@ -37,18 +37,28 @@ logger = logging.getLogger(__name__)
 
 
 class EarlyStopping:
-    """Stops training when val_loss has not improved for *patience* epochs."""
+    """Stops training when a monitored metric has not improved for *patience* epochs.
 
-    def __init__(self, patience: int = 13, min_delta: float = 0.0):
+    mode="min": stops when metric stops decreasing (e.g. val_loss)
+    mode="max": stops when metric stops increasing (e.g. val_acc)
+    """
+
+    def __init__(self, patience: int = 13, min_delta: float = 0.0, mode: str = "min"):
         self.patience = patience
         self.min_delta = min_delta
-        self.best_loss = float("inf")
+        self.mode = mode
+        self.best = float("inf") if mode == "min" else -float("inf")
         self.counter = 0
         self.stop = False
 
-    def step(self, val_loss: float) -> bool:
-        if val_loss < self.best_loss - self.min_delta:
-            self.best_loss = val_loss
+    def step(self, metric: float) -> bool:
+        if self.mode == "min":
+            improved = metric < self.best - self.min_delta
+        else:
+            improved = metric > self.best + self.min_delta
+
+        if improved:
+            self.best = metric
             self.counter = 0
         else:
             self.counter += 1
@@ -128,8 +138,13 @@ class Trainer:
             min_lr=cfg.lr_min,
         )
 
-        # Early stopping: patience=13
-        self.early_stopping = EarlyStopping(patience=cfg.early_stop_patience)
+        # Early stopping tracks val_acc (max) — the metric we optimize.
+        # val_loss is too noisy for stopping decisions: its std (0.010) is
+        # disproportionately large relative to its range, causing premature stops.
+        # The LR scheduler continues to use val_loss (min) separately.
+        self.early_stopping = EarlyStopping(
+            patience=cfg.early_stop_patience, mode="max"
+        )
 
         # CSV log
         os.makedirs(run_dir, exist_ok=True)
@@ -194,13 +209,14 @@ class Trainer:
                 if os.path.exists(prev_ckpt) and prev_ckpt != best_ckpt_path:
                     os.remove(prev_ckpt)
 
-            # Scheduler and early stopping both track val_loss (RMSE)
+            # Scheduler tracks val_loss (RMSE) — standard for regression.
+            # Early stopping tracks val_acc (max) — the target metric.
             self.scheduler.step(val_loss)
 
-            if self.early_stopping.step(val_loss):
+            if self.early_stopping.step(val_acc):
                 logger.info(
                     f"[Fold {self.fold}] Early stopping at epoch {epoch} "
-                    f"(val_loss no improvement for {self.cfg.early_stop_patience} epochs)"
+                    f"(val_acc no improvement for {self.cfg.early_stop_patience} epochs)"
                 )
                 break
 

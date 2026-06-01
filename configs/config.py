@@ -84,16 +84,20 @@ class DRConfig(TrainConfig):
     n_folds: int = 10                # paper: 10-fold CV
     val_fraction: float = 0.1        # 10% of train folds for validation
     run_dir: str = "runs/dr"
+    # 100 epochs: v6-old hit the 75-epoch cap still improving (best at ep70),
+    # and early stopping now fires on val_acc (more stable) so we need headroom.
+    epochs: int = 100
     # lr=1e-4: empirically required despite paper stating 1e-3.
     # lr=1e-3 causes catastrophic instability (v4: 52.93%; proxy run 25: 42.36%).
     lr: float = 1e-4
     # lr_patience=8: DR's 5-class contrastive landscape needs more time at high LR
     # before reduction. v5 reduced at ep22 (too early), cutting off recovery.
     lr_patience: int = 8
-    # tau=1.0: prevents exp overflow with 5-class ordinal distances.
-    # tau=0.7 gives exp((1+4)/0.7)=1261 in denominators — manageable but larger.
-    # tau=1.0 gives exp(5)=148 — more balanced gradients across all class pairs.
-    temperature: float = 1.0
+    # tau=0.7: spikier contrastive gradients help the model keep improving during
+    # the high-LR (1e-4) phase before the first scheduler drop. With tau=1.0 the
+    # model reached its ep3 val_loss minimum (0.6424) and stayed there, triggering
+    # LR reduction after only 12 epochs. tau=0.7 kept improving until ep18/28.
+    temperature: float = 0.7
     # alpha=0.00337: PCOL needs small alpha on the full 35K dataset.
     # With 640 grade-4 images, batch prototypes (4 samples) are noisy.
     # alpha=0.2 (proxy-tuned) amplifies that noise into 42% of total gradient
