@@ -1,6 +1,6 @@
 # PyTorch dataloaders consistent with the paper's described preprocessing:
 # - Resize to 300x300
-# - Normalize to [0,1] (i.e., ToTensor() only, no mean/std normalization)
+# - ToTensor + ImageNet normalization (mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
 # - DR: labels from CSV (image, level), images found in train/ or test/
 # - BUSI: labels from class folders (benign/malignant/normal), ignore mask files
 # - Class-stratified batch sampling for stability of prototypes
@@ -25,16 +25,21 @@ from torchvision.transforms.functional import to_pil_image
 # ----------------------------
 # Common transforms (paper: resize 300x300, normalize to [0,1])
 # ----------------------------
+_IMAGENET_MEAN = [0.485, 0.456, 0.406]
+_IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+
 def build_transform(img_size: int = 300) -> Callable:
-    """Evaluation transform: resize + ToTensor only (no augmentation)."""
+    """Evaluation transform: resize + ToTensor + ImageNet normalization."""
     return transforms.Compose([
         transforms.Resize((img_size, img_size)),
-        transforms.ToTensor(),  # scales to [0,1]
+        transforms.ToTensor(),
+        transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
     ])
 
 
 def build_train_transform(img_size: int = 300) -> Callable:
-    """Training transform: augmentation + resize + ToTensor.
+    """Training transform: augmentation + resize + ToTensor + ImageNet normalization.
 
     Augmentations are mild and clinically safe for ultrasound/fundus images:
     horizontal/vertical flips preserve diagnostic content, small rotations
@@ -46,7 +51,8 @@ def build_train_transform(img_size: int = 300) -> Callable:
         transforms.RandomVerticalFlip(p=0.5),
         transforms.RandomRotation(degrees=10),
         transforms.ColorJitter(brightness=0.1, contrast=0.1),
-        transforms.ToTensor(),  # scales to [0,1]
+        transforms.ToTensor(),
+        transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
     ])
 
 

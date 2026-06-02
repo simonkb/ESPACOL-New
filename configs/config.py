@@ -85,22 +85,15 @@ class DRConfig(TrainConfig):
     val_fraction: float = 0.1        # 10% of train folds for validation
     run_dir: str = "runs/dr"
     epochs: int = 75
-    # lr=1e-4: empirically required despite paper stating 1e-3.
-    # lr=1e-3 causes catastrophic instability (v4: 52.93%; proxy run 25: 42.36%).
-    lr: float = 1e-4
-    # lr_patience=8: DR's 5-class contrastive landscape needs more time at high LR
-    # before reduction. v5 reduced at ep22 (too early), cutting off recovery.
-    lr_patience: int = 8
-    # tau=0.7: spikier contrastive gradients help the model keep improving during
-    # the high-LR (1e-4) phase before the first scheduler drop. With tau=1.0 the
-    # model reached its ep3 val_loss minimum (0.6424) and stayed there, triggering
-    # LR reduction after only 12 epochs. tau=0.7 kept improving until ep18/28.
-    temperature: float = 0.7
+    # Paper lr=1e-3; previously unstable without ImageNet normalization (v4: 52.93%).
+    # With correct normalization the backbone activations are in range, so 1e-3 is safe.
+    lr: float = 1e-3
+    # Paper lr_patience=5
+    lr_patience: int = 5
+    # Standard contrastive temperature; previous τ=0.7 compressed gradients and
+    # caused PCOL/SCOLw to barely converge (only ~17% loss reduction over 60+ epochs).
+    temperature: float = 0.1
     # alpha=0.00337: PCOL needs small alpha on the full 35K dataset.
     # With 640 grade-4 images, batch prototypes (4 samples) are noisy.
-    # alpha=0.2 (proxy-tuned) amplifies that noise into 42% of total gradient
-    # and HURTS on the full dataset (v6-new: 72.71% vs v6-old: 75.78%).
-    # Proxy result (82.27%) is misleading: 406-image test set has high variance
-    # and the proxy model heavily overfits (train_rmse=0.05, val_rmse=0.53).
     alpha: float = 0.00337
     beta: float = 0.0929
