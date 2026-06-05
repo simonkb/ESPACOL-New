@@ -85,15 +85,18 @@ class DRConfig(TrainConfig):
     val_fraction: float = 0.1        # 10% of train folds for validation
     run_dir: str = "runs/dr"
     epochs: int = 75
+    batch_size: int = 24
     # Paper lr=1e-3; previously unstable without ImageNet normalization (v4: 52.93%).
     # With correct normalization the backbone activations are in range, so 1e-3 is safe.
-    lr: float = 1e-3
+    lr: float = 2e-4
+    weight_decay: float = 1e-6
     # Paper lr_patience=5
-    lr_patience: int = 5
+    lr_patience: int = 8
+    early_stop_patience: int = 20
     # Standard contrastive temperature; previous τ=0.7 compressed gradients and
     # caused PCOL/SCOLw to barely converge (only ~17% loss reduction over 60+ epochs).
-    temperature: float = 0.1
+    temperature: float = 0.7
     # alpha=0.00337: PCOL needs small alpha on the full 35K dataset.
     # With 640 grade-4 images, batch prototypes (4 samples) are noisy.
-    alpha: float = 0.00337
-    beta: float = 0.0929
+    alpha: float = 0.00662474091401746
+    beta: float = 0.05516050165777829

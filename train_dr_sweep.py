@@ -159,7 +159,7 @@ class SweepTrainer(Trainer):
                     os.remove(prev_ckpt)
 
             self.scheduler.step(val_loss)
-            if self.early_stopping.step(val_loss):
+            if self.early_stopping.step(val_acc):
                 logging.getLogger(__name__).info(f"Early stopping at epoch {epoch}")
                 break
 
@@ -189,6 +189,9 @@ def run_sweep(args, img_cache=None):
     cfg.weight_decay = float(wc.get("weight_decay", cfg.weight_decay))
     cfg.lr           = float(wc.get("lr",           cfg.lr))
     cfg.lr_patience  = int(wc.get("lr_patience",   cfg.lr_patience))
+    cfg.epochs       = int(wc.get("epochs",         cfg.epochs))
+    cfg.batch_size   = int(wc.get("batch_size",     cfg.batch_size))
+    cfg.early_stop_patience = int(wc.get("early_stop_patience", cfg.early_stop_patience))
 
     run_dir = os.path.join(args.run_dir, run.id)
     cfg.run_dir = run_dir
@@ -293,6 +296,9 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=None)
     parser.add_argument("--lr",           type=float, default=None)
     parser.add_argument("--lr_patience",  type=int,   default=None)
+    parser.add_argument("--epochs",       type=int,   default=None)
+    parser.add_argument("--batch_size",   type=int,   default=None)
+    parser.add_argument("--early_stop_patience", type=int, default=None)
     args = parser.parse_args()
 
     if args.train_csv is None:
