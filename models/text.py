@@ -56,4 +56,4 @@ class ClinicalTextEncoder(nn.Module):
         self.projection = TextProjectionHead(text_dim, proj_out_dim)
 
     def forward(self) -> torch.Tensor:
-        return self.projection(self.raw_text_embeddings)
+        return F.normalize(self.projection(self.raw_text_embeddings), dim=-1)

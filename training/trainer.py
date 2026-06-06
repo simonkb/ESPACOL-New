@@ -1,21 +1,5 @@
 from __future__ import annotations
 
-"""
-Single-fold trainer implementing the paper's training protocol (Section 3):
-
-  - One-stage training: all three heads (PCOL, SCOLw, Regression) jointly
-  - 75 epochs max, batch size 24, LR = 1e-3
-  - ReduceLROnPlateau: factor=0.2, patience=5, monitor val_acc (max)
-  - Early stopping: patience=13, monitor val_acc (max)
-  - Class-stratified batch sampling for prototype stability
-
-Checkpoint and early stopping use val_acc (not val_loss) because:
-  - val set is small (~60 images) so RMSE is too noisy to reliably rank epochs
-  - accuracy is the target metric and directly reflects rounding behaviour
-  - RMSE-optimal epoch ≠ accuracy-optimal epoch when predictions are rounded
-Logs training/validation loss + metrics to a CSV and to the Python logger.
-"""
-
 import csv
 import logging
 import os
@@ -31,19 +15,13 @@ from torch.utils.data import DataLoader
 from configs.config import TrainConfig
 from losses.combined import HybridContrastiveOrdinalLoss, compute_class_weights
 from models.text import ClinicalTextEncoder
-from utils.checkpoint import save_checkpoint
-from utils.metrics import evaluate_predictions, confusion_stats
+from utils.checkpoint import save_checkpoint, load_checkpoint
+from utils.metrics import evaluate_predictions
 
 logger = logging.getLogger(__name__)
 
 
 class EarlyStopping:
-    """Stops training when a monitored metric has not improved for *patience* epochs.
-
-    mode="min": stops when metric stops decreasing (e.g. val_loss)
-    mode="max": stops when metric stops increasing (e.g. val_acc)
-    """
-
     def __init__(self, patience: int = 13, min_delta: float = 0.0, mode: str = "min"):
         self.patience = patience
         self.min_delta = min_delta
@@ -65,18 +43,11 @@ class EarlyStopping:
             self.counter += 1
             if self.counter >= self.patience:
                 self.stop = True
+
         return self.stop
 
 
 class Trainer:
-    """
-    Trains one fold of the cross-validation experiment.
-
-    Usage:
-        trainer = Trainer(model, train_loader, val_loader, cfg, run_dir)
-        test_metrics = trainer.fit(test_loader)
-    """
-
     def __init__(
         self,
         model: nn.Module,
@@ -84,7 +55,7 @@ class Trainer:
         val_loader: DataLoader,
         cfg: TrainConfig,
         run_dir: str,
-        train_labels: list[int],     # all training labels (for class-weight computation)
+        train_labels: list[int],
         device: Optional[torch.device] = None,
         fold: int = 0,
     ):
@@ -94,60 +65,59 @@ class Trainer:
         self.cfg = cfg
         self.run_dir = run_dir
         self.fold = fold
+
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else
-            "mps"  if torch.backends.mps.is_available() else
+            "mps" if torch.backends.mps.is_available() else
             "cpu"
         )
         self.model.to(self.device)
 
-        # cuDNN auto-tuner: profiles kernels on first batch, then reuses fastest.
-        # Safe because input size is always 300×300 throughout training.
         if self.device.type == "cuda":
             torch.backends.cudnn.benchmark = True
 
-        # AMP: enabled on CUDA only (Tensor Cores). Disabled on MPS/CPU.
         self.use_amp = cfg.amp and self.device.type == "cuda"
         self.scaler = GradScaler(device="cuda", enabled=self.use_amp)
+
         self.text_encoder = None
         if getattr(cfg, "use_image_text", False):
             from configs.clinical_text import BUSI_CLASS_DESCRIPTIONS, DR_CLASS_DESCRIPTIONS
+
             class_descriptions = (
                 DR_CLASS_DESCRIPTIONS if cfg.dataset == "DR" else BUSI_CLASS_DESCRIPTIONS
             )
+
             self.text_encoder = ClinicalTextEncoder(
-                cfg.text_encoder_name,
-                class_descriptions,
-                cfg.proj_out_dim,
-                self.device,
+                model_name=cfg.text_encoder_name,
+                class_descriptions=class_descriptions,
+                proj_out_dim=cfg.proj_out_dim,
+                device=self.device,
             ).to(self.device)
 
-        # Optimizer (Adam is the standard; paper says "optimized based on validation loss")
+        optim_params = list(self.model.parameters())
+        if self.text_encoder is not None:
+            optim_params += list(self.text_encoder.projection.parameters())
+
         self.optimizer = torch.optim.Adam(
-            list(model.parameters()) + (
-                list(self.text_encoder.projection.parameters())
-                if self.text_encoder is not None else []
-            ),
+            optim_params,
             lr=cfg.lr,
             weight_decay=cfg.weight_decay,
         )
 
-        # Loss
         self.criterion = HybridContrastiveOrdinalLoss(
             alpha=cfg.alpha,
             beta=cfg.beta,
-            temperature=cfg.temperature,
             gamma=cfg.gamma,
+            temperature=cfg.temperature,
+            use_image_text=cfg.use_image_text,
             lambda_ord_it=cfg.lambda_ord_it,
         )
 
-        # Class weights for SCOLw (computed from training set; "inverse frequency of class in dataset")
         self.class_weights = compute_class_weights(
             train_labels, cfg.n_classes, device=self.device
         )
         logger.info(f"Class weights: {self.class_weights.tolist()}")
 
-        # LR scheduler: ReduceLROnPlateau factor=0.2, patience=5, tracking val_loss
         self.scheduler = ReduceLROnPlateau(
             self.optimizer,
             mode="min",
@@ -156,29 +126,18 @@ class Trainer:
             min_lr=cfg.lr_min,
         )
 
-        # Early stopping tracks val_acc (max) — the metric we optimize.
-        # val_loss is too noisy for stopping decisions: its std (0.010) is
-        # disproportionately large relative to its range, causing premature stops.
-        # The LR scheduler continues to use val_loss (min) separately.
         self.early_stopping = EarlyStopping(
-            patience=cfg.early_stop_patience, mode="max"
+            patience=cfg.early_stop_patience,
+            mode="max",
         )
 
-        # CSV log
         os.makedirs(run_dir, exist_ok=True)
         self._log_path = os.path.join(run_dir, f"fold{fold}_history.csv")
         self._csv_header_written = False
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Public API
-    # ──────────────────────────────────────────────────────────────────────────
-
     def fit(self, test_loader: DataLoader) -> dict:
-        """Train for up to cfg.epochs epochs; evaluate on test_loader at the end.
-
-        Returns final test metrics dict.
-        """
         best_val_acc = -float("inf")
+        best_ckpt_path = os.path.join(self.run_dir, f"fold{self.fold}_best.pth")
 
         for epoch in range(1, self.cfg.epochs + 1):
             t0 = time.time()
@@ -194,32 +153,33 @@ class Trainer:
             val_acc = val_metrics["val_acc"]
             val_loss = val_metrics["val_loss"]
 
-            # Checkpoint by val_acc — directly optimises the target metric.
-            # (Since val==test fold, val_acc IS the test accuracy at this epoch.)
             is_best = val_acc > best_val_acc
             if is_best:
                 best_val_acc = val_acc
 
             ckpt_path = os.path.join(self.run_dir, f"fold{self.fold}_epoch{epoch}.pth")
-            best_ckpt_path = os.path.join(self.run_dir, f"fold{self.fold}_best.pth")
+
             save_checkpoint(
-                ckpt_path,
-                self.model,
-                self.optimizer,
-                epoch,
-                {**train_metrics, **val_metrics},
+                path=ckpt_path,
+                model=self.model,
+                optimizer=self.optimizer,
+                epoch=epoch,
+                metrics={**train_metrics, **val_metrics},
                 is_best=is_best,
+                text_encoder=self.text_encoder,
             )
+
             if is_best:
                 save_checkpoint(
-                    best_ckpt_path,
-                    self.model,
-                    self.optimizer,
-                    epoch,
-                    {**train_metrics, **val_metrics},
+                    path=best_ckpt_path,
+                    model=self.model,
+                    optimizer=self.optimizer,
+                    epoch=epoch,
+                    metrics={**train_metrics, **val_metrics},
                     is_best=False,
+                    text_encoder=self.text_encoder,
                 )
-            # Remove non-best epoch checkpoints to save disk
+
             if epoch > 1:
                 prev_ckpt = os.path.join(
                     self.run_dir, f"fold{self.fold}_epoch{epoch - 1}.pth"
@@ -227,8 +187,6 @@ class Trainer:
                 if os.path.exists(prev_ckpt) and prev_ckpt != best_ckpt_path:
                     os.remove(prev_ckpt)
 
-            # Scheduler tracks val_loss (RMSE) — standard for regression.
-            # Early stopping tracks val_acc (max) — the target metric.
             self.scheduler.step(val_loss)
 
             if self.early_stopping.step(val_acc):
@@ -238,10 +196,14 @@ class Trainer:
                 )
                 break
 
-        # Load best checkpoint before evaluating on test set
         if os.path.exists(best_ckpt_path):
-            from utils.checkpoint import load_checkpoint
-            load_checkpoint(best_ckpt_path, self.model, device=self.device)
+            load_checkpoint(
+                path=best_ckpt_path,
+                model=self.model,
+                optimizer=None,
+                text_encoder=self.text_encoder,
+                device=self.device,
+            )
             logger.info(f"[Fold {self.fold}] Loaded best model from {best_ckpt_path}")
 
         test_metrics = self._eval_epoch(test_loader, prefix="test")
@@ -251,17 +213,18 @@ class Trainer:
         )
         return test_metrics
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Private helpers
-    # ──────────────────────────────────────────────────────────────────────────
-
     def _train_epoch(self, epoch: int) -> dict:
         self.model.train()
-        total_loss = total_pcol = total_scolw = total_rmse = total_it = 0.0
+        if self.text_encoder is not None:
+            self.text_encoder.train()
+
+        total_loss = 0.0
+        total_pcol = 0.0
+        total_scolw = 0.0
+        total_rmse = 0.0
+        total_it = 0.0
         n_batches = 0
 
-        # non_blocking=True is safe with CUDA + pinned memory: overlaps CPU→GPU
-        # copy with the previous GPU kernel. On MPS this would produce garbage values.
         nb = self.device.type == "cuda"
 
         for x, y in self.train_loader:
@@ -270,34 +233,50 @@ class Trainer:
 
             self.optimizer.zero_grad(set_to_none=True)
 
-            # Paper (author response): weights computed per-batch using inverse
-            # class frequency of the current mini-batch, not dataset-level.
-            # With stratified sampling (4 per class) this gives ~uniform weights
-            # (~1.2 each), avoiding the 36× gradient imbalance that dataset-level
-            # weights would produce between rare (grade-4) and common (grade-0).
             batch_weights = compute_class_weights(
-                y.cpu().tolist(), self.cfg.n_classes, device=self.device
+                y.cpu().tolist(),
+                self.cfg.n_classes,
+                device=self.device,
             )
+
             with autocast(device_type=self.device.type, enabled=self.use_amp):
                 out = self.model(x)
-                if len(out) == 5:
+
+                if isinstance(out, dict):
+                    z_pcol = out["z_pcol"]
+                    z_scolw = out["z_scolw"]
+                    z_it = out.get("z_it", None)
+                    pred = out["pred"]
+                elif len(out) == 5:
                     _, z_pcol, z_scolw, z_it, pred = out
-                    text_prototypes = (
-                        self.text_encoder() if self.text_encoder is not None else None
-                    )
-                    loss, comps = self.criterion(
-                        z_pcol, z_scolw, pred, y, batch_weights, z_it, text_prototypes
-                    )
                 else:
                     z_pcol, z_scolw, pred = out
-                    loss, comps = self.criterion(
-                        z_pcol, z_scolw, pred, y, batch_weights
-                    )
+                    z_it = None
+
+                text_prototypes = None
+                if self.text_encoder is not None and self.cfg.use_image_text:
+                    text_prototypes = self.text_encoder()
+
+                loss, comps = self.criterion(
+                    z_pcol=z_pcol,
+                    z_scolw=z_scolw,
+                    pred=pred,
+                    labels=y,
+                    class_weights=batch_weights,
+                    z_it=z_it,
+                    text_prototypes=text_prototypes,
+                )
 
             self.scaler.scale(loss).backward()
-            # Unscale before clip so the gradient norm is in the original fp32 scale.
+
             self.scaler.unscale_(self.optimizer)
-            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+            clip_params = list(self.model.parameters())
+            if self.text_encoder is not None:
+                clip_params += list(self.text_encoder.projection.parameters())
+
+            nn.utils.clip_grad_norm_(clip_params, max_norm=1.0)
+
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
@@ -308,20 +287,26 @@ class Trainer:
             total_it += comps.get("loss_it", 0.0)
             n_batches += 1
 
-        nb = max(n_batches, 1)
+        nbatches = max(n_batches, 1)
+
         metrics = {
-            "train_loss": total_loss / nb,
-            "train_loss_pcol": total_pcol / nb,
-            "train_loss_scolw": total_scolw / nb,
-            "train_loss_rmse": total_rmse / nb,
+            "train_loss": total_loss / nbatches,
+            "train_loss_pcol": total_pcol / nbatches,
+            "train_loss_scolw": total_scolw / nbatches,
+            "train_loss_rmse": total_rmse / nbatches,
         }
-        if self.text_encoder is not None:
-            metrics["train_loss_it"] = total_it / nb
+
+        if self.text_encoder is not None and self.cfg.use_image_text:
+            metrics["train_loss_it"] = total_it / nbatches
+
         return metrics
 
     @torch.no_grad()
     def _eval_epoch(self, loader: DataLoader, prefix: str) -> dict:
         self.model.eval()
+        if self.text_encoder is not None:
+            self.text_encoder.eval()
+
         all_preds = []
         all_labels = []
         total_rmse = 0.0
@@ -333,14 +318,9 @@ class Trainer:
             x = x.to(self.device, non_blocking=nb)
             y = y.to(self.device, non_blocking=nb)
 
-            # Only the regression head is used at inference (paper Section 2.1).
-            # Contrastive losses require stratified batches (≥2 classes present)
-            # which is NOT guaranteed on validation/test loaders — computing them
-            # here produces degenerate −1e9 values that break early stopping and
-            # checkpoint selection.  Use RMSE-only as the validation criterion.
             with autocast(device_type=self.device.type, enabled=self.use_amp):
                 pred = self.model.predict(x)
-                rmse = torch.sqrt(nn.functional.mse_loss(pred, y.float()))
+                rmse = torch.sqrt(nn.functional.mse_loss(pred, y.float()) + 1e-8)
 
             total_rmse += rmse.item()
             n_batches += 1
@@ -352,10 +332,10 @@ class Trainer:
         all_labels = torch.cat(all_labels)
 
         m = evaluate_predictions(all_preds, all_labels, self.cfg.n_classes)
-        nb = max(n_batches, 1)
+        nbatches = max(n_batches, 1)
 
         return {
-            f"{prefix}_loss": total_rmse / nb,   # RMSE — valid on any batch mix
+            f"{prefix}_loss": total_rmse / nbatches,
             f"{prefix}_acc": m["acc"],
             f"{prefix}_mae": m["mae"],
         }
@@ -370,21 +350,23 @@ class Trainer:
     ) -> None:
         row = {"epoch": epoch, "elapsed": f"{elapsed:.1f}", "lr": lr, **train, **val}
 
-        # Print to console
+        it_text = ""
+        if "train_loss_it" in train:
+            it_text = f" it={train['train_loss_it']:.3f}"
+
         logger.info(
             f"[Fold {self.fold}] Ep {epoch:3d} | "
             f"loss={train['train_loss']:.4f} "
             f"(pcol={train['train_loss_pcol']:.3f} "
             f"scolw={train['train_loss_scolw']:.3f} "
             f"rmse={train['train_loss_rmse']:.3f}"
-            f"{' it=' + format(train['train_loss_it'], '.3f') if 'train_loss_it' in train else ''}) | "
+            f"{it_text}) | "
             f"val_loss={val['val_loss']:.4f}  "
             f"val_acc={val['val_acc']:.2f}%  "
             f"val_mae={val['val_mae']:.4f}  "
             f"lr={lr:.2e}  t={elapsed:.1f}s"
         )
 
-        # Append to CSV
         with open(self._log_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=list(row.keys()))
             if not self._csv_header_written:
