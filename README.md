@@ -408,3 +408,55 @@ python train_dr_sweep.py --dr_root Datasets/DR \
 | α, β | Not specified | DR: α=0.20, β=0.09 (found via proxy sweep); BUSI: α=0.00337, β=0.0929 |
 
 ---
+
+## Change Analysis: Most Likely Contributors to the Performance Improvement
+
+* [ ] **SCOLw Class Weight Computation:** The old replication code computes inverse-frequency class weights once from the entire training fold. However, the authors later clarified in their rebuttal that SCOLw uses **dynamic, per-instance weighting based on batch-level class frequencies**, with class-specific weights ((w_i)) recomputed for every mini-batch. The new replication code follows this clarification, making the implementation more consistent with the authors' intended SCOLw formulation and substantially changing the behavior of the SCOLw loss.
+
+* [ ] **Loss Function Hyperparameter Tuning (α and β):** The old replication code used different manually selected loss weights, whereas the new replication code performs extensive tuning of the PCOL and SCOLw loss contributions.
+
+  **BUSI (best values):**
+
+  * α (PCOL) = `0.00337`
+  * β (SCOLw) = `0.0929`
+
+  **DR (best values):**
+
+  * α (PCOL) = `0.00662474091401746`
+  * β (SCOLw) = `0.05516050165777829`
+
+  Since the overall objective is:
+
+  [
+  L = \alpha L_{PCOL} + \beta L_{SCOLw} + L_{RMSE}
+  ]
+
+  these parameters directly control the influence of the two proposed contrastive losses and are likely among the most significant contributors to the performance gain.
+
+* [ ] **Contrastive Temperature (τ) Tuning:** The paper does not specify a temperature value. The old replication code used `τ = 0.2`, whereas the new replication code uses tuned dataset-specific values.
+
+  **BUSI (best value):**
+
+  * τ = `0.1`
+
+  **DR (best value):**
+
+  * τ = `0.7`
+
+  Temperature strongly affects similarity scaling, prototype attraction, negative separation, and gradient magnitudes in both PCOL and SCOLw, making it a highly influential hyperparameter.
+
+* [ ] **PCOL and SCOLw Ordinal Distance Formulation:** The old replication code normalizes ordinal distances by `(n_classes − 1)`, restricting penalties to the range `[0,1]`. The new replication code uses raw ordinal distances `|y_a − y_n|` directly in both PCOL and SCOLw. This formulation is more faithful to the paper equations, which define ordinal distance as label distance and do not describe any normalization step. The change significantly increases the penalty assigned to mistakes involving distant ordinal classes and strengthens ordinal separation.
+
+* [ ] **Learning Rate Optimization:** The old replication code used a fixed learning-rate strategy, whereas the new replication code uses dataset-specific tuning.
+
+  **BUSI (best value):**
+
+  * Learning Rate = `5e-4`
+
+  **DR (best value):**
+
+  * Learning Rate = `2e-4`
+
+  Combined with the tuned contrastive parameters and revised loss formulation, this likely contributed to more stable convergence and better optimization of the hybrid objective.
+
+* [ ] **Dataloader Normalization:** The new replication code applies ImageNet mean/std normalization in addition to scaling images to `[0,1]`, whereas the old replication code only scales pixel values to `[0,1]` following the paper description. Although this deviates from the paper specification, EfficientNet-V2S pretrained weights are originally trained with ImageNet normalization, making this a plausible contributor to improved feature extraction and downstream performance.
