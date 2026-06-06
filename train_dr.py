@@ -184,12 +184,22 @@ def main():
         "--cache_dir", type=str, default="Datasets/DR/train_cache",
         help="Directory for pre-decoded .pt files (built on first run, reused after)"
     )
+    parser.add_argument("--use_image_text", action="store_true")
+    parser.add_argument("--gamma", type=float, default=None)
+    parser.add_argument("--lambda_ord_it", type=float, default=None)
     args = parser.parse_args()
 
     if args.train_csv is None:
         args.train_csv = os.path.join(args.dr_root, "trainLabels.csv")
 
     cfg = DRConfig(run_dir=args.run_dir)
+    if args.use_image_text:
+        cfg.use_image_text = True
+    if args.gamma is not None:
+        cfg.gamma = args.gamma
+        cfg.use_image_text = cfg.gamma > 0
+    if args.lambda_ord_it is not None:
+        cfg.lambda_ord_it = args.lambda_ord_it
     setup_logging(args.run_dir)
     log = logging.getLogger("train_dr")
     set_seed(cfg.seed)

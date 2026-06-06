@@ -65,6 +65,11 @@ class TrainConfig:
     # Automatic Mixed Precision — enabled on CUDA only (T4/A10 Tensor Cores → ~2× speed)
     amp: bool = True
 
+    use_image_text: bool = True
+    gamma: float = 0.0929   
+    lambda_ord_it: float = 1.0
+    text_encoder_name: str = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+
 
 @dataclass
 class BUSIConfig(TrainConfig):

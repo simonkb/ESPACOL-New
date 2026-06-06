@@ -27,12 +27,14 @@ class HybridContrastiveOrdinalModel(nn.Module):
         pcol_head: MLPProjectionHead,
         scolw_head: MLPProjectionHead,
         regression_head: RegressionHead,
+        image_text_head: MLPProjectionHead | None = None,
     ):
         super().__init__()
         self.backbone = backbone
         self.pcol_head = pcol_head
         self.scolw_head = scolw_head
         self.regression_head = regression_head
+        self.image_text_head = image_text_head
 
     def forward(self, x: torch.Tensor):
         """
@@ -45,7 +47,13 @@ class HybridContrastiveOrdinalModel(nn.Module):
         z_pcol = self.pcol_head(features)            # (N, 128)
         z_scolw = self.scolw_head(features)          # (N, 128)
         pred = self.regression_head(features)        # (N,)
+        if self.image_text_head is not None:
+            z_it = self.image_text_head(features)
+            return features, z_pcol, z_scolw, z_it, pred
         return z_pcol, z_scolw, pred
+
+    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone(x)
 
     @torch.no_grad()
     def predict(self, x: torch.Tensor) -> torch.Tensor:
@@ -59,6 +67,7 @@ def build_model(
     pretrained: bool = True,
     proj_hidden_dim: int = 1280,
     proj_out_dim: int = 128,
+    use_image_text: bool = False,
 ) -> HybridContrastiveOrdinalModel:
     backbone = EfficientNetV2SBackbone(pretrained=pretrained)
     feat_dim = backbone.OUT_DIM       # 1280
@@ -66,5 +75,11 @@ def build_model(
     pcol_head = MLPProjectionHead(feat_dim, proj_hidden_dim, proj_out_dim)
     scolw_head = MLPProjectionHead(feat_dim, proj_hidden_dim, proj_out_dim)
     reg_head = RegressionHead(feat_dim)
+    image_text_head = (
+        MLPProjectionHead(feat_dim, proj_hidden_dim, proj_out_dim)
+        if use_image_text else None
+    )
 
-    return HybridContrastiveOrdinalModel(backbone, pcol_head, scolw_head, reg_head)
+    return HybridContrastiveOrdinalModel(
+        backbone, pcol_head, scolw_head, reg_head, image_text_head
+    )

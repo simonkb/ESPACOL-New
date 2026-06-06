@@ -30,6 +30,7 @@ from torch.utils.data import DataLoader
 
 from configs.config import TrainConfig
 from losses.combined import HybridContrastiveOrdinalLoss, compute_class_weights
+from models.text import ClinicalTextEncoder
 from utils.checkpoint import save_checkpoint
 from utils.metrics import evaluate_predictions, confusion_stats
 
@@ -108,10 +109,25 @@ class Trainer:
         # AMP: enabled on CUDA only (Tensor Cores). Disabled on MPS/CPU.
         self.use_amp = cfg.amp and self.device.type == "cuda"
         self.scaler = GradScaler(device="cuda", enabled=self.use_amp)
+        self.text_encoder = None
+        if getattr(cfg, "use_image_text", False):
+            from configs.clinical_text import BUSI_CLASS_DESCRIPTIONS, DR_CLASS_DESCRIPTIONS
+            class_descriptions = (
+                DR_CLASS_DESCRIPTIONS if cfg.dataset == "DR" else BUSI_CLASS_DESCRIPTIONS
+            )
+            self.text_encoder = ClinicalTextEncoder(
+                cfg.text_encoder_name,
+                class_descriptions,
+                cfg.proj_out_dim,
+                self.device,
+            ).to(self.device)
 
         # Optimizer (Adam is the standard; paper says "optimized based on validation loss")
         self.optimizer = torch.optim.Adam(
-            model.parameters(),
+            list(model.parameters()) + (
+                list(self.text_encoder.projection.parameters())
+                if self.text_encoder is not None else []
+            ),
             lr=cfg.lr,
             weight_decay=cfg.weight_decay,
         )
@@ -121,6 +137,8 @@ class Trainer:
             alpha=cfg.alpha,
             beta=cfg.beta,
             temperature=cfg.temperature,
+            gamma=cfg.gamma,
+            lambda_ord_it=cfg.lambda_ord_it,
         )
 
         # Class weights for SCOLw (computed from training set; "inverse frequency of class in dataset")
@@ -239,7 +257,7 @@ class Trainer:
 
     def _train_epoch(self, epoch: int) -> dict:
         self.model.train()
-        total_loss = total_pcol = total_scolw = total_rmse = 0.0
+        total_loss = total_pcol = total_scolw = total_rmse = total_it = 0.0
         n_batches = 0
 
         # non_blocking=True is safe with CUDA + pinned memory: overlaps CPU→GPU
@@ -261,10 +279,20 @@ class Trainer:
                 y.cpu().tolist(), self.cfg.n_classes, device=self.device
             )
             with autocast(device_type=self.device.type, enabled=self.use_amp):
-                z_pcol, z_scolw, pred = self.model(x)
-                loss, comps = self.criterion(
-                    z_pcol, z_scolw, pred, y, batch_weights
-                )
+                out = self.model(x)
+                if len(out) == 5:
+                    _, z_pcol, z_scolw, z_it, pred = out
+                    text_prototypes = (
+                        self.text_encoder() if self.text_encoder is not None else None
+                    )
+                    loss, comps = self.criterion(
+                        z_pcol, z_scolw, pred, y, batch_weights, z_it, text_prototypes
+                    )
+                else:
+                    z_pcol, z_scolw, pred = out
+                    loss, comps = self.criterion(
+                        z_pcol, z_scolw, pred, y, batch_weights
+                    )
 
             self.scaler.scale(loss).backward()
             # Unscale before clip so the gradient norm is in the original fp32 scale.
@@ -277,15 +305,19 @@ class Trainer:
             total_pcol += comps["loss_pcol"]
             total_scolw += comps["loss_scolw"]
             total_rmse += comps["loss_rmse"]
+            total_it += comps.get("loss_it", 0.0)
             n_batches += 1
 
         nb = max(n_batches, 1)
-        return {
+        metrics = {
             "train_loss": total_loss / nb,
             "train_loss_pcol": total_pcol / nb,
             "train_loss_scolw": total_scolw / nb,
             "train_loss_rmse": total_rmse / nb,
         }
+        if self.text_encoder is not None:
+            metrics["train_loss_it"] = total_it / nb
+        return metrics
 
     @torch.no_grad()
     def _eval_epoch(self, loader: DataLoader, prefix: str) -> dict:
@@ -344,7 +376,8 @@ class Trainer:
             f"loss={train['train_loss']:.4f} "
             f"(pcol={train['train_loss_pcol']:.3f} "
             f"scolw={train['train_loss_scolw']:.3f} "
-            f"rmse={train['train_loss_rmse']:.3f}) | "
+            f"rmse={train['train_loss_rmse']:.3f}"
+            f"{' it=' + format(train['train_loss_it'], '.3f') if 'train_loss_it' in train else ''}) | "
             f"val_loss={val['val_loss']:.4f}  "
             f"val_acc={val['val_acc']:.2f}%  "
             f"val_mae={val['val_mae']:.4f}  "
