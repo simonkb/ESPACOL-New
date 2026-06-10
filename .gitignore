@@ -12,3 +12,5 @@ MICCAI 2025 code for MBZUAI group.ipynb
 Datasets/DR/train.zip
 /Datasets/DR/train_cache/
 .claude/settings.local.json
+/wandb_runs/
+/wandb_storage/

@@ -1,0 +1,25 @@
+program: train_dr_sweep.py
+method: grid
+
+metric:
+  goal: maximize
+  name: running_best_score
+
+early_terminate:
+  type: hyperband
+  min_iter: 10
+  eta: 2
+
+parameters:
+  ablation_mode:
+    values:
+      - full_it
+      - no_pcol
+      - no_scolw
+      - only_it
+
+  gamma:
+    values: [0.001, 0.005, 0.01, 0.02, 0.05]
+
+  lambda_ord_it:
+    values: [0.5, 1.0, 2.0]
