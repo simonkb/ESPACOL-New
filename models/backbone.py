@@ -44,17 +44,19 @@ class BiomedCLIPImageBackbone(nn.Module):
             ) from exc
 
         model, _, _ = open_clip.create_model_and_transforms(model_name)
-        self._clip = model
+        # Store only the visual encoder so the text half of the CLIP model is
+        # not included in parameters() and not wastefully trained.
+        self._visual = model.visual
 
         # Probe output dimension with a dummy forward pass (same pattern used
         # by ClinicalTextEncoder for the text branch).
         with torch.no_grad():
             dummy = torch.zeros(1, 3, 224, 224)
-            out = self._clip.encode_image(dummy, normalize=False)
+            out = self._visual(dummy)
             self.OUT_DIM: int = out.shape[-1]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self._clip.encode_image(x, normalize=False)   # (N, OUT_DIM)
+        return self._visual(x)   # (N, OUT_DIM), un-normalized
 
 
 class EfficientNetV2SBackbone(nn.Module):
