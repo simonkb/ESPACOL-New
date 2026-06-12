@@ -92,15 +92,34 @@ class Trainer:
                 class_descriptions=class_descriptions,
                 proj_out_dim=cfg.proj_out_dim,
                 device=self.device,
+                finetune_text_encoder=getattr(cfg, "finetune_text_encoder", False),
+                finetune_layers=getattr(cfg, "text_finetune_layers", 0),
             ).to(self.device)
 
-        optim_params = list(self.model.parameters())
+        optim_params = [{"params": list(self.model.parameters()), "lr": cfg.lr}]
         if self.text_encoder is not None:
-            optim_params += list(self.text_encoder.projection.parameters())
+            optim_params.append(
+                {"params": list(self.text_encoder.projection.parameters()), "lr": cfg.lr}
+            )
+            if getattr(cfg, "finetune_text_encoder", False):
+                n_text_params = self.text_encoder.set_text_finetune(True)
+                text_params = self.text_encoder.trainable_text_parameters()
+                self.text_encoder.set_text_finetune(False)
+                if text_params:
+                    optim_params.append(
+                        {
+                            "params": text_params,
+                            "lr": getattr(cfg, "text_encoder_lr", 1e-6),
+                        }
+                    )
+                logger.info(
+                    f"Text encoder fine-tuning: layers={getattr(cfg, 'text_finetune_layers', 0)} "
+                    f"start_epoch={getattr(cfg, 'text_finetune_start_epoch', 1)} "
+                    f"trainable_params={n_text_params}"
+                )
 
         self.optimizer = torch.optim.Adam(
             optim_params,
-            lr=cfg.lr,
             weight_decay=cfg.weight_decay,
         )
 
@@ -134,6 +153,7 @@ class Trainer:
         os.makedirs(run_dir, exist_ok=True)
         self._log_path = os.path.join(run_dir, f"fold{fold}_history.csv")
         self._csv_header_written = False
+        self._text_finetune_enabled = False
 
     def fit(self, test_loader: DataLoader) -> dict:
         best_val_acc = -float("inf")
@@ -141,6 +161,7 @@ class Trainer:
 
         for epoch in range(1, self.cfg.epochs + 1):
             t0 = time.time()
+            self._maybe_enable_text_finetune(epoch)
 
             train_metrics = self._train_epoch(epoch)
             val_metrics = self._eval_epoch(self.val_loader, prefix="val")
@@ -213,10 +234,30 @@ class Trainer:
         )
         return test_metrics
 
+    def _maybe_enable_text_finetune(self, epoch: int) -> None:
+        if self.text_encoder is None or self._text_finetune_enabled:
+            return
+        if not getattr(self.cfg, "finetune_text_encoder", False):
+            return
+        start_epoch = getattr(self.cfg, "text_finetune_start_epoch", 1)
+        if epoch < start_epoch:
+            return
+        n_text_params = self.text_encoder.set_text_finetune(True)
+        self._text_finetune_enabled = True
+        logger.info(
+            f"[Fold {self.fold}] Enabled text encoder fine-tuning at epoch {epoch} "
+            f"({n_text_params} trainable text params, lr={getattr(self.cfg, 'text_encoder_lr', 1e-6):.2e})"
+        )
+
     def _train_epoch(self, epoch: int) -> dict:
         self.model.train()
         if self.text_encoder is not None:
             self.text_encoder.train()
+            if (
+                getattr(self.cfg, "finetune_text_encoder", False)
+                and not self._text_finetune_enabled
+            ):
+                self.text_encoder.text_model.eval()
 
         total_loss = 0.0
         total_pcol = 0.0
@@ -274,6 +315,7 @@ class Trainer:
             clip_params = list(self.model.parameters())
             if self.text_encoder is not None:
                 clip_params += list(self.text_encoder.projection.parameters())
+                clip_params += self.text_encoder.trainable_text_parameters()
 
             nn.utils.clip_grad_norm_(clip_params, max_norm=1.0)
 

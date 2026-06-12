@@ -14,3 +14,4 @@ Datasets/DR/train.zip
 .claude/settings.local.json
 /wandb_runs/
 /wandb_storage/
+*.zip
