@@ -195,36 +195,17 @@ class Trainer:
             is_best = val_acc > best_val_acc
             if is_best:
                 best_val_acc = val_acc
-
-            ckpt_path = os.path.join(self.run_dir, f"fold{self.fold}_epoch{epoch}.pth")
-
-            save_checkpoint(
-                path=ckpt_path,
-                model=self.model,
-                optimizer=self.optimizer,
-                epoch=epoch,
-                metrics={**train_metrics, **val_metrics},
-                is_best=is_best,
-                text_encoder=self.text_encoder,
-            )
-
-            if is_best:
+                # Save weights-only best checkpoint (no optimizer state, no full
+                # text encoder) to keep disk usage minimal (~350 MB vs ~2 GB).
                 save_checkpoint(
                     path=best_ckpt_path,
                     model=self.model,
-                    optimizer=self.optimizer,
+                    optimizer=None,
                     epoch=epoch,
                     metrics={**train_metrics, **val_metrics},
                     is_best=False,
-                    text_encoder=self.text_encoder,
+                    text_encoder=None,
                 )
-
-            if epoch > 1:
-                prev_ckpt = os.path.join(
-                    self.run_dir, f"fold{self.fold}_epoch{epoch - 1}.pth"
-                )
-                if os.path.exists(prev_ckpt) and prev_ckpt != best_ckpt_path:
-                    os.remove(prev_ckpt)
 
             self.scheduler.step(val_loss)
 
