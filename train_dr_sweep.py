@@ -65,8 +65,9 @@ def make_loaders(
     device=None,
     img_cache=None,
 ):
-    train_tfm = build_train_transform(cfg.img_size)
-    eval_tfm = build_transform(cfg.img_size)
+    clip_norm = getattr(cfg, "use_clip_normalization", True)
+    train_tfm = build_train_transform(cfg.img_size, use_clip_norm=clip_norm)
+    eval_tfm = build_transform(cfg.img_size, use_clip_norm=clip_norm)
 
     use_mps = device is not None and device.type == "mps"
     num_workers = 0 if use_mps else cfg.num_workers
@@ -399,6 +400,7 @@ def run_sweep(args, img_cache=None):
         proj_hidden_dim=cfg.proj_hidden_dim,
         proj_out_dim=cfg.proj_out_dim,
         use_image_text=cfg.use_image_text,
+        image_encoder_name=cfg.image_encoder_name,
     )
 
     train_labels = [y for _, y in train_items]
@@ -441,7 +443,7 @@ def main():
     parser.add_argument(
         "--cache_dir",
         type=str,
-        default="Datasets/DR/train_cache",
+        default="Datasets/DR/train_cache_224",
         help="Directory for pre-decoded .pt image cache",
     )
 

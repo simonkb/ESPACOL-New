@@ -20,7 +20,7 @@ from dataclasses import dataclass
 @dataclass
 class TrainConfig:
     # Data
-    img_size: int = 300
+    img_size: int = 224              # BiomedCLIP ViT-B/16 native resolution
     num_workers: int = 4
     pin_memory: bool = True
 
@@ -49,8 +49,8 @@ class TrainConfig:
     # tau=0.05 helped fold0 but hurt fold1; tau=0.1 is a compromise
     temperature: float = 0.1
 
-    # Projection head dimensions (paper: "1280 and 128 neurons")
-    proj_hidden_dim: int = 1280
+    # Projection head dimensions.  proj_hidden_dim=0 means auto (= backbone.OUT_DIM).
+    proj_hidden_dim: int = 0
     proj_out_dim: int = 128
 
     # Checkpoint directory (set per experiment)
@@ -59,14 +59,19 @@ class TrainConfig:
     # Stratified batch sampling (paper: class-stratified batch sampling)
     stratified: bool = True
 
-    # Whether to use pretrained ImageNet weights for backbone
+    # Whether to use pretrained weights for backbone
     pretrained: bool = True
 
     # Automatic Mixed Precision — enabled on CUDA only (T4/A10 Tensor Cores → ~2× speed)
     amp: bool = True
 
+    # Image backbone — BiomedCLIP ViT-B/16 (same model as text encoder)
+    image_encoder_name: str = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+    # Use CLIP normalization (mean/std from open_clip) instead of ImageNet normalization
+    use_clip_normalization: bool = True
+
     use_image_text: bool = True
-    gamma: float = 0.0929   
+    gamma: float = 0.0929
     lambda_ord_it: float = 1.0
     text_encoder_name: str = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
     finetune_text_encoder: bool = False
@@ -95,18 +100,11 @@ class DRConfig(TrainConfig):
     run_dir: str = "runs/dr"
     epochs: int = 75
     batch_size: int = 24
-    # Paper lr=1e-3; previously unstable without ImageNet normalization (v4: 52.93%).
-    # With correct normalization the backbone activations are in range, so 1e-3 is safe.
     lr: float = 2e-4
     weight_decay: float = 1e-6
-    # Paper lr_patience=5
     lr_patience: int = 8
     early_stop_patience: int = 20
-    # Standard contrastive temperature; previous τ=0.7 compressed gradients and
-    # caused PCOL/SCOLw to barely converge (only ~17% loss reduction over 60+ epochs).
     temperature: float = 0.7
-    # alpha=0.00337: PCOL needs small alpha on the full 35K dataset.
-    # With 640 grade-4 images, batch prototypes (4 samples) are noisy.
     alpha: float = 0.00662474091401746
     beta: float = 0.05516050165777829
     use_image_text: bool = True

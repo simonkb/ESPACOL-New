@@ -23,28 +23,43 @@ from torchvision.transforms.functional import to_pil_image
 
 
 # ----------------------------
-# Common transforms (paper: resize 300x300, normalize to [0,1])
+# Common transforms
 # ----------------------------
 _IMAGENET_MEAN = [0.485, 0.456, 0.406]
 _IMAGENET_STD  = [0.229, 0.224, 0.225]
 
+# CLIP normalization used by BiomedCLIP / open_clip ViT models
+_CLIP_MEAN = [0.48145466, 0.4578275,  0.40821073]
+_CLIP_STD  = [0.26862954, 0.26130258, 0.27577711]
 
-def build_transform(img_size: int = 300) -> Callable:
-    """Evaluation transform: resize + ToTensor + ImageNet normalization."""
+
+def build_transform(img_size: int = 224, use_clip_norm: bool = True) -> Callable:
+    """Evaluation transform: resize + ToTensor + normalization.
+
+    use_clip_norm=True  → CLIP normalization (for BiomedCLIP backbone).
+    use_clip_norm=False → ImageNet normalization (for EfficientNet backbone).
+    """
+    mean = _CLIP_MEAN if use_clip_norm else _IMAGENET_MEAN
+    std  = _CLIP_STD  if use_clip_norm else _IMAGENET_STD
     return transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
+        transforms.Normalize(mean=mean, std=std),
     ])
 
 
-def build_train_transform(img_size: int = 300) -> Callable:
-    """Training transform: augmentation + resize + ToTensor + ImageNet normalization.
+def build_train_transform(img_size: int = 224, use_clip_norm: bool = True) -> Callable:
+    """Training transform: augmentation + resize + ToTensor + normalization.
 
     Augmentations are mild and clinically safe for ultrasound/fundus images:
     horizontal/vertical flips preserve diagnostic content, small rotations
     and slight brightness/contrast shifts simulate acquisition variability.
+
+    use_clip_norm=True  → CLIP normalization (for BiomedCLIP backbone).
+    use_clip_norm=False → ImageNet normalization (for EfficientNet backbone).
     """
+    mean = _CLIP_MEAN if use_clip_norm else _IMAGENET_MEAN
+    std  = _CLIP_STD  if use_clip_norm else _IMAGENET_STD
     return transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.RandomHorizontalFlip(p=0.5),
@@ -52,7 +67,7 @@ def build_train_transform(img_size: int = 300) -> Callable:
         transforms.RandomRotation(degrees=10),
         transforms.ColorJitter(brightness=0.1, contrast=0.1),
         transforms.ToTensor(),
-        transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
+        transforms.Normalize(mean=mean, std=std),
     ])
 
 
