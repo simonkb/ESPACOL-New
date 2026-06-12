@@ -69,6 +69,9 @@ class TrainConfig:
     image_encoder_name: str = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
     # Use CLIP normalization (mean/std from open_clip) instead of ImageNet normalization
     use_clip_normalization: bool = True
+    # Separate LR for the pretrained ViT backbone — much lower than head LR.
+    # ViT features are fragile at high LR; 1/20 of head LR is a safe default.
+    image_encoder_lr: float = 1e-5
 
     use_image_text: bool = True
     gamma: float = 0.0929

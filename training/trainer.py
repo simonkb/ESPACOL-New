@@ -96,7 +96,25 @@ class Trainer:
                 finetune_layers=getattr(cfg, "text_finetune_layers", 0),
             ).to(self.device)
 
-        optim_params = [{"params": list(self.model.parameters()), "lr": cfg.lr}]
+        # Split backbone from heads: ViT needs a much lower LR than randomly
+        # initialised projection/regression heads.  Mirrors how text_encoder_lr
+        # controls the text fine-tuning rate.
+        image_encoder_lr = getattr(cfg, "image_encoder_lr", cfg.lr)
+        backbone_params = list(self.model.backbone.parameters())
+        backbone_param_ids = {id(p) for p in backbone_params}
+        head_params = [p for p in self.model.parameters()
+                       if id(p) not in backbone_param_ids]
+
+        optim_params = [
+            {"params": backbone_params, "lr": image_encoder_lr},
+            {"params": head_params,     "lr": cfg.lr},
+        ]
+        logger.info(
+            f"Optimizer param groups — backbone: {sum(p.numel() for p in backbone_params):,} params "
+            f"lr={image_encoder_lr:.2e} | heads: {sum(p.numel() for p in head_params):,} params "
+            f"lr={cfg.lr:.2e}"
+        )
+
         if self.text_encoder is not None:
             optim_params.append(
                 {"params": list(self.text_encoder.projection.parameters()), "lr": cfg.lr}
