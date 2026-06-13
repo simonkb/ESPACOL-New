@@ -25,7 +25,7 @@ def save_checkpoint(
     state = {
         "epoch": epoch,
         "model_state": model.state_dict(),
-        "optimizer_state": optimizer.state_dict(),
+        "optimizer_state": optimizer.state_dict() if optimizer is not None else None,
         "metrics": metrics,
     }
 
