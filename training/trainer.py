@@ -96,24 +96,39 @@ class Trainer:
                 finetune_layers=getattr(cfg, "text_finetune_layers", 0),
             ).to(self.device)
 
-        # Split backbone from heads: ViT needs a much lower LR than randomly
-        # initialised projection/regression heads.  Mirrors how text_encoder_lr
-        # controls the text fine-tuning rate.
         image_encoder_lr = getattr(cfg, "image_encoder_lr", cfg.lr)
+        self._image_encoder_lr = image_encoder_lr
+        self._freeze_backbone_epochs = getattr(cfg, "freeze_backbone_epochs", 0)
+        self._backbone_unfrozen = self._freeze_backbone_epochs == 0
+
         backbone_params = list(self.model.backbone.parameters())
         backbone_param_ids = {id(p) for p in backbone_params}
         head_params = [p for p in self.model.parameters()
                        if id(p) not in backbone_param_ids]
 
-        optim_params = [
-            {"params": backbone_params, "lr": image_encoder_lr},
-            {"params": head_params,     "lr": cfg.lr},
-        ]
-        logger.info(
-            f"Optimizer param groups — backbone: {sum(p.numel() for p in backbone_params):,} params "
-            f"lr={image_encoder_lr:.2e} | heads: {sum(p.numel() for p in head_params):,} params "
-            f"lr={cfg.lr:.2e}"
-        )
+        if self._freeze_backbone_epochs > 0:
+            # Freeze backbone for warmup: heads initialize from strong pretrained
+            # features before any ViT weights are disturbed.
+            for p in backbone_params:
+                p.requires_grad = False
+            optim_params = [
+                {"params": head_params, "lr": cfg.lr},
+            ]
+            logger.info(
+                f"Backbone frozen for first {self._freeze_backbone_epochs} epochs "
+                f"— heads only: {sum(p.numel() for p in head_params):,} params "
+                f"lr={cfg.lr:.2e}"
+            )
+        else:
+            optim_params = [
+                {"params": backbone_params, "lr": image_encoder_lr},
+                {"params": head_params,     "lr": cfg.lr},
+            ]
+            logger.info(
+                f"Optimizer param groups — backbone: {sum(p.numel() for p in backbone_params):,} params "
+                f"lr={image_encoder_lr:.2e} | heads: {sum(p.numel() for p in head_params):,} params "
+                f"lr={cfg.lr:.2e}"
+            )
 
         if self.text_encoder is not None:
             optim_params.append(
@@ -179,6 +194,7 @@ class Trainer:
 
         for epoch in range(1, self.cfg.epochs + 1):
             t0 = time.time()
+            self._maybe_unfreeze_backbone(epoch)
             self._maybe_enable_text_finetune(epoch)
 
             train_metrics = self._train_epoch(epoch)
@@ -232,6 +248,27 @@ class Trainer:
             f"mae={test_metrics['test_mae']:.4f}"
         )
         return test_metrics
+
+    def _maybe_unfreeze_backbone(self, epoch: int) -> None:
+        if self._backbone_unfrozen:
+            return
+        if epoch < self._freeze_backbone_epochs + 1:
+            return
+        for p in self.model.backbone.parameters():
+            p.requires_grad = True
+        self.optimizer.add_param_group({
+            "params": list(self.model.backbone.parameters()),
+            "lr": self._image_encoder_lr,
+        })
+        # Reset patience counter so the unfreeze-induced loss change doesn't
+        # immediately trigger a LR reduction.
+        self.scheduler.num_bad_epochs = 0
+        self._backbone_unfrozen = True
+        n = sum(p.numel() for p in self.model.backbone.parameters())
+        logger.info(
+            f"[Fold {self.fold}] Backbone unfrozen at epoch {epoch} "
+            f"({n:,} params, lr={self._image_encoder_lr:.2e}) — full model training starts"
+        )
 
     def _maybe_enable_text_finetune(self, epoch: int) -> None:
         if self.text_encoder is None or self._text_finetune_enabled:

@@ -101,14 +101,13 @@ class DRConfig(TrainConfig):
     n_folds: int = 10                # paper: 10-fold CV
     val_fraction: float = 0.1        # 10% of train folds for validation
     run_dir: str = "runs/dr"
-    epochs: int = 100
+    epochs: int = 120            # extended: 10 frozen warmup + 110 fine-tuning
     batch_size: int = 24
     lr: float = 2e-4
     weight_decay: float = 1e-6
-    lr_patience: int = 12            # text finetune at ep 20 caused a false plateau
-                                     # that fired the scheduler prematurely at ep 29
+    lr_patience: int = 15            # longer patience: reset after backbone unfreeze
     lr_min: float = 1e-7             # lower floor: 3-4 backbone LR drops instead of 2
-    early_stop_patience: int = 25
+    early_stop_patience: int = 30
     temperature: float = 0.7
     alpha: float = 0.00662474091401746
     beta: float = 0.05516050165777829
@@ -119,4 +118,5 @@ class DRConfig(TrainConfig):
     text_finetune_layers: int = 2
     text_encoder_lr: float = 1e-6
     text_finetune_start_epoch: int = 20
-    image_encoder_lr: float = 5e-5   # 5× higher than v3; backbone needs more LR range
+    image_encoder_lr: float = 2e-5   # stable range; no oscillation at this LR
+    freeze_backbone_epochs: int = 10 # heads-only warmup before backbone fine-tuning
