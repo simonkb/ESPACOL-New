@@ -219,6 +219,25 @@ def main():
         default=None,
         help="Optional override for BioMedCLIP/open_clip text encoder name",
     )
+    parser.add_argument(
+        "--use_tamo",
+        action="store_true",
+        help="Enable TAMO loss (Text-Anchored Metric Ordinality) — upgrades all "
+             "projection heads to DeepProjectionHead and adds prototype geometry "
+             "distillation from text space.  Implies use_image_text=True.",
+    )
+    parser.add_argument(
+        "--gamma_tamo",
+        type=float,
+        default=None,
+        help="Weight for TAMO loss in total loss (overrides DRConfig default)",
+    )
+    parser.add_argument(
+        "--lambda_orc",
+        type=float,
+        default=None,
+        help="Relative weight of ORC term within TAMO loss",
+    )
 
     args = parser.parse_args()
 
@@ -240,13 +259,25 @@ def main():
     if args.text_encoder_name is not None:
         cfg.text_encoder_name = args.text_encoder_name
 
+    if args.use_tamo:
+        cfg.use_tamo = True
+        cfg.use_image_text = True   # TAMO requires a text encoder
+
+    if args.gamma_tamo is not None:
+        cfg.gamma_tamo = args.gamma_tamo
+
+    if args.lambda_orc is not None:
+        cfg.lambda_orc = args.lambda_orc
+
     setup_logging(args.run_dir)
     log = logging.getLogger("train_dr")
 
     set_seed(cfg.seed)
 
     log.info("=" * 70)
-    if cfg.use_image_text:
+    if getattr(cfg, "use_tamo", False):
+        log.info("DR 10-fold CV  (BiomedCLIP ViT-B/16 + PCOL + SCOLw + IT + TAMO [DeepHeads])")
+    elif cfg.use_image_text:
         log.info("DR 10-fold CV  (BiomedCLIP ViT-B/16 + PCOL + SCOLw + ImageText)")
     else:
         log.info("DR 10-fold CV  (BiomedCLIP ViT-B/16 + PCOL + SCOLw)")
@@ -338,6 +369,7 @@ def main():
             proj_hidden_dim=cfg.proj_hidden_dim,
             proj_out_dim=cfg.proj_out_dim,
             use_image_text=cfg.use_image_text,
+            use_tamo=getattr(cfg, "use_tamo", False),
             image_encoder_name=cfg.image_encoder_name,
         )
 

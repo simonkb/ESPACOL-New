@@ -120,3 +120,14 @@ class DRConfig(TrainConfig):
     text_finetune_start_epoch: int = 20
     image_encoder_lr: float = 2e-5   # stable range; no oscillation at this LR
     freeze_backbone_epochs: int = 10 # heads-only warmup before backbone fine-tuning
+
+    # ── TAMO (Text-Anchored Metric Ordinality) ────────────────────────────────
+    # use_tamo: enable the TAMO loss and upgrade all heads to DeepProjectionHead.
+    # gamma_tamo: weight for L_TAMO in total loss (L_PMD + lambda_orc * L_ORC).
+    # lambda_orc: relative weight of ORC term vs PMD within TAMO.
+    # Set to True via --use_tamo flag in train_dr.py to activate TAMO.
+    # Default False so existing sweep scripts are unaffected.
+    use_tamo: bool = False
+    gamma_tamo: float = 0.15        # start conservative; scale up after ablation
+    lambda_orc: float = 0.5         # ORC is noisier than PMD; down-weight initially
+    tamo_huber_delta: float = 0.1   # Huber threshold in normalized distance units

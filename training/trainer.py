@@ -163,7 +163,12 @@ class Trainer:
             temperature=cfg.temperature,
             use_image_text=cfg.use_image_text,
             lambda_ord_it=cfg.lambda_ord_it,
+            use_tamo=getattr(cfg, "use_tamo", False),
+            gamma_tamo=getattr(cfg, "gamma_tamo", 0.0),
+            lambda_orc=getattr(cfg, "lambda_orc", 1.0),
+            huber_delta=getattr(cfg, "tamo_huber_delta", 0.1),
         )
+        self._use_tamo = getattr(cfg, "use_tamo", False)
 
         self.class_weights = compute_class_weights(
             train_labels, cfg.n_classes, device=self.device
@@ -289,6 +294,31 @@ class Trainer:
             f"({n_text_params} trainable text params, lr={getattr(self.cfg, 'text_encoder_lr', 1e-6):.2e})"
         )
 
+    def _precompute_text_dist_matrix(self) -> torch.Tensor | None:
+        """
+        Precompute the C×C pairwise cosine distance matrix between text
+        class prototypes at the start of each training epoch.
+
+        Returns None if TAMO is not active or there is no text encoder.
+
+        Called once per epoch (not per batch) for efficiency.  If the text
+        encoder is being fine-tuned, the matrix is recomputed each epoch so
+        it reflects the current text weights.  If the text encoder is frozen
+        (finetune_text_encoder=False), the matrix is constant across epochs,
+        but the overhead of recomputing it is negligible (~5 forward passes
+        through a 5-token BERT for 5 class descriptions).
+        """
+        if not self._use_tamo or self.text_encoder is None:
+            return None
+
+        with torch.no_grad():
+            text_protos = self.text_encoder()    # (C, d), L2-normalized
+            # Cosine distance = 1 - cosine_similarity
+            sim_tt = text_protos @ text_protos.t()
+            text_dist_matrix = (1.0 - sim_tt).clamp(min=0.0)   # (C, C)
+
+        return text_dist_matrix
+
     def _train_epoch(self, epoch: int) -> dict:
         self.model.train()
         if self.text_encoder is not None:
@@ -299,11 +329,18 @@ class Trainer:
             ):
                 self.text_encoder.text_model.eval()
 
+        # Precompute text prototype distance matrix once for the whole epoch.
+        # This is constant within the epoch (text encoder not updated inside
+        # the batch loop) and used by TAMOLoss for PMD and ORC terms.
+        text_dist_matrix = self._precompute_text_dist_matrix()
+
         total_loss = 0.0
         total_pcol = 0.0
         total_scolw = 0.0
         total_rmse = 0.0
         total_it = 0.0
+        total_tamo_pmd = 0.0
+        total_tamo_orc = 0.0
         n_batches = 0
 
         nb = self.device.type == "cuda"
@@ -327,12 +364,15 @@ class Trainer:
                     z_pcol = out["z_pcol"]
                     z_scolw = out["z_scolw"]
                     z_it = out.get("z_it", None)
+                    z_tamo = out.get("z_tamo", None)
                     pred = out["pred"]
                 elif len(out) == 5:
                     _, z_pcol, z_scolw, z_it, pred = out
+                    z_tamo = None
                 else:
                     z_pcol, z_scolw, pred = out
                     z_it = None
+                    z_tamo = None
 
                 text_prototypes = None
                 if self.text_encoder is not None and self.cfg.use_image_text:
@@ -346,6 +386,8 @@ class Trainer:
                     class_weights=batch_weights,
                     z_it=z_it,
                     text_prototypes=text_prototypes,
+                    z_tamo=z_tamo,
+                    text_dist_matrix=text_dist_matrix,
                 )
 
             self.scaler.scale(loss).backward()
@@ -367,6 +409,8 @@ class Trainer:
             total_scolw += comps["loss_scolw"]
             total_rmse += comps["loss_rmse"]
             total_it += comps.get("loss_it", 0.0)
+            total_tamo_pmd += comps.get("loss_tamo_pmd", 0.0)
+            total_tamo_orc += comps.get("loss_tamo_orc", 0.0)
             n_batches += 1
 
         nbatches = max(n_batches, 1)
@@ -380,6 +424,10 @@ class Trainer:
 
         if self.text_encoder is not None and self.cfg.use_image_text:
             metrics["train_loss_it"] = total_it / nbatches
+
+        if self._use_tamo:
+            metrics["train_loss_tamo_pmd"] = total_tamo_pmd / nbatches
+            metrics["train_loss_tamo_orc"] = total_tamo_orc / nbatches
 
         return metrics
 
@@ -436,13 +484,20 @@ class Trainer:
         if "train_loss_it" in train:
             it_text = f" it={train['train_loss_it']:.3f}"
 
+        tamo_text = ""
+        if "train_loss_tamo_pmd" in train:
+            tamo_text = (
+                f" pmd={train['train_loss_tamo_pmd']:.3f}"
+                f" orc={train['train_loss_tamo_orc']:.3f}"
+            )
+
         logger.info(
             f"[Fold {self.fold}] Ep {epoch:3d} | "
             f"loss={train['train_loss']:.4f} "
             f"(pcol={train['train_loss_pcol']:.3f} "
             f"scolw={train['train_loss_scolw']:.3f} "
             f"rmse={train['train_loss_rmse']:.3f}"
-            f"{it_text}) | "
+            f"{it_text}{tamo_text}) | "
             f"val_loss={val['val_loss']:.4f}  "
             f"val_acc={val['val_acc']:.2f}%  "
             f"val_mae={val['val_mae']:.4f}  "
