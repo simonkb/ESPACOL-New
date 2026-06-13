@@ -140,6 +140,8 @@ class SweepTrainer(Trainer):
 
         for epoch in range(1, self.cfg.epochs + 1):
             t0 = time.time()
+            self._maybe_unfreeze_backbone(epoch)
+            self._maybe_enable_text_finetune(epoch)
 
             train_metrics = self._train_epoch(epoch)
             val_metrics = self._eval_epoch(self.val_loader, prefix="val")
@@ -267,6 +269,7 @@ def apply_sweep_config(cfg: DRConfig, wc) -> str:
     cfg.early_stop_patience = 20
     cfg.batch_size = 24
     cfg.epochs = 75
+    cfg.freeze_backbone_epochs = 0  # ablation sweep uses unfrozen backbone from ep 1
 
     ablation_mode = str(wc.get("ablation_mode", "full_it"))
     cfg.gamma = float(wc.get("gamma", 0.01))

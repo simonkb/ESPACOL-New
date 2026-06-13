@@ -260,6 +260,10 @@ class Trainer:
             "params": list(self.model.backbone.parameters()),
             "lr": self._image_encoder_lr,
         })
+        # ReduceLROnPlateau stores min_lrs indexed by param group. Adding a new
+        # group via add_param_group() doesn't update that list, causing an
+        # IndexError on the next scheduler.step(). Extend it manually.
+        self.scheduler.min_lrs.append(self.cfg.lr_min)
         # Reset patience counter so the unfreeze-induced loss change doesn't
         # immediately trigger a LR reduction.
         self.scheduler.num_bad_epochs = 0
