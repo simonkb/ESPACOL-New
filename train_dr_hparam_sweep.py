@@ -49,42 +49,45 @@ from utils.checkpoint import save_checkpoint, load_checkpoint
 
 
 # ---------------------------------------------------------------------------
-# WandB sweep config (Bayesian, 30 trials)
+# WandB sweep config (random, 40 trials)
+#
+# Method is random (not bayes) so that zero values are sampled uniformly —
+# a Bayesian optimizer would deprioritize 0s after the first few trials and
+# we'd never get the ablation coverage we want.
+#
+# alpha/beta/gamma each include 0.0 (ablation — no that loss) and 1.0
+# (maximum weight — stress-test that loss).  This means ~1/7 of trials will
+# have alpha=0, ~1/7 with beta=0, etc., giving a natural ablation study
+# embedded in the sweep at no extra cost.
 # ---------------------------------------------------------------------------
 
 SWEEP_CONFIG = {
-    "method": "bayes",
+    "method": "random",
     "metric": {"name": "best_val_acc", "goal": "maximize"},
     "parameters": {
+        # 0.0 = no PCOL loss,  1.0 = maximum PCOL weight
         "alpha": {
-            "distribution": "log_uniform_values",
-            "min": 0.001,
-            "max": 0.05,
+            "distribution": "categorical",
+            "values": [0.0, 0.001, 0.005, 0.01, 0.02, 0.05, 1.0],
         },
+        # 0.0 = no SCOLw loss, 1.0 = maximum SCOLw weight
         "beta": {
-            "distribution": "log_uniform_values",
-            "min": 0.01,
-            "max": 0.30,
+            "distribution": "categorical",
+            "values": [0.0, 0.01, 0.05, 0.1, 0.2, 0.3, 1.0],
         },
+        # 0.0 = no IT loss (text encoder disabled), 1.0 = maximum IT weight
         "gamma": {
-            "distribution": "log_uniform_values",
-            "min": 0.01,
-            "max": 0.20,
+            "distribution": "categorical",
+            "values": [0.0, 0.01, 0.05, 0.1, 0.2, 1.0],
         },
         "temperature": {
             "distribution": "categorical",
             "values": [0.3, 0.5, 0.7, 1.0],
         },
         "lr": {
-            "distribution": "log_uniform_values",
-            "min": 5e-5,
-            "max": 5e-4,
+            "distribution": "categorical",
+            "values": [5e-5, 1e-4, 2e-4, 5e-4],
         },
-    },
-    "early_terminate": {
-        "type": "hyperband",
-        "min_iter": 20,
-        "eta": 2,
     },
 }
 
@@ -209,11 +212,13 @@ class HparamSweepTrainer(Trainer):
                 step=epoch,
             )
 
-            # Early abandon: clearly bad runs
-            if epoch == 20 and best_val_acc < 40.0:
-                log.info(f"Abandoning at epoch {epoch}: best_val_acc={best_val_acc:.2f}% < 40%")
+            # Early abandon: clearly bad runs.
+            # Thresholds are lenient to allow ablation runs (single loss,
+            # gamma=0, etc.) enough time to converge before being abandoned.
+            if epoch == 25 and best_val_acc < 35.0:
+                log.info(f"Abandoning at epoch {epoch}: best_val_acc={best_val_acc:.2f}% < 35%")
                 break
-            if epoch == 35 and best_val_acc < 55.0:
+            if epoch == 45 and best_val_acc < 55.0:
                 log.info(f"Abandoning at epoch {epoch}: best_val_acc={best_val_acc:.2f}% < 55%")
                 break
 
@@ -269,6 +274,22 @@ def run_sweep(args, img_cache=None):
     cfg.temperature = float(wc.get("temperature", 0.7))
     cfg.lr          = float(wc.get("lr",          2e-4))
 
+    # gamma=0 means no image-text loss — disable text encoder entirely to
+    # save memory and skip the text encoder forward pass each epoch.
+    if cfg.gamma == 0.0:
+        cfg.use_image_text = False
+        cfg.finetune_text_encoder = False
+
+    # Derive a human-readable ablation label for logging.
+    ablation_parts = []
+    if cfg.alpha == 0.0:
+        ablation_parts.append("no_pcol")
+    if cfg.beta == 0.0:
+        ablation_parts.append("no_scolw")
+    if cfg.gamma == 0.0:
+        ablation_parts.append("no_it")
+    ablation_label = "+".join(ablation_parts) if ablation_parts else "full"
+
     run_dir = os.path.join(args.run_dir, run.id)
     os.makedirs(run_dir, exist_ok=True)
     cfg.run_dir = run_dir
@@ -282,20 +303,23 @@ def run_sweep(args, img_cache=None):
 
     log = logging.getLogger("hparam_sweep")
     log.info(
-        f"Run {run.id}: alpha={cfg.alpha:.4f} beta={cfg.beta:.4f} gamma={cfg.gamma:.4f} "
-        f"tau={cfg.temperature} lr={cfg.lr:.2e}"
+        f"Run {run.id} [{ablation_label}]: "
+        f"alpha={cfg.alpha} beta={cfg.beta} gamma={cfg.gamma} "
+        f"tau={cfg.temperature} lr={cfg.lr:.2e} use_it={cfg.use_image_text}"
     )
 
     wandb.config.update(
         {
-            "effective_alpha":       cfg.alpha,
-            "effective_beta":        cfg.beta,
-            "effective_gamma":       cfg.gamma,
-            "effective_temperature": cfg.temperature,
-            "effective_lr":          cfg.lr,
-            "image_encoder_lr":      cfg.image_encoder_lr,
+            "effective_alpha":        cfg.alpha,
+            "effective_beta":         cfg.beta,
+            "effective_gamma":        cfg.gamma,
+            "effective_temperature":  cfg.temperature,
+            "effective_lr":           cfg.lr,
+            "ablation_label":         ablation_label,
+            "use_image_text":         cfg.use_image_text,
+            "image_encoder_lr":       cfg.image_encoder_lr,
             "freeze_backbone_epochs": cfg.freeze_backbone_epochs,
-            "epochs":                cfg.epochs,
+            "epochs":                 cfg.epochs,
         },
         allow_val_change=True,
     )
@@ -381,7 +405,7 @@ def main():
 
     parser.add_argument("--sweep_id",  type=str, default=None,
                         help="WandB sweep ID (entity/project/sweep_id). Runs the agent.")
-    parser.add_argument("--count",     type=int, default=30,
+    parser.add_argument("--count",     type=int, default=40,
                         help="Number of trials for this agent.")
 
     parser.add_argument("--create_sweep", action="store_true",
