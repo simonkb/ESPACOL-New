@@ -45,7 +45,7 @@ from Datasets.dataloaders import (
 from models.framework import build_model
 from training.cross_val import DRCrossValidator
 from training.trainer import Trainer
-from utils.checkpoint import save_checkpoint, load_checkpoint
+
 
 
 # ---------------------------------------------------------------------------
@@ -160,12 +160,16 @@ def make_loaders(train_items, val_items, test_items, cfg: DRConfig, device=None,
 # ---------------------------------------------------------------------------
 
 class HparamSweepTrainer(Trainer):
-    """Trainer subclass that logs per-epoch metrics to W&B and supports early abandon."""
+    """Trainer subclass that logs per-epoch metrics to W&B and supports early abandon.
+
+    No checkpoints are saved — the sweep only needs WandB logs to identify the
+    best hyperparameters.  Skipping .pth writes saves ~350 MB per trial and
+    prevents filling the home partition during parallel sweeps.
+    """
 
     def fit(self, test_loader) -> dict:
         best_val_acc  = -float("inf")
         best_val_mae  = float("inf")
-        best_ckpt_path = os.path.join(self.run_dir, "fold0_best.pth")
 
         log = logging.getLogger(__name__)
 
@@ -186,19 +190,9 @@ class HparamSweepTrainer(Trainer):
             val_mae  = val_metrics["val_mae"]
             val_loss = val_metrics["val_loss"]
 
-            is_best = val_acc > best_val_acc
-            if is_best:
+            if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 best_val_mae = val_mae
-                save_checkpoint(
-                    path=best_ckpt_path,
-                    model=self.model,
-                    optimizer=None,
-                    epoch=epoch,
-                    metrics={**train_metrics, **val_metrics},
-                    is_best=False,
-                    text_encoder=None,
-                )
 
             wandb.log(
                 {
@@ -228,15 +222,9 @@ class HparamSweepTrainer(Trainer):
                 log.info(f"Early stopping at epoch {epoch}")
                 break
 
-        if os.path.exists(best_ckpt_path):
-            load_checkpoint(
-                path=best_ckpt_path,
-                model=self.model,
-                optimizer=None,
-                text_encoder=self.text_encoder,
-                device=self.device,
-            )
-
+        # No checkpoint to reload — evaluate on current (last) model state.
+        # For hyperparameter search the best_val_acc metric is what matters,
+        # not the final test accuracy on the exact best-epoch weights.
         test_metrics = self._eval_epoch(test_loader, prefix="test")
 
         wandb.log({
