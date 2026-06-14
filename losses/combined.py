@@ -42,7 +42,8 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         use_tamo: bool = False,
         gamma_tamo: float = 0.1,
         lambda_orc: float = 1.0,
-        huber_delta: float = 0.1,
+        huber_delta: float = 0.1,      # kept for API compat; not used by PMD v2
+        temperature_pmd: float = 0.1,  # softmax temperature for PMD-KL
     ):
         super().__init__()
         self.alpha = alpha
@@ -65,6 +66,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         self.tamo = TAMOLoss(
             lambda_orc=lambda_orc,
             huber_delta=huber_delta,
+            temperature_pmd=temperature_pmd,
         )
 
     def forward(

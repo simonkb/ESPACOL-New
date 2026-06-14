@@ -26,6 +26,8 @@ import random
 import sys
 import time
 
+import copy
+
 import numpy as np
 import torch
 import wandb
@@ -45,7 +47,6 @@ from Datasets.dataloaders import (
 from models.framework import build_model
 from training.cross_val import DRCrossValidator
 from training.trainer import Trainer
-from utils.checkpoint import save_checkpoint, load_checkpoint
 
 
 def set_seed(seed: int) -> None:
@@ -135,8 +136,7 @@ class SweepTrainer(Trainer):
         best_score = -float("inf")
         best_val_acc = -float("inf")
         best_val_mae = float("inf")
-
-        best_ckpt_path = os.path.join(self.run_dir, f"fold{self.fold}_best.pth")
+        best_model_state = None   # in-memory best weights — no disk I/O
 
         for epoch in range(1, self.cfg.epochs + 1):
             t0 = time.time()
@@ -156,7 +156,6 @@ class SweepTrainer(Trainer):
             val_loss = val_metrics["val_loss"]
 
             # Joint score: prioritize accuracy, but penalize worse MAE.
-            # Example: +1% acc is worth roughly 0.1 MAE.
             score = val_acc - 10.0 * val_mae
 
             is_best = score > best_score
@@ -164,6 +163,7 @@ class SweepTrainer(Trainer):
                 best_score = score
                 best_val_acc = val_acc
                 best_val_mae = val_mae
+                best_model_state = copy.deepcopy(self.model.state_dict())
 
             wandb.log(
                 {
@@ -188,50 +188,14 @@ class SweepTrainer(Trainer):
                 )
                 break
 
-            ckpt_path = os.path.join(self.run_dir, f"fold{self.fold}_epoch{epoch}.pth")
-
-            save_checkpoint(
-                path=ckpt_path,
-                model=self.model,
-                optimizer=self.optimizer,
-                epoch=epoch,
-                metrics={**train_metrics, **val_metrics},
-                is_best=is_best,
-                text_encoder=self.text_encoder,
-            )
-
-            if is_best:
-                save_checkpoint(
-                    path=best_ckpt_path,
-                    model=self.model,
-                    optimizer=self.optimizer,
-                    epoch=epoch,
-                    metrics={**train_metrics, **val_metrics},
-                    is_best=False,
-                    text_encoder=self.text_encoder,
-                )
-
-            if epoch > 1:
-                prev_ckpt = os.path.join(
-                    self.run_dir, f"fold{self.fold}_epoch{epoch - 1}.pth"
-                )
-                if os.path.exists(prev_ckpt) and prev_ckpt != best_ckpt_path:
-                    os.remove(prev_ckpt)
-
             self.scheduler.step(val_loss)
 
             if self.early_stopping.step(val_acc):
                 logging.getLogger(__name__).info(f"Early stopping at epoch {epoch}")
                 break
 
-        if os.path.exists(best_ckpt_path):
-            load_checkpoint(
-                path=best_ckpt_path,
-                model=self.model,
-                optimizer=None,
-                text_encoder=self.text_encoder,
-                device=self.device,
-            )
+        if best_model_state is not None:
+            self.model.load_state_dict(best_model_state)
 
         test_metrics = self._eval_epoch(test_loader, prefix="test")
 

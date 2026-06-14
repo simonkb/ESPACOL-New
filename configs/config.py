@@ -128,6 +128,11 @@ class DRConfig(TrainConfig):
     # Set to True via --use_tamo flag in train_dr.py to activate TAMO.
     # Default False so existing sweep scripts are unaffected.
     use_tamo: bool = False
-    gamma_tamo: float = 0.15        # start conservative; scale up after ablation
+    # gamma_tamo raised to 1.0: PMD-KL values are ~0.05-0.15 (vs Huber's 0.001-0.032),
+    # so a larger weight is needed to give the TAMO loss comparable scale to RMSE.
+    gamma_tamo: float = 1.0
     lambda_orc: float = 0.5         # ORC is noisier than PMD; down-weight initially
-    tamo_huber_delta: float = 0.1   # Huber threshold in normalized distance units
+    tamo_huber_delta: float = 0.1   # kept for API compat; not used by PMD v2
+    # Softmax temperature for PMD-KL.  Lower τ → sharper teacher distribution →
+    # more sensitive to fine-grained ordering differences between classes.
+    tamo_temperature_pmd: float = 0.1
