@@ -136,25 +136,33 @@ class TAMOLoss(nn.Module):
         diag = torch.eye(K, dtype=torch.bool, device=device)
         off_diag = ~diag
 
-        # ── PMD v2: KL divergence on softmax of pairwise distances ────────
+        # ── PMD v2: KL divergence on off-diagonal softmax distributions ────
         #
-        # Mask the diagonal with a large distance before softmax so the
-        # self-similarity (always 0) doesn't dominate the distribution.
-        D_img_m = D_img.masked_fill(diag, 1e4)          # (K, K)
-        D_txt_m = D_txt.masked_fill(diag, 1e4)          # (K, K) — already detached
+        # Explicitly extract the K×(K-1) off-diagonal distances instead of
+        # masking the diagonal with a large constant.  Masked-fill with 1e4
+        # produces -1e5 logits that become -inf in float16, leading to
+        # 0 * log(0/-inf) = 0 * NaN = NaN in kl_div (even though kl_div
+        # backward is actually fine since it computes -target=0 for those
+        # positions).  Explicit extraction avoids the issue entirely.
+        #
+        # off_diag is a (K, K) bool with True on all K*(K-1) off-diagonal
+        # positions; indexing produces those elements in row-major order.
         tau = self.temperature_pmd
 
-        # Teacher: text-derived distribution (detached — no gradient)
-        txt_probs = F.softmax(-D_txt_m / tau, dim=1)    # (K, K)
+        D_img_od = D_img[off_diag].view(K, K - 1)           # (K, K-1) differentiable
+        D_txt_od = D_txt[off_diag].view(K, K - 1).detach()  # (K, K-1) teacher, fixed
 
-        # Student: image-derived log-distribution (differentiable via D_img)
-        img_log_probs = F.log_softmax(-D_img_m / tau, dim=1)  # (K, K)
+        # Teacher: text-derived distribution over the K-1 other classes
+        txt_probs = F.softmax(-D_txt_od / tau, dim=1)        # (K, K-1)
 
-        # KL(p_txt || p_img) — averaged over anchor classes
+        # Student: image-derived log-distribution
+        img_log_probs = F.log_softmax(-D_img_od / tau, dim=1)  # (K, K-1)
+
+        # KL(p_txt || p_img) — averaged over K anchor classes
         l_pmd = F.kl_div(
             img_log_probs,          # log Q (approximation)
             txt_probs,              # P    (target)
-            reduction="batchmean",  # sum over K, divide by K
+            reduction="batchmean",  # sum over K*(K-1), divide by K
             log_target=False,
         )
 

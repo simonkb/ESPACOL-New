@@ -44,10 +44,17 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         lambda_orc: float = 1.0,
         huber_delta: float = 0.1,      # kept for API compat; not used by PMD v2
         temperature_pmd: float = 0.1,  # softmax temperature for PMD-KL
+        # Label smoothing for regression: adds Gaussian noise σ to integer targets.
+        # Prevents the model from memorising exact integer values, closing the
+        # train-RMSE / val-RMSE gap (train 0.047 vs val 0.71 in v2 run).
+        label_smooth_sigma: float = 0.0,
+        n_classes: int = 5,
     ):
         super().__init__()
         self.alpha = alpha
         self.beta = beta
+        self.label_smooth_sigma = label_smooth_sigma
+        self.n_classes = n_classes
         self.gamma = gamma
         self.use_image_text = use_image_text
         self.use_tamo = use_tamo
@@ -84,7 +91,15 @@ class HybridContrastiveOrdinalLoss(nn.Module):
 
         l_pcol = self.pcol(z_pcol, labels)
         l_scolw = self.scolw(z_scolw, labels, class_weights)
-        l_rmse = torch.sqrt(F.mse_loss(pred, labels.float()) + 1e-8)
+
+        # Ordinal label smoothing: add small Gaussian noise to integer targets
+        # so the model cannot drive RMSE to near-zero by memorising exact grades.
+        targets = labels.float()
+        if self.label_smooth_sigma > 0.0 and self.training:
+            noise = torch.randn_like(targets) * self.label_smooth_sigma
+            targets = (targets + noise).clamp(0.0, float(self.n_classes - 1))
+
+        l_rmse = torch.sqrt(F.mse_loss(pred, targets) + 1e-8)
 
         l_it = torch.tensor(0.0, device=pred.device)
         if self.use_image_text and self.gamma > 0.0:

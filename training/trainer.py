@@ -168,6 +168,8 @@ class Trainer:
             lambda_orc=getattr(cfg, "lambda_orc", 1.0),
             huber_delta=getattr(cfg, "tamo_huber_delta", 0.1),
             temperature_pmd=getattr(cfg, "tamo_temperature_pmd", 0.1),
+            label_smooth_sigma=getattr(cfg, "label_smooth_sigma", 0.0),
+            n_classes=cfg.n_classes,
         )
         self._use_tamo = getattr(cfg, "use_tamo", False)
 

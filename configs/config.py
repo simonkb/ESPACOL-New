@@ -136,3 +136,7 @@ class DRConfig(TrainConfig):
     # Softmax temperature for PMD-KL.  Lower τ → sharper teacher distribution →
     # more sensitive to fine-grained ordering differences between classes.
     tamo_temperature_pmd: float = 0.1
+    # Ordinal label smoothing for regression: σ of Gaussian noise added to integer
+    # targets during training.  Prevents the model from memorising exact grades and
+    # closing the train-RMSE / val-RMSE gap.  0.15–0.25 is a safe range.
+    label_smooth_sigma: float = 0.2
