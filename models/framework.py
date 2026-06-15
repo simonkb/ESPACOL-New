@@ -34,6 +34,7 @@ from .heads import (
     DeepProjectionHead,
     RegressionHead,
     DeepRegressionHead,
+    CoralHead,
 )
 
 _DEFAULT_IMAGE_ENCODER = (
@@ -104,8 +105,14 @@ class HybridContrastiveOrdinalModel(nn.Module):
 
     @torch.no_grad()
     def predict(self, x: torch.Tensor) -> torch.Tensor:
-        """Inference-only: returns continuous regression output."""
+        """
+        Inference-only: returns continuous grade prediction in [0, K-1].
+        For CoralHead: sum of sigmoid activations (rounds to nearest grade).
+        For RegressionHead/DeepRegressionHead: direct scalar output.
+        """
         features = self.backbone(x)
+        if hasattr(self.regression_head, "predict"):
+            return self.regression_head.predict(features)
         return self.regression_head(features)
 
 
@@ -116,6 +123,7 @@ def build_model(
     proj_out_dim: int = 128,
     use_image_text: bool = False,
     use_tamo: bool = False,
+    use_coral: bool = False,
     image_encoder_name: str = _DEFAULT_IMAGE_ENCODER,
 ) -> HybridContrastiveOrdinalModel:
     """
@@ -139,7 +147,11 @@ def build_model(
         # prototype computations, skip connections for fast convergence.
         pcol_head = DeepProjectionHead(feat_dim, hidden_dim, proj_out_dim)
         scolw_head = DeepProjectionHead(feat_dim, hidden_dim, proj_out_dim)
-        reg_head = DeepRegressionHead(feat_dim, hidden_dim=min(hidden_dim, 256))
+        reg_head = (
+            CoralHead(feat_dim, n_classes=n_classes)
+            if use_coral
+            else DeepRegressionHead(feat_dim, hidden_dim=min(hidden_dim, 256))
+        )
         # IT head kept as deep variant for consistency with TAMO embedding space.
         image_text_head = DeepProjectionHead(feat_dim, hidden_dim, proj_out_dim)
         # TAMO head is always present when use_tamo=True.
@@ -148,7 +160,11 @@ def build_model(
         # Original paper heads — used for baseline and ablation sweep runs.
         pcol_head = MLPProjectionHead(feat_dim, hidden_dim, proj_out_dim)
         scolw_head = MLPProjectionHead(feat_dim, hidden_dim, proj_out_dim)
-        reg_head = RegressionHead(feat_dim)
+        reg_head = (
+            CoralHead(feat_dim, n_classes=n_classes)
+            if use_coral
+            else RegressionHead(feat_dim)
+        )
         image_text_head = MLPProjectionHead(feat_dim, hidden_dim, proj_out_dim) if use_image_text else None
         tamo_head = None
 

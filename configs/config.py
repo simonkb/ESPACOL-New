@@ -121,6 +121,13 @@ class DRConfig(TrainConfig):
     image_encoder_lr: float = 2e-5   # stable range; no oscillation at this LR
     freeze_backbone_epochs: int = 10 # heads-only warmup before backbone fine-tuning
 
+    # ── CORAL (Consistent Rank Logits ordinal classification) ─────────────────
+    # Replaces scalar RMSE regression with K-1 rank-consistent binary classifiers.
+    # CoralHead shares all weights except per-rank biases (rank consistency).
+    # CORAL loss: sum of K-1 binary cross-entropies, one per grade boundary.
+    # Enable with --use_coral flag; compatible with TAMO and image-text.
+    use_coral: bool = False
+
     # ── TAMO (Text-Anchored Metric Ordinality) ────────────────────────────────
     # use_tamo: enable the TAMO loss and upgrade all heads to DeepProjectionHead.
     # gamma_tamo: weight for L_TAMO in total loss (L_PMD + lambda_orc * L_ORC).

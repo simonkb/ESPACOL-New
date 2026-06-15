@@ -220,6 +220,13 @@ def main():
         help="Optional override for BioMedCLIP/open_clip text encoder name",
     )
     parser.add_argument(
+        "--use_coral",
+        action="store_true",
+        help="Replace RMSE regression with CORAL ordinal classification. "
+             "CoralHead predicts K-1 rank-consistent binary classifiers "
+             "(shared weights, per-rank biases).  Compatible with --use_tamo.",
+    )
+    parser.add_argument(
         "--use_tamo",
         action="store_true",
         help="Enable TAMO loss (Text-Anchored Metric Ordinality) — upgrades all "
@@ -245,6 +252,9 @@ def main():
         args.train_csv = os.path.join(args.dr_root, "trainLabels.csv")
 
     cfg = DRConfig(run_dir=args.run_dir)
+
+    if args.use_coral:
+        cfg.use_coral = True
 
     if args.use_image_text:
         cfg.use_image_text = True
@@ -274,13 +284,14 @@ def main():
 
     set_seed(cfg.seed)
 
+    reg_str = "CORAL" if getattr(cfg, "use_coral", False) else "RMSE"
     log.info("=" * 70)
     if getattr(cfg, "use_tamo", False):
-        log.info("DR 10-fold CV  (BiomedCLIP ViT-B/16 + PCOL + SCOLw + IT + TAMO [DeepHeads])")
+        log.info(f"DR 10-fold CV  (BiomedCLIP ViT-B/16 + PCOL + SCOLw + IT + TAMO [DeepHeads] + {reg_str})")
     elif cfg.use_image_text:
-        log.info("DR 10-fold CV  (BiomedCLIP ViT-B/16 + PCOL + SCOLw + ImageText)")
+        log.info(f"DR 10-fold CV  (BiomedCLIP ViT-B/16 + PCOL + SCOLw + ImageText + {reg_str})")
     else:
-        log.info("DR 10-fold CV  (BiomedCLIP ViT-B/16 + PCOL + SCOLw)")
+        log.info(f"DR 10-fold CV  (BiomedCLIP ViT-B/16 + PCOL + SCOLw + {reg_str})")
     log.info("=" * 70)
     log.info(f"Config: {cfg}")
 
@@ -370,6 +381,7 @@ def main():
             proj_out_dim=cfg.proj_out_dim,
             use_image_text=cfg.use_image_text,
             use_tamo=getattr(cfg, "use_tamo", False),
+            use_coral=getattr(cfg, "use_coral", False),
             image_encoder_name=cfg.image_encoder_name,
         )
 

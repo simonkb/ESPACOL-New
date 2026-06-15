@@ -26,6 +26,7 @@ from .pcol import PCOLLoss
 from .scolw import SCOLwLoss
 from .image_text import ImageTextOrdinalLoss
 from .tamo import TAMOLoss
+from .coral import CoralLoss
 
 
 class HybridContrastiveOrdinalLoss(nn.Module):
@@ -38,21 +39,22 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         temperature: float = 0.07,
         use_image_text: bool = False,
         lambda_ord_it: float = 1.0,
+        # CORAL: replace scalar RMSE with rank-consistent binary classification
+        use_coral: bool = False,
         # TAMO parameters
         use_tamo: bool = False,
         gamma_tamo: float = 0.1,
         lambda_orc: float = 1.0,
         huber_delta: float = 0.1,      # kept for API compat; not used by PMD v2
         temperature_pmd: float = 0.1,  # softmax temperature for PMD-KL
-        # Label smoothing for regression: adds Gaussian noise σ to integer targets.
-        # Prevents the model from memorising exact integer values, closing the
-        # train-RMSE / val-RMSE gap (train 0.047 vs val 0.71 in v2 run).
+        # Label smoothing for regression (only used when use_coral=False).
         label_smooth_sigma: float = 0.0,
         n_classes: int = 5,
     ):
         super().__init__()
         self.alpha = alpha
         self.beta = beta
+        self.use_coral = use_coral
         self.label_smooth_sigma = label_smooth_sigma
         self.n_classes = n_classes
         self.gamma = gamma
@@ -62,6 +64,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
 
         self.pcol = PCOLLoss(temperature=temperature)
         self.scolw = SCOLwLoss(temperature=temperature)
+        self.coral = CoralLoss()
 
         self.image_text = ImageTextOrdinalLoss(
             temperature=temperature,
@@ -92,14 +95,18 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         l_pcol = self.pcol(z_pcol, labels)
         l_scolw = self.scolw(z_scolw, labels, class_weights)
 
-        # Ordinal label smoothing: add small Gaussian noise to integer targets
-        # so the model cannot drive RMSE to near-zero by memorising exact grades.
-        targets = labels.float()
-        if self.label_smooth_sigma > 0.0 and self.training:
-            noise = torch.randn_like(targets) * self.label_smooth_sigma
-            targets = (targets + noise).clamp(0.0, float(self.n_classes - 1))
-
-        l_rmse = torch.sqrt(F.mse_loss(pred, targets) + 1e-8)
+        # Ordinal prediction loss: CORAL binary cross-entropy or RMSE regression.
+        if self.use_coral:
+            # pred: (N, K-1) rank logits from CoralHead.forward()
+            l_rmse = self.coral(pred, labels)
+        else:
+            # Label smoothing: adds Gaussian noise to integer targets so the model
+            # cannot drive RMSE to near-zero by memorising exact grade values.
+            targets = labels.float()
+            if self.label_smooth_sigma > 0.0 and self.training:
+                noise = torch.randn_like(targets) * self.label_smooth_sigma
+                targets = (targets + noise).clamp(0.0, float(self.n_classes - 1))
+            l_rmse = torch.sqrt(F.mse_loss(pred, targets) + 1e-8)
 
         l_it = torch.tensor(0.0, device=pred.device)
         if self.use_image_text and self.gamma > 0.0:

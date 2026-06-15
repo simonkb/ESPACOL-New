@@ -162,3 +162,50 @@ class DeepRegressionHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x).squeeze(-1)   # (N,)
+
+
+class CoralHead(nn.Module):
+    """
+    CORAL ordinal classification head (Cao et al., 2020).
+
+    Replaces scalar RMSE regression with K-1 rank-consistent binary classifiers.
+    All classifiers share the same feature-extraction weights; only the per-rank
+    biases differ.  This shared-weight CORAL constraint ensures rank consistency:
+    if the model predicts "grade >= 3" it will also predict "grade >= 1" and ">= 2".
+
+    Training output : (N, K-1) raw logits — feed to CoralLoss.
+    Inference       : predict() returns sum(sigmoid(logits)) ∈ [0, K-1],
+                      which rounds to the predicted integer grade.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 512,
+        n_classes: int = 5,
+        hidden_dim: int = 256,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        self.extractor = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        # Shared weight implements the CORAL constraint — same w for all K-1 ranks.
+        self.weight = nn.Linear(hidden_dim, 1, bias=False)
+        # Learnable per-rank biases: one threshold per grade boundary 0→1, 1→2, …
+        self.bias = nn.Parameter(torch.zeros(n_classes - 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns (N, K-1) raw rank logits for training with CoralLoss."""
+        h = self.extractor(x)
+        # (N, 1) broadcasts with (K-1,) bias → (N, K-1)
+        return self.weight(h) + self.bias
+
+    def predict(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Continuous grade prediction in [0, K-1]: sum of sigmoid activations.
+        Round to nearest integer for accuracy; use as-is for MAE.
+        """
+        return torch.sigmoid(self.forward(x)).sum(dim=1)

@@ -163,6 +163,7 @@ class Trainer:
             temperature=cfg.temperature,
             use_image_text=cfg.use_image_text,
             lambda_ord_it=cfg.lambda_ord_it,
+            use_coral=getattr(cfg, "use_coral", False),
             use_tamo=getattr(cfg, "use_tamo", False),
             gamma_tamo=getattr(cfg, "gamma_tamo", 0.0),
             lambda_orc=getattr(cfg, "lambda_orc", 1.0),
@@ -494,12 +495,13 @@ class Trainer:
                 f" orc={train['train_loss_tamo_orc']:.3f}"
             )
 
+        reg_label = "coral" if getattr(self.cfg, "use_coral", False) else "rmse"
         logger.info(
             f"[Fold {self.fold}] Ep {epoch:3d} | "
             f"loss={train['train_loss']:.4f} "
             f"(pcol={train['train_loss_pcol']:.3f} "
             f"scolw={train['train_loss_scolw']:.3f} "
-            f"rmse={train['train_loss_rmse']:.3f}"
+            f"{reg_label}={train['train_loss_rmse']:.3f}"
             f"{it_text}{tamo_text}) | "
             f"val_loss={val['val_loss']:.4f}  "
             f"val_acc={val['val_acc']:.2f}%  "
