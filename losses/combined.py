@@ -1,21 +1,30 @@
 from __future__ import annotations
 
 """
-Combined hybrid loss with optional TAMO extension.
+Combined hybrid loss with optional extensions.
 
 Baseline:
     L_total = alpha * L_PCOL + beta * L_SCOLw + L_RMSE
 
-ESPAOCL extension (image-text):
+ESPAOCL (image-text):
     L_total = alpha * L_PCOL + beta * L_SCOLw + gamma_it * L_IT + L_RMSE
 
-TAMO extension:
-    L_total = alpha * L_PCOL + beta * L_SCOLw
-              + gamma_it * L_IT
-              + gamma_tamo * (L_PMD + lambda_orc * L_ORC)
-              + L_RMSE
+TAMO:
+    L_total = alpha * L_PCOL + beta * L_SCOLw + gamma_it * L_IT
+              + gamma_tamo * (L_PMD + lambda_orc * L_ORC) + L_RMSE
 
-L_PMD and L_ORC are the two terms of TAMOLoss (see losses/tamo.py).
+CORAL (use_coral=True):
+    Replaces L_RMSE with CORAL binary cross-entropy over K-1 rank thresholds.
+
+Two-Stage Hierarchical (use_two_stage=True):
+    L_reg = L_screen + grading_lambda * L_grade
+      L_screen : BCE(screen_logit, binary_label)         — all samples
+      L_grade  : CORAL(grade_logits[dr+], grade-1)       — DR-positive only
+
+    The binary screening loss forces early separation of grade-0 from grade-1+.
+    The CORAL grading loss then focuses on ordinal discrimination within DR+,
+    eliminating the "hedge toward grade-0" attractor that breaks RMSE regression
+    when 73.5% of training data is grade-0.
 """
 
 import torch
@@ -39,21 +48,26 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         temperature: float = 0.07,
         use_image_text: bool = False,
         lambda_ord_it: float = 1.0,
-        # CORAL: replace scalar RMSE with rank-consistent binary classification
+        # Two-stage: screening (binary BCE) + grading (CORAL on DR+ only)
+        use_two_stage: bool = False,
+        grading_lambda: float = 2.0,
+        # CORAL: replace RMSE with rank-consistent binary BCE over all K classes
         use_coral: bool = False,
         # TAMO parameters
         use_tamo: bool = False,
         gamma_tamo: float = 0.1,
         lambda_orc: float = 1.0,
-        huber_delta: float = 0.1,      # kept for API compat; not used by PMD v2
-        temperature_pmd: float = 0.1,  # softmax temperature for PMD-KL
-        # Label smoothing for regression (only used when use_coral=False).
+        huber_delta: float = 0.1,
+        temperature_pmd: float = 0.1,
+        # Label smoothing for RMSE regression only (bypassed for CORAL / two-stage)
         label_smooth_sigma: float = 0.0,
         n_classes: int = 5,
     ):
         super().__init__()
         self.alpha = alpha
         self.beta = beta
+        self.use_two_stage = use_two_stage
+        self.grading_lambda = grading_lambda
         self.use_coral = use_coral
         self.label_smooth_sigma = label_smooth_sigma
         self.n_classes = n_classes
@@ -71,8 +85,6 @@ class HybridContrastiveOrdinalLoss(nn.Module):
             lambda_ord=lambda_ord_it,
         )
 
-        # TAMOLoss is instantiated regardless of use_tamo so forward() can
-        # be called uniformly; it returns zeros when use_tamo=False.
         self.tamo = TAMOLoss(
             lambda_orc=lambda_orc,
             huber_delta=huber_delta,
@@ -90,24 +102,52 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         text_prototypes: torch.Tensor | None = None,
         z_tamo: torch.Tensor | None = None,
         text_dist_matrix: torch.Tensor | None = None,
+        pred_grading: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
 
         l_pcol = self.pcol(z_pcol, labels)
         l_scolw = self.scolw(z_scolw, labels, class_weights)
 
-        # Ordinal prediction loss: CORAL binary cross-entropy or RMSE regression.
-        if self.use_coral:
-            # pred: (N, K-1) rank logits from CoralHead.forward()
+        # ── Ordinal prediction loss ───────────────────────────────────────────
+        if self.use_two_stage and pred_grading is not None:
+            # Stage 1: binary screening — grade-0 (negative) vs grade-1+ (positive)
+            # Use dataset-proportion pos_weight to compensate for stratified batch
+            # oversampling of minority classes (batch has ~1:4 grade-0:DR+ ratio
+            # vs 73.5:26.5 in the full dataset; pos_weight restores the correct
+            # relative penalty without changing which samples are seen).
+            binary_labels = (labels > 0).float()                 # (N,)
+            pos_weight = torch.tensor(
+                [self.n_classes / (self.n_classes - 1)],         # ≈1.25 for K=5
+                device=pred.device,
+            )
+            l_screen = F.binary_cross_entropy_with_logits(
+                pred, binary_labels, pos_weight=pos_weight
+            )
+
+            # Stage 2: CORAL ordinal grading — only on DR-positive samples.
+            # Labels are shifted: grade k → k-1 so grades 1..K-1 map to 0..K-2.
+            dr_mask = labels > 0
+            if dr_mask.sum() >= 2:
+                grading_labels = labels[dr_mask] - 1             # shift to 0-based
+                l_grade = self.coral(pred_grading[dr_mask], grading_labels)
+            else:
+                l_grade = torch.tensor(0.0, device=pred.device)
+
+            l_rmse = l_screen + self.grading_lambda * l_grade
+
+        elif self.use_coral:
+            # Direct K-class ordinal classification via shared-weight rank BCE.
             l_rmse = self.coral(pred, labels)
+
         else:
-            # Label smoothing: adds Gaussian noise to integer targets so the model
-            # cannot drive RMSE to near-zero by memorising exact grade values.
+            # Standard RMSE with optional ordinal label smoothing.
             targets = labels.float()
             if self.label_smooth_sigma > 0.0 and self.training:
                 noise = torch.randn_like(targets) * self.label_smooth_sigma
                 targets = (targets + noise).clamp(0.0, float(self.n_classes - 1))
             l_rmse = torch.sqrt(F.mse_loss(pred, targets) + 1e-8)
 
+        # ── Image-text ordinal loss ───────────────────────────────────────────
         l_it = torch.tensor(0.0, device=pred.device)
         if self.use_image_text and self.gamma > 0.0:
             if z_it is None:
@@ -120,6 +160,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
                 text_prototypes=text_prototypes,
             )
 
+        # ── TAMO loss ─────────────────────────────────────────────────────────
         l_pmd = torch.tensor(0.0, device=pred.device)
         l_orc = torch.tensor(0.0, device=pred.device)
         if self.use_tamo and self.gamma_tamo > 0.0:
@@ -162,17 +203,11 @@ def compute_class_weights(
     """
     Batch-level inverse-frequency class weights for SCOLw:
         w[c] = N_batch / (n_classes * n_c)
-
-    This follows the authors' clarification that SCOLw weights are computed
-    dynamically per mini-batch using inverse class frequency.
     """
     counts = torch.zeros(n_classes)
-
     for y in labels:
         counts[int(y)] += 1
-
     counts = counts.clamp(min=1)
     n_total = counts.sum()
     weights = n_total / (n_classes * counts)
-
     return weights.to(device)

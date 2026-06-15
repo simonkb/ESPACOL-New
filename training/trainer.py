@@ -163,6 +163,8 @@ class Trainer:
             temperature=cfg.temperature,
             use_image_text=cfg.use_image_text,
             lambda_ord_it=cfg.lambda_ord_it,
+            use_two_stage=getattr(cfg, "use_two_stage", False),
+            grading_lambda=getattr(cfg, "grading_lambda", 2.0),
             use_coral=getattr(cfg, "use_coral", False),
             use_tamo=getattr(cfg, "use_tamo", False),
             gamma_tamo=getattr(cfg, "gamma_tamo", 0.0),
@@ -172,6 +174,7 @@ class Trainer:
             label_smooth_sigma=getattr(cfg, "label_smooth_sigma", 0.0),
             n_classes=cfg.n_classes,
         )
+        self._use_two_stage = getattr(cfg, "use_two_stage", False)
         self._use_tamo = getattr(cfg, "use_tamo", False)
 
         self.class_weights = compute_class_weights(
@@ -370,13 +373,16 @@ class Trainer:
                     z_it = out.get("z_it", None)
                     z_tamo = out.get("z_tamo", None)
                     pred = out["pred"]
+                    pred_grading = out.get("pred_grading", None)
                 elif len(out) == 5:
                     _, z_pcol, z_scolw, z_it, pred = out
                     z_tamo = None
+                    pred_grading = None
                 else:
                     z_pcol, z_scolw, pred = out
                     z_it = None
                     z_tamo = None
+                    pred_grading = None
 
                 text_prototypes = None
                 if self.text_encoder is not None and self.cfg.use_image_text:
@@ -392,6 +398,7 @@ class Trainer:
                     text_prototypes=text_prototypes,
                     z_tamo=z_tamo,
                     text_dist_matrix=text_dist_matrix,
+                    pred_grading=pred_grading,
                 )
 
             self.scaler.scale(loss).backward()
@@ -495,7 +502,12 @@ class Trainer:
                 f" orc={train['train_loss_tamo_orc']:.3f}"
             )
 
-        reg_label = "coral" if getattr(self.cfg, "use_coral", False) else "rmse"
+        if getattr(self.cfg, "use_two_stage", False):
+            reg_label = "2stg"
+        elif getattr(self.cfg, "use_coral", False):
+            reg_label = "coral"
+        else:
+            reg_label = "rmse"
         logger.info(
             f"[Fold {self.fold}] Ep {epoch:3d} | "
             f"loss={train['train_loss']:.4f} "

@@ -121,6 +121,16 @@ class DRConfig(TrainConfig):
     image_encoder_lr: float = 2e-5   # stable range; no oscillation at this LR
     freeze_backbone_epochs: int = 10 # heads-only warmup before backbone fine-tuning
 
+    # ── Two-Stage Hierarchical Ordinal (use_two_stage) ────────────────────────
+    # Splits ordinal regression into two jointly-trained specialised heads:
+    #   Stage 1 — ScreeningHead (binary BCE): grade-0 vs grade-1+
+    #   Stage 2 — GradingHead  (CORAL on DR+ only): ordinal grades 1..K-1
+    # Loss: L_reg = L_screen + grading_lambda * L_grade
+    # Prediction: if sigmoid(screen) > 0.5 → CORAL grade + 1; else → 0
+    # Expected accuracy: ~88% by eliminating the grade-0 regression attractor.
+    use_two_stage: bool = False
+    grading_lambda: float = 2.0     # relative weight of Stage-2 vs Stage-1 loss
+
     # ── CORAL (Consistent Rank Logits ordinal classification) ─────────────────
     # Replaces scalar RMSE regression with K-1 rank-consistent binary classifiers.
     # CoralHead shares all weights except per-rank biases (rank consistency).
