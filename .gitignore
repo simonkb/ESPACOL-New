@@ -17,3 +17,6 @@ Datasets/DR/train.zip
 *.pth
 *.pt
 *.ckpt
+
+# Local Claude context (not for the shared repo)
+Hady/CLAUDE.md

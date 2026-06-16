@@ -1,0 +1,3349 @@
+==== CELL 42 markdown ====
+## 17. Final Explainability with Structured Paths
+
+This is the **clean** explainability section. Every figure and CSV produced here lands in a self-describing folder structure:
+
+```
+figures/validation/{dataset}/gamma_{tag}/
+├── README.txt                            ← auto-written, describes the folder
+├── fold{F}_idx{N}_{class}/               ← one folder per test image
+│   ├── 01_BEFORE_alignment_concepts.png
+│   ├── 02_AFTER_alignment_single.png
+│   ├── 03_AFTER_alignment_concepts.png
+│   ├── 04_AFTER_localisation_diagnostic.png
+│   └── metadata.json                     ← prediction, score, top concepts, checkpoint
+└── tables/
+    ├── concept_table_PRE.csv
+    ├── concept_table_POST.csv
+    └── localisation_metrics.csv
+```
+
+You can open any figure folder and its filename + `metadata.json` will tell you exactly what it shows.
+
+### Section 17 run order
+- 17.0 → Path helper + alignment-MLP injection helper
+- 17.1 → BUSI γ=0.1 pipeline + alignment MLP
+- 17.2 → BUSI BEFORE/AFTER alignment heatmap comparison (the core experiment)
+- 17.3 → BUSI single-image publication figure + concept tables (PRE + POST)
+- 17.4 → BUSI localisation verification (pointing accuracy + IoU)
+- 17.5 → DR γ=0.1 pipeline + alignment + figures
+
+
+==== CELL 44 code ====
+# ── 17.0 Path helper (defined inline) ────────────────────────────────
+import os, json
+from pathlib import Path
+from datetime import datetime
+
+
+class RunPaths:
+    """Structured output paths for one validation run."""
+
+    def __init__(self, dataset, gamma_tag, fold, sample_idx, class_name,
+                 ckpt_path="", root="figures/validation"):
+        self.dataset    = dataset.lower()
+        self.gamma_tag  = str(gamma_tag).replace(".", "")
+        self.fold       = int(fold)
+        self.sample_idx = int(sample_idx)
+        self.class_name = class_name.lower().replace(" ", "_")
+        self.ckpt_path  = ckpt_path
+
+        self.gamma_dir = Path(root) / self.dataset / f"gamma_{self.gamma_tag}"
+        self.gamma_dir.mkdir(parents=True, exist_ok=True)
+
+        self.image_dir = self.gamma_dir / f"fold{self.fold}_idx{self.sample_idx}_{self.class_name}"
+        self.image_dir.mkdir(parents=True, exist_ok=True)
+
+        self._tables = self.gamma_dir / "tables"
+        self._tables.mkdir(parents=True, exist_ok=True)
+
+        readme = self.gamma_dir / "README.txt"
+        if not readme.exists():
+            readme.write_text(
+                f"ESPAOCL validation outputs — {self.dataset.upper()} γ={self.gamma_tag}\n"
+                f"{'='*60}\n\n"
+                f"Folder layout:\n"
+                f"  fold{{F}}_idx{{N}}_{{class}}/\n"
+                f"    01_BEFORE_*.png            before-alignment artefacts\n"
+                f"    02_BEFORE_*_concepts.png   before-alignment concept grid\n"
+                f"    03_AFTER_*.png             after-alignment artefacts\n"
+                f"    04_AFTER_*_concepts.png   after-alignment concept grid\n"
+                f"    05_*.png                   diagnostic figures\n"
+                f"    metadata.json              prediction, score, top concepts\n"
+                f"  tables/\n"
+                f"    concept_table_PRE.csv\n"
+                f"    concept_table_POST.csv\n"
+                f"    localisation_metrics.csv\n"
+            )
+
+    def _path(self, n, stage, kind, ext="png"):
+        return str(self.image_dir / f"{n:02d}_{stage}_{kind}.{ext}")
+
+    def before_single(self):     return self._path(1, "BEFORE", "alignment_single")
+    def before_concepts(self):   return self._path(2, "BEFORE", "alignment_single")
+    def after_single(self):      return self._path(3, "AFTER",  "alignment_single")
+    def after_concepts(self):    return self._path(4, "AFTER",  "alignment_single")
+    def localisation_diag(self): return self._path(5, "AFTER",  "localisation_diagnostic")
+
+    def tables_dir(self):  return str(self._tables)
+    def table_pre(self):   return str(self._tables / "concept_table_PRE.csv")
+    def table_post(self):  return str(self._tables / "concept_table_POST.csv")
+    def table_loc(self):   return str(self._tables / "localisation_metrics.csv")
+
+    def save_metadata(self, info):
+        base = {
+            "timestamp":       datetime.now().isoformat(timespec="seconds"),
+            "dataset":         self.dataset,
+            "gamma_tag":       self.gamma_tag,
+            "fold":            self.fold,
+            "sample_idx":      self.sample_idx,
+            "class_name":      self.class_name,
+            "checkpoint_path": self.ckpt_path,
+        }
+        base.update(info)
+        meta = self.image_dir / "metadata.json"
+        if meta.exists():
+            try:
+                existing = json.loads(meta.read_text())
+                existing.update(base)
+                base = existing
+            except Exception:
+                pass
+        meta.write_text(json.dumps(base, indent=2, default=str))
+        print(f"  Metadata: {meta}")
+
+
+# ── 17.0b Alignment-MLP helper ───────────────────────────────────────
+import torch.nn as nn
+import torch.nn.functional as F
+
+class _TextAligner(nn.Module):
+    def __init__(self, in_dim=512, hidden=768, out_dim=1280):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.GELU(), nn.Dropout(0.1),
+            nn.Linear(hidden, out_dim),
+        )
+    def forward(self, x):
+        return self.net(x)
+
+
+def inject_alignment_mlp(pipeline, model, dataset_obj, val_idx,
+                         concepts_dict, class_concepts_map, n_classes,
+                        epochs=800, batch_size=32, lambda_push=0.0, push_margin=0.6):
+    model.eval()
+    loader = DataLoader(Subset(dataset_obj, val_idx),
+                        batch_size=batch_size, shuffle=False, num_workers=0)
+    feats, labels = [], []
+    with torch.no_grad():
+        for images, lab in loader:
+            images = images.to(device)
+            f = F.normalize(model(images)[0], dim=-1)
+            feats.append(f.cpu()); labels.append(lab)
+    feats  = torch.cat(feats)
+    labels = torch.cat(labels)
+
+    protos = {}
+    for c in range(n_classes):
+        mask = (labels == c)
+        if mask.sum() < 2:
+            print(f"  WARN: class {c} has {int(mask.sum())} samples")
+            continue
+        protos[c] = F.normalize(feats[mask].median(0).values, dim=0).to(device)
+
+    biomedclip.eval()
+    with torch.no_grad():
+        tokens    = tokenizer(concepts_dict["concepts"]).to(device)
+        text_vecs = F.normalize(biomedclip.encode_text(tokens).float(), dim=-1)
+
+    n_concepts = len(concepts_dict["concepts"])
+    targets    = torch.zeros(n_concepts, 1280, device=device)
+    for class_id, idxs in class_concepts_map.items():
+        if class_id not in protos:
+            continue
+        for j in idxs:
+            if j < n_concepts:
+                targets[j] = protos[class_id]
+
+    norms      = targets.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    targets    = targets / norms
+    has_target = targets.norm(dim=-1) > 0.5
+    missing    = (~has_target).sum().item()
+    if missing:
+        print(f"  WARN: {missing} concept(s) unmapped")
+
+    # same-class concept index pairs for the push-apart term
+    pair_i, pair_j = [], []
+    for _cls, _idxs in class_concepts_map.items():
+        for _a in range(len(_idxs)):
+            for _b in range(_a + 1, len(_idxs)):
+                if _idxs[_a] < n_concepts and _idxs[_b] < n_concepts:
+                    pair_i.append(_idxs[_a]); pair_j.append(_idxs[_b])
+    pair_i = torch.tensor(pair_i, device=device, dtype=torch.long)
+    pair_j = torch.tensor(pair_j, device=device, dtype=torch.long)
+
+    aligner = _TextAligner().to(device)
+    opt     = torch.optim.Adam(aligner.parameters(), lr=1e-3, weight_decay=1e-4)
+    aligner.train()
+    for ep in range(epochs):
+        opt.zero_grad()
+        proj = F.normalize(aligner(text_vecs), dim=-1)
+        pull = (1 - (proj * targets).sum(dim=-1))[has_target].mean()
+        if lambda_push > 0 and len(pair_i) > 0:
+            pair_cos = (proj[pair_i] * proj[pair_j]).sum(dim=-1)
+            push = torch.clamp(pair_cos - push_margin, min=0).mean()  # 0 once separated past margin
+        else:
+            push = torch.zeros((), device=device)
+        loss = pull + lambda_push * push
+        loss.backward()
+        opt.step()
+        if (ep + 1) % 200 == 0:
+            print(f"    epoch {ep+1:4d}  pull={pull.item():.5f}  "
+                  f"push={float(push):+.5f}  total={loss.item():.5f}")
+
+    aligner.eval()
+    with torch.no_grad():
+        aligned_vecs = F.normalize(aligner(text_vecs), dim=-1)
+
+    pipeline.concept_explainer.embeddings = aligned_vecs
+    print(f"  Injected aligned vectors {tuple(aligned_vecs.shape)} into pipeline")
+    return aligner, protos, aligned_vecs
+
+
+BUSI_CLASS_CONCEPTS = {
+    0: [0, 1],
+    1: [2, 3, 4, 5],
+    2: [6, 7, 8, 9],
+}
+
+print("RunPaths + alignment helper defined inline.")
+---- OUTPUT ----
+RunPaths + alignment helper defined inline.
+
+
+==== CELL 46 code ====
+# ── 17.1 BUSI γ=0.1 pipeline + alignment MLP ─────────────────────────
+from explainability import (
+    ExplainabilityPipeline, ConceptExplainer,
+    DR_CONCEPTS, BUSI_CONCEPTS,
+)
+
+ckpt_path_busi = os.path.join(os.getcwd(),
+    "checkpoints", "busi", "busi_gamma_01", "fold_1_best.pt")
+assert os.path.isfile(ckpt_path_busi), f"Missing checkpoint: {ckpt_path_busi}"
+
+explain_model_g01 = HybridContrastiveOrdinalNet(
+    embed_dim=cfg.embed_dim, proj_dim=cfg.proj_dim
+).to(device).eval()
+explain_model_g01.load_state_dict(
+    torch.load(ckpt_path_busi, map_location=device, weights_only=False)["model_state"],
+    strict=False,
+)
+print(f"Loaded checkpoint: {ckpt_path_busi}")
+
+busi_pipeline_aligned_g01 = ExplainabilityPipeline(
+    model         = explain_model_g01,
+    dataset       = "busi",
+    device        = device,
+    encoder       = "biomedclip",
+    text_model    = biomedclip,
+    tokenizer     = tokenizer,
+    layer_indices = [2, 4, 6, 7],   # 4-stage fusion (paper Table 3)
+    top_k         = 5,
+)
+
+aligner_busi_g01, protos_busi_g01, aligned_vecs_busi_g01 = inject_alignment_mlp(
+    pipeline           = busi_pipeline_aligned_g01,
+    model              = explain_model_g01,
+    dataset_obj        = full_busi_ds,
+    val_idx            = folds_busi[0][1],
+    concepts_dict      = BUSI_CONCEPTS,
+    class_concepts_map = BUSI_CLASS_CONCEPTS,
+    n_classes          = cfg.busi_n_classes,
+)
+print("\nBUSI γ=0.1 aligned pipeline ready.")
+---- OUTPUT ----
+Loaded checkpoint: /teamspace/studios/this_studio/ESPAOCL/checkpoints/busi/busi_gamma_01/fold_1_best.pt
+    epoch  200  pull=0.00096  push=+0.00000  total=0.00096
+    epoch  400  pull=0.00071  push=+0.00000  total=0.00071
+    epoch  600  pull=0.00104  push=+0.00000  total=0.00104
+    epoch  800  pull=0.00059  push=+0.00000  total=0.00059
+  Injected aligned vectors (10, 1280) into pipeline
+
+BUSI γ=0.1 aligned pipeline ready.
+
+
+==== CELL 47 markdown ====
+### 17.1b Concept separation: push-apart alignment (Option 1)
+
+The baseline alignment loss pulls every within-class concept to the **same** class prototype, so the four Malignant (and four Benign) concept vectors collapse onto one point. That is why every Malignant concept scores ~0.946 on a Malignant image (Table 9) and why their LayerCAM heatmaps are visually identical: the concept vector is the gradient target, so identical vectors give identical maps.
+
+Adding a within-class repulsion term spreads the vectors apart while still keeping each near its class anchor:
+
+`L_align = pull_to_prototype + lambda_push * mean_{same-class i,j} cos(M(text_i), M(text_j))`
+
+The cell below sweeps `lambda_push`, tracks two things, and lets you pick a value:
+- **within-class concept-to-concept cosine** (lower = more separated), and
+- **mean class-defining score** (must stay high, or we have broken class discrimination to buy separation).
+
+What this fixes and what it does not: separating the vectors makes the per-concept scores and heatmaps distinct again, which directly answers the contradictory-ranking and identical-heatmap complaints. It does **not** by itself guarantee the correct-grade concept wins per image on Mild/Moderate DR. That requires the per-image contrastive loss (Option 2). After picking a `lambda_push`, re-run the 17.6 per-image WHERE eval to see how much of the per-image collapse this actually buys.
+
+==== CELL 48 code ====
+# ── 17.1b  Push-apart lambda sweep (BUSI) ────────────────────────────
+import numpy as np, pandas as pd, torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+
+BUSI_CONCEPT_NAMES = BUSI_CONCEPTS["concepts"]
+VAL_IDX_BUSI       = folds_busi[0][1]
+CLASS_NAMES        = ["Normal", "Benign", "Malignant"]
+
+def _within_class_cc_cosine(vecs):
+    out = {}
+    for cls, idxs in BUSI_CLASS_CONCEPTS.items():
+        if len(idxs) < 2:
+            continue
+        sims = [(vecs[idxs[a]] * vecs[idxs[b]]).sum().item()
+                for a in range(len(idxs)) for b in range(a + 1, len(idxs))]
+        out[cls] = float(np.mean(sims))
+    return out
+
+def _concept_table(vecs):
+    explain_model_g01.eval()
+    loader = DataLoader(Subset(full_busi_ds, VAL_IDX_BUSI),
+                        batch_size=16, shuffle=False, num_workers=0)
+    rows = []
+    with torch.no_grad():
+        for imgs, labs in loader:
+            feats = F.normalize(explain_model_g01(imgs.to(device))[0], dim=-1)
+            sims  = feats @ vecs.to(device).T
+            for i in range(feats.shape[0]):
+                row = {"true": int(labs[i])}
+                row.update({BUSI_CONCEPT_NAMES[j]: sims[i, j].item()
+                            for j in range(len(BUSI_CONCEPT_NAMES))})
+                rows.append(row)
+    return pd.DataFrame(rows).groupby("true").mean()
+
+push_vecs = {}
+rows = []
+for lam in [0.0, 0.3, 0.5, 1.0]:
+    print(f"\n=== lambda_push = {lam} ===")
+    _, _, vecs = inject_alignment_mlp(
+        pipeline           = busi_pipeline_aligned_g01,
+        model              = explain_model_g01,
+        dataset_obj        = full_busi_ds,
+        val_idx            = VAL_IDX_BUSI,
+        concepts_dict      = BUSI_CONCEPTS,
+        class_concepts_map = BUSI_CLASS_CONCEPTS,
+        n_classes          = cfg.busi_n_classes,
+        lambda_push        = lam,
+    )
+    vecs = vecs.detach().cpu()
+    push_vecs[lam] = vecs
+    cc  = _within_class_cc_cosine(vecs)
+    tbl = _concept_table(vecs)
+    diag = [tbl.loc[ci, [BUSI_CONCEPT_NAMES[j] for j in BUSI_CLASS_CONCEPTS[ci]]].mean()
+            for ci in range(len(CLASS_NAMES))]
+    rows.append({
+        "lambda_push":            lam,
+        "cc-cos Benign":          round(cc.get(1, float("nan")), 3),
+        "cc-cos Malignant":       round(cc.get(2, float("nan")), 3),
+        "class-defining score":   round(float(np.mean(diag)), 3),
+    })
+
+print("\nlower cc-cos = more separated;  class-defining score must stay high")
+print(pd.DataFrame(rows).to_string(index=False))
+
+---- OUTPUT ----
+
+=== lambda_push = 0.0 ===
+    epoch  200  pull=0.00098  push=+0.00000  total=0.00098
+    epoch  400  pull=0.00098  push=+0.00000  total=0.00098
+    epoch  600  pull=0.00119  push=+0.00000  total=0.00119
+    epoch  800  pull=0.00183  push=+0.00000  total=0.00183
+  Injected aligned vectors (10, 1280) into pipeline
+
+=== lambda_push = 0.3 ===
+    epoch  200  pull=0.00248  push=+0.39453  total=0.12084
+    epoch  400  pull=0.00145  push=+0.39800  total=0.12084
+    epoch  600  pull=0.00126  push=+0.39808  total=0.12069
+    epoch  800  pull=0.00175  push=+0.39891  total=0.12142
+  Injected aligned vectors (10, 1280) into pipeline
+
+=== lambda_push = 0.5 ===
+    epoch  200  pull=0.12591  push=+0.04923  total=0.15052
+    epoch  400  pull=0.12100  push=+0.06098  total=0.15149
+    epoch  600  pull=0.11610  push=+0.07114  total=0.15167
+    epoch  800  pull=0.12108  push=+0.05919  total=0.15068
+  Injected aligned vectors (10, 1280) into pipeline
+
+=== lambda_push = 1.0 ===
+    epoch  200  pull=0.15111  push=+0.02367  total=0.17478
+    epoch  400  pull=0.14713  push=+0.02081  total=0.16795
+    epoch  600  pull=0.15864  push=+0.00586  total=0.16450
+    epoch  800  pull=0.15149  push=+0.00998  total=0.16147
+  Injected aligned vectors (10, 1280) into pipeline
+
+lower cc-cos = more separated;  class-defining score must stay high
+ lambda_push  cc-cos Benign  cc-cos Malignant  class-defining score
+         0.0          0.999             1.000                 0.915
+         0.3          1.000             1.000                 0.917
+         0.5          0.614             0.621                 0.819
+         1.0          0.586             0.582                 0.783
+
+
+==== CELL 49 code ====
+# ── 17.1b  Inspect chosen lambda on one Malignant image + save vectors ──
+LAMBDA_PUSH_BEST = 0.5   # set this after reading the sweep above
+
+vecs_base = push_vecs[0.0].to(device)
+vecs_push = push_vecs[LAMBDA_PUSH_BEST].to(device)
+
+loader = DataLoader(Subset(full_busi_ds, VAL_IDX_BUSI), batch_size=1, shuffle=False)
+x_m = next((x.to(device) for x, y in loader if int(y) == 2), None)
+
+explain_model_g01.eval()
+with torch.no_grad():
+    f      = F.normalize(explain_model_g01(x_m)[0], dim=-1).squeeze(0)
+    s_base = f @ vecs_base.T
+    s_push = f @ vecs_push.T
+
+print(f"Per-concept cosine on one Malignant image   (lambda=0  ->  lambda={LAMBDA_PUSH_BEST})")
+print("-" * 74)
+for j, name in enumerate(BUSI_CONCEPT_NAMES):
+    tag = "   <- Malignant concept" if j in BUSI_CLASS_CONCEPTS[2] else ""
+    print(f"  {name:<32s}  {s_base[j].item():+.3f}  ->  {s_push[j].item():+.3f}{tag}")
+
+aligned_vecs_busi_PUSH = vecs_push.detach()
+# keep the baseline injected so existing 17.3 / 17.6 tables are unchanged until you opt in
+busi_pipeline_aligned_g01.concept_explainer.embeddings = vecs_base
+print("\nSaved: aligned_vecs_busi_PUSH")
+print("To use push-apart downstream:")
+print("  busi_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_busi_PUSH")
+
+---- OUTPUT ----
+Per-concept cosine on one Malignant image   (lambda=0  ->  lambda=0.5)
+--------------------------------------------------------------------------
+  no mass                           -0.174  ->  -0.162
+  no distortion                     -0.159  ->  -0.169
+  oval shape                        -0.041  ->  +0.091
+  circumscribed margin              -0.049  ->  -0.587
+  parallel orientation              -0.021  ->  +0.112
+  posterior enhancement             -0.091  ->  +0.067
+  irregular shape                   +0.987  ->  +0.809   <- Malignant concept
+  spiculated margins                +0.986  ->  +0.873   <- Malignant concept
+  nonparallel orientation           +0.987  ->  +0.837   <- Malignant concept
+  posterior acoustic shadowing      +0.986  ->  +0.823   <- Malignant concept
+
+Saved: aligned_vecs_busi_PUSH
+To use push-apart downstream:
+  busi_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_busi_PUSH
+
+
+==== CELL 50 code ====
+# ── Verify concept heatmaps are now spatially distinct ───────────────
+import numpy as np, torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+
+busi_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_busi_PUSH  # separated vectors
+
+loader = DataLoader(Subset(full_busi_ds, folds_busi[0][1]), batch_size=1, shuffle=False)
+x_m = next((x.to(device) for x, y in loader if int(y) == 2), None)   # a Malignant image
+
+res = busi_pipeline_aligned_g01.explain(x_m, concept_heatmaps=True)
+cmaps = res["concept_heatmaps"]
+names = list(cmaps.keys())
+flat  = np.stack([cmaps[n].ravel() for n in names])
+flat  = flat / (np.linalg.norm(flat, axis=1, keepdims=True) + 1e-8)
+sim   = flat @ flat.T
+iu    = np.triu_indices(len(names), k=1)
+print(f"panel-to-panel similarity: mean={sim[iu].mean():.3f}  max={sim[iu].max():.3f}")
+print("(near 1.0 = identical panels = still broken;  lower = distinct panels = fixed)")
+
+mal = [i for i,n in enumerate(names) if n in
+       ("irregular shape","spiculated margins","nonparallel orientation","posterior acoustic shadowing")]
+sub = sim[np.ix_(mal, mal)]
+print("\nMalignant-concept panel similarity:\n", np.round(sub,3))
+---- OUTPUT ----
+panel-to-panel similarity: mean=0.769  max=1.000
+(near 1.0 = identical panels = still broken;  lower = distinct panels = fixed)
+
+Malignant-concept panel similarity:
+ [[1.    0.908 0.886 0.904]
+ [0.908 1.    0.844 0.963]
+ [0.886 0.844 1.    0.8  ]
+ [0.904 0.963 0.8   1.   ]]
+
+
+==== CELL 51 code ====
+# ── Verify concept heatmaps: similarity numbers + visual panel check ──
+import numpy as np, torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, Subset
+from explainability import LayerCAM, _ultrasound_mask
+
+busi_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_busi_PUSH
+
+# grab one Malignant image (tensor for the model, np for display)
+loader = DataLoader(Subset(full_busi_ds, folds_busi[0][1]), batch_size=1, shuffle=False)
+x_m, img_np = None, None
+for x, y in loader:
+    if int(y) == 2:
+        x_m = x.to(device)
+        img_np = x.squeeze(0).permute(1, 2, 0).cpu().numpy()
+        break
+
+res   = busi_pipeline_aligned_g01.explain(x_m, concept_heatmaps=True)
+cmaps = res["concept_heatmaps"]
+names = list(cmaps.keys())
+
+# ---- similarity numbers ----
+flat = np.stack([cmaps[n].ravel() for n in names])
+flat = flat / (np.linalg.norm(flat, axis=1, keepdims=True) + 1e-8)
+sim  = flat @ flat.T
+iu   = np.triu_indices(len(names), k=1)
+print(f"panel-to-panel similarity: mean={sim[iu].mean():.3f}  max={sim[iu].max():.3f}")
+print("(target: malignant panels distinct-but-related, ~0.6-0.8; was 0.92 at stage 7)\n")
+
+mal_names = ["irregular shape", "spiculated margins",
+             "nonparallel orientation", "posterior acoustic shadowing"]
+mal = [names.index(n) for n in mal_names if n in names]
+print("Malignant-concept panel similarity:")
+print(np.round(sim[np.ix_(mal, mal)], 3))
+
+# ---- visual: original + 4 malignant panels side by side ----
+us = _ultrasound_mask(img_np)
+fig, axes = plt.subplots(1, len(mal) + 1, figsize=(4 * (len(mal) + 1), 4))
+disp = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
+axes[0].imshow(disp); axes[0].set_title("original\n(Malignant)", fontsize=10); axes[0].axis("off")
+for ax, j in zip(axes[1:], mal):
+    hm = cmaps[names[j]] * us
+    if hm.max() > hm.min():
+        hm = (hm - hm.min()) / (hm.max() - hm.min() + 1e-8)
+    ax.imshow(LayerCAM.overlay(img_np, hm, alpha=0.5))
+    ax.set_title(names[j], fontsize=9); ax.axis("off")
+plt.suptitle("Per-concept heatmaps on one Malignant image", fontweight="bold")
+plt.tight_layout()
+out_path = "paper_figures_FINAL/busi/concept_panel_check.png"
+import os; os.makedirs(os.path.dirname(out_path), exist_ok=True)
+fig.savefig(out_path, dpi=150, bbox_inches="tight"); plt.show()
+print(f"\nSaved side-by-side panels: {out_path}")
+---- OUTPUT ----
+panel-to-panel similarity: mean=0.769  max=1.000
+(target: malignant panels distinct-but-related, ~0.6-0.8; was 0.92 at stage 7)
+
+Malignant-concept panel similarity:
+[[1.    0.908 0.886 0.904]
+ [0.908 1.    0.844 0.963]
+ [0.886 0.844 1.    0.8  ]
+ [0.904 0.963 0.8   1.   ]]
+
+Saved side-by-side panels: paper_figures_FINAL/busi/concept_panel_check.png
+
+
+==== CELL 52 code ====
+# ── WHERE diagnostic: how much heatmap energy lands on the lesion ─────
+import os, glob, numpy as np, torch
+from PIL import Image as PILImage
+from torch.utils.data import DataLoader, Subset
+
+busi_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_busi_PUSH
+
+def load_all_masks(image_path, size=(300, 300)):
+    """Union every mask file for this image: _mask, _mask_1, _mask_2, ..."""
+    base, ext = os.path.splitext(image_path)
+    paths = [f"{base}_mask{ext}"] + sorted(glob.glob(f"{base}_mask_*{ext}"))
+    union = None
+    for p in paths:
+        if os.path.isfile(p):
+            m = np.array(PILImage.open(p).convert("L").resize(size, PILImage.NEAREST))
+            m = (m > 127).astype(np.uint8)
+            union = m if union is None else np.maximum(union, m)
+    return union
+
+def us_mask_of(img_np):
+    from explainability import _ultrasound_mask
+    return (_ultrasound_mask(img_np) > 0.5).astype(np.uint8)
+
+rows = {}
+val_idx = folds_busi[0][1]
+for cls_idx, cls_name in [(1, "Benign"), (2, "Malignant")]:
+    frac_in, point_in, n_multi, n = [], [], 0, 0
+    for gidx in val_idx:
+        image_path, label = full_busi_ds.items[gidx]
+        if label != cls_idx:
+            continue
+        lesion = load_all_masks(image_path)
+        if lesion is None:
+            continue
+        # count multi-lesion images
+        base, ext = os.path.splitext(image_path)
+        if glob.glob(f"{base}_mask_*{ext}"):
+            n_multi += 1
+
+        x, _ = full_busi_ds[gidx]
+        res = busi_pipeline_aligned_g01.explain(x.unsqueeze(0).to(device))
+        cam = res["heatmap"]
+        img_np = x.permute(1, 2, 0).cpu().numpy()
+        us = us_mask_of(img_np)
+        cam = cam * us
+        if cam.sum() <= 0:
+            continue
+        # fraction of heatmap energy inside the lesion
+        frac_in.append(float((cam * lesion).sum() / cam.sum()))
+        # does the hottest point land on the lesion
+        ay, ax = np.unravel_index(int(np.argmax(cam)), cam.shape)
+        point_in.append(int(lesion[ay, ax] == 1))
+        n += 1
+    rows[cls_name] = dict(n=n, n_multi=n_multi,
+                          energy_in_lesion=float(np.mean(frac_in)),
+                          pointing=float(np.mean(point_in)))
+
+print(f"{'class':<10s} {'n':>4s} {'multi-lesion':>13s} {'energy in lesion':>17s} {'pointing':>9s}")
+for c, r in rows.items():
+    print(f"{c:<10s} {r['n']:>4d} {r['n_multi']:>13d} {r['energy_in_lesion']:>17.3f} {r['pointing']:>9.3f}")
+print("\nenergy in lesion = fraction of heatmap mass inside the lesion mask (higher = better localised)")
+print("pointing = fraction where the hottest pixel is on the lesion")
+---- OUTPUT ----
+class         n  multi-lesion  energy in lesion  pointing
+Benign       87             5             0.094     0.195
+Malignant    42             0             0.301     0.738
+
+energy in lesion = fraction of heatmap mass inside the lesion mask (higher = better localised)
+pointing = fraction where the hottest pixel is on the lesion
+
+
+==== CELL 59 markdown ====
+### 17.2 BUSI BEFORE / AFTER alignment comparison — the core experiment
+
+Same image, same model, same backbone gradients. Only the concept text vectors change. Run this and check the saved files in:
+
+```
+figures/validation/busi/gamma_01/fold1_idx{N}_malignant/
+├── 01_BEFORE_alignment_single.png            ← BEFORE 3-panel
+├── 01_BEFORE_alignment_single_concepts.png   ← BEFORE 10-panel grid
+├── 02_AFTER_alignment_single.png             ← AFTER 3-panel
+├── 02_AFTER_alignment_single_concepts.png    ← AFTER 10-panel grid
+└── metadata.json                             ← scores from both runs
+```
+
+Expected: BEFORE all near zero, AFTER malignant concepts at 0.96–0.97.
+
+==== CELL 60 code ====
+# ── 17.2 BUSI BEFORE / AFTER alignment comparison ────────────────────
+
+# 17.2.1 Pick a Malignant validation image — capture its index
+single_loader = DataLoader(Subset(full_busi_ds, folds_busi[0][1]),
+                           batch_size=1, shuffle=False)
+x_one, y_one, sample_idx = None, None, None
+for i, (x, y) in enumerate(single_loader):
+    if y.item() == 2:
+        x_one, y_one, sample_idx = x.to(device), y, i
+        break
+if x_one is None:
+    for i, (x, y) in enumerate(single_loader):
+        x_one, y_one, sample_idx = x.to(device), y, i
+        break
+
+img_np      = x_one.squeeze().permute(1, 2, 0).cpu().numpy()
+true_class  = BUSI_CONCEPTS["class_names"][y_one.item()]
+print(f"Test image: {true_class}  (val sample idx = {sample_idx})")
+
+# 17.2.2 Build the structured-paths object for this run
+paths_busi_g01 = RunPaths(
+    dataset    = "busi",
+    gamma_tag  = "01",
+    fold       = 1,
+    sample_idx = sample_idx,
+    class_name = true_class,
+    ckpt_path  = ckpt_path_busi,
+)
+print(f"Output folder: {paths_busi_g01.image_dir}")
+
+# 17.2.3 Build raw BioMedCLIP concept vectors with the same orthonormal
+#        projection ConceptExplainer uses (fair pre-alignment baseline)
+biomedclip.eval()
+templates = [f"a breast ultrasound image showing {c}"
+             for c in BUSI_CONCEPTS["concepts"]]
+with torch.no_grad():
+    tokens = tokenizer(templates).to(device)
+    raw    = F.normalize(biomedclip.encode_text(tokens).float(), dim=-1)
+
+text_dim = raw.shape[-1]
+g = torch.Generator(); g.manual_seed(42)
+rand_mat = torch.randn(1280, text_dim, generator=g)
+q, _     = torch.linalg.qr(rand_mat)
+proj     = q[:, :text_dim].to(device)
+raw_aligned_proj = F.normalize(raw @ proj.T, dim=-1)
+print(f"Raw BioMedCLIP concept vectors built: {raw_aligned_proj.shape}")
+
+# 17.2.4 BEFORE: swap in raw vectors
+saved_aligned = busi_pipeline_aligned_g01.concept_explainer.embeddings.clone()
+busi_pipeline_aligned_g01.concept_explainer.embeddings = raw_aligned_proj
+
+result_before = busi_pipeline_aligned_g01.explain(x_one, concept_heatmaps=True)
+print("\nBEFORE alignment — concept scores:")
+for c, s in result_before["concept_scores"]:
+    print(f"  {c:<42s}  {s:+.4f}")
+
+busi_pipeline_aligned_g01.visualize(
+    img_np, result_before,
+    save_path=paths_busi_g01.before_concepts(),  # visualize() also writes _concepts.png
+    show=False,
+)
+
+# 17.2.5 AFTER: restore aligned vectors
+busi_pipeline_aligned_g01.concept_explainer.embeddings = saved_aligned
+
+result_after = busi_pipeline_aligned_g01.explain(x_one, concept_heatmaps=True)
+print("\nAFTER alignment — concept scores:")
+for c, s in result_after["concept_scores"]:
+    print(f"  {c:<42s}  {s:+.4f}")
+
+busi_pipeline_aligned_g01.visualize(
+    img_np, result_after,
+    save_path=paths_busi_g01.after_concepts(),
+    show=False,
+)
+
+# 17.2.6 Numerical summary + metadata
+b_min = min(s for _, s in result_before["concept_scores"])
+b_max = max(s for _, s in result_before["concept_scores"])
+a_min = min(s for _, s in result_after["concept_scores"])
+a_max = max(s for _, s in result_after["concept_scores"])
+
+print(f"\n{'='*60}")
+print("NUMERICAL SUMMARY")
+print(f"{'='*60}")
+print(f"BEFORE range : [{b_min:+.4f}, {b_max:+.4f}]   spread {b_max - b_min:.4f}")
+print(f"AFTER range  : [{a_min:+.4f}, {a_max:+.4f}]   spread {a_max - a_min:.4f}")
+print(f"\nIf alignment is working:")
+print(f"  - BEFORE spread should be small  (< 0.10)")
+print(f"  - AFTER spread should be large   (> 0.5)")
+print(f"  - AFTER malignant concepts > 0.9")
+print(f"{'='*60}")
+
+paths_busi_g01.save_metadata({
+    "stage"      : "BEFORE_AND_AFTER",
+    "before_concept_scores": [(c, float(s)) for c, s in result_before["concept_scores"]],
+    "after_concept_scores" : [(c, float(s)) for c, s in result_after["concept_scores"]],
+    "before_range_min": float(b_min),
+    "before_range_max": float(b_max),
+    "after_range_min" : float(a_min),
+    "after_range_max" : float(a_max),
+})
+---- OUTPUT ----
+Test image: Malignant  (val sample idx = 114)
+Output folder: figures/validation/busi/gamma_01/fold1_idx114_malignant
+Raw BioMedCLIP concept vectors built: torch.Size([10, 1280])
+
+BEFORE alignment — concept scores:
+  no mass                                     +0.0282
+  no distortion                               +0.0276
+  oval shape                                  +0.0241
+  irregular shape                             +0.0238
+  parallel orientation                        +0.0236
+
+AFTER alignment — concept scores:
+  spiculated margins                          +0.8726
+  nonparallel orientation                     +0.8369
+  posterior acoustic shadowing                +0.8227
+  irregular shape                             +0.8086
+  parallel orientation                        +0.1117
+
+============================================================
+NUMERICAL SUMMARY
+============================================================
+BEFORE range : [+0.0236, +0.0282]   spread 0.0046
+AFTER range  : [+0.1117, +0.8726]   spread 0.7609
+
+If alignment is working:
+  - BEFORE spread should be small  (< 0.10)
+  - AFTER spread should be large   (> 0.5)
+  - AFTER malignant concepts > 0.9
+============================================================
+  Metadata: figures/validation/busi/gamma_01/fold1_idx114_malignant/metadata.json
+
+
+==== CELL 62 code ====
+# ── 17.3 BUSI single-image figure + concept tables ───────────────────
+
+# Re-inject aligned vectors
+busi_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_busi_g01
+
+# 17.3.1 Single-image AFTER explanation
+result_single = busi_pipeline_aligned_g01.explain(x_one)
+
+print(f"True : {BUSI_CONCEPTS['class_names'][y_one.item()]}")
+print(f"Pred : {result_single['predicted_class']}  "
+      f"(regression={result_single['regression_score']:.3f})")
+print("Top-5 concepts:")
+for c, s in result_single["concept_scores"]:
+    print(f"  {c:<42s}  {s:+.4f}")
+
+busi_pipeline_aligned_g01.visualize(
+    img_np, result_single,
+    save_path=paths_busi_g01.after_single(),
+    show=False,
+)
+
+# 17.3.2 Update metadata with prediction
+paths_busi_g01.save_metadata({
+    "prediction"      : result_single["predicted_class"],
+    "regression_score": float(result_single["regression_score"]),
+    "top_concepts"    : [(c, float(s)) for c, s in result_single["concept_scores"]],
+})
+
+# 17.3.3 PRE-alignment concept table
+raw_concept_explainer = ConceptExplainer(
+    concepts   = BUSI_CONCEPTS["concepts"],
+    feat_dim   = 1280,
+    encoder    = "biomedclip",
+    device     = device,
+    text_model = biomedclip,
+    tokenizer  = tokenizer,
+)
+
+rows_pre = []
+loader = DataLoader(Subset(full_busi_ds, folds_busi[0][1]),
+                    batch_size=8, shuffle=False, num_workers=2)
+explain_model_g01.eval()
+with torch.no_grad():
+    for images, labels in loader:
+        images = images.to(device)
+        feats  = explain_model_g01(images)[0]
+        for i in range(feats.shape[0]):
+            scores = raw_concept_explainer.scores(feats[i])
+            row    = {"true_class": BUSI_CONCEPTS["class_names"][labels[i].item()]}
+            row.update(scores)
+            rows_pre.append(row)
+
+table_pre = pd.DataFrame(rows_pre).groupby("true_class").mean().round(3)
+print("\nBUSI γ=0.1 PRE-alignment concept table:")
+print(table_pre.to_string())
+table_pre.to_csv(paths_busi_g01.table_pre())
+print(f"Saved: {paths_busi_g01.table_pre()}")
+
+print("\nPRE-alignment per-class summary:")
+for cls in table_pre.index:
+    vals = table_pre.loc[cls].values
+    print(f"  {cls:<10s} min={vals.min():+.3f}  max={vals.max():+.3f}  mean={vals.mean():+.3f}")
+
+# 17.3.4 POST-alignment concept table
+busi_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_busi_g01
+
+rows_post = []
+loader = DataLoader(Subset(full_busi_ds, folds_busi[0][1]),
+                    batch_size=8, shuffle=False, num_workers=2)
+with torch.no_grad():
+    for images, labels in loader:
+        images = images.to(device)
+        feats  = explain_model_g01(images)[0]
+        for i in range(feats.shape[0]):
+            scores = busi_pipeline_aligned_g01.concept_explainer.scores(feats[i])
+            row    = {"true_class": BUSI_CONCEPTS["class_names"][labels[i].item()]}
+            row.update(scores)
+            rows_post.append(row)
+
+table_post = pd.DataFrame(rows_post).groupby("true_class").mean().round(3)
+print("\nBUSI γ=0.1 POST-alignment concept table:")
+print(table_post.to_string())
+table_post.to_csv(paths_busi_g01.table_post())
+print(f"Saved: {paths_busi_g01.table_post()}")
+---- OUTPUT ----
+True : Malignant
+Pred : Malignant  (regression=1.988)
+Top-5 concepts:
+  spiculated margins                          +0.9858
+  irregular shape                             +0.9849
+  posterior acoustic shadowing                +0.9846
+  nonparallel orientation                     +0.9817
+  posterior enhancement                       -0.0826
+  Metadata: figures/validation/busi/gamma_01/fold1_idx114_malignant/metadata.json
+
+BUSI γ=0.1 PRE-alignment concept table:
+            no mass  no distortion  oval shape  circumscribed margin  parallel orientation  posterior enhancement  irregular shape  spiculated margins  nonparallel orientation  posterior acoustic shadowing
+true_class                                                                                                                                                                                                   
+Benign        0.023          0.023       0.019                 0.022                 0.022                  0.008            0.027               0.018                    0.019                         0.023
+Malignant     0.035          0.036       0.031                 0.022                 0.034                  0.017            0.032               0.030                    0.024                         0.021
+Normal       -0.070         -0.076      -0.071                -0.061                -0.080                 -0.064           -0.078              -0.057                   -0.078                        -0.070
+Saved: figures/validation/busi/gamma_01/tables/concept_table_PRE.csv
+
+PRE-alignment per-class summary:
+  Benign     min=+0.008  max=+0.027  mean=+0.020
+  Malignant  min=+0.017  max=+0.036  mean=+0.028
+  Normal     min=-0.080  max=-0.057  mean=-0.071
+
+BUSI γ=0.1 POST-alignment concept table:
+            no mass  no distortion  oval shape  circumscribed margin  parallel orientation  posterior enhancement  irregular shape  spiculated margins  nonparallel orientation  posterior acoustic shadowing
+true_class                                                                                                                                                                                                   
+Benign       -0.213         -0.218       0.930                 0.930                 0.931                  0.931           -0.006              -0.019                    0.020                        -0.006
+Malignant    -0.269         -0.258       0.041                 0.032                 0.032                  0.059            0.919               0.918                    0.922                         0.919
+Normal        0.899          0.899      -0.193                -0.198                -0.205                 -0.215           -0.191              -0.197                   -0.228                        -0.209
+Saved: figures/validation/busi/gamma_01/tables/concept_table_POST.csv
+
+
+==== CELL 65 code ====
+# ═══════════════════════════════════════════════════════════════════════
+# CELL 7 — BUSI per-class pointing accuracy + IoU + diagnostic figures
+# Computes pointing accuracy and Mean IoU @ top-20% for Benign and
+# Malignant (with masks) and pointing-into-ultrasound-region for
+# Normal (no mask). Saves a per-class 6-image diagnostic to
+# paper_figures_FINAL/busi/05_localisation_diagnostic_{class}.png
+# Saves metrics to paper_figures_FINAL/busi/localisation_per_class.json
+# ═══════════════════════════════════════════════════════════════════════
+import json
+import numpy as np
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from pathlib import Path
+from PIL import Image as PILImage
+from torch.utils.data import DataLoader, Subset
+from scipy.ndimage import gaussian_filter
+from explainability import _ultrasound_mask
+
+OUT_DIR = Path("paper_figures_FINAL/busi")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+VAL_IDX_BUSI    = folds_busi[0][1]
+TOP_PCT         = 0.20         # IoU threshold
+MARGIN_FRAC     = 0.05         # 5% margin suppression on each side
+BUSI_CLASSES    = {0: "Normal", 1: "Benign", 2: "Malignant"}
+N_DIAG_PER_CLS  = 6
+
+# Inject aligned vectors
+busi_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_busi_g01
+
+# ── Helpers ──────────────────────────────────────────────────────
+def load_lesion_mask(image_path):
+    """Try standard BUSI mask filename pattern."""
+    p = Path(image_path)
+    stem = p.stem  # e.g. "malignant (84)"
+    parent = p.parent
+    candidates = [
+        parent / f"{stem}_mask.png",
+        parent / f"{stem}_mask_1.png",
+        parent / f"{stem} mask.png",
+    ]
+    for c in candidates:
+        if c.exists():
+            m = np.array(PILImage.open(c).convert("L").resize((300, 300)))
+            return (m > 127).astype(np.uint8)
+    return None
+
+def apply_margin_suppression(arr, frac=MARGIN_FRAC):
+    """Zero out a margin around the array borders."""
+    arr = arr.copy()
+    h, w = arr.shape[:2]
+    mh, mw = int(h * frac), int(w * frac)
+    arr[:mh, :] = 0
+    arr[-mh:, :] = 0
+    arr[:, :mw] = 0
+    arr[:, -mw:] = 0
+    return arr
+
+def compute_metrics_for_class(class_idx, class_name):
+    """Return dict of metrics + list of per-image diagnostic data."""
+    pipe = busi_pipeline_aligned_g01
+    pipe.concept_explainer.embeddings = aligned_vecs_busi_g01
+
+    # Filter validation images by class
+    items_in_class = []
+    for global_idx in VAL_IDX_BUSI:
+        image_path, label = full_busi_ds.items[global_idx]
+        if label == class_idx:
+            items_in_class.append((global_idx, image_path))
+
+    if not items_in_class:
+        return None, []
+
+    pointing_in_lesion = []
+    pointing_in_us     = []
+    iou_top20          = []
+    diag_records       = []  # for the figure
+
+    for global_idx, image_path in items_in_class:
+        # Image
+        img_tensor, _ = full_busi_ds[global_idx]
+        img_tensor = img_tensor.unsqueeze(0).to(device)
+        raw = PILImage.open(image_path).convert("RGB").resize((300, 300))
+        img_np = np.array(raw).astype(np.float32) / 255.0
+
+        # Heatmap (use the predicted-class CAM, i.e. the standard explanation)
+        result = pipe.explain(img_tensor)
+        cam = result["heatmap"]                # (300, 300), already pipeline-normalised
+        cam = apply_margin_suppression(cam)
+
+        # Ultrasound region mask
+        us_mask = _ultrasound_mask(img_np)
+        us_mask = apply_margin_suppression(us_mask.astype(np.uint8))
+
+        # Lesion mask (Benign / Malignant only)
+        lesion_mask = load_lesion_mask(image_path)
+        if lesion_mask is not None:
+            lesion_mask = apply_margin_suppression(lesion_mask)
+
+        # Argmax inside the (margin-suppressed) ultrasound region
+        cam_in_us = cam * us_mask
+        if cam_in_us.max() <= 0:
+            continue
+        flat_idx = np.argmax(cam_in_us)
+        ay, ax = np.unravel_index(flat_idx, cam.shape)
+
+        in_us = us_mask[ay, ax] == 1
+        pointing_in_us.append(in_us)
+
+        if lesion_mask is not None:
+            in_lesion = lesion_mask[ay, ax] == 1
+            pointing_in_lesion.append(in_lesion)
+
+            # IoU at top-20%
+            thresh = np.quantile(cam[us_mask == 1], 1 - TOP_PCT) if (us_mask == 1).sum() > 0 else 1.0
+            heatmap_bin = (cam >= thresh).astype(np.uint8) * us_mask
+            inter = ((heatmap_bin == 1) & (lesion_mask == 1)).sum()
+            union = ((heatmap_bin == 1) | (lesion_mask == 1)).sum()
+            iou = inter / union if union > 0 else 0.0
+            iou_top20.append(iou)
+
+        diag_records.append({
+            "img_np":      img_np,
+            "cam":         cam,
+            "lesion_mask": lesion_mask,
+            "us_mask":     us_mask,
+            "argmax":      (ay, ax),
+            "image_path":  str(image_path),
+        })
+
+    metrics = {
+        "class":             class_name,
+        "n":                 len(items_in_class),
+        "n_with_lesion":     len(pointing_in_lesion),
+        "pointing_in_lesion": float(np.mean(pointing_in_lesion)) if pointing_in_lesion else None,
+        "pointing_in_us":    float(np.mean(pointing_in_us)) if pointing_in_us else None,
+        "mean_iou_top20":    float(np.mean(iou_top20)) if iou_top20 else None,
+        "std_iou_top20":     float(np.std(iou_top20)) if iou_top20 else None,
+    }
+    return metrics, diag_records
+
+# ── Diagnostic figure (top row: img + lesion outline + argmax cross) ──
+def save_diagnostic(diag_records, class_name, out_path, n_show=6):
+    diag_records = diag_records[:n_show]
+    n = len(diag_records)
+    if n == 0:
+        return
+    fig, axes = plt.subplots(2, n, figsize=(3.0 * n, 6.0))
+    if n == 1:
+        axes = axes.reshape(2, 1)
+
+    for col, rec in enumerate(diag_records):
+        img      = rec["img_np"]
+        cam      = rec["cam"]
+        lesion   = rec["lesion_mask"]
+        ay, ax   = rec["argmax"]
+        img_uint = (img * 255).astype(np.uint8)
+
+        # Top: original + lesion outline (green) + argmax (red cross)
+        axes[0, col].imshow(img_uint)
+        if lesion is not None:
+            axes[0, col].contour(lesion, levels=[0.5], colors="lime", linewidths=1.5)
+        axes[0, col].plot(ax, ay, "r+", markersize=18, markeredgewidth=2.5)
+        axes[0, col].set_xticks([]); axes[0, col].set_yticks([])
+        axes[0, col].set_title(Path(rec["image_path"]).stem, fontsize=9)
+
+        # Bottom: heatmap + lesion outline (white) + argmax (black cross)
+        axes[1, col].imshow(img_uint)
+        # soft-mask the heatmap for display
+        soft = gaussian_filter(rec["us_mask"].astype(np.float32), sigma=9)
+        if soft.max() > 0:
+            soft = soft / soft.max()
+        h_disp = cam * soft
+        if h_disp.max() > h_disp.min():
+            h_disp = (h_disp - h_disp.min()) / (h_disp.max() - h_disp.min() + 1e-8)
+        axes[1, col].imshow(h_disp, cmap="jet", alpha=0.45, vmin=0, vmax=1)
+        if lesion is not None:
+            axes[1, col].contour(lesion, levels=[0.5], colors="white", linewidths=1.5)
+        axes[1, col].plot(ax, ay, "kx", markersize=14, markeredgewidth=2.5)
+        axes[1, col].set_xticks([]); axes[1, col].set_yticks([])
+
+    # Row labels
+    axes[0, 0].set_ylabel("Original\n(green=lesion, red=argmax)", fontsize=10)
+    axes[1, 0].set_ylabel("Heatmap\n(white=lesion, black=argmax)", fontsize=10)
+    plt.suptitle(f"BUSI localisation diagnostic — {class_name} (γ=0.1)",
+                 fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved: {out_path}")
+
+# ── Run all classes ───────────────────────────────────────────────
+all_metrics = {}
+for cls_idx, cls_name in BUSI_CLASSES.items():
+    print(f"\n[{cls_name}]")
+    metrics, diag_records = compute_metrics_for_class(cls_idx, cls_name)
+    if metrics is None:
+        print(f"  no images of this class in val set")
+        continue
+    all_metrics[cls_name] = metrics
+    print(f"  n={metrics['n']}  (with lesion mask: {metrics['n_with_lesion']})")
+    if metrics["pointing_in_lesion"] is not None:
+        print(f"  pointing accuracy (in lesion):     {metrics['pointing_in_lesion']:.3f}")
+    print(f"  pointing accuracy (in ultrasound): {metrics['pointing_in_us']:.3f}")
+    if metrics["mean_iou_top20"] is not None:
+        print(f"  Mean IoU @ top-20%:                {metrics['mean_iou_top20']:.3f} ± {metrics['std_iou_top20']:.3f}")
+
+    out_path = OUT_DIR / f"05_localisation_diagnostic_{cls_name.lower()}.png"
+    save_diagnostic(diag_records, cls_name, out_path, n_show=N_DIAG_PER_CLS)
+
+# Save metrics
+metrics_path = OUT_DIR / "localisation_per_class.json"
+with open(metrics_path, "w") as f:
+    json.dump(all_metrics, f, indent=2)
+print(f"\nMetrics saved: {metrics_path}")
+
+# Pretty print final table
+print(f"\n{'='*70}")
+print(f"BUSI per-class localisation (γ=0.1, fold-1 validation)")
+print(f"{'='*70}")
+print(f"  {'Class':<12s}{'n':>6s}{'Point→Lesion':>16s}{'Point→US':>14s}{'IoU@top20%':>14s}")
+print(f"  {'-'*62}")
+for cls in ["Normal", "Benign", "Malignant"]:
+    m = all_metrics.get(cls, {})
+    pl  = f"{m['pointing_in_lesion']:.3f}" if m.get("pointing_in_lesion") is not None else "n/a"
+    pus = f"{m['pointing_in_us']:.3f}" if m.get("pointing_in_us") is not None else "n/a"
+    iou = f"{m['mean_iou_top20']:.3f}" if m.get("mean_iou_top20") is not None else "n/a"
+    print(f"  {cls:<12s}{m.get('n', 0):>6d}{pl:>16s}{pus:>14s}{iou:>14s}")
+---- OUTPUT ----
+
+[Normal]
+  n=27  (with lesion mask: 27)
+  pointing accuracy (in lesion):     0.000
+  pointing accuracy (in ultrasound): 1.000
+  Mean IoU @ top-20%:                0.000 ± 0.000
+  saved: paper_figures_FINAL/busi/05_localisation_diagnostic_normal.png
+
+[Benign]
+  n=87  (with lesion mask: 87)
+  pointing accuracy (in lesion):     0.138
+  pointing accuracy (in ultrasound): 1.000
+  Mean IoU @ top-20%:                0.054 ± 0.082
+  saved: paper_figures_FINAL/busi/05_localisation_diagnostic_benign.png
+
+[Malignant]
+  n=42  (with lesion mask: 42)
+  pointing accuracy (in lesion):     0.690
+  pointing accuracy (in ultrasound): 1.000
+  Mean IoU @ top-20%:                0.133 ± 0.108
+  saved: paper_figures_FINAL/busi/05_localisation_diagnostic_malignant.png
+
+Metrics saved: paper_figures_FINAL/busi/localisation_per_class.json
+
+======================================================================
+BUSI per-class localisation (γ=0.1, fold-1 validation)
+======================================================================
+  Class            n    Point→Lesion      Point→US    IoU@top20%
+  --------------------------------------------------------------
+  Normal          27           0.000         1.000         0.000
+  Benign          87           0.138         1.000         0.054
+  Malignant       42           0.690         1.000         0.133
+
+
+==== CELL 66 code ====
+# ── Generate fresh localisation diagnostic with patched mask ─────────
+import os
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from PIL import Image as PILImage
+
+def load_mask_for_image(image_path, target_size=(300, 300)):
+    base = os.path.basename(image_path)
+    name, ext = os.path.splitext(base)
+    mask_path = os.path.join(os.path.dirname(image_path), f"{name}_mask{ext}")
+    if not os.path.exists(mask_path):
+        return None
+    m = PILImage.open(mask_path).convert("L").resize(target_size, PILImage.NEAREST)
+    return (np.array(m).astype(np.float32) / 255.0 > 0.5).astype(np.float32)
+
+# Re-inject aligned vectors
+busi_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_busi_g01
+
+val_loader = DataLoader(Subset(full_busi_ds, folds_busi[0][1]),
+                        batch_size=1, shuffle=False)
+
+# Pick 6 sample malignant cases
+samples = []
+for i, (x, y) in enumerate(val_loader):
+    if y.item() == 2 and len(samples) < 6:
+        val_indices = folds_busi[0][1]
+        src_idx = val_indices[i]
+        image_path, _ = full_busi_ds.items[src_idx]
+        mask = load_mask_for_image(image_path)
+        if mask is None:
+            continue
+        samples.append((i, x, mask, image_path))
+
+# Compute heatmaps with patched mask
+fig, axes = plt.subplots(2, 6, figsize=(24, 8))
+for col, (sidx, x, gt_mask, image_path) in enumerate(samples):
+    x_dev = x.to(device)
+    result = busi_pipeline_aligned_g01.explain(x_dev)
+
+    # Apply patched ultrasound mask
+    img_np = x.squeeze().permute(1, 2, 0).cpu().numpy()
+    us_mask = explainability._ultrasound_mask(img_np)
+    heatmap = result["heatmap"] * us_mask
+    if heatmap.max() > heatmap.min():
+        heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+
+    # Find argmax
+    flat_idx = int(np.argmax(heatmap))
+    h, w = heatmap.shape
+    py, px = flat_idx // w, flat_idx % w
+    in_mask = gt_mask[py, px] > 0.5
+
+    img_uint8 = (img_np * 255).astype(np.uint8) if img_np.dtype != np.uint8 else img_np
+
+    # Top row: image + lesion outline + argmax
+    ax_top = axes[0, col]
+    ax_top.imshow(img_uint8)
+    ax_top.contour(gt_mask, levels=[0.5], colors="lime", linewidths=2)
+    ax_top.plot(px, py, "rx", markersize=15, markeredgewidth=3)
+    ax_top.set_title(f"Img {col+1}: argmax @ ({py},{px})\nin mask: {in_mask}",
+                     fontsize=10)
+    ax_top.axis("off")
+
+    # Bottom row: heatmap + lesion outline + argmax
+    ax_bot = axes[1, col]
+    ax_bot.imshow(heatmap, cmap="jet")
+    ax_bot.contour(gt_mask, levels=[0.5], colors="white", linewidths=2)
+    ax_bot.plot(px, py, "kx", markersize=15, markeredgewidth=3)
+    ax_bot.set_title(f"max: {heatmap.max():.3f}", fontsize=10)
+    ax_bot.axis("off")
+
+plt.suptitle(
+    "BUSI Localisation Diagnostic (patched mask)\n"
+    "Top: image + lesion (green) + argmax (red)\n"
+    "Bottom: heatmap + lesion (white) + argmax (black)",
+    fontsize=12,
+)
+plt.tight_layout()
+
+out = "figures/validation/busi/gamma_01/fold1_idx114_malignant/05_AFTER_localisation_diagnostic_patched.png"
+plt.savefig(out, dpi=150, bbox_inches="tight")
+plt.show()
+print(f"\nSaved: {out}")
+---- OUTPUT ----
+
+Saved: figures/validation/busi/gamma_01/fold1_idx114_malignant/05_AFTER_localisation_diagnostic_patched.png
+
+
+==== CELL 70 code ====
+# ── 17.5.2 DR γ=0.1 pipeline + alignment MLP ─────────────────────────
+ckpt_path_dr = os.path.join(os.getcwd(),
+    "checkpoints", "dr", "dr_gamma_01", "fold_1_best.pt")
+assert os.path.isfile(ckpt_path_dr), f"Missing checkpoint: {ckpt_path_dr}"
+
+explain_model_dr_g01 = HybridContrastiveOrdinalNet(
+    embed_dim=cfg.embed_dim, proj_dim=cfg.proj_dim
+).to(device).eval()
+explain_model_dr_g01.load_state_dict(
+    torch.load(ckpt_path_dr, map_location=device, weights_only=False)["model_state"],
+    strict=False,
+)
+print(f"Loaded checkpoint: {ckpt_path_dr}")
+
+dr_pipeline_aligned_g01 = ExplainabilityPipeline(
+    model      = explain_model_dr_g01,
+    dataset    = "dr",
+    device     = device,
+    encoder    = "biomedclip",
+    text_model = biomedclip,
+    tokenizer  = tokenizer,
+    layer_indices = [2, 4, 6, 7],   # 4-stage fusion (paper Table 3)
+    top_k      = 5,
+)
+
+aligner_dr_g01, protos_dr_g01, aligned_vecs_dr_g01 = inject_alignment_mlp(
+    pipeline           = dr_pipeline_aligned_g01,
+    model              = explain_model_dr_g01,
+    dataset_obj        = full_dr_ds if 'full_dr_ds' in dir() else dr_full_ds,
+    val_idx            = folds_dr[0][1][:1500],
+    concepts_dict      = DR_CONCEPTS,
+    class_concepts_map = CLASS_CONCEPTS_DR,
+    n_classes          = cfg.dr_n_classes,
+)
+print("\nDR γ=0.1 aligned pipeline ready.")
+---- OUTPUT ----
+Loaded checkpoint: /teamspace/studios/this_studio/ESPAOCL/checkpoints/dr/dr_gamma_01/fold_1_best.pt
+    epoch  200  pull=0.00131  push=+0.00000  total=0.00131
+    epoch  400  pull=0.00097  push=+0.00000  total=0.00097
+    epoch  600  pull=0.00064  push=+0.00000  total=0.00064
+    epoch  800  pull=0.00059  push=+0.00000  total=0.00059
+  Injected aligned vectors (11, 1280) into pipeline
+
+DR γ=0.1 aligned pipeline ready.
+
+
+==== CELL 72 code ====
+PATCHED_DR_CONCEPTS = [
+    "normal retina with no apparent lesions",
+    "healthy fundus without microaneurysms",
+    "microaneurysms",
+    "dot and blot hemorrhages",
+    "hard exudates",
+    "cotton wool spots",
+    "venous beading",
+    "intraretinal microvascular abnormalities",
+    "neovascularization",
+    "preretinal hemorrhage",
+    "vitreous hemorrhage",
+]
+assert len(PATCHED_DR_CONCEPTS) == aligned_vecs_dr_g01.shape[0], (
+    f"Mismatch: {len(PATCHED_DR_CONCEPTS)} names vs {aligned_vecs_dr_g01.shape[0]} vectors"
+)
+dr_pipeline_aligned_g01.concept_explainer.concepts = PATCHED_DR_CONCEPTS
+print(f"Fixed. Pipeline now has {len(dr_pipeline_aligned_g01.concept_explainer.concepts)} concepts:")
+for i, c in enumerate(dr_pipeline_aligned_g01.concept_explainer.concepts):
+    print(f"  [{i}]  {c}")
+---- OUTPUT ----
+Fixed. Pipeline now has 11 concepts:
+  [0]  normal retina with no apparent lesions
+  [1]  healthy fundus without microaneurysms
+  [2]  microaneurysms
+  [3]  dot and blot hemorrhages
+  [4]  hard exudates
+  [5]  cotton wool spots
+  [6]  venous beading
+  [7]  intraretinal microvascular abnormalities
+  [8]  neovascularization
+  [9]  preretinal hemorrhage
+  [10]  vitreous hemorrhage
+
+
+==== CELL 73 code ====
+# ── 17.5b  DR push-apart sweep + per-grade per-image top-1 ───────────
+import numpy as np, pandas as pd, torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+
+_dr_ds     = full_dr_ds if 'full_dr_ds' in dir() else dr_full_ds
+VAL_IDX_DR = folds_dr[0][1][:1500]
+DR_GRADES  = ["No DR", "Mild", "Moderate", "Severe", "PDR"]
+DR_GRADE_CONCEPTS = CLASS_CONCEPTS_DR   # same map used for alignment, no drift
+N_PER_CLS  = 20   # set to 10 to match the paper Table 13 protocol
+
+explain_model_dr_g01.eval()
+feats_by_grade = {g: [] for g in range(5)}
+loader = DataLoader(Subset(_dr_ds, VAL_IDX_DR), batch_size=16, shuffle=False, num_workers=0)
+with torch.no_grad():
+    for imgs, labs in loader:
+        if all(len(feats_by_grade[g]) >= N_PER_CLS for g in range(5)):
+            break
+        if imgs.shape[1] == 1:
+            imgs = imgs.repeat(1, 3, 1, 1)
+        f = F.normalize(explain_model_dr_g01(imgs.to(device))[0], dim=-1).cpu()
+        for fi, li in zip(f, labs.numpy()):
+            if len(feats_by_grade[int(li)]) < N_PER_CLS:
+                feats_by_grade[int(li)].append(fi)
+feats_by_grade = {g: torch.stack(v) for g, v in feats_by_grade.items() if len(v) > 0}
+for g in range(5):
+    n = feats_by_grade.get(g, torch.empty(0)).shape[0]
+    print(f"  grade {g} ({DR_GRADES[g]}): {n} images")
+
+def _dr_top1_by_grade(vecs):
+    vecs = vecs.to(device)
+    out = {}
+    for g, feats in feats_by_grade.items():
+        valid = set(DR_GRADE_CONCEPTS[g])
+        top1  = (feats.to(device) @ vecs.T).argmax(dim=1).cpu().tolist()
+        out[g] = float(np.mean([1.0 if t in valid else 0.0 for t in top1]))
+    return out
+
+dr_push_vecs = {}
+rows = []
+for lam in [0.0, 0.3, 0.5]:
+    print(f"\n=== DR lambda_push = {lam} ===")
+    _, _, vecs = inject_alignment_mlp(
+        pipeline           = dr_pipeline_aligned_g01,
+        model              = explain_model_dr_g01,
+        dataset_obj        = _dr_ds,
+        val_idx            = VAL_IDX_DR,
+        concepts_dict      = DR_CONCEPTS,
+        class_concepts_map = CLASS_CONCEPTS_DR,
+        n_classes          = cfg.dr_n_classes,
+        lambda_push        = lam,
+        push_margin        = 0.6,
+    )
+    vecs = vecs.detach().cpu()
+    dr_push_vecs[lam] = vecs
+    t1 = _dr_top1_by_grade(vecs)
+    rows.append({"lambda_push": lam,
+                 **{DR_GRADES[g]: round(t1.get(g, float("nan")), 2) for g in range(5)},
+                 "mean": round(float(np.mean(list(t1.values()))), 2)})
+
+print(f"\nPer-image top-1 concept correctness by grade  (n={N_PER_CLS} per grade)")
+print(pd.DataFrame(rows).to_string(index=False))
+---- OUTPUT ----
+  grade 0 (No DR): 20 images
+  grade 1 (Mild): 20 images
+  grade 2 (Moderate): 20 images
+  grade 3 (Severe): 20 images
+  grade 4 (PDR): 20 images
+
+=== DR lambda_push = 0.0 ===
+    epoch  200  pull=0.00136  push=+0.00000  total=0.00136
+    epoch  400  pull=0.00096  push=+0.00000  total=0.00096
+    epoch  600  pull=0.00068  push=+0.00000  total=0.00068
+    epoch  800  pull=0.00069  push=+0.00000  total=0.00069
+  Injected aligned vectors (11, 1280) into pipeline
+
+=== DR lambda_push = 0.3 ===
+    epoch  200  pull=0.07010  push=+0.13485  total=0.11056
+    epoch  400  pull=0.06766  push=+0.14085  total=0.10991
+    epoch  600  pull=0.06338  push=+0.15686  total=0.11044
+    epoch  800  pull=0.06209  push=+0.16442  total=0.11142
+  Injected aligned vectors (11, 1280) into pipeline
+
+=== DR lambda_push = 0.5 ===
+    epoch  200  pull=0.11460  push=+0.02182  total=0.12552
+    epoch  400  pull=0.10851  push=+0.03687  total=0.12694
+    epoch  600  pull=0.10506  push=+0.04289  total=0.12651
+    epoch  800  pull=0.11165  push=+0.02440  total=0.12385
+  Injected aligned vectors (11, 1280) into pipeline
+
+Per-image top-1 concept correctness by grade  (n=20 per grade)
+ lambda_push  No DR  Mild  Moderate  Severe  PDR  mean
+         0.0    0.5  0.45       0.2    0.75  0.8  0.54
+         0.3    0.5  0.40       0.2    0.65  0.8  0.51
+         0.5    0.1  0.65       0.3    0.30  0.8  0.43
+
+
+==== CELL 74 code ====
+# ── 17.5b  Pick DR lambda, save PUSH vectors, baseline-vs-push by grade ──
+DR_LAMBDA_PUSH_BEST = 0.5   # set after reading the table above
+
+aligned_vecs_dr_PUSH = dr_push_vecs[DR_LAMBDA_PUSH_BEST].detach()
+base_t1 = _dr_top1_by_grade(dr_push_vecs[0.0])
+push_t1 = _dr_top1_by_grade(aligned_vecs_dr_PUSH)
+print(f"per-grade per-image top-1   (lambda=0  ->  lambda={DR_LAMBDA_PUSH_BEST})")
+print("-" * 48)
+for g in range(5):
+    print(f"  {DR_GRADES[g]:<10s}  {base_t1.get(g, float('nan')):.2f}  ->  {push_t1.get(g, float('nan')):.2f}")
+
+dr_pipeline_aligned_g01.concept_explainer.embeddings = dr_push_vecs[0.0].to(device)
+print("\nSaved: aligned_vecs_dr_PUSH")
+print("To use push-apart downstream (then re-run the WHERE eval with DATASET='dr'):")
+print("  dr_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_dr_PUSH")
+---- OUTPUT ----
+per-grade per-image top-1   (lambda=0  ->  lambda=0.5)
+------------------------------------------------
+  No DR       0.50  ->  0.10
+  Mild        0.45  ->  0.65
+  Moderate    0.20  ->  0.30
+  Severe      0.75  ->  0.30
+  PDR         0.80  ->  0.80
+
+Saved: aligned_vecs_dr_PUSH
+To use push-apart downstream (then re-run the WHERE eval with DATASET='dr'):
+  dr_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_dr_PUSH
+
+
+==== CELL 76 code ====
+# ── 17.5d  Multi-prototype alignment for DR ──────────────────────────
+import numpy as np, torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+from sklearn.cluster import KMeans
+
+K_SUB        = 2          # sub-clusters per grade (1 = reduces to single-prototype)
+ALIGN_EPOCHS = 800
+DR_GRADES    = ["No DR","Mild","Moderate","Severe","PDR"]
+VAL_IDX_DR   = folds_dr[0][1]
+_dr_ds       = full_dr_ds if "full_dr_ds" in dir() else dr_full_ds
+
+# 1) collect val embeddings + labels once
+explain_model_dr_g01.eval()
+emb, lab = [], []
+loader = DataLoader(Subset(_dr_ds, VAL_IDX_DR), batch_size=32, shuffle=False, num_workers=0)
+with torch.no_grad():
+    for imgs, labs in loader:
+        if imgs.shape[1] == 1:
+            imgs = imgs.repeat(1, 3, 1, 1)
+        f = F.normalize(explain_model_dr_g01(imgs.to(device))[0], dim=-1).cpu()
+        emb.append(f); lab.append(labs)
+emb = torch.cat(emb); lab = torch.cat(lab).numpy()
+print(f"val embeddings: {tuple(emb.shape)}")
+
+# 2) build up to K_SUB sub-prototypes per grade
+sub_protos = {}
+for g in range(5):
+    fg = emb[lab == g].numpy()
+    if len(fg) < K_SUB:
+        ctr = [fg.mean(0)] if len(fg) else []
+    else:
+        km  = KMeans(n_clusters=K_SUB, n_init=10, random_state=0).fit(fg)
+        ctr = [km.cluster_centers_[k] for k in range(K_SUB)]
+    sub_protos[g] = [F.normalize(torch.tensor(c, dtype=torch.float32), dim=0).to(device) for c in ctr]
+    print(f"  grade {g} ({DR_GRADES[g]:<9s}): {len(fg):>5d} imgs -> {len(ctr)} sub-prototype(s)")
+
+# 3) per-concept target = densest sub-prototype of its grade
+biomedclip.eval()
+with torch.no_grad():
+    tok  = tokenizer(DR_CONCEPTS["concepts"]).to(device)
+    tvec = F.normalize(biomedclip.encode_text(tok).float(), dim=-1)
+n_con = len(DR_CONCEPTS["concepts"])
+
+grade_target = {}
+for g, protos in sub_protos.items():
+    if len(protos) == 1:
+        grade_target[g] = protos[0]; continue
+    fg = emb[lab == g].to(device)
+    P  = torch.stack(protos)
+    nearest = (fg @ P.T).argmax(dim=1)
+    counts  = torch.bincount(nearest, minlength=len(protos))
+    grade_target[g] = protos[int(counts.argmax())]
+
+targets = torch.zeros(n_con, 1280, device=device)
+has_t   = torch.zeros(n_con, dtype=torch.bool, device=device)
+for g, idxs in CLASS_CONCEPTS_DR.items():
+    for j in idxs:
+        if j < n_con:
+            targets[j] = grade_target[g]; has_t[j] = True
+
+# 4) refit the alignment MLP
+class _Aln(nn.Module):
+    def __init__(s):
+        super().__init__()
+        s.net = nn.Sequential(nn.Linear(512,768), nn.GELU(), nn.Dropout(0.1), nn.Linear(768,1280))
+    def forward(s,x): return s.net(x)
+
+aln = _Aln().to(device)
+opt = torch.optim.Adam(aln.parameters(), lr=1e-3, weight_decay=1e-4)
+for ep in range(ALIGN_EPOCHS):
+    opt.zero_grad()
+    proj = F.normalize(aln(tvec), dim=-1)
+    loss = (1 - (proj * targets).sum(-1))[has_t].mean()
+    loss.backward(); opt.step()
+    if (ep+1) % 200 == 0:
+        print(f"    epoch {ep+1:4d}  align_loss={loss.item():.5f}")
+
+aln.eval()
+with torch.no_grad():
+    aligned_vecs_dr_MULTI = F.normalize(aln(tvec), dim=-1).detach()
+print("Built: aligned_vecs_dr_MULTI")
+---- OUTPUT ----
+val embeddings: (3514, 1280)
+  grade 0 (No DR    ):  2572 imgs -> 2 sub-prototype(s)
+  grade 1 (Mild     ):   230 imgs -> 2 sub-prototype(s)
+  grade 2 (Moderate ):   548 imgs -> 2 sub-prototype(s)
+  grade 3 (Severe   ):    88 imgs -> 2 sub-prototype(s)
+  grade 4 (PDR      ):    76 imgs -> 2 sub-prototype(s)
+    epoch  200  align_loss=0.00115
+    epoch  400  align_loss=0.00060
+    epoch  600  align_loss=0.00054
+    epoch  800  align_loss=0.00037
+Built: aligned_vecs_dr_MULTI
+
+
+==== CELL 79 code ====
+# ── 17.5.3 DR single + concept heatmap figures with structured paths ─
+
+# Use whichever DR dataset variable is available
+_dr_ds = full_dr_ds if 'full_dr_ds' in dir() else dr_full_ds
+
+VAL_IDX_DR = folds_dr[0][1][:1500]
+single_loader = DataLoader(Subset(_dr_ds, VAL_IDX_DR),
+                           batch_size=1, shuffle=False)
+
+# Pick first Severe NPDR (grade 3) or PDR (grade 4) image
+x_dr, y_dr, dr_idx = None, None, None
+for i, (x, y) in enumerate(single_loader):
+    if y.item() >= 3:
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+        x_dr, y_dr, dr_idx = x.to(device), y, i
+        break
+if x_dr is None:
+    for i, (x, y) in enumerate(single_loader):
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+        x_dr, y_dr, dr_idx = x.to(device), y, i
+        break
+
+dr_class_str = DR_CONCEPTS["class_names"][y_dr.item()].lower().replace(" ", "_")
+print(f"DR test image: {DR_CONCEPTS['class_names'][y_dr.item()]}  (val sample idx = {dr_idx})")
+
+paths_dr_g01 = RunPaths(
+    dataset    = "dr",
+    gamma_tag  = "01",
+    fold       = 1,
+    sample_idx = dr_idx,
+    class_name = dr_class_str,
+    ckpt_path  = ckpt_path_dr,
+)
+print(f"Output folder: {paths_dr_g01.image_dir}")
+
+# Re-inject aligned vectors
+dr_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_dr_g01
+
+# Single-image AFTER explanation
+result_dr = dr_pipeline_aligned_g01.explain(x_dr)
+dr_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_dr_g01
+
+img_dr_np = x_dr.squeeze().permute(1, 2, 0).cpu().numpy()
+if img_dr_np.shape[-1] == 1:
+    img_dr_np = np.repeat(img_dr_np, 3, axis=-1)
+
+print(f"\nTrue : {DR_CONCEPTS['class_names'][y_dr.item()]}")
+print(f"Pred : {result_dr['predicted_class']}  (score={result_dr['regression_score']:.3f})")
+print("Top-5 concepts:")
+for c, s in result_dr["concept_scores"]:
+    print(f"  {c:<46s}  {s:+.4f}")
+
+dr_pipeline_aligned_g01.visualize(
+    img_dr_np, result_dr,
+    save_path=paths_dr_g01.after_single(),
+    show=False,
+)
+
+# Concept heatmaps
+result_dr_h = dr_pipeline_aligned_g01.explain(x_dr, concept_heatmaps=True)
+dr_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_dr_g01
+dr_pipeline_aligned_g01.visualize(
+    img_dr_np, result_dr_h,
+    save_path=paths_dr_g01.after_concepts(),
+    show=False,
+)
+
+# DR concept discrimination table (POST-alignment)
+rows_dr = []
+table_loader_dr = DataLoader(Subset(_dr_ds, VAL_IDX_DR),
+                             batch_size=16, shuffle=False, num_workers=0)
+explain_model_dr_g01.eval()
+with torch.no_grad():
+    for images, labels in table_loader_dr:
+        images = images.to(device)
+        feats  = F.normalize(explain_model_dr_g01(images)[0], dim=-1)
+        dr_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_dr_g01
+        for i in range(feats.shape[0]):
+            scores = dr_pipeline_aligned_g01.concept_explainer.scores(feats[i])
+            row    = {"true_class": DR_CONCEPTS["class_names"][labels[i].item()]}
+            row.update(scores)
+            rows_dr.append(row)
+
+table_dr = pd.DataFrame(rows_dr).groupby("true_class").mean().round(3)
+print("\nDR γ=0.1 POST-alignment concept table:")
+print(table_dr.to_string())
+table_dr.to_csv(paths_dr_g01.table_post())
+print(f"Saved: {paths_dr_g01.table_post()}")
+
+paths_dr_g01.save_metadata({
+    "stage"           : "AFTER",
+    "prediction"      : result_dr["predicted_class"],
+    "regression_score": float(result_dr["regression_score"]),
+    "top_concepts"    : [(c, float(s)) for c, s in result_dr["concept_scores"]],
+})
+
+dr_pipeline_aligned_g01.remove_hooks()
+---- OUTPUT ----
+DR test image: Severe NPDR  (val sample idx = 2)
+Output folder: figures/validation/dr/gamma_01/fold1_idx2_severe_npdr
+
+True : Severe NPDR
+Pred : Severe NPDR  (score=2.680)
+Top-5 concepts:
+  intraretinal microvascular abnormalities        +0.9982
+  venous beading                                  +0.9972
+  vitreous hemorrhage                             +0.5891
+  neovascularization                              +0.5877
+  preretinal hemorrhage                           +0.5875
+
+DR γ=0.1 POST-alignment concept table:
+               normal retina with no apparent lesions  healthy fundus without microaneurysms  microaneurysms  dot and blot hemorrhages  hard exudates  cotton wool spots  venous beading  intraretinal microvascular abnormalities  neovascularization  preretinal hemorrhage  vitreous hemorrhage
+true_class                                                                                                                                                                                                                                                                                        
+Mild NPDR                                       0.920                                  0.921           0.925                     0.810          0.807              0.810           0.056                                     0.087              -0.187                 -0.171               -0.190
+Moderate NPDR                                   0.584                                  0.584           0.606                     0.769          0.769              0.769           0.456                                     0.476               0.094                  0.105                0.094
+No DR                                           0.943                                  0.943           0.942                     0.780          0.777              0.780          -0.004                                     0.028              -0.216                 -0.201               -0.220
+PDR                                            -0.111                                 -0.124          -0.109                     0.193          0.203              0.196           0.604                                     0.595               0.817                  0.818                0.817
+Severe NPDR                                     0.081                                  0.078           0.108                     0.537          0.542              0.539           0.868                                     0.872               0.485                  0.487                0.487
+Saved: figures/validation/dr/gamma_01/tables/concept_table_POST.csv
+  Metadata: figures/validation/dr/gamma_01/fold1_idx2_severe_npdr/metadata.json
+
+
+==== CELL 81 code ====
+# ═══════════════════════════════════════════════════════════════════════
+# CELL 1 (FIXED) — Full WHERE evaluation across all classes (n=10 per class)
+# Uses YOUR notebook's existing variables:
+#   busi_pipeline_aligned_g01, dr_pipeline_aligned_g01
+#   aligned_vecs_busi_g01, aligned_vecs_dr_g01
+#   explain_model_g01, explain_model_dr_g01
+#   full_busi_ds, full_dr_ds (or dr_full_ds)
+#   folds_busi, folds_dr
+#   tokenizer, biomedclip
+# ═══════════════════════════════════════════════════════════════════════
+import os, json
+import numpy as np
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from pathlib import Path
+from PIL import Image
+from collections import defaultdict
+from scipy.ndimage import binary_erosion
+
+# ── Toggle dataset here ────────────────────────────────────────────
+DATASET   = "busi"        # change to "dr" then re-run for the DR pass
+N_PER_CLS = 10
+
+OUT_ROOT  = Path("paper_figures_FINAL/full_eval") / DATASET
+OUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+# ── Pick the right pipeline + vectors + model + dataset ───────────
+if DATASET == "busi":
+    pipe          = busi_pipeline_aligned_g01
+    aligned_vecs  = aligned_vecs_busi_g01
+    explain_model = explain_model_g01
+    full_ds       = full_busi_ds
+    val_idx       = folds_busi[0][1]            # fold 1 validation
+    DATA_ROOT     = Path("/teamspace/studios/this_studio/ESPAOCL/Datasets/BUSI")
+    CLASS_FOLDERS = {"Normal": "normal", "Benign": "benign", "Malignant": "malignant"}
+    HAS_MASKS     = True
+    CLASS_TO_CONCEPT_IDX = {
+        "Normal":    [0, 1],
+        "Benign":    [2, 3, 4, 5],
+        "Malignant": [6, 7, 8, 9],
+    }
+else:
+    pipe          = dr_pipeline_aligned_g01
+    aligned_vecs  = aligned_vecs_dr_g01
+    explain_model = explain_model_dr_g01
+    full_ds       = full_dr_ds if 'full_dr_ds' in dir() else dr_full_ds
+    val_idx       = folds_dr[0][1][:1500]       # match 17.5
+    DATA_ROOT     = None                         # DR uses dataset-by-index, not files
+    HAS_MASKS     = False
+    # DR concept order after the cell-17.5.1 patch:
+    # [0] normal retina (anchor)  [1] healthy fundus (anchor)
+    # [2] microaneurysms          [3] dot/blot          [4] hard exudates
+    # [5] cotton wool             [6] venous beading    [7] IRMA
+    # [8] neovasc.                [9] preretinal hem.   [10] vitreous hem.
+    CLASS_TO_CONCEPT_IDX = {
+        "No DR":     [0, 1],
+        "Mild":      [2],
+        "Moderate":  [3, 4, 5],
+        "Severe":    [6, 7],
+        "PDR":       [8, 9, 10],
+    }
+
+# Make sure the aligned vectors are in the pipeline (cells get re-run a lot)
+pipe.concept_explainer.embeddings = aligned_vecs
+
+# ── Helpers ────────────────────────────────────────────────────────
+def ultrasound_region_mask(img_np):
+    """Binary mask of the actual scan area, with 5% edge suppression."""
+    if img_np.dtype != np.uint8:
+        gray = (img_np.mean(axis=2) if img_np.ndim == 3 else img_np)
+    else:
+        gray = (img_np.astype(np.float32).mean(axis=2) / 255.0
+                if img_np.ndim == 3 else img_np.astype(np.float32) / 255.0)
+    region = (gray > 0.03).astype(np.uint8)
+    margin = max(1, int(0.05 * min(region.shape)))
+    eroded = binary_erosion(region, iterations=margin)
+    return eroded.astype(np.uint8)
+
+def load_busi_mask(image_path):
+    """BUSI lesion mask: foo.png -> foo_mask.png next to it."""
+    base, ext = os.path.splitext(image_path)
+    mask_path = f"{base}_mask{ext}"
+    if not os.path.isfile(mask_path):
+        return None
+    m = Image.open(mask_path).convert("L").resize((300, 300), Image.NEAREST)
+    return (np.array(m) > 127).astype(np.uint8)
+
+# ── Iterator that yields (img_tensor, img_np, lesion_mask, class_name, image_id) ──
+def iter_samples():
+    """Walk the validation set, sample N_PER_CLS per class."""
+    counts = defaultdict(int)
+
+    if DATASET == "busi":
+        # Use the dataset's own items list filtered by fold-1 val indices
+        idx_set = set(val_idx)
+        for global_idx in val_idx:
+            image_path, label = full_ds.items[global_idx]
+            class_name = ["Normal", "Benign", "Malignant"][label]
+            if counts[class_name] >= N_PER_CLS:
+                continue
+            counts[class_name] += 1
+
+            # Load image via the dataset (uses the same transform model was trained on)
+            img_tensor, _ = full_ds[global_idx]
+            img_tensor = img_tensor.unsqueeze(0).to(device)
+
+            # Raw image array for masking + display
+            raw = Image.open(image_path).convert("RGB").resize((300, 300))
+            img_np = np.array(raw)
+
+            lesion_mask = load_busi_mask(image_path)
+            yield img_tensor, img_np, lesion_mask, class_name, os.path.basename(image_path)
+
+    else:  # DR
+        from torch.utils.data import DataLoader, Subset
+        loader = DataLoader(Subset(full_ds, val_idx), batch_size=1, shuffle=False)
+        class_names = ["No DR", "Mild", "Moderate", "Severe", "PDR"]
+        for i, (x, y) in enumerate(loader):
+            label = int(y.item())
+            class_name = class_names[label]
+            if counts[class_name] >= N_PER_CLS:
+                continue
+            counts[class_name] += 1
+
+            if x.shape[1] == 1:
+                x = x.repeat(1, 3, 1, 1)
+            img_tensor = x.to(device)
+            img_np = x.squeeze().permute(1, 2, 0).cpu().numpy()
+            if img_np.shape[-1] == 1:
+                img_np = np.repeat(img_np, 3, axis=-1)
+            yield img_tensor, img_np, None, class_name, f"dr_idx{i:04d}"
+
+            # Stop early once all classes are full
+            if all(counts[c] >= N_PER_CLS for c in class_names):
+                break
+
+# ── Run eval ────────────────────────────────────────────────────────
+results_by_class = defaultdict(list)
+all_concepts = pipe.concept_explainer.concepts
+print(f"\n=== {DATASET.upper()}  (using val_idx, n={N_PER_CLS} per class) ===")
+
+for img_tensor, img_np, lesion_mask, class_name, image_id in iter_samples():
+    expected_idx = CLASS_TO_CONCEPT_IDX[class_name]
+
+    # Ensure aligned vectors stay injected (some helpers reset embeddings)
+    pipe.concept_explainer.embeddings = aligned_vecs
+
+    # WHERE
+    result = pipe.explain(img_tensor)
+    heatmap = result["heatmap"]   # 300x300
+
+    # WHY: full concept score dict (top_k truncates, so compute directly)
+    with torch.no_grad():
+        feat = F.normalize(explain_model(img_tensor)[0], dim=-1).squeeze(0)
+    all_scores = pipe.concept_explainer.scores(feat)
+
+    # Mask + argmax
+    us_mask = ultrasound_region_mask(img_np)
+    masked_hm = heatmap * us_mask
+    flat = int(np.argmax(masked_hm))
+    y, x_ = np.unravel_index(flat, masked_hm.shape)
+
+    pointing_hit, iou_top20 = None, None
+    if lesion_mask is not None:
+        pointing_hit = bool(lesion_mask[y, x_])
+        thresh = np.percentile(heatmap, 80)
+        binarised = (heatmap >= thresh).astype(np.uint8)
+        inter = int(np.logical_and(binarised, lesion_mask).sum())
+        union = int(np.logical_or (binarised, lesion_mask).sum())
+        iou_top20 = float(inter / union) if union > 0 else 0.0
+
+    # Top-1 concept correctness
+    sorted_scores = sorted(all_scores.items(), key=lambda kv: kv[1], reverse=True)
+    top1_name = sorted_scores[0][0]
+    top1_idx  = all_concepts.index(top1_name)
+    top1_correct = (top1_idx in expected_idx) if expected_idx else False
+
+    rec = {
+        "image_id":        image_id,
+        "class":           class_name,
+        "argmax_yx":       [int(y), int(x_)],
+        "pointing_hit":    pointing_hit,
+        "iou_top20":       iou_top20,
+        "top1_concept":    top1_name,
+        "top1_correct":    bool(top1_correct),
+        "predicted_class": result["predicted_class"],
+        "regression":      float(result["regression_score"]),
+        "all_scores":      {k: float(v) for k, v in all_scores.items()},
+    }
+    results_by_class[class_name].append(rec)
+
+    flag = "✓" if top1_correct else "✗"
+    extra = "" if pointing_hit is None else f"  hit={pointing_hit}  iou={iou_top20:.2f}"
+    print(f"  {class_name:<10} {image_id:<28} top1={top1_name[:30]:<30} {flag}{extra}")
+
+# ── Aggregate ───────────────────────────────────────────────────────
+summary = {}
+for class_name, recs in results_by_class.items():
+    n = len(recs)
+    s = {
+        "n":             n,
+        "top1_accuracy": sum(r["top1_correct"] for r in recs) / n,
+    }
+    if HAS_MASKS:
+        hits = [r["pointing_hit"] for r in recs if r["pointing_hit"] is not None]
+        ious = [r["iou_top20"]    for r in recs if r["iou_top20"]    is not None]
+        if hits:
+            s["pointing_accuracy"] = sum(hits) / len(hits)
+        if ious:
+            s["mean_iou"] = float(np.mean(ious))
+            s["std_iou"]  = float(np.std(ious))
+    positions = [tuple(r["argmax_yx"]) for r in recs]
+    counts = {}
+    for p in positions:
+        counts[p] = counts.get(p, 0) + 1
+    s["argmax_max_repeat_frac"] = max(counts.values()) / n
+    summary[class_name] = s
+
+out = {
+    "dataset":     DATASET,
+    "n_per_class": N_PER_CLS,
+    "summary":     summary,
+    "raw":         dict(results_by_class),
+}
+with open(OUT_ROOT / "metrics.json", "w") as f:
+    json.dump(out, f, indent=2)
+
+print(f"\n=== SUMMARY ({DATASET}) ===")
+for class_name, m in summary.items():
+    line = f"  {class_name:<10}  n={m['n']:2d}  top1={m['top1_accuracy']:.2f}"
+    if "pointing_accuracy" in m:
+        line += f"  pointing={m['pointing_accuracy']:.2f}  iou={m['mean_iou']:.2f}±{m['std_iou']:.2f}"
+    line += f"  argmax_repeat={m['argmax_max_repeat_frac']:.2f}"
+    print(line)
+print(f"\nSaved: {OUT_ROOT/'metrics.json'}")
+---- OUTPUT ----
+
+=== BUSI  (using val_idx, n=10 per class) ===
+  Normal     normal (13).png              top1=no distortion                  ✓  hit=False  iou=0.00
+  Normal     normal (130).png             top1=no distortion                  ✓  hit=False  iou=0.00
+  Normal     normal (34).png              top1=no distortion                  ✓  hit=False  iou=0.00
+  Normal     normal (119).png             top1=no distortion                  ✓  hit=False  iou=0.00
+  Normal     normal (69).png              top1=no distortion                  ✓  hit=False  iou=0.00
+  Normal     normal (87).png              top1=no mass                        ✓  hit=False  iou=0.00
+  Normal     normal (9).png               top1=parallel orientation           ✗  hit=False  iou=0.00
+  Normal     normal (127).png             top1=no distortion                  ✓  hit=False  iou=0.00
+  Normal     normal (12).png              top1=no distortion                  ✓  hit=False  iou=0.00
+  Normal     normal (91).png              top1=no distortion                  ✓  hit=False  iou=0.00
+  Benign     benign (323).png             top1=posterior enhancement          ✓  hit=False  iou=0.05
+  Benign     benign (334).png             top1=posterior enhancement          ✓  hit=False  iou=0.01
+  Benign     benign (331).png             top1=posterior enhancement          ✓  hit=False  iou=0.01
+  Benign     benign (407).png             top1=posterior enhancement          ✓  hit=False  iou=0.00
+  Benign     benign (431).png             top1=parallel orientation           ✓  hit=False  iou=0.08
+  Benign     benign (330).png             top1=posterior enhancement          ✓  hit=False  iou=0.64
+  Benign     benign (347).png             top1=posterior enhancement          ✓  hit=False  iou=0.04
+  Benign     benign (310).png             top1=posterior enhancement          ✓  hit=False  iou=0.03
+  Benign     benign (290).png             top1=oval shape                     ✓  hit=False  iou=0.31
+  Benign     benign (125).png             top1=parallel orientation           ✓  hit=False  iou=0.06
+  Malignant  malignant (49).png           top1=spiculated margins             ✓  hit=True  iou=0.28
+  Malignant  malignant (59).png           top1=spiculated margins             ✓  hit=False  iou=0.34
+  Malignant  malignant (183).png          top1=spiculated margins             ✓  hit=True  iou=0.50
+  Malignant  malignant (122).png          top1=nonparallel orientation        ✓  hit=True  iou=0.57
+  Malignant  malignant (174).png          top1=posterior enhancement          ✗  hit=True  iou=0.36
+  Malignant  malignant (14).png           top1=spiculated margins             ✓  hit=True  iou=0.53
+  Malignant  malignant (16).png           top1=nonparallel orientation        ✓  hit=True  iou=0.34
+  Malignant  malignant (133).png          top1=spiculated margins             ✓  hit=True  iou=0.35
+  Malignant  malignant (165).png          top1=nonparallel orientation        ✓  hit=True  iou=0.45
+  Malignant  malignant (101).png          top1=spiculated margins             ✓  hit=True  iou=0.54
+
+=== SUMMARY (busi) ===
+  Normal      n=10  top1=0.90  pointing=0.00  iou=0.00±0.00  argmax_repeat=0.10
+  Benign      n=10  top1=1.00  pointing=0.00  iou=0.12±0.19  argmax_repeat=0.30
+  Malignant   n=10  top1=0.90  pointing=0.90  iou=0.43±0.10  argmax_repeat=0.20
+
+Saved: paper_figures_FINAL/full_eval/busi/metrics.json
+
+
+==== CELL 82 code ====
+# ═══════════════════════════════════════════════════════════════════════
+# CELL 1b — Save diagnostic heatmap per image so you can visually verify
+# Reads metrics.json from Cell 1, saves PNGs to:
+#   paper_figures_FINAL/full_eval/{dataset}/diagnostics/{class}/{image_id}.png
+# Each PNG: 4 panels per image
+#   1. Original image
+#   2. Heatmap overlay (after ultrasound/fundus mask)
+#   3. Heatmap alone with argmax marker
+#   4. Lesion mask outline (BUSI only) or top-3 concept bars (DR)
+# ═══════════════════════════════════════════════════════════════════════
+import json
+import numpy as np
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from pathlib import Path
+from PIL import Image
+from scipy.ndimage import binary_erosion
+
+DATASET = "busi"   # change to "dr" then re-run
+
+# Pick the right pipeline + vectors + dataset (same as Cell 1)
+if DATASET == "busi":
+    pipe          = busi_pipeline_aligned_g01
+    aligned_vecs  = aligned_vecs_busi_g01
+    explain_model = explain_model_g01
+    full_ds       = full_busi_ds
+    val_idx       = folds_busi[0][1]
+    HAS_MASKS     = True
+else:
+    pipe          = dr_pipeline_aligned_g01
+    aligned_vecs  = aligned_vecs_dr_g01
+    explain_model = explain_model_dr_g01
+    full_ds       = full_dr_ds if 'full_dr_ds' in dir() else dr_full_ds
+    val_idx       = folds_dr[0][1][:1500]
+    HAS_MASKS     = False
+
+pipe.concept_explainer.embeddings = aligned_vecs
+
+EVAL_PATH = Path("paper_figures_FINAL/full_eval") / DATASET / "metrics.json"
+OUT_ROOT  = Path("paper_figures_FINAL/full_eval") / DATASET / "diagnostics"
+OUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+with open(EVAL_PATH) as f:
+    eval_data = json.load(f)
+
+
+def ultrasound_region_mask(img_np):
+    if img_np.dtype != np.uint8:
+        gray = img_np.mean(axis=2) if img_np.ndim == 3 else img_np
+    else:
+        gray = (img_np.astype(np.float32).mean(axis=2) / 255.0
+                if img_np.ndim == 3 else img_np.astype(np.float32) / 255.0)
+    region = (gray > 0.03).astype(np.uint8)
+    margin = max(1, int(0.05 * min(region.shape)))
+    return binary_erosion(region, iterations=margin).astype(np.uint8)
+
+
+def load_busi_lesion_mask(image_path):
+    base, ext = os.path.splitext(image_path)
+    mask_path = f"{base}_mask{ext}"
+    if not os.path.isfile(mask_path):
+        return None
+    m = Image.open(mask_path).convert("L").resize((300, 300), Image.NEAREST)
+    return (np.array(m) > 127).astype(np.uint8)
+
+
+def make_diagnostic(img_np, heatmap_raw, lesion_mask, argmax_yx, top3, title, out_path):
+    """4-panel diagnostic for one image."""
+    us_mask = ultrasound_region_mask(img_np) if DATASET == "busi" else np.ones_like(heatmap_raw)
+
+    # Soften the mask edge for display only (metrics.json was computed
+    # with the hard mask in Cell 1 and is unaffected)
+    from scipy.ndimage import gaussian_filter
+    us_mask_soft = gaussian_filter(us_mask.astype(np.float32), sigma=9.0)
+    if us_mask_soft.max() > 0:
+        us_mask_soft = us_mask_soft / us_mask_soft.max()
+    heatmap = heatmap_raw * us_mask_soft
+
+    if heatmap.max() > heatmap.min():
+        heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+    y_arg, x_arg = argmax_yx
+
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+
+    # 1. Original
+    axes[0].imshow(img_np)
+    axes[0].set_title("Original")
+    axes[0].axis("off")
+
+    # 2. Heatmap overlay
+    axes[1].imshow(img_np)
+    axes[1].imshow(heatmap, cmap="jet", alpha=0.45, vmin=0, vmax=1)
+    axes[1].plot(x_arg, y_arg, "x", color="white", markersize=14, markeredgewidth=3)
+    axes[1].set_title(f"Heatmap overlay\nargmax (white x)")
+    axes[1].axis("off")
+
+    # 3. Heatmap alone with mask outline + argmax
+    axes[2].imshow(heatmap, cmap="jet", vmin=0, vmax=1)
+    if lesion_mask is not None:
+        axes[2].contour(lesion_mask, levels=[0.5], colors="lime", linewidths=2)
+    axes[2].plot(x_arg, y_arg, "x", color="black", markersize=14, markeredgewidth=3)
+    title_3 = "Heatmap + lesion (green) + argmax (black)" if lesion_mask is not None else "Heatmap + argmax"
+    axes[2].set_title(title_3)
+    axes[2].axis("off")
+
+    # 4. Top-3 concept bar chart
+    names  = [t[0][:30] for t in top3]
+    scores = [t[1] for t in top3]
+    colors = ["steelblue" if s >= 0 else "tomato" for s in scores]
+    axes[3].barh(names[::-1], scores[::-1], color=colors[::-1])
+    axes[3].axvline(0, color="black", linewidth=0.8)
+    axes[3].set_xlim(-1, 1)
+    axes[3].set_xlabel("cosine similarity")
+    axes[3].set_title("Top-3 concepts")
+
+    fig.suptitle(title, fontsize=12, fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ── Iterate raw eval records and regenerate heatmaps ────────────────
+n_saved = 0
+for class_name, recs in eval_data["raw"].items():
+    out_dir = OUT_ROOT / class_name.replace(" ", "_")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for rec in recs:
+        # Rebuild input
+        if DATASET == "busi":
+            # Find the index in full_ds.items
+            global_idx = next(
+                (i for i, (p, _) in enumerate(full_ds.items)
+                 if os.path.basename(p) == rec["image_id"]),
+                None,
+            )
+            if global_idx is None:
+                print(f"  Could not locate {rec['image_id']}")
+                continue
+            img_tensor, _ = full_ds[global_idx]
+            img_tensor = img_tensor.unsqueeze(0).to(device)
+            image_path = full_ds.items[global_idx][0]
+            raw = Image.open(image_path).convert("RGB").resize((300, 300))
+            img_np = np.array(raw)
+            lesion_mask = load_busi_lesion_mask(image_path)
+        else:
+            # DR: image_id is "dr_idxNNNN" — pull that index from val_idx via dataloader
+            idx_in_val = int(rec["image_id"].replace("dr_idx", ""))
+            from torch.utils.data import DataLoader, Subset
+            sub = Subset(full_ds, [val_idx[idx_in_val]])
+            x, _ = next(iter(DataLoader(sub, batch_size=1)))
+            if x.shape[1] == 1:
+                x = x.repeat(1, 3, 1, 1)
+            img_tensor = x.to(device)
+            img_np = x.squeeze().permute(1, 2, 0).cpu().numpy()
+            if img_np.shape[-1] == 1:
+                img_np = np.repeat(img_np, 3, axis=-1)
+            lesion_mask = None
+
+        # Recompute heatmap
+        pipe.concept_explainer.embeddings = aligned_vecs
+        result = pipe.explain(img_tensor)
+        heatmap = result["heatmap"]
+
+        # Top-3 from saved scores
+        sorted_scores = sorted(rec["all_scores"].items(), key=lambda kv: kv[1], reverse=True)
+        top3 = sorted_scores[:3]
+
+        title = (f"{class_name} | {rec['image_id']}  |  predicted: {rec['predicted_class']}  "
+                 f"(reg={rec['regression']:.2f})")
+        if rec.get("pointing_hit") is not None:
+            title += f"  |  pointing={'HIT' if rec['pointing_hit'] else 'MISS'}, IoU={rec['iou_top20']:.2f}"
+
+        out_path = out_dir / f"{rec['image_id'].replace('.png','')}.png"
+        make_diagnostic(img_np, heatmap, lesion_mask, rec["argmax_yx"], top3, title, out_path)
+        n_saved += 1
+
+    print(f"  {class_name}: {len(recs)} diagnostics saved -> {out_dir}")
+
+print(f"\nTotal diagnostics: {n_saved}")
+print(f"Browse them: paper_figures_FINAL/full_eval/{DATASET}/diagnostics/")
+---- OUTPUT ----
+  Normal: 10 diagnostics saved -> paper_figures_FINAL/full_eval/busi/diagnostics/Normal
+  Benign: 10 diagnostics saved -> paper_figures_FINAL/full_eval/busi/diagnostics/Benign
+  Malignant: 10 diagnostics saved -> paper_figures_FINAL/full_eval/busi/diagnostics/Malignant
+
+Total diagnostics: 30
+Browse them: paper_figures_FINAL/full_eval/busi/diagnostics/
+
+
+==== CELL 83 code ====
+# ── Check Moderate vs Severe gap across all 10 Moderate images ──
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+
+dr_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_dr_g01
+
+_dr_ds = full_dr_ds if 'full_dr_ds' in dir() else dr_full_ds
+val_idx_dr = folds_dr[0][1][:1500]
+loader = DataLoader(Subset(_dr_ds, val_idx_dr), batch_size=1, shuffle=False)
+
+moderate_concepts = ["dot and blot hemorrhages", "hard exudates", "cotton wool spots"]
+severe_concepts   = ["venous beading", "intraretinal microvascular abnormalities"]
+
+print(f"{'val_pos':<10}{'best_moderate':>18}{'best_severe':>15}{'gap':>10}")
+print("-" * 53)
+
+n_found = 0
+for i, (x, y) in enumerate(loader):
+    if y.item() != 2:
+        continue
+    if n_found >= 10:
+        break
+    n_found += 1
+    if x.shape[1] == 1:
+        x = x.repeat(1, 3, 1, 1)
+    x_dev = x.to(device)
+    
+    explain_model_dr_g01.eval()
+    with torch.no_grad():
+        feat = F.normalize(explain_model_dr_g01(x_dev)[0], dim=-1).squeeze(0)
+    scores = dr_pipeline_aligned_g01.concept_explainer.scores(feat)
+    
+    best_mod = max(scores[c] for c in moderate_concepts)
+    best_sev = max(scores[c] for c in severe_concepts)
+    gap = best_sev - best_mod
+    
+    print(f"{i:<10}{best_mod:>+18.4f}{best_sev:>+15.4f}{gap:>+10.4f}")
+---- OUTPUT ----
+val_pos        best_moderate    best_severe       gap
+-----------------------------------------------------
+18                   +0.6457        +0.9054   +0.2597
+19                   +0.6254        +0.9368   +0.3114
+24                   +0.3917        +0.9778   +0.5862
+25                   +0.4068        +0.9867   +0.5799
+30                   +0.8266        +0.0175   -0.8091
+31                   +0.7709        -0.0520   -0.8229
+49                   +0.6922        -0.0613   -0.7535
+74                   +0.3995        +0.9668   +0.5673
+75                   +0.5054        +0.9964   +0.4910
+78                   +0.9373        +0.2191   -0.7182
+
+
+==== CELL 85 code ====
+# ═══════════════════════════════════════════════════════════════════════
+# CELL 8 (patched) — BUSI per-(class, concept-group) cross-similarity matrix
+# ═══════════════════════════════════════════════════════════════════════
+import json
+import torch
+import torch.nn.functional as F
+import numpy as np
+from pathlib import Path
+from torch.utils.data import DataLoader, Subset
+
+OUT_PATH = Path("paper_figures_FINAL/busi/concept_cross_matrix.json")
+OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+BUSI_CONCEPT_CLASS = {
+    0: "Normal", 1: "Normal",
+    2: "Benign", 3: "Benign", 4: "Benign", 5: "Benign",
+    6: "Malignant", 7: "Malignant", 8: "Malignant", 9: "Malignant",
+}
+CLASS_NAMES = ["Normal", "Benign", "Malignant"]
+CLASS_IDX   = {"Normal": 0, "Benign": 1, "Malignant": 2}
+
+# Validation embeddings
+VAL_IDX_BUSI = folds_busi[0][1]
+val_subset = Subset(full_busi_ds, VAL_IDX_BUSI)
+loader = DataLoader(val_subset, batch_size=16, shuffle=False, num_workers=0)
+
+model = busi_pipeline_aligned_g01.layercam.model.eval().to(device)
+
+all_embeds, all_labels = [], []
+with torch.no_grad():
+    for imgs, lbls in loader:
+        imgs = imgs.to(device)
+        out = model(imgs)             # tuple of 5
+        z = out[0]                    # (B, 1280) — the image embedding
+        z = F.normalize(z, dim=1)
+        all_embeds.append(z.cpu())
+        all_labels.append(lbls)
+embeds = torch.cat(all_embeds, dim=0)
+labels = torch.cat(all_labels, dim=0).numpy()
+print(f"Validation embeddings: {embeds.shape}, classes: {np.bincount(labels)}")
+
+# Aligned concept vectors (γ=0.1)
+concept_vecs = F.normalize(aligned_vecs_busi_g01.cpu(), dim=1)  # (10, 1280)
+
+# Image-by-concept cosine similarity
+sim = embeds @ concept_vecs.T  # (N, 10)
+
+# Group concepts by class and average
+concept_groups = {"Normal": [], "Benign": [], "Malignant": []}
+for c_idx, cls in BUSI_CONCEPT_CLASS.items():
+    concept_groups[cls].append(c_idx)
+
+matrix = {}
+for test_cls in CLASS_NAMES:
+    test_mask = labels == CLASS_IDX[test_cls]
+    if test_mask.sum() == 0:
+        continue
+    test_sims = sim[test_mask]
+    matrix[test_cls] = {
+        cg: test_sims[:, concept_groups[cg]].mean().item()
+        for cg in CLASS_NAMES
+    }
+
+with open(OUT_PATH, "w") as f:
+    json.dump({"matrix": matrix, "fold": 0, "gamma": 0.1}, f, indent=2)
+
+# Print
+print(f"\n{'='*70}")
+print(f"BUSI (test-class × concept-group) mean cosine similarity, γ=0.1")
+print(f"{'='*70}")
+hdr = f"{'':<18s}" + "".join(f"{cg+' concepts':>17s}" for cg in CLASS_NAMES)
+print(hdr); print("-" * len(hdr))
+for tc in CLASS_NAMES:
+    n = (labels == CLASS_IDX[tc]).sum()
+    row = f"{tc+' images':<18s}"
+    for cg in CLASS_NAMES:
+        v = matrix[tc][cg]
+        mark = "*" if cg == tc else " "
+        row += f"{v:>+16.3f}{mark}"
+    row += f"   (n={n})"
+    print(row)
+print(f"\nSaved: {OUT_PATH}")
+---- OUTPUT ----
+Validation embeddings: torch.Size([156, 1280]), classes: [27 87 42]
+
+======================================================================
+BUSI (test-class × concept-group) mean cosine similarity, γ=0.1
+======================================================================
+                    Normal concepts  Benign conceptsMalignant concepts
+----------------------------------------------------------------------
+Normal images               +0.899*          -0.203           -0.206    (n=27)
+Benign images               -0.215           +0.931*          -0.003    (n=87)
+Malignant images            -0.264           +0.041           +0.919*   (n=42)
+
+Saved: paper_figures_FINAL/busi/concept_cross_matrix.json
+
+
+==== CELL 87 code ====
+# ═══════════════════════════════════════════════════════════════════════
+# CELL 2 — Generate blind + named per-concept panels for the LLM quiz
+# Produces:
+#   paper_figures_FINAL/llm_quiz_panels/{busi,dr}/case_NNN__{class}__{img_id}/
+#     original.png
+#     ground_truth.json
+#     named/NN__concept_name.png        (one panel per concept, with concept name title)
+#     blind/panel_NN.png                (same panel, NO concept name visible)
+#     grid_named.png                    (full grid for disease-classification call)
+#   paper_figures_FINAL/llm_quiz_panels/manifest.json
+# ═══════════════════════════════════════════════════════════════════════
+import os, json, re
+import numpy as np
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from pathlib import Path
+from PIL import Image
+from torch.utils.data import DataLoader, Subset
+from explainability import LayerCAM, _ultrasound_mask, _fundus_mask
+from scipy.ndimage import gaussian_filter
+
+# ── Output root ────────────────────────────────────────────────────
+QUIZ_ROOT = Path("paper_figures_FINAL/llm_quiz_panels")
+QUIZ_ROOT.mkdir(parents=True, exist_ok=True)
+
+# ── How many cases per class ───────────────────────────────────────
+# Total cases = (BUSI: 3 classes × N) + (DR: 5 classes × N)
+# At N=2 we get 6 BUSI + 10 DR = 16 cases × ~10 panels = ~160 panels per LLM
+N_PER_CLASS = 2
+
+# ── Soft-mask sigma for display (matches your make_diagnostic fix) ─
+VIS_MASK_SIGMA = 9.0
+
+# ──────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────
+
+def safe_name(s):
+    """Sanitise a concept name into a filename-safe slug."""
+    s = s.lower().replace(" ", "_").replace("/", "_")
+    return re.sub(r"[^a-z0-9_]", "", s)
+
+def soft_mask_for_display(img_np, dataset):
+    """Same soft-mask logic that fixed your diagnostic figures."""
+    if dataset == "busi":
+        hard = _ultrasound_mask(img_np)
+    elif dataset == "dr":
+        hard = _fundus_mask(img_np)
+    else:
+        return None
+    soft = gaussian_filter(hard.astype(np.float32), sigma=VIS_MASK_SIGMA)
+    if soft.max() > 0:
+        soft = soft / soft.max()
+    return soft
+
+def save_original(img_np, out_path):
+    """Save the original image (no overlay)."""
+    img_uint8 = (img_np * 255).astype(np.uint8) if img_np.dtype != np.uint8 else img_np
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.imshow(img_uint8)
+    ax.axis("off")
+    fig.tight_layout(pad=0)
+    fig.savefig(out_path, dpi=140, bbox_inches="tight", pad_inches=0)
+    plt.close(fig)
+
+def save_panel(img_np, heatmap, soft_mask, concept_name, score,
+               out_path, blind=False):
+    """Save one concept panel.
+       If blind=True, no concept name and no score are visible."""
+    if soft_mask is not None:
+        h = heatmap * soft_mask
+    else:
+        h = heatmap.copy()
+    if h.max() > h.min():
+        h = (h - h.min()) / (h.max() - h.min() + 1e-8)
+
+    img_uint8 = (img_np * 255).astype(np.uint8) if img_np.dtype != np.uint8 else img_np
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.imshow(img_uint8)
+    ax.imshow(h, cmap="jet", alpha=0.45, vmin=0, vmax=1)
+    ax.axis("off")
+    if not blind:
+        ax.set_title(f"{concept_name}\nsim={score:+.2f}", fontsize=11)
+    fig.tight_layout(pad=0)
+    fig.savefig(out_path, dpi=140, bbox_inches="tight", pad_inches=0.02)
+    plt.close(fig)
+
+def save_grid_named(img_np, heatmaps, scores, concepts, soft_mask,
+                    out_path, suptitle):
+    """Full named grid — used as input for the disease-classification call."""
+    n = len(concepts)
+    ncols = min(5, n)
+    nrows = (n + ncols - 1) // ncols
+    img_uint8 = (img_np * 255).astype(np.uint8) if img_np.dtype != np.uint8 else img_np
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.2*ncols, 3.2*nrows))
+    axes = np.array(axes).flatten()
+    for i, (concept, hmap) in enumerate(zip(concepts, heatmaps)):
+        h = hmap * soft_mask if soft_mask is not None else hmap.copy()
+        if h.max() > h.min():
+            h = (h - h.min()) / (h.max() - h.min() + 1e-8)
+        axes[i].imshow(img_uint8)
+        axes[i].imshow(h, cmap="jet", alpha=0.45, vmin=0, vmax=1)
+        axes[i].set_title(f"{concept}\nsim={scores[concept]:+.2f}", fontsize=9)
+        axes[i].axis("off")
+    for j in range(n, len(axes)):
+        axes[j].axis("off")
+
+    plt.suptitle(suptitle, fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+# ──────────────────────────────────────────────────────────────────
+# Per-dataset case generator
+# ──────────────────────────────────────────────────────────────────
+
+def generate_cases(dataset, pipe, aligned_vecs, explain_model, full_ds,
+                   val_idx, class_names, n_per_class, out_root):
+    pipe.concept_explainer.embeddings = aligned_vecs
+    concepts = pipe.concept_explainer.concepts
+
+    cases_done = []
+    counts = {c: 0 for c in class_names}
+    case_counter = 0
+
+    if dataset == "busi":
+        # iterate using full_ds.items (we have file paths)
+        iterator = []
+        for global_idx in val_idx:
+            image_path, label = full_ds.items[global_idx]
+            class_name = class_names[label]
+            if counts[class_name] >= n_per_class:
+                continue
+            counts[class_name] += 1
+            iterator.append((global_idx, image_path, class_name))
+            if all(counts[c] >= n_per_class for c in class_names):
+                break
+
+    else:  # dr
+        loader = DataLoader(Subset(full_ds, val_idx), batch_size=1, shuffle=False)
+        iterator = []
+        for i, (x, y) in enumerate(loader):
+            label = int(y.item())
+            class_name = class_names[label]
+            if counts[class_name] >= n_per_class:
+                continue
+            counts[class_name] += 1
+            iterator.append((i, x, class_name))
+            if all(counts[c] >= n_per_class for c in class_names):
+                break
+
+    print(f"\n[{dataset.upper()}] {len(iterator)} cases to generate")
+
+    for entry in iterator:
+        case_counter += 1
+        if dataset == "busi":
+            global_idx, image_path, class_name = entry
+            img_id = os.path.splitext(os.path.basename(image_path))[0].replace(" ", "_")
+            img_tensor, _ = full_ds[global_idx]
+            img_tensor = img_tensor.unsqueeze(0).to(device)
+            raw = Image.open(image_path).convert("RGB").resize((300, 300))
+            img_np = np.array(raw).astype(np.float32) / 255.0
+        else:
+            i, x, class_name = entry
+            if x.shape[1] == 1:
+                x = x.repeat(1, 3, 1, 1)
+            img_tensor = x.to(device)
+            img_np = x.squeeze().permute(1, 2, 0).cpu().numpy()
+            if img_np.shape[-1] == 1:
+                img_np = np.repeat(img_np, 3, axis=-1)
+            img_id = f"dr_idx{i:04d}"
+
+        case_slug = f"case_{case_counter:03d}__{safe_name(class_name)}__{safe_name(img_id)}"
+        case_dir = out_root / dataset / case_slug
+        (case_dir / "named").mkdir(parents=True, exist_ok=True)
+        (case_dir / "blind").mkdir(parents=True, exist_ok=True)
+
+        # Compute concept heatmaps
+        pipe.concept_explainer.embeddings = aligned_vecs
+        result = pipe.explain(img_tensor, concept_heatmaps=True)
+        cmaps = result["concept_heatmaps"]
+
+        # Compute full concept-score dict (top_k truncates, so use scores())
+        with torch.no_grad():
+            feat = F.normalize(explain_model(img_tensor)[0], dim=-1).squeeze(0)
+        all_scores = pipe.concept_explainer.scores(feat)
+
+        soft_mask = soft_mask_for_display(img_np, dataset)
+
+        # Save original
+        save_original(img_np, case_dir / "original.png")
+
+        # Save per-concept named + blind panels
+        ground_truth = {
+            "dataset":       dataset,
+            "true_class":    class_name,
+            "image_id":      img_id,
+            "predicted_class": result["predicted_class"],
+            "regression_score": float(result["regression_score"]),
+            "panels": [],
+        }
+
+        for panel_idx, concept in enumerate(concepts):
+            score = all_scores[concept]
+            heatmap = cmaps[concept]
+            named_fname = f"{panel_idx:02d}__{safe_name(concept)}.png"
+            blind_fname = f"panel_{panel_idx:02d}.png"
+
+            save_panel(img_np, heatmap, soft_mask, concept, score,
+                       case_dir / "named" / named_fname, blind=False)
+            save_panel(img_np, heatmap, soft_mask, concept, score,
+                       case_dir / "blind" / blind_fname, blind=True)
+
+            ground_truth["panels"].append({
+                "panel_idx":        panel_idx,
+                "concept":          concept,
+                "named_filename":   f"named/{named_fname}",
+                "blind_filename":   f"blind/{blind_fname}",
+                "cosine_similarity": float(score),
+            })
+
+        # Sort panels list by score desc for convenience (but don't change panel_idx)
+        ground_truth["panels_by_score"] = sorted(
+            ground_truth["panels"], key=lambda p: p["cosine_similarity"], reverse=True
+        )
+
+        # Save full named grid (for disease-classification call)
+        suptitle = f"{dataset.upper()} | true: {class_name} | id: {img_id}"
+        save_grid_named(
+            img_np,
+            [cmaps[c] for c in concepts],
+            all_scores, concepts, soft_mask,
+            case_dir / "grid_named.png",
+            suptitle=suptitle,
+        )
+
+        with open(case_dir / "ground_truth.json", "w") as f:
+            json.dump(ground_truth, f, indent=2)
+
+        cases_done.append({
+            "case_slug":  case_slug,
+            "dataset":    dataset,
+            "true_class": class_name,
+            "image_id":   img_id,
+            "n_panels":   len(concepts),
+            "case_dir":   str(case_dir.relative_to(out_root.parent.parent)),
+        })
+
+        print(f"  [{case_counter:3d}] {class_name:<14s}  {img_id:<22s}  "
+              f"-> {case_slug}")
+
+    return cases_done
+
+# ──────────────────────────────────────────────────────────────────
+# Run BUSI
+# ──────────────────────────────────────────────────────────────────
+
+busi_class_names = ["Normal", "Benign", "Malignant"]
+busi_cases = generate_cases(
+    dataset      = "busi",
+    pipe         = busi_pipeline_aligned_g01,
+    aligned_vecs = aligned_vecs_busi_g01,
+    explain_model= explain_model_g01,
+    full_ds      = full_busi_ds,
+    val_idx      = folds_busi[0][1],
+    class_names  = busi_class_names,
+    n_per_class  = N_PER_CLASS,
+    out_root     = QUIZ_ROOT,
+)
+
+# ──────────────────────────────────────────────────────────────────
+# Run DR
+# ──────────────────────────────────────────────────────────────────
+
+dr_class_names = ["No DR", "Mild", "Moderate", "Severe", "PDR"]
+_dr_ds = full_dr_ds if 'full_dr_ds' in dir() else dr_full_ds
+dr_cases = generate_cases(
+    dataset      = "dr",
+    pipe         = dr_pipeline_aligned_g01,
+    aligned_vecs = aligned_vecs_dr_g01,
+    explain_model= explain_model_dr_g01,
+    full_ds      = _dr_ds,
+    val_idx      = folds_dr[0][1][:1500],
+    class_names  = dr_class_names,
+    n_per_class  = N_PER_CLASS,
+    out_root     = QUIZ_ROOT,
+)
+
+# ──────────────────────────────────────────────────────────────────
+# Master manifest
+# ──────────────────────────────────────────────────────────────────
+
+manifest = {
+    "n_per_class":    N_PER_CLASS,
+    "busi_concepts":  busi_pipeline_aligned_g01.concept_explainer.concepts,
+    "dr_concepts":    dr_pipeline_aligned_g01.concept_explainer.concepts,
+    "busi_classes":   busi_class_names,
+    "dr_classes":     dr_class_names,
+    "busi_cases":     busi_cases,
+    "dr_cases":       dr_cases,
+}
+
+with open(QUIZ_ROOT / "manifest.json", "w") as f:
+    json.dump(manifest, f, indent=2)
+
+# ──────────────────────────────────────────────────────────────────
+# Summary
+# ──────────────────────────────────────────────────────────────────
+
+n_busi_panels = sum(c["n_panels"] for c in busi_cases)
+n_dr_panels   = sum(c["n_panels"] for c in dr_cases)
+n_total_panels = n_busi_panels + n_dr_panels
+n_total_cases  = len(busi_cases) + len(dr_cases)
+
+print(f"\n{'='*60}")
+print(f"Cell 2 done.")
+print(f"  BUSI: {len(busi_cases)} cases × {len(busi_class_names)*0+manifest['busi_concepts'].__len__()} concepts = {n_busi_panels} panels")
+print(f"  DR:   {len(dr_cases)} cases × {manifest['dr_concepts'].__len__()} concepts = {n_dr_panels} panels")
+print(f"  Total: {n_total_cases} cases, {n_total_panels} blind panels")
+print(f"  Per-LLM call budget: {n_total_panels} panel calls + {n_total_cases} diagnosis calls = {n_total_panels + n_total_cases} per LLM")
+print(f"  3 LLMs: {(n_total_panels + n_total_cases) * 3} total calls")
+print(f"\nOutput: {QUIZ_ROOT}/")
+print(f"Master manifest: {QUIZ_ROOT}/manifest.json")
+---- OUTPUT ----
+
+[BUSI] 6 cases to generate
+  [  1] Normal          normal_(13)             -> case_001__normal__normal_13
+  [  2] Normal          normal_(130)            -> case_002__normal__normal_130
+  [  3] Benign          benign_(323)            -> case_003__benign__benign_323
+  [  4] Benign          benign_(334)            -> case_004__benign__benign_334
+  [  5] Malignant       malignant_(49)          -> case_005__malignant__malignant_49
+  [  6] Malignant       malignant_(59)          -> case_006__malignant__malignant_59
+
+[DR] 10 cases to generate
+  [  1] No DR           dr_idx0000              -> case_001__no_dr__dr_idx0000
+  [  2] No DR           dr_idx0001              -> case_002__no_dr__dr_idx0001
+  [  3] Severe          dr_idx0002              -> case_003__severe__dr_idx0002
+  [  4] Severe          dr_idx0003              -> case_004__severe__dr_idx0003
+  [  5] Mild            dr_idx0011              -> case_005__mild__dr_idx0011
+  [  6] Mild            dr_idx0017              -> case_006__mild__dr_idx0017
+  [  7] Moderate        dr_idx0018              -> case_007__moderate__dr_idx0018
+  [  8] Moderate        dr_idx0019              -> case_008__moderate__dr_idx0019
+  [  9] PDR             dr_idx0032              -> case_009__pdr__dr_idx0032
+  [ 10] PDR             dr_idx0033              -> case_010__pdr__dr_idx0033
+
+============================================================
+Cell 2 done.
+  BUSI: 6 cases × 10 concepts = 60 panels
+  DR:   10 cases × 11 concepts = 110 panels
+  Total: 16 cases, 170 blind panels
+  Per-LLM call budget: 170 panel calls + 16 diagnosis calls = 186 per LLM
+  3 LLMs: 558 total calls
+
+Output: paper_figures_FINAL/llm_quiz_panels/
+Master manifest: paper_figures_FINAL/llm_quiz_panels/manifest.json
+
+
+==== CELL 98 code ====
+# ── Regenerate DR figures with class labels in titles ────────────────
+import os
+import torch
+import numpy as np
+
+# DR PDR case (the primary figure)
+dr_pdr_dir = "figures/validation/dr/gamma_01/fold1_idx32_pdr"
+_dr_ds = full_dr_ds if 'full_dr_ds' in dir() else dr_full_ds
+VAL_IDX_DR = folds_dr[0][1][:1500]
+single_loader = DataLoader(Subset(_dr_ds, VAL_IDX_DR), batch_size=1, shuffle=False)
+
+x_pdr = None
+for i, (x, y) in enumerate(single_loader):
+    if i == 32:
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+        x_pdr = x.to(device)
+        break
+
+if x_pdr is not None:
+    img_np = x_pdr.squeeze().permute(1, 2, 0).cpu().numpy()
+    if img_np.shape[-1] == 1:
+        img_np = np.repeat(img_np, 3, axis=-1)
+    
+    dr_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_dr_g01
+    
+    # Single-image figure
+    result = dr_pipeline_aligned_g01.explain(x_pdr)
+    dr_pipeline_aligned_g01.visualize(
+        img_np, result,
+        save_path=os.path.join(dr_pdr_dir, "04_AFTER_alignment_single.png"),
+        show=False,
+    )
+    
+    # Concept grid
+    dr_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_dr_g01
+    result_h = dr_pipeline_aligned_g01.explain(x_pdr, concept_heatmaps=True)
+    dr_pipeline_aligned_g01.visualize(
+        img_np, result_h,
+        save_path=os.path.join(dr_pdr_dir, "04_AFTER_alignment_single.png"),
+        show=False,
+    )
+    print(f"  Regenerated PDR figures with class label")
+
+# Same for Severe NPDR
+dr_npdr_dir = "figures/validation/dr/gamma_01/fold1_idx2_severe_npdr"
+single_loader = DataLoader(Subset(_dr_ds, VAL_IDX_DR), batch_size=1, shuffle=False)
+
+x_npdr = None
+for i, (x, y) in enumerate(single_loader):
+    if i == 2:
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+        x_npdr = x.to(device)
+        break
+
+if x_npdr is not None:
+    img_np = x_npdr.squeeze().permute(1, 2, 0).cpu().numpy()
+    if img_np.shape[-1] == 1:
+        img_np = np.repeat(img_np, 3, axis=-1)
+    
+    dr_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_dr_g01
+    
+    result = dr_pipeline_aligned_g01.explain(x_npdr)
+    dr_pipeline_aligned_g01.visualize(
+        img_np, result,
+        save_path=os.path.join(dr_npdr_dir, "04_AFTER_alignment_single.png"),
+        show=False,
+    )
+    
+    dr_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_dr_g01
+    result_h = dr_pipeline_aligned_g01.explain(x_npdr, concept_heatmaps=True)
+    dr_pipeline_aligned_g01.visualize(
+        img_np, result_h,
+        save_path=os.path.join(dr_npdr_dir, "04_AFTER_alignment_single.png"),
+        show=False,
+    )
+    print(f"  Regenerated Severe NPDR figures with class label")
+
+# BUSI Malignant case (regenerate too for consistency)
+busi_dir = "figures/validation/busi/gamma_01/fold1_idx114_malignant"
+busi_loader = DataLoader(Subset(full_busi_ds, folds_busi[0][1]), batch_size=1, shuffle=False)
+
+x_mal = None
+for i, (x, y) in enumerate(busi_loader):
+    if i == 114:
+        x_mal = x.to(device)
+        break
+
+if x_mal is not None:
+    img_np = x_mal.squeeze().permute(1, 2, 0).cpu().numpy()
+    
+    busi_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_busi_g01
+    
+    result = busi_pipeline_aligned_g01.explain(x_mal)
+    busi_pipeline_aligned_g01.visualize(
+        img_np, result,
+        save_path=os.path.join(busi_dir, "04_AFTER_alignment_single.png"),
+        show=False,
+    )
+    
+    busi_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_busi_g01
+    result_h = busi_pipeline_aligned_g01.explain(x_mal, concept_heatmaps=True)
+    busi_pipeline_aligned_g01.visualize(
+        img_np, result_h,
+        save_path=os.path.join(busi_dir, "04_AFTER_alignment_single.png"),
+        show=False,
+    )
+    print(f"  Regenerated BUSI figures with class label")
+
+print("\nAll figures regenerated with disease class labels.")
+print("Now re-copy to paper_figures_FINAL/ to update the locked set.")
+
+==== CELL 99 code ====
+import shutil, os
+
+PAPER_FIGURES = "paper_figures_FINAL"
+os.makedirs(PAPER_FIGURES, exist_ok=True)
+
+# ── BUSI ─────────────────────────────────────────────────────────────
+busi_src = "figures/validation/busi/gamma_01/fold1_idx114_malignant"
+busi_dst = os.path.join(PAPER_FIGURES, "busi")
+os.makedirs(busi_dst, exist_ok=True)
+
+for fname in [
+    "02_BEFORE_alignment_single.png",
+    "02_BEFORE_alignment_single_concepts.png",
+    "04_AFTER_alignment_single.png",
+    "04_AFTER_alignment_single_concepts.png",
+    "05_AFTER_localisation_diagnostic_patched.png",
+    "metadata.json",
+]:
+    src = os.path.join(busi_src, fname)
+    if os.path.isfile(src):
+        shutil.copy(src, busi_dst)
+        print(f"  busi/{fname}")
+
+# BUSI tables
+busi_tables_dst = os.path.join(busi_dst, "tables")
+shutil.copytree("figures/validation/busi/gamma_01/tables",
+                busi_tables_dst, dirs_exist_ok=True)
+print(f"  busi/tables/  copied")
+
+# ── DR primary (PDR) ─────────────────────────────────────────────────
+dr_pdr_src = "figures/validation/dr/gamma_01/fold1_idx32_pdr"
+dr_pdr_dst = os.path.join(PAPER_FIGURES, "dr_primary_pdr")
+os.makedirs(dr_pdr_dst, exist_ok=True)
+
+for fname in [
+    "04_AFTER_alignment_single.png",
+    "04_AFTER_alignment_single_concepts.png",
+    "metadata.json",
+]:
+    src = os.path.join(dr_pdr_src, fname)
+    if os.path.isfile(src):
+        shutil.copy(src, dr_pdr_dst)
+        print(f"  dr_primary_pdr/{fname}")
+
+# Fallback for files saved as 03_ instead of 04_
+src_03 = os.path.join(dr_pdr_src, "03_AFTER_alignment_single.png")
+dst_04 = os.path.join(dr_pdr_dst, "04_AFTER_alignment_single.png")
+if os.path.isfile(src_03) and not os.path.isfile(dst_04):
+    shutil.copy(src_03, dst_04)
+    print(f"  dr_primary_pdr/04_AFTER_alignment_single.png  (renamed from 03)")
+
+# ── DR secondary (Severe NPDR) ───────────────────────────────────────
+dr_npdr_src = "figures/validation/dr/gamma_01/fold1_idx2_severe_npdr"
+dr_npdr_dst = os.path.join(PAPER_FIGURES, "dr_secondary_severe_npdr")
+os.makedirs(dr_npdr_dst, exist_ok=True)
+
+for fname in os.listdir(dr_npdr_src):
+    src = os.path.join(dr_npdr_src, fname)
+    if os.path.isfile(src):
+        shutil.copy(src, dr_npdr_dst)
+        print(f"  dr_secondary_severe_npdr/{fname}")
+
+# ── DR tables ────────────────────────────────────────────────────────
+dr_tables_dst = os.path.join(PAPER_FIGURES, "dr_tables")
+shutil.copytree("figures/validation/dr/gamma_01/tables",
+                dr_tables_dst, dirs_exist_ok=True)
+print(f"  dr_tables/  copied")
+
+# ── Final inventory ──────────────────────────────────────────────────
+print("\n" + "="*60)
+print(f"Final {PAPER_FIGURES}/ contents:")
+print("="*60)
+for root, dirs, files in os.walk(PAPER_FIGURES):
+    rel = os.path.relpath(root, PAPER_FIGURES)
+    indent = "  " * (rel.count(os.sep) + (0 if rel == "." else 1))
+    print(f"{indent}{os.path.basename(root) if rel != '.' else PAPER_FIGURES}/")
+    for f in sorted(files):
+        size_kb = os.path.getsize(os.path.join(root, f)) / 1024
+        print(f"{indent}  {size_kb:>7.1f} KB   {f}")
+
+n_files = sum(len(files) for _, _, files in os.walk(PAPER_FIGURES))
+n_bytes = sum(os.path.getsize(os.path.join(r, f))
+              for r, _, fs in os.walk(PAPER_FIGURES) for f in fs)
+print(f"\nTotal: {n_files} files, {n_bytes / 1024 / 1024:.1f} MB")
+
+==== CELL 102 code ====
+# ── 18. Summary ──────────────────────────────────────────────────────
+ROOT = "figures/validation"
+print(f"\nAll outputs in {ROOT}/:\n")
+for dirpath, dirnames, filenames in os.walk(ROOT):
+    rel = os.path.relpath(dirpath, ROOT)
+    indent = "  " * (rel.count(os.sep) + (0 if rel == "." else 1))
+    print(f"{indent}{os.path.basename(dirpath) if rel != '.' else ROOT}/")
+    for f in sorted(filenames):
+        full = os.path.join(dirpath, f)
+        size = os.path.getsize(full)
+        print(f"{indent}  {size:>9,d} B   {f}")
+
+print(f"\n{'='*60}")
+print("VALIDATION COMPLETE")
+print(f"{'='*60}")
+print("Things to check:")
+print("  - busi/gamma_01/fold1_idx*_malignant/01_BEFORE_*_concepts.png")
+print("    All 10 panels should look identical, scores ~0.00-0.04")
+print("  - busi/gamma_01/fold1_idx*_malignant/04_AFTER_*_concepts.png")
+print("    Top row: low-score (Normal/Benign concepts)")
+print("    Bottom row: high-score Malignant concepts (~0.96-0.97)")
+print("  - busi/gamma_01/tables/concept_table_PRE.csv")
+print("    Should look like the paper's Table 5 (~zero margin)")
+print("  - busi/gamma_01/tables/localisation_metrics.csv")
+print("    Pointing accuracy ~0.05, mean IoU ~0.13")
+print("  - dr/gamma_01/fold1_idx*_severe*/04_AFTER_*_concepts.png")
+print("    venous beading + IRMA should score highest")
+print(f"{'='*60}")
+
+==== CELL 103 markdown ====
+## 19. Quantitative results for slides (run after all pipelines are built)
+
+These cells produce the large-scale quantitative evidence: per-concept correctness across the FULL validation fold (not 10 images), a concept-confusion matrix, the full-fold localization table, and multi-case figure grids. Everything saves to `paper_figures_FINAL/quant/` for the slides.
+
+Prerequisite (already defined by the cells above):
+BUSI: explain_model_g01, busi_pipeline_aligned_g01, aligned_vecs_busi_PUSH, full_busi_ds, folds_busi, BUSI_CLASS_CONCEPTS.
+DR: explain_model_dr_g01, dr_pipeline_aligned_g01, dr_push_vecs, CLASS_CONCEPTS_DR, folds_dr, _dr_ds.
+
+==== CELL 104 code ====
+# == 19.1  Per-concept correctness across the FULL validation fold ==
+import numpy as np, torch, json, os
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+os.makedirs("paper_figures_FINAL/quant", exist_ok=True)
+
+def per_concept_stats(model, ds, val_idx, concepts, class_concepts, vecs):
+    model.eval()
+    V = vecs.to(device); Cn = V.shape[0]
+    top1_hits=np.zeros(Cn); grade_imgs=np.zeros(Cn)
+    sim_sum=np.zeros(Cn); sim_n=np.zeros(Cn); rank_sum=np.zeros(Cn)
+    cgrade={}
+    for g,idxs in class_concepts.items():
+        for j in idxs: cgrade[j]=g
+    ld=DataLoader(Subset(ds,val_idx),batch_size=32,shuffle=False,num_workers=0)
+    with torch.no_grad():
+        for imgs,labs in ld:
+            if imgs.shape[1]==1: imgs=imgs.repeat(1,3,1,1)
+            f=F.normalize(model(imgs.to(device))[0],dim=-1)
+            sims=(f@V.T).cpu().numpy(); top1=sims.argmax(1); order=(-sims).argsort(1)
+            for bi,lab in enumerate(labs.numpy().tolist()):
+                for j in class_concepts[lab]:
+                    grade_imgs[j]+=1; sim_sum[j]+=sims[bi,j]; sim_n[j]+=1
+                    rank_sum[j]+=int(np.where(order[bi]==j)[0][0])+1
+                    if top1[bi]==j: top1_hits[j]+=1
+    rows=[]
+    for j in range(Cn):
+        if grade_imgs[j]>0:
+            rows.append(dict(concept=concepts[j], grade=cgrade.get(j,-1),
+                n=int(grade_imgs[j]), top1=round(top1_hits[j]/grade_imgs[j],3),
+                mean_sim=round(sim_sum[j]/sim_n[j],3), mean_rank=round(rank_sum[j]/sim_n[j],2)))
+    return rows
+
+dr_rows=per_concept_stats(explain_model_dr_g01,_dr_ds,folds_dr[0][1],
+    dr_pipeline_aligned_g01.concept_explainer.concepts, CLASS_CONCEPTS_DR, dr_push_vecs[0.0])
+busi_rows=per_concept_stats(explain_model_g01,full_busi_ds,folds_busi[0][1],
+    busi_pipeline_aligned_g01.concept_explainer.concepts, BUSI_CLASS_CONCEPTS, aligned_vecs_busi_PUSH)
+
+for name,rows in [("DR",dr_rows),("BUSI",busi_rows)]:
+    print("\n=== %s per-concept (full fold) ===" % name)
+    print("%-42s%4s%6s%7s%7s%6s" % ("concept","grd","n","top1","sim","rank"))
+    for r in rows:
+        print("%-42s%4d%6d%7.2f%7.2f%6.1f" % (r["concept"][:40],r["grade"],r["n"],r["top1"],r["mean_sim"],r["mean_rank"]))
+json.dump({"dr":dr_rows,"busi":busi_rows},open("paper_figures_FINAL/quant/per_concept.json","w"),indent=2)
+print("\nsaved paper_figures_FINAL/quant/per_concept.json")
+
+---- OUTPUT ----
+
+=== DR per-concept (full fold) ===
+concept                                    grd     n   top1    sim  rank
+normal retina with no apparent lesions       0  2572   0.49   0.94   2.4
+healthy fundus without microaneurysms        0  2572   0.07   0.94   2.4
+microaneurysms                               1   230   0.36   0.91   2.7
+dot and blot hemorrhages                     2   548   0.09   0.77   4.2
+hard exudates                                2   548   0.08   0.77   4.0
+cotton wool spots                            2   548   0.14   0.77   4.1
+venous beading                               3    88   0.35   0.83   2.7
+intraretinal microvascular abnormalities     3    88   0.42   0.84   2.4
+neovascularization                           4    76   0.37   0.67   4.7
+preretinal hemorrhage                        4    76   0.00   0.67   4.4
+vitreous hemorrhage                          4    76   0.21   0.68   4.2
+
+=== BUSI per-concept (full fold) ===
+concept                                    grd     n   top1    sim  rank
+no mass                                      0    27   0.37   0.90   2.0
+no distortion                                0    27   0.56   0.90   1.9
+oval shape                                   1    87   0.00   0.78   3.2
+circumscribed margin                         1    87   0.12   0.77   3.1
+parallel orientation                         1    87   0.38   0.79   2.1
+posterior enhancement                        1    87   0.49   0.80   1.7
+irregular shape                              2    42   0.07   0.79   3.3
+spiculated margins                           2    42   0.50   0.74   2.5
+nonparallel orientation                      2    42   0.00   0.77   3.0
+posterior acoustic shadowing                 2    42   0.36   0.80   2.4
+
+saved paper_figures_FINAL/quant/per_concept.json
+
+
+==== CELL 106 code ====
+# == 19.3  Concept-confusion matrix (which concept wins, by true grade) ==
+import numpy as np, torch, matplotlib.pyplot as plt
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+
+def concept_confusion(model, ds, val_idx, n_classes, vecs):
+    model.eval(); V=vecs.to(device); Cn=V.shape[0]
+    M=np.zeros((n_classes,Cn))
+    ld=DataLoader(Subset(ds,val_idx),batch_size=32,shuffle=False,num_workers=0)
+    with torch.no_grad():
+        for imgs,labs in ld:
+            if imgs.shape[1]==1: imgs=imgs.repeat(1,3,1,1)
+            f=F.normalize(model(imgs.to(device))[0],dim=-1)
+            t1=(f@V.T).argmax(1).cpu().numpy()
+            for lab,t in zip(labs.numpy(),t1): M[int(lab),t]+=1
+    return M/M.sum(1,keepdims=True).clip(min=1)
+
+for name,model,ds,vi,concepts,nc,vecs,grades in [
+    ("DR",explain_model_dr_g01,_dr_ds,folds_dr[0][1],
+       dr_pipeline_aligned_g01.concept_explainer.concepts,5,dr_push_vecs[0.0],
+       ["No DR","Mild","Moderate","Severe","PDR"]),
+    ("BUSI",explain_model_g01,full_busi_ds,folds_busi[0][1],
+       busi_pipeline_aligned_g01.concept_explainer.concepts,3,aligned_vecs_busi_PUSH,
+       ["Normal","Benign","Malignant"])]:
+    M=concept_confusion(model,ds,vi,nc,vecs)
+    fig,ax=plt.subplots(figsize=(0.5*len(concepts)+2,0.5*nc+2))
+    im=ax.imshow(M,cmap="Blues",vmin=0,vmax=1,aspect="auto")
+    ax.set_xticks(range(len(concepts))); ax.set_xticklabels([c[:18] for c in concepts],rotation=55,ha="right",fontsize=8)
+    ax.set_yticks(range(nc)); ax.set_yticklabels(grades,fontsize=9)
+    ax.set_xlabel("top-1 concept chosen"); ax.set_ylabel("true grade")
+    ax.set_title("%s: which concept wins, by true grade (row-normalized)"%name,fontsize=11)
+    for r in range(nc):
+        for cc in range(len(concepts)):
+            if M[r,cc]>=0.08:
+                ax.text(cc,r,"%.2f"%M[r,cc],ha="center",va="center",fontsize=7,
+                        color="white" if M[r,cc]>0.5 else "black")
+    plt.colorbar(im,fraction=0.025); plt.tight_layout()
+    p="paper_figures_FINAL/quant/confusion_%s.png"%name.lower()
+    fig.savefig(p,dpi=150,bbox_inches="tight"); plt.show(); print("saved",p)
+
+---- OUTPUT ----
+saved paper_figures_FINAL/quant/confusion_dr.png
+saved paper_figures_FINAL/quant/confusion_busi.png
+
+
+==== CELL 107 code ====
+# == 19.4  Multi-case concept-heatmap grid (BUSI, many images not 1) ==
+import numpy as np, torch, matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, Subset
+from explainability import LayerCAM, _ultrasound_mask
+busi_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_busi_PUSH
+
+N_PER_CLASS=4
+show_concepts=["spiculated margins","posterior acoustic shadowing","circumscribed margin","oval shape"]
+picks={1:[],2:[]}
+ld=DataLoader(Subset(full_busi_ds,folds_busi[0][1]),batch_size=1,shuffle=False)
+for gi,(x,y) in zip(folds_busi[0][1],ld):
+    lab=int(y)
+    if lab in picks and len(picks[lab])<N_PER_CLASS: picks[lab].append((gi,x))
+    if all(len(v)>=N_PER_CLASS for v in picks.values()): break
+
+rows=[(gi,x,lab) for lab in (1,2) for (gi,x) in picks[lab]]
+ncol=1+len(show_concepts)
+fig,axes=plt.subplots(len(rows),ncol,figsize=(3*ncol,3*len(rows)))
+cls={1:"Benign",2:"Malignant"}
+for r,(gi,x,lab) in enumerate(rows):
+    xb=x.to(device); img=x.squeeze(0).permute(1,2,0).cpu().numpy()
+    disp=(img-img.min())/(img.max()-img.min()+1e-8); us=_ultrasound_mask(img)
+    res=busi_pipeline_aligned_g01.explain(xb,concept_heatmaps=True)
+    axes[r][0].imshow(disp); axes[r][0].set_ylabel(cls[lab],fontsize=10)
+    axes[r][0].set_xticks([]); axes[r][0].set_yticks([])
+    if r==0: axes[r][0].set_title("image",fontsize=9)
+    for cci,cn in enumerate(show_concepts):
+        hm=res["concept_heatmaps"].get(cn); ax=axes[r][cci+1]
+        if hm is not None:
+            hm=hm*us; hm=(hm-hm.min())/(hm.max()-hm.min()+1e-8)
+            ax.imshow(LayerCAM.overlay(img,hm,alpha=0.5))
+        ax.axis("off")
+        if r==0: ax.set_title(cn[:18],fontsize=8)
+plt.suptitle("BUSI concept heatmaps across multiple cases",fontsize=12,y=1.001)
+plt.tight_layout()
+p="paper_figures_FINAL/quant/concept_grid_busi.png"
+fig.savefig(p,dpi=150,bbox_inches="tight"); plt.show(); print("saved",p)
+
+---- OUTPUT ----
+saved paper_figures_FINAL/quant/concept_grid_busi.png
+
+
+==== CELL 112 code ====
+# ── 19.6  MULTI-FOLD per-concept correctness (mean ± std) ────────────
+import numpy as np, torch, json, os, glob
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+os.makedirs("paper_figures_FINAL/quant", exist_ok=True)
+_dr_ds = full_dr_ds if 'full_dr_ds' in dir() else dr_full_ds
+
+def _per_concept_fold(model, ds, val_idx, class_concepts, vecs, n_concepts):
+    model.eval(); V=vecs.to(device)
+    hits=np.zeros(n_concepts); nn=np.zeros(n_concepts); rank=np.zeros(n_concepts)
+    ld=DataLoader(Subset(ds,val_idx),batch_size=32,shuffle=False,num_workers=0)
+    with torch.no_grad():
+        for x,y in ld:
+            if x.shape[1]==1: x=x.repeat(1,3,1,1)
+            f=F.normalize(model(x.to(device))[0],dim=-1)
+            sims=(f@V.T).cpu().numpy(); t1=sims.argmax(1); order=(-sims).argsort(1)
+            for bi,lab in enumerate(y.numpy().tolist()):
+                for j in class_concepts[lab]:
+                    nn[j]+=1; rank[j]+=int(np.where(order[bi]==j)[0][0])+1
+                    if t1[bi]==j: hits[j]+=1
+    t=np.divide(hits,nn,out=np.full(n_concepts,np.nan),where=nn>0)
+    r=np.divide(rank,nn,out=np.full(n_concepts,np.nan),where=nn>0)
+    return t,r
+
+def _run_multifold(name, ckpt_glob, build_model, ds, concepts, class_concepts,
+                   inject_fn, concepts_dict, n_classes, n_folds, folds):
+    nC=len(concepts); T=[]; R=[]
+    for k in range(n_folds):
+        ckpt=f"checkpoints/{ckpt_glob}/fold_{k+1}_best.pt"
+        if not os.path.isfile(ckpt):
+            print(f"  {name} fold {k+1}: MISSING, skip"); continue
+        model=build_model(ckpt)
+        # rebuild alignment on THIS fold's val split
+        _,_,vecs = inject_fn(model, ds, folds[k][1], concepts_dict, class_concepts, n_classes)
+        t,r=_per_concept_fold(model, ds, folds[k][1], class_concepts, vecs.detach().cpu(), nC)
+        T.append(t); R.append(r); print(f"  {name} fold {k+1}: done")
+    T=np.vstack(T); R=np.vstack(R)
+    cg={}; [cg.update({j:g}) for g,idxs in class_concepts.items() for j in idxs]
+    rows=[]
+    for j in range(nC):
+        rows.append(dict(concept=concepts[j], grade=cg.get(j,-1), n_folds=int(np.sum(~np.isnan(T[:,j]))),
+            top1_mean=round(float(np.nanmean(T[:,j])),3), top1_std=round(float(np.nanstd(T[:,j])),3),
+            rank_mean=round(float(np.nanmean(R[:,j])),2), rank_std=round(float(np.nanstd(R[:,j])),2)))
+    return rows
+
+# builders that match how the notebook loads models
+def _build_dr(ckpt):
+    m=HybridContrastiveOrdinalNet(embed_dim=cfg.embed_dim, proj_dim=cfg.proj_dim).to(device).eval()
+    m.load_state_dict(torch.load(ckpt,map_location=device,weights_only=False)["model_state"],strict=False)
+    return m
+def _build_busi(ckpt):
+    m=HybridContrastiveOrdinalNet(embed_dim=cfg.embed_dim, proj_dim=cfg.proj_dim).to(device).eval()
+    m.load_state_dict(torch.load(ckpt,map_location=device,weights_only=False)["model_state"],strict=False)
+    return m
+
+# alignment injector wrapper (matches inject_alignment_mlp signature)
+def _inject_dr(model, ds, val_idx, concepts_dict, class_map, n_classes):
+    pipe=ExplainabilityPipeline(model=model,dataset="dr",device=device,encoder="biomedclip",
+            text_model=biomedclip,tokenizer=tokenizer,layer_indices=[2,4,6,7],top_k=5)
+    # patch to 11 concepts to match CLASS_CONCEPTS_DR
+    pipe.concept_explainer.concepts = concepts_dict["concepts"]
+    return inject_alignment_mlp(pipeline=pipe, model=model, dataset_obj=ds, val_idx=val_idx,
+            concepts_dict=concepts_dict, class_concepts_map=class_map, n_classes=n_classes)
+def _inject_busi(model, ds, val_idx, concepts_dict, class_map, n_classes):
+    pipe=ExplainabilityPipeline(model=model,dataset="busi",device=device,encoder="biomedclip",
+            text_model=biomedclip,tokenizer=tokenizer,layer_indices=[2,4,6,7],top_k=5)
+    return inject_alignment_mlp(pipeline=pipe, model=model, dataset_obj=ds, val_idx=val_idx,
+            concepts_dict=concepts_dict, class_concepts_map=class_map, n_classes=n_classes)
+
+print("=== DR multi-fold (10) ===")
+dr_mf=_run_multifold("DR","dr/dr_gamma_01",_build_dr,_dr_ds,
+    DR_CONCEPTS["concepts"], CLASS_CONCEPTS_DR, _inject_dr, DR_CONCEPTS, cfg.dr_n_classes, 10, folds_dr)
+print("\n=== BUSI multi-fold (5) ===")
+busi_mf=_run_multifold("BUSI","busi/busi_gamma_01",_build_busi,full_busi_ds,
+    BUSI_CONCEPTS["concepts"], BUSI_CLASS_CONCEPTS, _inject_busi, BUSI_CONCEPTS, cfg.busi_n_classes, 5, folds_busi)
+
+print(f"\n{'DR concept':<40s}{'grd':>4s}{'top1±std':>14s}{'rank±std':>13s}")
+for r in dr_mf:
+    print(f"{r['concept'][:38]:<40s}{r['grade']:>4d}   {r['top1_mean']:.2f}±{r['top1_std']:.2f}   {r['rank_mean']:.1f}±{r['rank_std']:.1f}")
+print(f"\n{'BUSI concept':<40s}{'grd':>4s}{'top1±std':>14s}{'rank±std':>13s}")
+for r in busi_mf:
+    print(f"{r['concept'][:38]:<40s}{r['grade']:>4d}   {r['top1_mean']:.2f}±{r['top1_std']:.2f}   {r['rank_mean']:.1f}±{r['rank_std']:.1f}")
+
+json.dump({"dr":dr_mf,"busi":busi_mf}, open("paper_figures_FINAL/quant/per_concept_multifold.json","w"), indent=2)
+print("\nsaved paper_figures_FINAL/quant/per_concept_multifold.json")
+---- OUTPUT ----
+=== DR multi-fold (10) ===
+    epoch  200  pull=0.00118  push=+0.00000  total=0.00118
+    epoch  400  pull=0.00102  push=+0.00000  total=0.00102
+    epoch  600  pull=0.00065  push=+0.00000  total=0.00065
+    epoch  800  pull=0.00052  push=+0.00000  total=0.00052
+  Injected aligned vectors (11, 1280) into pipeline
+  DR fold 1: done
+    epoch  200  pull=0.00175  push=+0.00000  total=0.00175
+    epoch  400  pull=0.00092  push=+0.00000  total=0.00092
+    epoch  600  pull=0.00095  push=+0.00000  total=0.00095
+    epoch  800  pull=0.00074  push=+0.00000  total=0.00074
+  Injected aligned vectors (11, 1280) into pipeline
+  DR fold 2: done
+    epoch  200  pull=0.00149  push=+0.00000  total=0.00149
+    epoch  400  pull=0.00065  push=+0.00000  total=0.00065
+    epoch  600  pull=0.00060  push=+0.00000  total=0.00060
+    epoch  800  pull=0.00066  push=+0.00000  total=0.00066
+  Injected aligned vectors (11, 1280) into pipeline
+  DR fold 3: done
+    epoch  200  pull=0.00193  push=+0.00000  total=0.00193
+    epoch  400  pull=0.00109  push=+0.00000  total=0.00109
+    epoch  600  pull=0.00085  push=+0.00000  total=0.00085
+    epoch  800  pull=0.00051  push=+0.00000  total=0.00051
+  Injected aligned vectors (11, 1280) into pipeline
+  DR fold 4: done
+    epoch  200  pull=0.00112  push=+0.00000  total=0.00112
+    epoch  400  pull=0.00074  push=+0.00000  total=0.00074
+    epoch  600  pull=0.00080  push=+0.00000  total=0.00080
+    epoch  800  pull=0.00056  push=+0.00000  total=0.00056
+  Injected aligned vectors (11, 1280) into pipeline
+  DR fold 5: done
+    epoch  200  pull=0.00139  push=+0.00000  total=0.00139
+    epoch  400  pull=0.00111  push=+0.00000  total=0.00111
+    epoch  600  pull=0.00058  push=+0.00000  total=0.00058
+    epoch  800  pull=0.00078  push=+0.00000  total=0.00078
+  Injected aligned vectors (11, 1280) into pipeline
+  DR fold 6: done
+    epoch  200  pull=0.00128  push=+0.00000  total=0.00128
+    epoch  400  pull=0.00103  push=+0.00000  total=0.00103
+    epoch  600  pull=0.00126  push=+0.00000  total=0.00126
+    epoch  800  pull=0.00077  push=+0.00000  total=0.00077
+  Injected aligned vectors (11, 1280) into pipeline
+  DR fold 7: done
+    epoch  200  pull=0.00158  push=+0.00000  total=0.00158
+    epoch  400  pull=0.00073  push=+0.00000  total=0.00073
+    epoch  600  pull=0.00054  push=+0.00000  total=0.00054
+    epoch  800  pull=0.00072  push=+0.00000  total=0.00072
+  Injected aligned vectors (11, 1280) into pipeline
+  DR fold 8: done
+    epoch  200  pull=0.00166  push=+0.00000  total=0.00166
+    epoch  400  pull=0.00079  push=+0.00000  total=0.00079
+    epoch  600  pull=0.00055  push=+0.00000  total=0.00055
+    epoch  800  pull=0.00067  push=+0.00000  total=0.00067
+  Injected aligned vectors (11, 1280) into pipeline
+  DR fold 9: done
+    epoch  200  pull=0.00127  push=+0.00000  total=0.00127
+    epoch  400  pull=0.00093  push=+0.00000  total=0.00093
+    epoch  600  pull=0.00093  push=+0.00000  total=0.00093
+    epoch  800  pull=0.00087  push=+0.00000  total=0.00087
+  Injected aligned vectors (11, 1280) into pipeline
+  DR fold 10: done
+
+=== BUSI multi-fold (5) ===
+    epoch  200  pull=0.00078  push=+0.00000  total=0.00078
+    epoch  400  pull=0.00085  push=+0.00000  total=0.00085
+    epoch  600  pull=0.00068  push=+0.00000  total=0.00068
+    epoch  800  pull=0.00057  push=+0.00000  total=0.00057
+  Injected aligned vectors (10, 1280) into pipeline
+  BUSI fold 1: done
+    epoch  200  pull=0.00084  push=+0.00000  total=0.00084
+    epoch  400  pull=0.00093  push=+0.00000  total=0.00093
+    epoch  600  pull=0.00097  push=+0.00000  total=0.00097
+    epoch  800  pull=0.00069  push=+0.00000  total=0.00069
+  Injected aligned vectors (10, 1280) into pipeline
+  BUSI fold 2: done
+    epoch  200  pull=0.00109  push=+0.00000  total=0.00109
+    epoch  400  pull=0.00102  push=+0.00000  total=0.00102
+    epoch  600  pull=0.00063  push=+0.00000  total=0.00063
+    epoch  800  pull=0.00077  push=+0.00000  total=0.00077
+  Injected aligned vectors (10, 1280) into pipeline
+  BUSI fold 3: done
+    epoch  200  pull=0.00087  push=+0.00000  total=0.00087
+    epoch  400  pull=0.00111  push=+0.00000  total=0.00111
+    epoch  600  pull=0.00089  push=+0.00000  total=0.00089
+    epoch  800  pull=0.00084  push=+0.00000  total=0.00084
+  Injected aligned vectors (10, 1280) into pipeline
+  BUSI fold 4: done
+    epoch  200  pull=0.00121  push=+0.00000  total=0.00121
+    epoch  400  pull=0.00093  push=+0.00000  total=0.00093
+    epoch  600  pull=0.00062  push=+0.00000  total=0.00062
+    epoch  800  pull=0.00084  push=+0.00000  total=0.00084
+  Injected aligned vectors (10, 1280) into pipeline
+  BUSI fold 5: done
+
+DR concept                               grd      top1±std     rank±std
+normal retina with no apparent lesions     0   0.42±0.16   2.4±0.1
+healthy fundus without microaneurysms      0   0.18±0.17   2.5±0.2
+microaneurysms                             1   0.38±0.02   2.7±0.0
+dot and blot hemorrhages                   2   0.19±0.04   3.9±0.3
+hard exudates                              2   0.13±0.06   3.9±0.3
+cotton wool spots                          2   0.07±0.07   3.9±0.3
+venous beading                             3   0.30±0.07   2.8±0.2
+intraretinal microvascular abnormaliti     3   0.37±0.06   2.8±0.1
+neovascularization                         4   0.33±0.17   3.7±0.5
+preretinal hemorrhage                      4   0.13±0.16   3.7±0.6
+vitreous hemorrhage                        4   0.19±0.18   3.7±0.5
+
+BUSI concept                             grd      top1±std     rank±std
+no mass                                    0   0.53±0.22   1.8±0.3
+no distortion                              0   0.42±0.24   1.9±0.4
+oval shape                                 1   0.22±0.10   2.8±0.3
+circumscribed margin                       1   0.27±0.10   3.0±0.5
+parallel orientation                       1   0.20±0.15   2.9±0.1
+posterior enhancement                      1   0.22±0.11   2.8±0.2
+irregular shape                            2   0.34±0.14   2.9±0.3
+spiculated margins                         2   0.22±0.13   2.8±0.1
+nonparallel orientation                    2   0.20±0.13   2.9±0.1
+posterior acoustic shadowing               2   0.18±0.17   2.6±0.3
+
+saved paper_figures_FINAL/quant/per_concept_multifold.json
+
+
+==== CELL 115 code ====
+# ── LLM coherence audit: does the explanation hang together? ─────────
+import os, base64, json, io, numpy as np
+import torch, torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+import matplotlib.pyplot as plt
+from PIL import Image as PILImage
+import anthropic
+
+client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))  # set your key
+MODEL = "claude-sonnet-4-6"
+N_CASES = 8
+
+busi_pipeline_aligned_g01.concept_explainer.embeddings = aligned_vecs_busi_PUSH
+from explainability import LayerCAM, _ultrasound_mask
+
+def overlay_png_b64(img_np, heatmap):
+    us = _ultrasound_mask(img_np); hm = heatmap*us
+    if hm.max()>hm.min(): hm=(hm-hm.min())/(hm.max()-hm.min()+1e-8)
+    over = LayerCAM.overlay(img_np, hm, alpha=0.5)
+    buf=io.BytesIO(); PILImage.fromarray(over).save(buf,format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+PROMPT = """You are auditing the INTERNAL COHERENCE of an automated explanation. Do NOT diagnose the image yourself.
+
+The model predicted: grade = "{grade}".
+Its top clinical concept was: "{concept}".
+The heatmap overlay (red = where the model says this concept appears) is attached.
+
+Answer ONLY about coherence, in JSON:
+{{"concept_matches_grade": true/false,  // is "{concept}" a feature clinically consistent with grade "{grade}"?
+  "heatmap_localized": true/false,      // does the red region sit on a discrete structure, not spread over the whole image?
+  "explanation_coherent": true/false,   // overall: does the named concept + highlighted location form a self-consistent explanation?
+  "one_line_reason": "..."}}
+Return only the JSON."""
+
+ld = DataLoader(Subset(full_busi_ds, folds_busi[0][1]), batch_size=1, shuffle=False)
+results=[]
+for gi,(x,y) in zip(folds_busi[0][1], ld):
+    if len(results)>=N_CASES: break
+    if int(y)==0: continue  # skip Normal (no lesion concept)
+    xb=x.to(device)
+    res=busi_pipeline_aligned_g01.explain(xb)
+    grade=res["predicted_class"]; concept=res["concept_scores"][0][0]
+    img_np=x.squeeze(0).permute(1,2,0).cpu().numpy()
+    b64=overlay_png_b64(img_np, res["heatmap"])
+    msg=client.messages.create(model=MODEL, max_tokens=400,
+        messages=[{"role":"user","content":[
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":b64}},
+            {"type":"text","text":PROMPT.format(grade=grade, concept=concept)}]}])
+    txt=msg.content[0].text.strip().replace("```json","").replace("```","")
+    try: verdict=json.loads(txt)
+    except: verdict={"explanation_coherent":None,"one_line_reason":txt[:80]}
+    verdict.update(true_class=busi_pipeline_aligned_g01.class_names[int(y)], pred=grade, concept=concept)
+    results.append(verdict)
+    print(f"{verdict['true_class']:<10s} concept='{concept[:22]:<22s}' coherent={verdict.get('explanation_coherent')}  {verdict.get('one_line_reason','')[:60]}")
+
+n=len(results); coh=sum(1 for r in results if r.get("explanation_coherent")==True)
+print(f"\nCoherence: {coh}/{n} = {coh/n:.0%} of explanations judged internally coherent (n={n}, BUSI sample)")
+json.dump(results, open("paper_figures_FINAL/quant/llm_coherence.json","w"), indent=2)
+---- OUTPUT ----
+Benign     concept='posterior enhancement ' coherent=True  Posterior acoustic enhancement is a hallmark of simple cysts
+Benign     concept='posterior enhancement ' coherent=True  Posterior acoustic enhancement is a classic benign feature (
+Benign     concept='parallel orientation  ' coherent=False  While parallel orientation is a valid benign ultrasound feat
+Benign     concept='posterior enhancement ' coherent=False  Posterior enhancement is clinically consistent with benign c
+Benign     concept='posterior enhancement ' coherent=False  Posterior enhancement is clinically associated with benign/c
+Benign     concept='parallel orientation  ' coherent=True  Parallel orientation is a recognized benign sonographic feat
+Benign     concept='parallel orientation  ' coherent=False  While parallel orientation is clinically associated with ben
+Benign     concept='posterior enhancement ' coherent=False  Posterior enhancement is a benign-consistent feature (e.g., 
+
+Coherence: 3/8 = 38% of explanations judged internally coherent (n=8, BUSI sample)
+
+
