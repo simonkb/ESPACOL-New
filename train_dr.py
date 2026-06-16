@@ -28,6 +28,7 @@ from Datasets.dataloaders import (
     StratifiedBatchSampler,
     build_transform,
     build_train_transform,
+    build_tile_transform,
     preload_dr_images,
 )
 from models.framework import build_model
@@ -79,8 +80,13 @@ def make_loaders(
     img_cache=None,
 ):
     clip_norm = getattr(cfg, "use_clip_normalization", True)
-    train_tfm = build_train_transform(cfg.img_size, use_clip_norm=clip_norm)
-    eval_tfm = build_transform(cfg.img_size, use_clip_norm=clip_norm)
+    if getattr(cfg, "use_multi_tile", False):
+        tile_grid = cfg.tile_grid
+        train_tfm = build_tile_transform(tile_grid, cfg.img_size, use_clip_norm=clip_norm, train=True)
+        eval_tfm = build_tile_transform(tile_grid, cfg.img_size, use_clip_norm=clip_norm, train=False)
+    else:
+        train_tfm = build_train_transform(cfg.img_size, use_clip_norm=clip_norm)
+        eval_tfm = build_transform(cfg.img_size, use_clip_norm=clip_norm)
 
     use_mps = device is not None and device.type == "mps"
     num_workers = 0 if use_mps else cfg.num_workers
@@ -192,8 +198,11 @@ def main():
     parser.add_argument(
         "--cache_dir",
         type=str,
-        default="Datasets/DR/train_cache_224",
-        help="Directory for pre-decoded .pt image cache",
+        default=None,
+        help="Directory for pre-decoded .pt image cache. Default: "
+             "Datasets/DR/train_cache_224, or train_cache_tiles_<canvas> when "
+             "--use_multi_tile is set (canvas resolution differs from the "
+             "single-view cache, so they must not share a directory).",
     )
 
     parser.add_argument(
@@ -218,6 +227,24 @@ def main():
         type=str,
         default=None,
         help="Optional override for BioMedCLIP/open_clip text encoder name",
+    )
+    parser.add_argument(
+        "--use_multi_tile",
+        action="store_true",
+        help="Multi-tile attention backbone: crop each fundus image to its disc, "
+             "resize to a (tile_grid*img_size)^2 canvas, slice into tile_grid^2 "
+             "high-resolution crops + 1 global-context tile, and aggregate "
+             "per-tile BiomedCLIP features with attention pooling. Targets the "
+             "lesion-scale detail destroyed by a single global resize to 224x224 "
+             "on native ~3000-5000px fundus photos. Orthogonal to "
+             "--use_coral / --use_two_stage / --use_tamo.",
+    )
+    parser.add_argument(
+        "--tile_grid",
+        type=int,
+        default=None,
+        help="Local tile grid size (tile_grid x tile_grid crops + 1 global tile). "
+             "Default: 3 (9 local + 1 global = 10 views/image, ~10x backbone compute).",
     )
     parser.add_argument(
         "--use_two_stage",
@@ -269,6 +296,12 @@ def main():
 
     cfg = DRConfig(run_dir=args.run_dir)
 
+    if args.use_multi_tile:
+        cfg.use_multi_tile = True
+
+    if args.tile_grid is not None:
+        cfg.tile_grid = args.tile_grid
+
     if args.use_two_stage:
         cfg.use_two_stage = True
 
@@ -312,13 +345,18 @@ def main():
         reg_str = "CORAL"
     else:
         reg_str = "RMSE"
+    backbone_str = (
+        f"MultiTile[{cfg.tile_grid}x{cfg.tile_grid}+1]-BiomedCLIP"
+        if getattr(cfg, "use_multi_tile", False)
+        else "BiomedCLIP"
+    )
     log.info("=" * 70)
     if getattr(cfg, "use_tamo", False):
-        log.info(f"DR 10-fold CV  (BiomedCLIP + PCOL + SCOLw + IT + TAMO + {reg_str})")
+        log.info(f"DR 10-fold CV  ({backbone_str} + PCOL + SCOLw + IT + TAMO + {reg_str})")
     elif cfg.use_image_text:
-        log.info(f"DR 10-fold CV  (BiomedCLIP + PCOL + SCOLw + IT + {reg_str})")
+        log.info(f"DR 10-fold CV  ({backbone_str} + PCOL + SCOLw + IT + {reg_str})")
     else:
-        log.info(f"DR 10-fold CV  (BiomedCLIP + PCOL + SCOLw + {reg_str})")
+        log.info(f"DR 10-fold CV  ({backbone_str} + PCOL + SCOLw + {reg_str})")
     log.info("=" * 70)
     log.info(f"Config: {cfg}")
 
@@ -352,18 +390,28 @@ def main():
     img_cache = None
     if not args.no_cache:
         n_threads = 16
-        cache_dir = args.cache_dir if args.cache_dir else None
+        use_multi_tile = getattr(cfg, "use_multi_tile", False)
+        canvas_size = cfg.tile_grid * cfg.img_size if use_multi_tile else cfg.img_size
+
+        if args.cache_dir is not None:
+            cache_dir = args.cache_dir
+        elif use_multi_tile:
+            cache_dir = f"Datasets/DR/train_cache_tiles_{canvas_size}"
+        else:
+            cache_dir = "Datasets/DR/train_cache_224"
 
         log.info(
             f"Pre-loading DR images ({n_threads} threads) "
             f"{'(disk cache: ' + cache_dir + ')' if cache_dir else '(no disk cache)'}"
+            f"{'  [fundus-cropped, canvas=' + str(canvas_size) + 'px]' if use_multi_tile else ''}"
         )
 
         img_cache = preload_dr_images(
             all_items,
-            img_size=cfg.img_size,
+            img_size=canvas_size,
             n_threads=n_threads,
             cache_dir=cache_dir,
+            crop_fundus=use_multi_tile,
         )
         log.info(f"Image cache ready: {len(img_cache)} images")
 
@@ -410,6 +458,7 @@ def main():
             use_tamo=getattr(cfg, "use_tamo", False),
             use_coral=getattr(cfg, "use_coral", False),
             use_two_stage=getattr(cfg, "use_two_stage", False),
+            use_multi_tile=getattr(cfg, "use_multi_tile", False),
             image_encoder_name=cfg.image_encoder_name,
         )
 

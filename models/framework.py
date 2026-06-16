@@ -38,7 +38,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .backbone import BiomedCLIPImageBackbone, EfficientNetV2SBackbone
+from .backbone import BiomedCLIPImageBackbone, TiledBiomedCLIPBackbone, EfficientNetV2SBackbone
 from .heads import (
     MLPProjectionHead,
     DeepProjectionHead,
@@ -171,10 +171,17 @@ def build_model(
     use_tamo: bool = False,
     use_coral: bool = False,
     use_two_stage: bool = False,
+    use_multi_tile: bool = False,
     image_encoder_name: str = _DEFAULT_IMAGE_ENCODER,
 ) -> HybridContrastiveOrdinalModel:
     """
     Build the HybridContrastiveOrdinalModel with BiomedCLIP image backbone.
+
+    use_multi_tile=True replaces the single-view backbone with
+    TiledBiomedCLIPBackbone: the dataloader must then supply (N, T, C, H, W)
+    batches (see Datasets.dataloaders.build_tile_transform). Orthogonal to
+    use_tamo/use_coral/use_two_stage — it only changes how `features` are
+    produced, not which head/loss consumes them.
 
     Head selection priority (mutually exclusive for the regression/grading slot):
 
@@ -190,7 +197,10 @@ def build_model(
 
     proj_hidden_dim: 0 (default) auto-sets to backbone.OUT_DIM.
     """
-    backbone = BiomedCLIPImageBackbone(model_name=image_encoder_name, pretrained=pretrained)
+    if use_multi_tile:
+        backbone = TiledBiomedCLIPBackbone(model_name=image_encoder_name, pretrained=pretrained)
+    else:
+        backbone = BiomedCLIPImageBackbone(model_name=image_encoder_name, pretrained=pretrained)
     feat_dim = backbone.OUT_DIM
     hidden_dim = proj_hidden_dim if proj_hidden_dim > 0 else feat_dim
 

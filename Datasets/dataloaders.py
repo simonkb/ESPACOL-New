@@ -72,6 +72,94 @@ def build_train_transform(img_size: int = 224, use_clip_norm: bool = True) -> Ca
 
 
 # ----------------------------
+# Multi-tile transform (high-resolution crops for lesion-scale detail)
+# ----------------------------
+def crop_fundus_circle(img: Image.Image, threshold: int = 10, min_frac: float = 0.3) -> Image.Image:
+    """
+    Crop away the black border around the circular fundus disc so the
+    resized canvas spends its pixels on retina, not background.
+
+    Kaggle DR photos are captured at varying zoom/crop and surrounded by a
+    black letterbox; cropping to the bounding box of non-black content
+    before downsampling increases the effective resolution of the retina
+    itself for a fixed output size. Falls back to the original image if the
+    detected box looks like a detection failure (too small, i.e. the image
+    is mostly dark already, e.g. a near-black artifact frame).
+    """
+    gray = np.array(img.convert("L"))
+    mask = gray > threshold
+    if not mask.any():
+        return img
+
+    rows = np.where(mask.any(axis=1))[0]
+    cols = np.where(mask.any(axis=0))[0]
+    top, bottom = rows[0], rows[-1]
+    left, right = cols[0], cols[-1]
+
+    h, w = gray.shape
+    if (bottom - top) < min_frac * h or (right - left) < min_frac * w:
+        return img
+
+    return img.crop((left, top, right + 1, bottom + 1))
+
+
+def _split_into_tiles(canvas: torch.Tensor, tile_grid: int, tile_size: int) -> torch.Tensor:
+    """canvas: (C, tile_grid*tile_size, tile_grid*tile_size) -> (tile_grid**2, C, tile_size, tile_size)"""
+    C = canvas.shape[0]
+    tiles = canvas.unfold(1, tile_size, tile_size).unfold(2, tile_size, tile_size)
+    # (C, tile_grid, tile_grid, tile_size, tile_size) -> (tile_grid**2, C, tile_size, tile_size)
+    return tiles.permute(1, 2, 0, 3, 4).reshape(tile_grid * tile_grid, C, tile_size, tile_size)
+
+
+def build_tile_transform(
+    tile_grid: int = 3,
+    tile_size: int = 224,
+    use_clip_norm: bool = True,
+    train: bool = False,
+) -> Callable:
+    """
+    Returns a callable PIL.Image -> (T, C, tile_size, tile_size) tensor, where
+    T = tile_grid**2 local crops + 1 global context view.
+
+    The image is resized to a canvas of tile_grid*tile_size pixels (e.g.
+    3*224=672) — tile_grid times the linear resolution of a single global
+    resize — then sliced into a non-overlapping grid. Augmentation is applied
+    to the whole canvas before slicing so every tile in a sample shares the
+    same flip/rotation/jitter (consistent geometry across tiles). A final
+    tile holds the canvas downsampled back to tile_size for global context
+    (overall lesion distribution, optic disc/macula layout).
+
+    use_clip_norm=True → CLIP normalization (for BiomedCLIP backbone).
+    """
+    canvas_size = tile_grid * tile_size
+    mean = _CLIP_MEAN if use_clip_norm else _IMAGENET_MEAN
+    std  = _CLIP_STD  if use_clip_norm else _IMAGENET_STD
+
+    aug = [
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.RandomRotation(degrees=10),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1),
+    ] if train else []
+
+    canvas_tfm = transforms.Compose([
+        transforms.Resize((canvas_size, canvas_size)),
+        *aug,
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+    global_resize = transforms.Resize((tile_size, tile_size))
+
+    def _transform(img: Image.Image) -> torch.Tensor:
+        canvas = canvas_tfm(img)                                    # (C, canvas, canvas)
+        local_tiles = _split_into_tiles(canvas, tile_grid, tile_size)  # (G*G, C, t, t)
+        global_tile = global_resize(canvas).unsqueeze(0)             # (1, C, t, t)
+        return torch.cat([local_tiles, global_tile], dim=0)          # (G*G+1, C, t, t)
+
+    return _transform
+
+
+# ----------------------------
 # Helpers
 # ----------------------------
 _IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
@@ -540,6 +628,7 @@ def preload_dr_images(
     img_size: int = 300,
     n_threads: int = 16,
     cache_dir: Optional[str] = None,
+    crop_fundus: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """
     Load all DR images into RAM as resized uint8 tensors.
@@ -548,6 +637,11 @@ def preload_dr_images(
       - First call: decode JPEGs, resize, save as .pt files in cache_dir (~30 min).
       - Later calls: load .pt files directly (~30 sec). Survives process restarts.
     Without cache_dir: always decodes from source (no disk persistence).
+
+    crop_fundus=True crops the black border around the retinal disc before
+    resizing (see crop_fundus_circle) — use with a larger img_size (e.g. the
+    tile-grid canvas size) for the multi-tile pipeline so the cached canvas
+    spends its pixels on retina, not background.
 
     Returns {path: uint8 tensor (C, H, W)}.
     """
@@ -571,6 +665,8 @@ def preload_dr_images(
             if os.path.exists(pt):
                 return path, torch.load(pt, weights_only=True)
         img = _pil_loader(path, rgb=True)
+        if crop_fundus:
+            img = crop_fundus_circle(img)
         img = resize(img)
         t = torch.from_numpy(np.array(img)).permute(2, 0, 1).contiguous()
         if cache_dir:

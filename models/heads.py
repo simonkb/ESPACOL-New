@@ -164,6 +164,29 @@ class DeepRegressionHead(nn.Module):
         return self.net(x).squeeze(-1)   # (N,)
 
 
+class AttentionPool(nn.Module):
+    """
+    Single-query attention pooling over a bag of per-tile feature vectors.
+
+    Used by TiledBiomedCLIPBackbone to aggregate features extracted from
+    several high-resolution crops of one fundus image into a single
+    feature vector, so a lesion that only appears in one tile (e.g. a
+    microaneurysm visible in just one crop) can still dominate the pooled
+    representation instead of being averaged away.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(dim) * 0.02)
+        self.scale = dim ** -0.5
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (N, T, D) -> (N, D)"""
+        scores = (x @ self.query) * self.scale          # (N, T)
+        weights = torch.softmax(scores, dim=1)          # (N, T)
+        return (weights.unsqueeze(-1) * x).sum(dim=1)   # (N, D)
+
+
 class CoralHead(nn.Module):
     """
     CORAL ordinal classification head (Cao et al., 2020).

@@ -121,6 +121,23 @@ class DRConfig(TrainConfig):
     image_encoder_lr: float = 2e-5   # stable range; no oscillation at this LR
     freeze_backbone_epochs: int = 10 # heads-only warmup before backbone fine-tuning
 
+    # ── Multi-Tile Attention Backbone (use_multi_tile) ─────────────────────────
+    # Native DR fundus photos are ~2600-4900px; a single global resize to
+    # img_size (224) destroys lesion-scale detail — microaneurysms (the only
+    # feature distinguishing grade 0 from grade 1) are a handful of pixels
+    # even at native resolution and are averaged away by that resize before
+    # training starts. This is the suspected root cause of the ~75-76%
+    # ceiling that persisted across RMSE/CORAL/two-stage head designs.
+    #
+    # When enabled, each image is cropped to its fundus disc, resized to a
+    # (tile_grid*img_size)^2 canvas, and sliced into tile_grid^2 non-overlapping
+    # img_size^2 crops + 1 global-context tile (canvas downsampled to
+    # img_size^2). All tiles share the BiomedCLIP backbone; AttentionPool
+    # aggregates per-tile features into one vector before the existing
+    # heads/losses, which are otherwise unchanged.
+    use_multi_tile: bool = False
+    tile_grid: int = 3   # 3x3 local tiles + 1 global tile = 10 views/image (~10x backbone compute)
+
     # ── Two-Stage Hierarchical Ordinal (use_two_stage) ────────────────────────
     # Splits ordinal regression into two jointly-trained specialised heads:
     #   Stage 1 — ScreeningHead (binary BCE): grade-0 vs grade-1+
