@@ -16,6 +16,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class AttentionPool(nn.Module):
+    """Softmax attention pooling of T tile embeddings into a single vector."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(dim) * (dim ** -0.5))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, T, D)
+        scale = x.shape[-1] ** -0.5
+        scores = torch.einsum("d,ntd->nt", self.query, x) * scale   # (N, T)
+        weights = torch.softmax(scores, dim=-1)                       # (N, T)
+        return torch.einsum("nt,ntd->nd", weights, x)                 # (N, D)
+
+
 class MLPProjectionHead(nn.Module):
     """
     2-layer MLP: input_dim -> hidden_dim -> out_dim, L2-normalized output.

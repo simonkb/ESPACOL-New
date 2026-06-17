@@ -116,3 +116,5 @@ class DRConfig(TrainConfig):
     text_finetune_layers: int = 2
     text_encoder_lr: float = 1e-6
     text_finetune_start_epoch: int = 20
+    use_multi_tile: bool = False
+    tile_grid: int = 3

@@ -20,7 +20,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .backbone import EfficientNetV2SBackbone
+from .backbone import EfficientNetV2SBackbone, TiledEfficientNetBackbone
 from .heads import MLPProjectionHead, RegressionHead
 
 
@@ -87,8 +87,12 @@ def build_model(
     proj_hidden_dim: int = 1280,
     proj_out_dim: int = 128,
     use_image_text: bool = False,
+    use_multi_tile: bool = False,
 ) -> HybridContrastiveOrdinalModel:
-    backbone = EfficientNetV2SBackbone(pretrained=pretrained)
+    if use_multi_tile:
+        backbone = TiledEfficientNetBackbone(pretrained=pretrained)
+    else:
+        backbone = EfficientNetV2SBackbone(pretrained=pretrained)
     feat_dim = backbone.OUT_DIM
 
     pcol_head = MLPProjectionHead(feat_dim, proj_hidden_dim, proj_out_dim)

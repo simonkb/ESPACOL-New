@@ -28,6 +28,7 @@ from Datasets.dataloaders import (
     StratifiedBatchSampler,
     build_transform,
     build_train_transform,
+    build_tile_transform,
     preload_dr_images,
 )
 from models.framework import build_model
@@ -78,8 +79,13 @@ def make_loaders(
     device=None,
     img_cache=None,
 ):
-    train_tfm = build_train_transform(cfg.img_size)
-    eval_tfm = build_transform(cfg.img_size)
+    if getattr(cfg, "use_multi_tile", False):
+        tile_grid = getattr(cfg, "tile_grid", 3)
+        train_tfm = build_tile_transform(tile_size=cfg.img_size, tile_grid=tile_grid, augment=True)
+        eval_tfm  = build_tile_transform(tile_size=cfg.img_size, tile_grid=tile_grid, augment=False)
+    else:
+        train_tfm = build_train_transform(cfg.img_size)
+        eval_tfm  = build_transform(cfg.img_size)
 
     use_mps = device is not None and device.type == "mps"
     num_workers = 0 if use_mps else cfg.num_workers
@@ -184,6 +190,18 @@ def main():
     parser.add_argument("--no_pretrained", action="store_true")
 
     parser.add_argument(
+        "--use_multi_tile",
+        action="store_true",
+        help="Enable multi-tile input with AttentionPool aggregation",
+    )
+    parser.add_argument(
+        "--tile_grid",
+        type=int,
+        default=3,
+        help="Tile grid size (default 3 → 3×3 = 9 local tiles + 1 global = 10 total)",
+    )
+
+    parser.add_argument(
         "--no_cache",
         action="store_true",
         help="Disable image cache if RAM is limited",
@@ -225,6 +243,10 @@ def main():
         args.train_csv = os.path.join(args.dr_root, "trainLabels.csv")
 
     cfg = DRConfig(run_dir=args.run_dir)
+
+    if args.use_multi_tile:
+        cfg.use_multi_tile = True
+        cfg.tile_grid = args.tile_grid
 
     if args.use_image_text:
         cfg.use_image_text = True
@@ -282,18 +304,27 @@ def main():
     img_cache = None
     if not args.no_cache:
         n_threads = 16
-        cache_dir = args.cache_dir if args.cache_dir else None
+
+        # Auto-derive tile-specific cache dir when using default path
+        if cfg.use_multi_tile and args.cache_dir == "Datasets/DR/train_cache":
+            canvas_size = cfg.tile_grid * cfg.img_size
+            cache_dir = f"Datasets/DR/train_cache_tiles_{canvas_size}"
+        else:
+            cache_dir = args.cache_dir if args.cache_dir else None
+
+        preload_img_size = cfg.tile_grid * cfg.img_size if cfg.use_multi_tile else cfg.img_size
 
         log.info(
-            f"Pre-loading DR images ({n_threads} threads) "
+            f"Pre-loading DR images ({n_threads} threads, size={preload_img_size}) "
             f"{'(disk cache: ' + cache_dir + ')' if cache_dir else '(no disk cache)'}"
         )
 
         img_cache = preload_dr_images(
             all_items,
-            img_size=cfg.img_size,
+            img_size=preload_img_size,
             n_threads=n_threads,
             cache_dir=cache_dir,
+            crop_fundus=cfg.use_multi_tile,
         )
         log.info(f"Image cache ready: {len(img_cache)} images")
 
@@ -337,6 +368,7 @@ def main():
             proj_hidden_dim=cfg.proj_hidden_dim,
             proj_out_dim=cfg.proj_out_dim,
             use_image_text=cfg.use_image_text,
+            use_multi_tile=cfg.use_multi_tile,
         )
 
         train_labels = [y for _, y in train_items]

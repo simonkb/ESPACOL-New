@@ -57,6 +57,69 @@ def build_train_transform(img_size: int = 300) -> Callable:
 
 
 # ----------------------------
+# Multi-tile helpers (fundus cropping + tile splitting)
+# ----------------------------
+
+def crop_fundus_circle(img: Image.Image, min_frac: float = 0.3) -> Image.Image:
+    """Crop to bounding box of the fundus circle, removing black borders."""
+    gray = np.array(img.convert("L"))
+    mask = gray > 10
+    if mask.sum() < mask.size * min_frac:
+        return img  # mostly black — return as-is
+    rows = np.any(mask, axis=1)
+    cols = np.any(mask, axis=0)
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
+    return img.crop((cmin, rmin, cmax + 1, rmax + 1))
+
+
+def _split_into_tiles(canvas: torch.Tensor, tile_size: int, tile_grid: int) -> torch.Tensor:
+    """Split (C, G*tile_size, G*tile_size) canvas → (G^2, C, tile_size, tile_size)."""
+    C = canvas.shape[0]
+    tiles = (canvas
+             .unfold(1, tile_size, tile_size)
+             .unfold(2, tile_size, tile_size))
+    # tiles: (C, tile_grid, tile_grid, tile_size, tile_size)
+    return tiles.permute(1, 2, 0, 3, 4).reshape(-1, C, tile_size, tile_size)
+
+
+def build_tile_transform(
+    tile_size: int = 300,
+    tile_grid: int = 3,
+    augment: bool = False,
+) -> Callable:
+    """
+    Returns a transform PIL Image → (T, C, tile_size, tile_size) tensor.
+    T = tile_grid^2 + 1  (local grid tiles + 1 global context tile).
+    """
+    canvas_size = tile_grid * tile_size
+
+    aug_ops = [
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.RandomRotation(degrees=10),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1),
+    ] if augment else []
+
+    canvas_tfm = transforms.Compose([
+        transforms.Resize((canvas_size, canvas_size)),
+        *aug_ops,
+        transforms.ToTensor(),
+        transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
+    ])
+
+    global_resize = transforms.Resize((tile_size, tile_size))
+
+    def _transform(img: Image.Image) -> torch.Tensor:
+        canvas = canvas_tfm(img)                                        # (C, canvas_size, canvas_size)
+        local_tiles = _split_into_tiles(canvas, tile_size, tile_grid)  # (G^2, C, H, W)
+        global_tile = global_resize(canvas).unsqueeze(0)               # (1, C, H, W)
+        return torch.cat([local_tiles, global_tile], dim=0)            # (G^2+1, C, H, W)
+
+    return _transform
+
+
+# ----------------------------
 # Helpers
 # ----------------------------
 _IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
@@ -525,6 +588,7 @@ def preload_dr_images(
     img_size: int = 300,
     n_threads: int = 16,
     cache_dir: Optional[str] = None,
+    crop_fundus: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """
     Load all DR images into RAM as resized uint8 tensors.
@@ -556,6 +620,8 @@ def preload_dr_images(
             if os.path.exists(pt):
                 return path, torch.load(pt, weights_only=True)
         img = _pil_loader(path, rgb=True)
+        if crop_fundus:
+            img = crop_fundus_circle(img)
         img = resize(img)
         t = torch.from_numpy(np.array(img)).permute(2, 0, 1).contiguous()
         if cache_dir:
