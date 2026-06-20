@@ -155,6 +155,7 @@ def _apply_mask(heatmap: np.ndarray, mask: np.ndarray) -> np.ndarray:
 def build_combined_figure(plt, pipeline, image_np, result, true_name, encoder):
     """One figure: top row (Original | WHERE | WHY bars), bottom (WHY+WHERE grid)."""
     import matplotlib.gridspec as gridspec
+    import textwrap
 
     mask = _safe_mask(image_np)
     class_names = pipeline.class_names
@@ -170,7 +171,7 @@ def build_combined_figure(plt, pipeline, image_np, result, true_name, encoder):
     outer = gridspec.GridSpec(2, 1, height_ratios=[1.0, 1.25], hspace=0.32)
 
     # ── top row: 3 panels ─────────────────────────────────────────────────────
-    top = gridspec.GridSpecFromSubplotSpec(1, 3, subplot_spec=outer[0], wspace=0.25)
+    top = gridspec.GridSpecFromSubplotSpec(1, 3, subplot_spec=outer[0], wspace=0.45)
 
     ax_orig = fig.add_subplot(top[0])
     ax_orig.imshow((image_np * 255).astype(np.uint8))
@@ -187,9 +188,11 @@ def build_combined_figure(plt, pipeline, image_np, result, true_name, encoder):
 
     ax_why = fig.add_subplot(top[2])
     colors = ["steelblue" if v >= 0 else "tomato" for v in vals]
-    ax_why.barh(names[::-1], vals[::-1], color=colors[::-1])
+    wrapped = [textwrap.fill(n, 18) for n in names]
+    ax_why.barh(wrapped[::-1], vals[::-1], color=colors[::-1])
     ax_why.axvline(0, color="black", linewidth=0.8)
     ax_why.set_xlim(-1, 1)
+    ax_why.tick_params(axis="y", labelsize=8)
     ax_why.set_xlabel("Cosine similarity")
     ax_why.set_title(f"WHY: concept scores ({encoder})")
 
