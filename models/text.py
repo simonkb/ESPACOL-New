@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable
+from typing import Dict, Iterable, List
 
 import torch
 import torch.nn as nn
@@ -149,6 +149,20 @@ class ClinicalTextEncoder(nn.Module):
 
     def trainable_text_parameters(self):
         return [p for p in self.text_model.parameters() if p.requires_grad]
+
+    @torch.no_grad()
+    def get_concept_embeddings(self, concept_phrases: List[str]) -> torch.Tensor:
+        """
+        Encode clinical concept phrases and project to the same space as class prototypes.
+
+        Returns (M, proj_out_dim) L2-normalised concept text embeddings.
+        Called once at trainer init and cached — not re-encoded every forward pass.
+        """
+        device = self.raw_text_embeddings.device
+        tokens = self.tokenizer(concept_phrases).to(device)
+        raw = self.text_model.encode_text(tokens).float()
+        raw = F.normalize(raw, dim=-1)
+        return F.normalize(self.projection(raw), dim=-1)   # (M, proj_out_dim)
 
     def forward(self) -> torch.Tensor:
         text_is_trainable = any(

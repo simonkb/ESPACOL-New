@@ -66,13 +66,24 @@ class TrainConfig:
     amp: bool = True
 
     use_image_text: bool = True
-    gamma: float = 0.0929   
+    gamma: float = 0.0929
     lambda_ord_it: float = 1.0
     text_encoder_name: str = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
     finetune_text_encoder: bool = False
     text_finetune_layers: int = 0
     text_encoder_lr: float = 1e-6
     text_finetune_start_epoch: int = 20
+
+    # Concept Activation Spine (ESPAOCL)
+    use_concept_spine: bool = False
+    n_concepts: int = 9               # len(DR_CONCEPTS); override per dataset config
+    delta: float = 0.1               # weight for L_PIC
+    eta: float = 0.1                 # weight for L_cons
+    nu: float = 0.05                 # weight for L_faith
+    faith_start_epoch: int = 10      # warm-up epochs before enabling faithfulness loop
+    faith_every_n: int = 4           # run faithfulness every N batches
+    faith_margin: float = 0.1        # L_drop margin m_k
+    faith_tau: float = 0.05          # L_spec cross-concept tolerance τ
 
 
 @dataclass
@@ -83,6 +94,7 @@ class BUSIConfig(TrainConfig):
     n_folds: int = 5                 # paper: 5-fold CV
     val_fraction: float = 0.1        # 10% of train folds for validation
     run_dir: str = "runs/busi"
+    n_concepts: int = 10              # len(BUSI_CONCEPTS)
 
 
 @dataclass
@@ -118,3 +130,4 @@ class DRConfig(TrainConfig):
     text_finetune_start_epoch: int = 20
     use_multi_tile: bool = False
     tile_grid: int = 3
+    n_concepts: int = 9               # len(DR_CONCEPTS)

@@ -237,6 +237,43 @@ def main():
         help="Optional override for BioMedCLIP/open_clip text encoder name",
     )
 
+    # Concept Activation Spine (ESPAOCL)
+    parser.add_argument(
+        "--use_concept_spine",
+        action="store_true",
+        help="Enable Concept Activation Spine (L_PIC + L_cons + L_faith)",
+    )
+    parser.add_argument(
+        "--delta",
+        type=float,
+        default=None,
+        help="Weight for per-image concept loss L_PIC (default 0.1)",
+    )
+    parser.add_argument(
+        "--eta",
+        type=float,
+        default=None,
+        help="Weight for grade agreement loss L_cons (default 0.1)",
+    )
+    parser.add_argument(
+        "--nu",
+        type=float,
+        default=None,
+        help="Weight for faithfulness loss L_faith (default 0.05)",
+    )
+    parser.add_argument(
+        "--faith_start_epoch",
+        type=int,
+        default=None,
+        help="Epoch to start faithfulness training loop (default 10)",
+    )
+    parser.add_argument(
+        "--faith_every_n",
+        type=int,
+        default=None,
+        help="Run faithfulness loop every N batches (default 4)",
+    )
+
     args = parser.parse_args()
 
     if args.train_csv is None:
@@ -261,16 +298,33 @@ def main():
     if args.text_encoder_name is not None:
         cfg.text_encoder_name = args.text_encoder_name
 
+    if args.use_concept_spine:
+        cfg.use_concept_spine = True
+        # Concept spine requires the text encoder
+        cfg.use_image_text = True
+    if args.delta is not None:
+        cfg.delta = args.delta
+    if args.eta is not None:
+        cfg.eta = args.eta
+    if args.nu is not None:
+        cfg.nu = args.nu
+    if args.faith_start_epoch is not None:
+        cfg.faith_start_epoch = args.faith_start_epoch
+    if args.faith_every_n is not None:
+        cfg.faith_every_n = args.faith_every_n
+
     setup_logging(args.run_dir)
     log = logging.getLogger("train_dr")
 
     set_seed(cfg.seed)
 
     log.info("=" * 70)
+    extras_str = ""
     if cfg.use_image_text:
-        log.info("DR 10-fold CV  (EfficientNet-V2S + PCOL + SCOLw + ImageText)")
-    else:
-        log.info("DR 10-fold CV  (EfficientNet-V2S + PCOL + SCOLw)")
+        extras_str += " + ImageText"
+    if getattr(cfg, "use_concept_spine", False):
+        extras_str += " + ConceptSpine(L_PIC+L_cons+L_faith)"
+    log.info(f"DR 10-fold CV  (EfficientNet-V2S + PCOL + SCOLw{extras_str})")
     log.info("=" * 70)
     log.info(f"Config: {cfg}")
 
@@ -369,6 +423,8 @@ def main():
             proj_out_dim=cfg.proj_out_dim,
             use_image_text=cfg.use_image_text,
             use_multi_tile=cfg.use_multi_tile,
+            use_concept_spine=getattr(cfg, "use_concept_spine", False),
+            n_concepts=getattr(cfg, "n_concepts", 9),
         )
 
         train_labels = [y for _, y in train_items]

@@ -36,3 +36,24 @@ BUSI_CONCEPTS = [
     "nonparallel orientation",
     "posterior acoustic shadowing",
 ]
+
+# Cumulative concept-to-grade masks for L_PIC.
+# Each grade inherits all concepts from lower grades (clinical progression).
+# Index refers to position in DR_CONCEPTS / BUSI_CONCEPTS lists above.
+DR_CONCEPT_GRADE_MASK = {
+    0: [],                         # No DR: no pathological findings
+    1: [0],                        # Mild NPDR: microaneurysms
+    2: [0, 1, 2, 3],               # Moderate NPDR: + hemorrhages, hard exudates, cotton wool spots
+    3: [0, 1, 2, 3, 4, 5],         # Severe NPDR: + venous beading, IRMA
+    4: [0, 1, 2, 3, 4, 5, 6, 7, 8],  # PDR: all concepts
+}
+
+# Concepts 0-1 ("no mass", "no distortion") are absence-type for BUSI;
+# the ConceptSpine treats them with sign-flipped weights (w <= 0).
+BUSI_CONCEPT_GRADE_MASK = {
+    0: [0, 1],              # Normal: absence concepts active
+    1: [0, 1, 2, 3, 4, 5], # Benign: absence + benign morphology
+    2: [6, 7, 8, 9],        # Malignant: malignant morphology only
+}
+
+BUSI_ABSENCE_CONCEPT_INDICES = [0, 1]  # "no mass", "no distortion"
