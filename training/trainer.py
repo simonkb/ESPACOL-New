@@ -433,11 +433,16 @@ class Trainer:
                 # Top concept per image by absolute importance score |w_i * c_i|
                 top_k_idx = (w_detach * c.detach()).abs().argmax(dim=1)  # (N,)
 
-                # Backward through top-concept cosine similarity to populate LayerCAM hooks
-                z_c = out["z_c"]    # (N, 128) L2-normalised concept embedding
-                c_top = (z_c * self.concept_text_emb[top_k_idx]).sum(dim=1)  # (N,)
-                score_cam = c_top.float().sum()  # scalar — direction only, not for optim
-                score_cam.backward(retain_graph=True)
+                # Separate forward pass for CAM — avoids retain_graph=True (halves graph memory)
+                self.model.zero_grad()
+                with torch.enable_grad():
+                    out_cam = self.model(
+                        x.detach(), concept_text_emb=self.concept_text_emb
+                    )
+                    cam_score = (
+                        (out_cam["z_c"] * self.concept_text_emb[top_k_idx]).sum(dim=1)
+                    ).float().sum()
+                    cam_score.backward()  # frees this graph immediately after
 
                 # Extract batch-level heatmaps from hooks (detached, gradient-free)
                 H, W = x.shape[2], x.shape[3]
@@ -448,8 +453,8 @@ class Trainer:
                     H, W, self.device,
                 )  # (N, H, W)
 
-                # Clear CAM gradients before main backward
-                self.optimizer.zero_grad(set_to_none=True)
+                # Clear CAM gradients — main graph (for main_loss) is still alive
+                self.model.zero_grad()
 
                 # Soft occlusion of attended region
                 with torch.no_grad():
