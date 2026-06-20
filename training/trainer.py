@@ -541,15 +541,17 @@ class Trainer:
             x = x.to(self.device, non_blocking=nb)
             y = y.to(self.device, non_blocking=nb)
 
-            with autocast(device_type=self.device.type, enabled=self.use_amp):
-                pred = self.model.predict(x)
-                rmse = torch.sqrt(nn.functional.mse_loss(pred, y.float()) + 1e-8)
-
+            with torch.no_grad(), autocast(device_type=self.device.type, enabled=self.use_amp):
                 if use_cs and self.concept_text_emb is not None:
+                    # Single forward pass — no redundant backbone pass for concept_acc
                     out = self.model(x, concept_text_emb=self.concept_text_emb)
+                    pred = out["pred"]
                     if "E" in out:
                         y_concept = self.model.concept_spine.predict_grade(out["E"])
                         all_concept_grades.append(y_concept.cpu())
+                else:
+                    pred = self.model.predict(x)
+                rmse = torch.sqrt(nn.functional.mse_loss(pred, y.float()) + 1e-8)
 
             total_rmse += rmse.item()
             n_batches += 1

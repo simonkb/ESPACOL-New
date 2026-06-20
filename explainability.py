@@ -176,7 +176,7 @@ class LayerCAM:
 
             def make_fwd(i):
                 def fwd(m, inp, out):
-                    self._acts[i] = out   # keep grad_fn alive
+                    self._acts[i] = out.detach()
                 return fwd
 
             def make_bwd(i):
