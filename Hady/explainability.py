@@ -2,8 +2,10 @@
 explainability.py  —  ESPAOCL Explainability Module
 =====================================================
 
-Compatible with Simon's HybridContrastiveOrdinalNet which returns:
-    feat, z_pcol, z_scolw, z_it, y_pred   (5 outputs)
+Works with the repo model, whose forward() returns a dict:
+    {features, z_pcol, z_scolw, z_it, pred}
+(a legacy 5-tuple feat, z_pcol, z_scolw, z_it, pred is also accepted). z_it is
+the gamma image-text embedding; concept scores are computed in that aligned space.
 
 What this file implements
 --------------------------
@@ -12,10 +14,13 @@ What this file implements
                     Resolves individual lesions (not just blobs).
 
 2. ConceptExplainer WHY clinically?
-                    Cosine similarity between image embedding and
-                    clinical concept phrase vectors.
-                    Encoder options: "random" (placeholder) or "biomedclip"
-                    (uses the same BioMedCLIP model Simon already loaded).
+                    Cosine similarity between the image's aligned z_it embedding
+                    and clinical concept phrase vectors. With encoder="biomedclip"
+                    and a RECOVERED text projection (recover_text_projection.py),
+                    concept text is mapped into the same z_it space, so scores
+                    reflect the gamma image-text alignment. Without the recovered
+                    projection it falls back to a random-orthogonal bridge
+                    (placeholder scores).
 
 3. Concept-guided LayerCAM  — the novel contribution.
                     One heatmap per concept: "which pixels look like
@@ -96,6 +101,23 @@ BUSI_CONCEPTS = {
         "posterior acoustic shadowing",
     ],
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model-output accessor — supports the model's dict output and the legacy
+# 5-tuple used by the in-file smoke-test stub.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _unpack_out(out):
+    """Return (features, z_it, pred) for both dict and legacy-tuple outputs.
+
+    The repo model returns a dict {features, z_pcol, z_scolw, z_it, pred}; the
+    smoke-test stub returns a 5-tuple (feat, z_pcol, z_scolw, z_it, pred). z_it is
+    None for checkpoints trained without the image-text (gamma) head.
+    """
+    if isinstance(out, dict):
+        return out.get("features"), out.get("z_it"), out.get("pred")
+    return out[0], out[3], out[-1]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -241,8 +263,7 @@ class LayerCAM:
         self.model.eval()
 
         out = self.model(x)
-        # Works with both 4-output and 5-output model variants
-        y_pred = out[-1]   # always last element
+        _feat, _zit, y_pred = _unpack_out(out)
 
         if target_class is None:
             val = y_pred.detach().cpu().squeeze()
@@ -263,69 +284,48 @@ class LayerCAM:
         temperature: float = 10.0,
     ) -> np.ndarray:
         """
-        Spatial concept-guided LayerCAM.
+        Concept-guided LayerCAM in the aligned (z_it) space.
 
-        The previous version scored a concept against the GLOBAL pooled
-        embedding (one vector per image), so the gradient target had no
-        spatial dependence on the concept: every concept produced a
-        near-identical heatmap, differing only by a scalar. This version
-        scores the concept against the final feature MAP location-by-location,
-        so "where does it look like spiculated margins?" and "where does it
-        look like posterior shadowing?" backprop different spatial signals
-        and yield genuinely distinct heatmaps.
+        The gradient target is the cosine similarity between the image's aligned
+        embedding ``z_it`` and the concept vector (both 128-d, same space as the
+        recovered text projection). Backpropagating that score through the
+        network highlights the pixels that drive the image's alignment with the
+        concept. ``all_concept_vectors`` + softmax sharpening make each concept
+        produce a distinct gradient direction so the per-concept maps differ.
+
+        Falls back to the 1280-d backbone feature when the model has no z_it
+        (a checkpoint trained without the gamma image-text head).
         """
         assert x.dim() == 4 and x.shape[0] == 1
         self.model.eval()
 
-        # Forward pass populates self._acts via the registered hooks.
+        # Forward pass populates self._acts via the registered hooks; the score
+        # is the image's aligned embedding (z_it) cosine-similarity to the
+        # concept, so backprop highlights pixels that drive that alignment.
         out = self.model(x)
-
-        # Use the deepest hooked stage as the spatial concept-scoring map.
-        # spatial_idx = max(self.layer_indices)
-        spatial_idx = 4 if 4 in self.layer_indices else max(self.layer_indices)
-        if spatial_idx not in self._acts:
-            feat   = out[0]
-            feat_n = F.normalize(feat, dim=-1)
-            v      = concept_vector.to(feat.device).unsqueeze(0)
-            return self._fuse(x, (feat_n * v).sum())
-
-        A = self._acts[spatial_idx]
-        # A may be (B, C, h, w) or (C, h, w). Take the first sample, keep 3-D.
-        if A.dim() == 4:
-            A = A[0]                 # (C, h, w)  — indexing always drops dim 0
-        elif A.dim() != 3:
-            # unexpected shape; fall back to global cosine
-            feat_n = F.normalize(out[0], dim=-1)
-            v = concept_vector.to(feat_n.device).unsqueeze(0)
-            return self._fuse(x, (feat_n * v).sum())
-        C, h, w = A.shape
-
-        # Per-location channel vectors, L2-normalised over channels.
-        A_perm = A.permute(1, 2, 0).reshape(-1, C)        # (h*w, C)
-        A_n    = F.normalize(A_perm, dim=-1)              # (h*w, C)
-
-        cvec = concept_vector.to(A.device).float()
-        if cvec.numel() != C:
-            feat   = out[0]
-            feat_n = F.normalize(feat, dim=-1)
-            v      = concept_vector.to(feat.device).unsqueeze(0)
-            return self._fuse(x, (feat_n * v).sum())
-        cvec_n = F.normalize(cvec, dim=0)                 # (C,)
-
-        sim_map = A_n @ cvec_n                            # (h*w,) cosine per location
+        feat, z_it, _ = _unpack_out(out)
+        cdim = concept_vector.numel()
+        # Use whichever embedding matches the concept dim (z_it when a recovered
+        # projection is used; backbone feature for the random-bridge fallback).
+        emb = z_it if (z_it is not None and z_it.shape[-1] == cdim) else feat   # (1, D)
+        emb_n = F.normalize(emb, dim=-1)
+        cvec_n = F.normalize(
+            concept_vector.to(emb_n.device).float().view(1, -1), dim=-1
+        )                                                        # (1, D)
 
         if all_concept_vectors is not None and all_concept_vectors.shape[0] > 1:
-            all_v   = F.normalize(all_concept_vectors.to(A.device).float(), dim=-1)  # (n, C)
-            all_sim = A_n @ all_v.T                       # (h*w, n)
-            target_idx = ((all_v - cvec_n.unsqueeze(0)).abs().sum(-1) < 1e-4).nonzero()
+            all_v = F.normalize(all_concept_vectors.to(emb_n.device).float(), dim=-1)  # (n, D)
+            sims = (emb_n @ all_v.t()).squeeze(0)               # (n,)
+            target_idx = ((all_v - cvec_n).abs().sum(-1) < 1e-4).nonzero()
             if len(target_idx) > 0:
                 tj = int(target_idx[0, 0].item())
-                probs = F.softmax(all_sim * temperature, dim=-1)   # (h*w, n)
-                score = probs[:, tj].sum()
+                # Softmax-sharpen across concepts so each concept gets a
+                # distinct gradient direction (otherwise maps look alike).
+                score = F.softmax(sims * temperature, dim=-1)[tj]
             else:
-                score = F.relu(sim_map).sum()
+                score = (emb_n * cvec_n).sum()
         else:
-            score = F.relu(sim_map).sum()
+            score = (emb_n * cvec_n).sum()
 
         return self._fuse(x, score)
 
@@ -335,7 +335,9 @@ class LayerCAM:
         """Blend heatmap onto image. Returns (H, W, 3) uint8."""
         if image.dtype != np.uint8:
             image = (image * 255).astype(np.uint8)
-        colored = (cm.get_cmap(colormap)(heatmap)[..., :3] * 255).astype(np.uint8)
+        # matplotlib >=3.9 removed cm.get_cmap; matplotlib.colormaps works 3.5+.
+        cmap = matplotlib.colormaps[colormap]
+        colored = (cmap(heatmap)[..., :3] * 255).astype(np.uint8)
         return (alpha * colored + (1 - alpha) * image).astype(np.uint8)
 
 
@@ -368,11 +370,13 @@ class ConceptExplainer:
         device: Optional[torch.device] = None,
         text_model=None,    # BioMedCLIP model (for encoder="biomedclip")
         tokenizer=None,     # BioMedCLIP tokenizer
+        text_projection=None,  # recovered z_it-space projection (RecoveredTextProjection)
         seed: int = 0,
     ):
         self.concepts = concepts
         self.feat_dim = feat_dim
         self.device   = device or torch.device("cpu")
+        self.text_projection = text_projection
 
         if encoder == "biomedclip":
             vecs = self._encode_biomedclip(concepts, feat_dim, text_model, tokenizer)
@@ -421,12 +425,25 @@ class ConceptExplainer:
             raw    = text_model.encode_text(tokens).float()
             raw    = F.normalize(raw, dim=-1)
 
+        # Preferred path: map BioMedCLIP text features into the aligned z_it
+        # space with the RECOVERED text projection (recover_text_projection.py),
+        # so concept scores reflect the gamma image-text alignment.
+        if getattr(self, "text_projection", None) is not None:
+            proj = self.text_projection.to(self.device).eval()
+            with torch.no_grad():
+                raw = proj(raw.to(self.device))           # (n_concepts, out_dim), L2-normed
+            return raw.cpu()
+
+        # Fallback (no recovered projection): deterministic orthogonal QR bridge.
+        # Angular structure is preserved but the result is NOT aligned to z_it,
+        # so scores are weak placeholders (the pre-recovery behavior).
         text_dim = raw.shape[-1]
         if text_dim != dim:
-            # Use a deterministic ORTHOGONAL projection instead of a random
-            # Gaussian one. Orthogonal projection preserves angular structure,
-            # so concepts that were distinct in BioMedCLIP space stay distinct
-            # in image-feature space.
+            warnings.warn(
+                "biomedclip encoder has no recovered text projection; using the "
+                "random-orthogonal bridge. Concept scores will NOT reflect gamma "
+                "alignment. Run Hady/recover_text_projection.py and pass it in."
+            )
             g = torch.Generator(); g.manual_seed(42)
             rand_mat = torch.randn(dim, text_dim, generator=g)
             # QR decomposition gives orthonormal columns
@@ -566,6 +583,7 @@ class ExplainabilityPipeline:
         encoder: str = "random",
         text_model=None,
         tokenizer=None,
+        text_projection=None,
         layer_indices: List[int] = DEFAULT_LAYERS,
         top_k: int = 5,
     ):
@@ -579,13 +597,17 @@ class ExplainabilityPipeline:
 
         self.layercam = LayerCAM(model, layer_indices=layer_indices)
 
+        # With a recovered text projection, concept vectors live in the aligned
+        # z_it space (its out_dim, 128); otherwise in the 1280-d backbone space.
+        concept_dim = getattr(text_projection, "out_dim", 1280) if text_projection is not None else 1280
         self.concept_explainer = ConceptExplainer(
-            concepts    = info["concepts"],
-            feat_dim    = 1280,
-            encoder     = encoder,
-            device      = self.device,
-            text_model  = text_model,
-            tokenizer   = tokenizer,
+            concepts        = info["concepts"],
+            feat_dim        = concept_dim,
+            encoder         = encoder,
+            device          = self.device,
+            text_model      = text_model,
+            tokenizer       = tokenizer,
+            text_projection = text_projection,
         )
 
     def explain(
@@ -613,8 +635,7 @@ class ExplainabilityPipeline:
 
         with torch.no_grad():
             out    = model(x)
-            feat   = out[0]    # (1, 1280)
-            y_pred = out[-1]   # (1,)
+            feat, z_it, y_pred = _unpack_out(out)
 
         pred_label = int(
             y_pred.detach().cpu().squeeze().round().clamp(0, self.n_classes - 1).item()
@@ -627,8 +648,12 @@ class ExplainabilityPipeline:
             x, target_class=target_cls, n_classes=self.n_classes
         )
 
-        # WHY
-        top_concepts = self.concept_explainer.top_k(feat.squeeze(0), k=self.top_k)
+        # WHY — score concepts in whichever space the concept embeddings live in:
+        # the aligned z_it space when a recovered projection was used (dims match),
+        # else the 1280-d backbone feature (random-bridge / non-gamma fallback).
+        emb_dim = self.concept_explainer.embeddings.shape[-1]
+        why_emb = z_it if (z_it is not None and z_it.shape[-1] == emb_dim) else feat
+        top_concepts = self.concept_explainer.top_k(why_emb.squeeze(0), k=self.top_k)
 
         result = {
             "predicted_label":  pred_label,
@@ -644,7 +669,7 @@ class ExplainabilityPipeline:
             # Pass ALL concept vectors so each concept's gradient signal
             # is differentiated via softmax sharpening (otherwise every
             # concept produces a near-identical gradient direction).
-            all_vecs = self.concept_explainer.embeddings   # (n_concepts, 1280)
+            all_vecs = self.concept_explainer.embeddings   # (n_concepts, D)
             for concept in self.concept_explainer.concepts:
                 vec = self.concept_explainer.get_vector(concept)
                 cmaps[concept] = self.layercam.compute_concept(

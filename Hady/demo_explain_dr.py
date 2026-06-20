@@ -18,15 +18,16 @@ Run (from the repo root, ESPACOL-New/):
 
 Notes
 -----
-* The repo model returns 3 outputs (z_pcol, z_scolw, pred); explainability.py
-  expects a 5-output net whose out[0] is the 1280-d feature. A tiny adapter
-  (_ExplainAdapter) bridges the two and exposes .features for the CAM hooks.
+* The repo model is built with use_image_text=True so it produces the gamma
+  image-text embedding z_it; a tiny adapter (_ExplainAdapter) just exposes
+  .features for the CAM hooks and forwards the model's dict output.
 * --encoder biomedclip (default) downloads BioMedCLIP (~350 MB) on first run.
   --encoder random needs no download but its WHY scores are placeholders;
   the WHERE heatmap is fully meaningful either way.
-* DR_best_model.pth was trained WITHOUT the image-text alignment loss, so even
-  with biomedclip the concept (WHY) scores stay in the muted "before-alignment"
-  range. This is expected for this checkpoint.
+* WHY concept scores are computed in the aligned z_it space using the RECOVERED
+  text projection (Hady/DR_text_projection.pth, produced by
+  recover_text_projection.py). If that file is missing, the demo falls back to a
+  random-orthogonal text bridge and prints a warning (scores not gamma-aligned).
 * ~74% of DR images are grade 0 (No DR), so a plain random pick usually shows a
   lesion-free fundus. Use --grade to see a specific severity.
 """
@@ -71,12 +72,10 @@ BIOMEDCLIP_ID = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224
 
 class _ExplainAdapter(nn.Module):
     """
-    Wrap the repo's HybridContrastiveOrdinalModel so it matches the contract
-    explainability.py was written for:
-        forward(x) -> (feat, z_pcol, z_scolw, z_it, y_pred)
-    where out[0] is the 1280-d GAP feature and out[-1] is the scalar prediction.
-    Also exposes `.features` (the EfficientNet stages) so LayerCAM can hook
-    model.features[2,4,6,7].
+    Thin wrapper around the repo's HybridContrastiveOrdinalModel that exposes
+    `.features` (the EfficientNet stages) so LayerCAM can hook
+    model.features[2,4,6,7], and forwards the model's dict output
+    {features, z_pcol, z_scolw, z_it, pred} unchanged.
     """
 
     def __init__(self, base: nn.Module):
@@ -86,10 +85,9 @@ class _ExplainAdapter(nn.Module):
         self.features = base.backbone.features
 
     def forward(self, x: torch.Tensor):
-        feat = self.base.backbone(x)             # (N, 1280); runs .features -> hooks fire
-        pred = self.base.regression_head(feat)   # (N,)
-        # Middle three are never read by explainability; return feat as placeholders.
-        return feat, feat, feat, feat, pred
+        # Full forward runs backbone.features (CAM hooks fire) and returns the
+        # dict explainability reads — including the aligned z_it embedding.
+        return self.base(x)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -272,6 +270,11 @@ def parse_args():
         help="Concept (WHY) encoder. 'biomedclip' (default) downloads ~350 MB on first run; "
              "'random' is offline but its WHY scores are placeholders.",
     )
+    parser.add_argument(
+        "--text_projection", default=None,
+        help="Recovered z_it-space text projection .pth (default: Hady/DR_text_projection.pth). "
+             "Produced by recover_text_projection.py; needed for gamma-aligned WHY scores.",
+    )
     parser.add_argument("--save", default=None, help="Optional path to save the figure as PNG.")
     parser.add_argument("--no-show", action="store_true", help="Do not pop up a window (save only).")
     return parser.parse_args()
@@ -297,7 +300,7 @@ def main():
     print(f"Device: {device}")
 
     # ── Build repo model, load weights, wrap in the explainability adapter ────
-    base = build_model(n_classes=N_CLASSES, pretrained=False)
+    base = build_model(n_classes=N_CLASSES, pretrained=False, use_image_text=True)
     metrics = load_checkpoint(args.checkpoint, base, optimizer=None, device=device)
     base.to(device).eval()
     if metrics:
@@ -320,6 +323,19 @@ def main():
             encoder = "random"
     if encoder == "random":
         print("NOTE: WHY concept scores are random placeholders; WHERE heatmap is real.")
+
+    # ── Recovered text projection (maps concepts into the aligned z_it space) ──
+    text_projection = None
+    if encoder == "biomedclip":
+        proj_path = args.text_projection or os.path.join(_HERE, "DR_text_projection.pth")
+        if os.path.isfile(proj_path):
+            from text_projection import load_text_projection
+            text_projection, _bundle = load_text_projection(proj_path, device)
+            print(f"Loaded recovered text projection: {proj_path}")
+        else:
+            print(f"NOTE: no recovered text projection at {proj_path}; WHY scores use "
+                  f"the random-orthogonal bridge (NOT gamma-aligned). "
+                  f"Run Hady/recover_text_projection.py first.")
 
     # ── Pick one image (DRDataset applies the eval transform internally) ──────
     print("Indexing DR dataset (this can take a few seconds)...")
@@ -350,7 +366,8 @@ def main():
     n_concepts = len(DR_CONCEPTS["concepts"])
     pipeline = ExplainabilityPipeline(
         model, dataset="dr", device=device, encoder=encoder,
-        text_model=text_model, tokenizer=tokenizer, top_k=n_concepts,
+        text_model=text_model, tokenizer=tokenizer, text_projection=text_projection,
+        top_k=n_concepts,
     )
     print("Computing explanations (LayerCAM + per-concept heatmaps) ...")
     result = pipeline.explain(x.unsqueeze(0).to(device), concept_heatmaps=True)
