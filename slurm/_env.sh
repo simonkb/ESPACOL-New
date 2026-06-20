@@ -18,4 +18,4 @@ export TOKENIZERS_PARALLELISM=false
 export REPO=/home/kunet.ae/100066980/ESPACOL-New
 export RUNS=/dpc/kuin0170/u100066980/runs
 export DR_ROOT=/dpc/kuin0170/u100066980/DR
-export BUSI_ROOT=$REPO/Datasets/BUSI
+export BUSI_ROOT=/dpc/kuin0170/u100066980/BUSI

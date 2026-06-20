@@ -20,3 +20,6 @@ Datasets/DR/train.zip
 
 # Local Claude context (not for the shared repo)
 Hady/CLAUDE.md
+
+# HPC working directory (local only)
+HPC/
