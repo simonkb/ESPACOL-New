@@ -159,7 +159,18 @@ class LayerCAM:
         self._grads: Dict[int, torch.Tensor] = {}
         self._hooks: List = []
 
-        features = model.features if hasattr(model, "features") else model.backbone.features
+        if hasattr(model, "features"):
+            features = model.features
+        elif hasattr(model, "backbone"):
+            b = model.backbone
+            if hasattr(b, "features"):
+                features = b.features                      # EfficientNetV2SBackbone
+            elif hasattr(b, "base") and hasattr(b.base, "features"):
+                features = b.base.features                 # TiledEfficientNetBackbone
+            else:
+                raise AttributeError(f"Cannot locate 'features' in backbone type {type(b)}")
+        else:
+            raise AttributeError(f"Cannot locate 'features' in model type {type(model)}")
         for idx in layer_indices:
             layer = features[idx]
 
