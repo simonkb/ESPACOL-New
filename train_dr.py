@@ -184,18 +184,40 @@ def main():
         "--cache_dir", type=str, default="Datasets/DR/train_cache",
         help="Directory for pre-decoded .pt files (built on first run, reused after)"
     )
+    # ── Gamma image-text overrides (DR uses gamma by default via config) ───────
+    parser.add_argument("--no_image_text", action="store_true",
+                        help="Disable the gamma image-text loss (baseline run)")
+    parser.add_argument("--gamma", type=float, default=None,
+                        help="Override weight for the image-text ordinal loss")
+    parser.add_argument("--lambda_ord_it", type=float, default=None,
+                        help="Override ordinal penalty strength inside the image-text loss")
+    parser.add_argument("--text_encoder_name", type=str, default=None,
+                        help="Override BioMedCLIP/open_clip text encoder name")
     args = parser.parse_args()
 
     if args.train_csv is None:
         args.train_csv = os.path.join(args.dr_root, "trainLabels.csv")
 
     cfg = DRConfig(run_dir=args.run_dir)
+    if args.no_image_text:
+        cfg.use_image_text = False
+    if args.gamma is not None:
+        cfg.gamma = args.gamma
+        cfg.use_image_text = cfg.gamma > 0.0
+    if args.lambda_ord_it is not None:
+        cfg.lambda_ord_it = args.lambda_ord_it
+    if args.text_encoder_name is not None:
+        cfg.text_encoder_name = args.text_encoder_name
+
     setup_logging(args.run_dir)
     log = logging.getLogger("train_dr")
     set_seed(cfg.seed)
 
     log.info("=" * 70)
-    log.info("DR 10-fold Cross-Validation  (EfficientNet-V2S + PCOL + SCOLw)")
+    if cfg.use_image_text:
+        log.info("DR 10-fold CV  (EfficientNet-V2S + PCOL + SCOLw + ImageText[gamma])")
+    else:
+        log.info("DR 10-fold CV  (EfficientNet-V2S + PCOL + SCOLw)")
     log.info("=" * 70)
     log.info(f"Config: {cfg}")
 
@@ -274,6 +296,7 @@ def main():
             pretrained=not args.no_pretrained,
             proj_hidden_dim=cfg.proj_hidden_dim,
             proj_out_dim=cfg.proj_out_dim,
+            use_image_text=cfg.use_image_text,
         )
 
         train_labels = [y for _, y in train_items]
@@ -290,6 +313,13 @@ def main():
 
         test_metrics = trainer.fit(test_loader)
         fold_results.append(test_metrics)
+
+        # Race-safe per-fold result: SLURM job arrays share run_dir but each
+        # fold_dir is unique, so this never clobbers across parallel fold tasks.
+        # aggregate_dr.py reads these to build the final mean±std summary.
+        import json
+        with open(os.path.join(fold_dir, "test_result.json"), "w") as rf:
+            json.dump({"fold": fi, **test_metrics}, rf)
 
         log.info(
             f"  Fold {fi} summary: acc={test_metrics['test_acc']:.2f}%  "

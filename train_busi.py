@@ -154,15 +154,37 @@ def main():
         help="Comma-separated fold indices to run (e.g. '0,1,2') or 'all'"
     )
     parser.add_argument("--no_pretrained", action="store_true")
+    # ── Gamma image-text overrides (BUSI uses gamma by default via config) ─────
+    parser.add_argument("--no_image_text", action="store_true",
+                        help="Disable the gamma image-text loss (baseline run)")
+    parser.add_argument("--gamma", type=float, default=None,
+                        help="Override weight for the image-text ordinal loss")
+    parser.add_argument("--lambda_ord_it", type=float, default=None,
+                        help="Override ordinal penalty strength inside the image-text loss")
+    parser.add_argument("--text_encoder_name", type=str, default=None,
+                        help="Override BioMedCLIP/open_clip text encoder name")
     args = parser.parse_args()
 
     cfg = BUSIConfig(run_dir=args.run_dir)
+    if args.no_image_text:
+        cfg.use_image_text = False
+    if args.gamma is not None:
+        cfg.gamma = args.gamma
+        cfg.use_image_text = cfg.gamma > 0.0
+    if args.lambda_ord_it is not None:
+        cfg.lambda_ord_it = args.lambda_ord_it
+    if args.text_encoder_name is not None:
+        cfg.text_encoder_name = args.text_encoder_name
+
     setup_logging(args.run_dir)
     log = logging.getLogger("train_busi")
     set_seed(cfg.seed)
 
     log.info("=" * 70)
-    log.info("BUSI 5-fold Cross-Validation  (EfficientNet-V2S + PCOL + SCOLw)")
+    if cfg.use_image_text:
+        log.info("BUSI 5-fold CV  (EfficientNet-V2S + PCOL + SCOLw + ImageText[gamma])")
+    else:
+        log.info("BUSI 5-fold CV  (EfficientNet-V2S + PCOL + SCOLw)")
     log.info("=" * 70)
     log.info(f"Config: {cfg}")
 
@@ -223,6 +245,7 @@ def main():
             pretrained=not args.no_pretrained,
             proj_hidden_dim=cfg.proj_hidden_dim,
             proj_out_dim=cfg.proj_out_dim,
+            use_image_text=cfg.use_image_text,
         )
 
         train_labels = [y for _, y in train_items]

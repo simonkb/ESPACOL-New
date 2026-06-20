@@ -1,22 +1,24 @@
 from __future__ import annotations
 
 """
-Combined hybrid loss - Equation (3) in the paper:
+Combined hybrid loss:
 
-  L_total = α * L_PCOL  +  β * L_SCOLw  +  L_RMSE
+Baseline:
+    L_total = alpha * L_PCOL + beta * L_SCOLw + L_RMSE
 
-All three heads are optimized jointly in a single training stage.
+ESPAOCL extension:
+    L_total = alpha * L_PCOL + beta * L_SCOLw + gamma * L_IT + L_RMSE
 
-class_weights tensor is pre-computed from the training set as:
-  w[c] = N_total / (n_classes * n_c)
-so that the average weight across all samples equals 1.0.
+where L_IT is the image-text ordinal alignment loss.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .pcol import PCOLLoss
 from .scolw import SCOLwLoss
+from .image_text import ImageTextOrdinalLoss
 
 
 class HybridContrastiveOrdinalLoss(nn.Module):
@@ -25,39 +27,66 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         self,
         alpha: float = 1.0,
         beta: float = 1.0,
+        gamma: float = 0.0,
         temperature: float = 0.07,
+        use_image_text: bool = False,
+        lambda_ord_it: float = 1.0,
     ):
         super().__init__()
         self.alpha = alpha
         self.beta = beta
+        self.gamma = gamma
+        self.use_image_text = use_image_text
+
         self.pcol = PCOLLoss(temperature=temperature)
         self.scolw = SCOLwLoss(temperature=temperature)
 
-    def forward(
-        self,
-        z_pcol: torch.Tensor,        # (N, D) L2-normed - from PCOL head
-        z_scolw: torch.Tensor,       # (N, D) L2-normed - from SCOLw head
-        pred: torch.Tensor,          # (N,)   regression output
-        labels: torch.Tensor,        # (N,)   integer ordinal labels
-        class_weights: torch.Tensor, # (n_classes,) inverse-freq weights
-    ) -> tuple[torch.Tensor, dict]:
-        """
-        Returns:
-            total_loss: scalar tensor
-            components: dict with individual loss values for logging
-        """
-        l_pcol = self.pcol(z_pcol, labels)
-        l_scolw = self.scolw(z_scolw, labels, class_weights)
-        l_rmse = torch.sqrt(
-            nn.functional.mse_loss(pred, labels.float())
+        self.image_text = ImageTextOrdinalLoss(
+            temperature=temperature,
+            lambda_ord=lambda_ord_it,
         )
 
-        total = self.alpha * l_pcol + self.beta * l_scolw + l_rmse
+    def forward(
+        self,
+        z_pcol: torch.Tensor,
+        z_scolw: torch.Tensor,
+        pred: torch.Tensor,
+        labels: torch.Tensor,
+        class_weights: torch.Tensor,
+        z_it: torch.Tensor | None = None,
+        text_prototypes: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict]:
+
+        l_pcol = self.pcol(z_pcol, labels)
+        l_scolw = self.scolw(z_scolw, labels, class_weights)
+        l_rmse = torch.sqrt(F.mse_loss(pred, labels.float()) + 1e-8)
+
+        l_it = torch.tensor(0.0, device=pred.device)
+
+        if self.use_image_text and self.gamma > 0.0:
+            if z_it is None:
+                raise ValueError("z_it must be provided when use_image_text=True.")
+            if text_prototypes is None:
+                raise ValueError("text_prototypes must be provided when use_image_text=True.")
+
+            l_it = self.image_text(
+                image_embeddings=z_it,
+                labels=labels,
+                text_prototypes=text_prototypes,
+            )
+
+        total = (
+            self.alpha * l_pcol
+            + self.beta * l_scolw
+            + self.gamma * l_it
+            + l_rmse
+        )
 
         return total, {
             "loss_total": total.item(),
             "loss_pcol": l_pcol.item(),
             "loss_scolw": l_scolw.item(),
+            "loss_it": l_it.item(),
             "loss_rmse": l_rmse.item(),
         }
 
@@ -68,23 +97,19 @@ def compute_class_weights(
     device: torch.device = torch.device("cpu"),
 ) -> torch.Tensor:
     """
-    Inverse-frequency class weights as described in Section 2.3:
-      w[c] = N_total / (n_classes * n_c)
+    Batch-level inverse-frequency class weights for SCOLw:
+        w[c] = N_batch / (n_classes * n_c)
 
-    Args:
-        labels:    list of integer labels for the training set
-        n_classes: total number of classes
-        device:    target device
-
-    Returns:
-        Tensor of shape (n_classes,) with weight for each class.
+    This follows the authors' clarification that SCOLw weights are computed
+    dynamically per mini-batch using inverse class frequency.
     """
     counts = torch.zeros(n_classes)
-    for y in labels:
-        counts[y] += 1
 
-    # Replace zeros to avoid division by zero for missing classes
+    for y in labels:
+        counts[int(y)] += 1
+
     counts = counts.clamp(min=1)
     n_total = counts.sum()
     weights = n_total / (n_classes * counts)
+
     return weights.to(device)

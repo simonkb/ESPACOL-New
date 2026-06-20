@@ -1,18 +1,27 @@
 from __future__ import annotations
 
 """
-Single-fold trainer implementing the paper's training protocol (Section 3):
+Single-fold trainer implementing the paper's training protocol (Section 3),
+extended with the gamma image-text ordinal loss:
 
-  - One-stage training: all three heads (PCOL, SCOLw, Regression) jointly
-  - 75 epochs max, batch size 24, LR = 1e-3
-  - ReduceLROnPlateau: factor=0.2, patience=5, monitor val_acc (max)
-  - Early stopping: patience=13, monitor val_acc (max)
+  - One-stage training: PCOL, SCOLw, (Image-Text), Regression heads jointly
+  - 75 epochs max, batch size 24
+  - ReduceLROnPlateau: factor=0.2, patience=5, monitor val_loss (min)
+  - Early stopping: monitor val_acc (max)
   - Class-stratified batch sampling for prototype stability
 
+Gamma extension:
+  - When cfg.use_image_text, a BioMedCLIP text encoder produces class text
+    prototypes; the model's image_text_head produces z_it; the loss adds
+    gamma * L_IT.  The image backbone stays EfficientNet-V2S.
+  - The text encoder's projection (and, for DR, the top text transformer layers
+    from text_finetune_start_epoch onward) are trained alongside the model.
+
 Checkpoint and early stopping use val_acc (not val_loss) because:
-  - val set is small (~60 images) so RMSE is too noisy to reliably rank epochs
+  - val set is small so RMSE is too noisy to reliably rank epochs
   - accuracy is the target metric and directly reflects rounding behaviour
-  - RMSE-optimal epoch ≠ accuracy-optimal epoch when predictions are rounded
+The text encoder is NOT needed at inference (eval uses only the regression head),
+so checkpoints store the model only.
 Logs training/validation loss + metrics to a CSV and to the Python logger.
 """
 
@@ -30,6 +39,7 @@ from torch.utils.data import DataLoader
 
 from configs.config import TrainConfig
 from losses.combined import HybridContrastiveOrdinalLoss, compute_class_weights
+from models.text import ClinicalTextEncoder
 from utils.checkpoint import save_checkpoint
 from utils.metrics import evaluate_predictions, confusion_stats
 
@@ -109,21 +119,66 @@ class Trainer:
         self.use_amp = cfg.amp and self.device.type == "cuda"
         self.scaler = GradScaler(device="cuda", enabled=self.use_amp)
 
-        # Optimizer (Adam is the standard; paper says "optimized based on validation loss")
-        self.optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=cfg.lr,
-            weight_decay=cfg.weight_decay,
-        )
+        # ── Gamma image-text extension: BioMedCLIP text encoder ────────────────
+        # Builds class text prototypes (frozen by default; for DR the top text
+        # layers are unfrozen from text_finetune_start_epoch).  Only the text
+        # side is added — the image backbone remains EfficientNet-V2S.
+        self.text_encoder = None
+        self._text_finetune_enabled = False
+        if getattr(cfg, "use_image_text", False):
+            from configs.clinical_text import (
+                BUSI_CLASS_DESCRIPTIONS,
+                DR_CLASS_DESCRIPTIONS,
+            )
 
-        # Loss
+            class_descriptions = (
+                DR_CLASS_DESCRIPTIONS if cfg.dataset == "DR" else BUSI_CLASS_DESCRIPTIONS
+            )
+            self.text_encoder = ClinicalTextEncoder(
+                model_name=cfg.text_encoder_name,
+                class_descriptions=class_descriptions,
+                proj_out_dim=cfg.proj_out_dim,
+                device=self.device,
+                finetune_text_encoder=getattr(cfg, "finetune_text_encoder", False),
+                finetune_layers=getattr(cfg, "text_finetune_layers", 0),
+            ).to(self.device)
+
+        # Optimizer (Adam). The whole EfficientNet model trains at cfg.lr (as on
+        # this branch — no separate backbone LR). The text encoder's projection
+        # head trains at cfg.lr too; for DR the top text layers are added as a
+        # separate group (requires_grad toggled on at text_finetune_start_epoch).
+        optim_params = [{"params": list(self.model.parameters()), "lr": cfg.lr}]
+        if self.text_encoder is not None:
+            optim_params.append(
+                {"params": list(self.text_encoder.projection.parameters()), "lr": cfg.lr}
+            )
+            if getattr(cfg, "finetune_text_encoder", False):
+                self.text_encoder.set_text_finetune(True)
+                text_params = self.text_encoder.trainable_text_parameters()
+                self.text_encoder.set_text_finetune(False)  # off until start_epoch
+                if text_params:
+                    optim_params.append(
+                        {"params": text_params, "lr": getattr(cfg, "text_encoder_lr", 1e-6)}
+                    )
+                logger.info(
+                    f"Text fine-tuning configured: layers={getattr(cfg, 'text_finetune_layers', 0)} "
+                    f"start_epoch={getattr(cfg, 'text_finetune_start_epoch', 1)} "
+                    f"lr={getattr(cfg, 'text_encoder_lr', 1e-6):.2e}"
+                )
+
+        self.optimizer = torch.optim.Adam(optim_params, weight_decay=cfg.weight_decay)
+
+        # Loss (gamma image-text term active only when cfg.use_image_text and gamma>0)
         self.criterion = HybridContrastiveOrdinalLoss(
             alpha=cfg.alpha,
             beta=cfg.beta,
+            gamma=getattr(cfg, "gamma", 0.0),
             temperature=cfg.temperature,
+            use_image_text=getattr(cfg, "use_image_text", False),
+            lambda_ord_it=getattr(cfg, "lambda_ord_it", 1.0),
         )
 
-        # Class weights for SCOLw (computed from training set; "inverse frequency of class in dataset")
+        # Class weights for SCOLw (computed from training set; inverse frequency)
         self.class_weights = compute_class_weights(
             train_labels, cfg.n_classes, device=self.device
         )
@@ -139,9 +194,6 @@ class Trainer:
         )
 
         # Early stopping tracks val_acc (max) — the metric we optimize.
-        # val_loss is too noisy for stopping decisions: its std (0.010) is
-        # disproportionately large relative to its range, causing premature stops.
-        # The LR scheduler continues to use val_loss (min) separately.
         self.early_stopping = EarlyStopping(
             patience=cfg.early_stop_patience, mode="max"
         )
@@ -164,6 +216,8 @@ class Trainer:
 
         for epoch in range(1, self.cfg.epochs + 1):
             t0 = time.time()
+
+            self._maybe_enable_text_finetune(epoch)
 
             train_metrics = self._train_epoch(epoch)
             val_metrics = self._eval_epoch(self.val_loader, prefix="val")
@@ -237,9 +291,40 @@ class Trainer:
     # Private helpers
     # ──────────────────────────────────────────────────────────────────────────
 
+    def _maybe_enable_text_finetune(self, epoch: int) -> None:
+        """Unfreeze the top text transformer layers at text_finetune_start_epoch.
+
+        The layers are already registered as an optimizer param group (with
+        requires_grad=False); flipping requires_grad lets Adam start updating them.
+        """
+        if self.text_encoder is None or self._text_finetune_enabled:
+            return
+        if not getattr(self.cfg, "finetune_text_encoder", False):
+            return
+        start_epoch = getattr(self.cfg, "text_finetune_start_epoch", 1)
+        if epoch < start_epoch:
+            return
+        n_text_params = self.text_encoder.set_text_finetune(True)
+        self._text_finetune_enabled = True
+        logger.info(
+            f"[Fold {self.fold}] Enabled text encoder fine-tuning at epoch {epoch} "
+            f"({n_text_params} trainable text params, "
+            f"lr={getattr(self.cfg, 'text_encoder_lr', 1e-6):.2e})"
+        )
+
     def _train_epoch(self, epoch: int) -> dict:
         self.model.train()
-        total_loss = total_pcol = total_scolw = total_rmse = 0.0
+        if self.text_encoder is not None:
+            self.text_encoder.train()
+            # Keep the frozen text transformer in eval mode until fine-tuning starts
+            # (avoids dropout/LN-stat drift on the frozen prototypes).
+            if (
+                getattr(self.cfg, "finetune_text_encoder", False)
+                and not self._text_finetune_enabled
+            ):
+                self.text_encoder.text_model.eval()
+
+        total_loss = total_pcol = total_scolw = total_rmse = total_it = 0.0
         n_batches = 0
 
         # non_blocking=True is safe with CUDA + pinned memory: overlaps CPU→GPU
@@ -254,22 +339,38 @@ class Trainer:
 
             # Paper (author response): weights computed per-batch using inverse
             # class frequency of the current mini-batch, not dataset-level.
-            # With stratified sampling (4 per class) this gives ~uniform weights
-            # (~1.2 each), avoiding the 36× gradient imbalance that dataset-level
-            # weights would produce between rare (grade-4) and common (grade-0).
             batch_weights = compute_class_weights(
                 y.cpu().tolist(), self.cfg.n_classes, device=self.device
             )
             with autocast(device_type=self.device.type, enabled=self.use_amp):
-                z_pcol, z_scolw, pred = self.model(x)
+                out = self.model(x)
+                z_pcol = out["z_pcol"]
+                z_scolw = out["z_scolw"]
+                z_it = out.get("z_it", None)
+                pred = out["pred"]
+
+                text_prototypes = None
+                if self.text_encoder is not None and self.cfg.use_image_text:
+                    text_prototypes = self.text_encoder()
+
                 loss, comps = self.criterion(
-                    z_pcol, z_scolw, pred, y, batch_weights
+                    z_pcol=z_pcol,
+                    z_scolw=z_scolw,
+                    pred=pred,
+                    labels=y,
+                    class_weights=batch_weights,
+                    z_it=z_it,
+                    text_prototypes=text_prototypes,
                 )
 
             self.scaler.scale(loss).backward()
             # Unscale before clip so the gradient norm is in the original fp32 scale.
             self.scaler.unscale_(self.optimizer)
-            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            clip_params = list(self.model.parameters())
+            if self.text_encoder is not None:
+                clip_params += list(self.text_encoder.projection.parameters())
+                clip_params += self.text_encoder.trainable_text_parameters()
+            nn.utils.clip_grad_norm_(clip_params, max_norm=1.0)
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
@@ -277,19 +378,25 @@ class Trainer:
             total_pcol += comps["loss_pcol"]
             total_scolw += comps["loss_scolw"]
             total_rmse += comps["loss_rmse"]
+            total_it += comps.get("loss_it", 0.0)
             n_batches += 1
 
         nb = max(n_batches, 1)
-        return {
+        metrics = {
             "train_loss": total_loss / nb,
             "train_loss_pcol": total_pcol / nb,
             "train_loss_scolw": total_scolw / nb,
             "train_loss_rmse": total_rmse / nb,
         }
+        if self.text_encoder is not None and self.cfg.use_image_text:
+            metrics["train_loss_it"] = total_it / nb
+        return metrics
 
     @torch.no_grad()
     def _eval_epoch(self, loader: DataLoader, prefix: str) -> dict:
         self.model.eval()
+        if self.text_encoder is not None:
+            self.text_encoder.eval()
         all_preds = []
         all_labels = []
         total_rmse = 0.0
@@ -302,13 +409,11 @@ class Trainer:
             y = y.to(self.device, non_blocking=nb)
 
             # Only the regression head is used at inference (paper Section 2.1).
-            # Contrastive losses require stratified batches (≥2 classes present)
-            # which is NOT guaranteed on validation/test loaders — computing them
-            # here produces degenerate −1e9 values that break early stopping and
-            # checkpoint selection.  Use RMSE-only as the validation criterion.
+            # Contrastive / image-text losses require stratified batches and the
+            # text encoder, neither needed for the target metric.
             with autocast(device_type=self.device.type, enabled=self.use_amp):
                 pred = self.model.predict(x)
-                rmse = torch.sqrt(nn.functional.mse_loss(pred, y.float()))
+                rmse = torch.sqrt(nn.functional.mse_loss(pred, y.float()) + 1e-8)
 
             total_rmse += rmse.item()
             n_batches += 1
@@ -338,13 +443,18 @@ class Trainer:
     ) -> None:
         row = {"epoch": epoch, "elapsed": f"{elapsed:.1f}", "lr": lr, **train, **val}
 
+        it_text = ""
+        if "train_loss_it" in train:
+            it_text = f" it={train['train_loss_it']:.3f}"
+
         # Print to console
         logger.info(
             f"[Fold {self.fold}] Ep {epoch:3d} | "
             f"loss={train['train_loss']:.4f} "
             f"(pcol={train['train_loss_pcol']:.3f} "
             f"scolw={train['train_loss_scolw']:.3f} "
-            f"rmse={train['train_loss_rmse']:.3f}) | "
+            f"rmse={train['train_loss_rmse']:.3f}"
+            f"{it_text}) | "
             f"val_loss={val['val_loss']:.4f}  "
             f"val_acc={val['val_acc']:.2f}%  "
             f"val_mae={val['val_mae']:.4f}  "

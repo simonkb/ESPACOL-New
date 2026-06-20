@@ -65,6 +65,19 @@ class TrainConfig:
     # Automatic Mixed Precision — enabled on CUDA only (T4/A10 Tensor Cores → ~2× speed)
     amp: bool = True
 
+    # ── Gamma image-text extension (L_total += gamma * L_IT) ───────────────────
+    # L_IT aligns a per-image embedding (z_it head, on the SAME EfficientNet
+    # features) with class text prototypes from a BioMedCLIP text encoder.
+    # The image backbone stays EfficientNet-V2S — only the text side is added.
+    use_image_text: bool = True
+    gamma: float = 0.0929                 # weight on the image-text ordinal loss
+    lambda_ord_it: float = 1.0            # ordinal penalty strength inside L_IT
+    text_encoder_name: str = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+    finetune_text_encoder: bool = False   # if True, unfreeze top text layers mid-training
+    text_finetune_layers: int = 0         # number of top text transformer blocks to unfreeze
+    text_encoder_lr: float = 1e-6         # LR for the unfrozen text layers
+    text_finetune_start_epoch: int = 20   # epoch at which text fine-tuning kicks in
+
 
 @dataclass
 class BUSIConfig(TrainConfig):
@@ -100,3 +113,10 @@ class DRConfig(TrainConfig):
     # With 640 grade-4 images, batch prototypes (4 samples) are noisy.
     alpha: float = 0.00662474091401746 #Best for DR
     beta: float = 0.05516050165777829 #Best for DR
+    # Gamma image-text extension (DR overrides; from origin/extension DRConfig)
+    gamma: float = 0.05
+    lambda_ord_it: float = 2.0
+    finetune_text_encoder: bool = True
+    text_finetune_layers: int = 2
+    text_encoder_lr: float = 1e-6
+    text_finetune_start_epoch: int = 20
