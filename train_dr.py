@@ -200,6 +200,18 @@ def main():
         default=3,
         help="Tile grid size (default 3 → 3×3 = 9 local tiles + 1 global = 10 total)",
     )
+    parser.add_argument(
+        "--grad_checkpoint",
+        action="store_true",
+        help="Enable gradient checkpointing in backbone (saves ~60%% activation memory, "
+             "adds ~20%% backward time). Required for multi-tile + concept spine on 48GB GPUs.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help="Override batch size (default from config: 24)",
+    )
 
     parser.add_argument(
         "--no_cache",
@@ -284,6 +296,9 @@ def main():
     if args.use_multi_tile:
         cfg.use_multi_tile = True
         cfg.tile_grid = args.tile_grid
+
+    if args.batch_size is not None:
+        cfg.batch_size = args.batch_size
 
     if args.use_image_text:
         cfg.use_image_text = True
@@ -425,6 +440,7 @@ def main():
             use_multi_tile=cfg.use_multi_tile,
             use_concept_spine=getattr(cfg, "use_concept_spine", False),
             n_concepts=getattr(cfg, "n_concepts", 9),
+            grad_checkpoint=args.grad_checkpoint,
         )
 
         train_labels = [y for _, y in train_items]

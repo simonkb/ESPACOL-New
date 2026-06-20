@@ -146,11 +146,12 @@ def build_model(
     use_concept_spine: bool = False,
     n_concepts: int = 9,
     absence_indices: Optional[list] = None,
+    grad_checkpoint: bool = False,
 ) -> HybridContrastiveOrdinalModel:
     if use_multi_tile:
-        backbone = TiledEfficientNetBackbone(pretrained=pretrained)
+        backbone = TiledEfficientNetBackbone(pretrained=pretrained, grad_checkpoint=grad_checkpoint)
     else:
-        backbone = EfficientNetV2SBackbone(pretrained=pretrained)
+        backbone = EfficientNetV2SBackbone(pretrained=pretrained, grad_checkpoint=grad_checkpoint)
     feat_dim = backbone.OUT_DIM
 
     pcol_head = MLPProjectionHead(feat_dim, proj_hidden_dim, proj_out_dim)

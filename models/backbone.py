@@ -9,6 +9,7 @@ EfficientNet-V2S outputs 1280-dim features after GAP.
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint_sequential
 from torchvision.models import efficientnet_v2_s, EfficientNet_V2_S_Weights
 
 from .heads import AttentionPool
@@ -18,19 +19,30 @@ class EfficientNetV2SBackbone(nn.Module):
     """
     EfficientNet-V2S with classifier removed.
     Returns 1280-dim GAP features.
+
+    grad_checkpoint=True splits features into 4 segments and applies gradient
+    checkpointing, trading ~60% of activation memory for an extra backward recompute.
+    Useful when batch×tiles is large (multi-tile T=10), where the high-resolution
+    early stages (150×150, 75×75) dominate GPU activation memory.
     """
 
     OUT_DIM = 1280
 
-    def __init__(self, pretrained: bool = True):
+    def __init__(self, pretrained: bool = True, grad_checkpoint: bool = False):
         super().__init__()
         weights = EfficientNet_V2_S_Weights.DEFAULT if pretrained else None
         base = efficientnet_v2_s(weights=weights)
         self.features = base.features
         self.avgpool = base.avgpool   # AdaptiveAvgPool2d -> (N, 1280, 1, 1)
+        self.grad_checkpoint = grad_checkpoint
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.features(x)
+        if self.grad_checkpoint and self.training and torch.is_grad_enabled():
+            # use_reentrant=True re-triggers forward hooks during backward recompute,
+            # which is required for LayerCAM to capture the correct activations.
+            x = checkpoint_sequential(self.features, 4, x, use_reentrant=True)
+        else:
+            x = self.features(x)
         x = self.avgpool(x)
         return torch.flatten(x, 1)   # (N, 1280)
 
@@ -44,9 +56,9 @@ class TiledEfficientNetBackbone(nn.Module):
 
     OUT_DIM = 1280
 
-    def __init__(self, pretrained: bool = True):
+    def __init__(self, pretrained: bool = True, grad_checkpoint: bool = False):
         super().__init__()
-        self.base = EfficientNetV2SBackbone(pretrained=pretrained)
+        self.base = EfficientNetV2SBackbone(pretrained=pretrained, grad_checkpoint=grad_checkpoint)
         self.pool = AttentionPool(self.OUT_DIM)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
