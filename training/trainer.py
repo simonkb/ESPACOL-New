@@ -445,20 +445,28 @@ class Trainer:
                     cam_score.backward()  # frees this graph immediately after
 
                 # Extract batch-level heatmaps from hooks (detached, gradient-free)
-                H, W = x.shape[2], x.shape[3]
+                # x is (N, T, C, H, W) for multi-tile or (N, C, H, W) for single-tile
+                is_tiled = x.dim() == 5
+                H, W = (x.shape[3], x.shape[4]) if is_tiled else (x.shape[2], x.shape[3])
                 heatmaps = _compute_batch_concept_cams(
                     self.layer_cam._acts,
                     self.layer_cam._grads,
                     self.layer_cam.layer_indices,
                     H, W, self.device,
-                )  # (N, H, W)
+                )  # (N*T, H, W) for tiled, (N, H, W) for single
 
                 # Clear CAM gradients — main graph (for main_loss) is still alive
                 self.model.zero_grad()
 
                 # Soft occlusion of attended region
                 with torch.no_grad():
-                    x_occ = soft_occlude(x, heatmaps)
+                    if is_tiled:
+                        N_b, T_b, C_b, H_b, W_b = x.shape
+                        x_occ = soft_occlude(
+                            x.view(N_b * T_b, C_b, H_b, W_b), heatmaps
+                        ).view(N_b, T_b, C_b, H_b, W_b)
+                    else:
+                        x_occ = soft_occlude(x, heatmaps)
 
                 # Second forward for faithfulness loss (gradients flow through c_prime, E_prime)
                 with autocast(device_type=self.device.type, enabled=self.use_amp):
