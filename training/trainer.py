@@ -480,13 +480,16 @@ class Trainer:
                         top_k_idx=top_k_idx,
                     )
 
-                total_loss_combined = main_loss + nu * L_faith
                 L_faith_val = faith_comps["loss_faith"]
+                # Split backward: backward main first, then faith.
+                # Each graph is freed as soon as its backward completes,
+                # so peak memory = max(main_graph, occ_graph) not their sum.
+                scale = self.scaler.get_scale()
+                (main_loss * scale).backward()
+                (nu * L_faith * scale).backward()
             else:
-                total_loss_combined = main_loss
+                self.scaler.scale(main_loss).backward()
             # ────────────────────────────────────────────────────────────────
-
-            self.scaler.scale(total_loss_combined).backward()
 
             self.scaler.unscale_(self.optimizer)
 
