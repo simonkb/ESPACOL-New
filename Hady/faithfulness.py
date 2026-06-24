@@ -20,6 +20,7 @@ dataset-specific setup and call these helpers.
 """
 
 import os
+import random
 import sys
 
 import numpy as np
@@ -215,6 +216,111 @@ def run_concept_drop(pipeline, x0, tissue_mask=None, occlusion="blur",
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Step 3 — occlusion SPECIFICITY (on-target vs off-target control)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def control_masks(M, rng, n_roll=3):
+    """
+    Equal-area, equal-shape copies of mask `M` placed ELSEWHERE — the off-target
+    controls. Two reflections (180° and left-right) plus `n_roll` random circular
+    shifts. Moving the mask without changing its area isolates LOCATION as the only
+    variable, so comparing on- vs off-target drop tests whether the heatmap's
+    location (not just its size) is what carries the concept.
+    """
+    outs = [np.flip(M, (0, 1)).copy(), np.fliplr(M).copy()]
+    H, W = M.shape
+    for _ in range(n_roll):
+        dy = rng.randint(H // 4, 3 * H // 4)
+        dx = rng.randint(W // 4, 3 * W // 4)
+        outs.append(np.roll(M, (dy, dx), (0, 1)).copy())
+    return outs
+
+
+def occlusion_specificity(pipeline, x0, tissue_mask=None, occlusion="blur",
+                          blur_sigma=21.0, n_roll=3, rng=None, tol=0.0):
+    """
+    Step-3 control: does occluding the HEATMAP region drop the top concept MORE than
+    occluding an equal-size mask placed elsewhere? A bare concept-drop (step 1) can
+    be faithful localization, generic blur-sensitivity, or a trivially huge mask;
+    this separates them.
+
+        drop_on     = c_before - c_after(blur H_c region)
+        drop_ctrl   = mean over control masks of  c_before - c_after(blur shifted mask)
+        specificity = drop_on - drop_ctrl       (> 0 ⇒ the heatmap LOCATION matters)
+
+    Does NOT remove the pipeline's LayerCAM hooks (caller controls lifetime).
+
+    Returns a dict:
+        top, c_before, c_on, drop_on, drop_ctrl, ctrl_drops, specificity,
+        mask_frac (fraction of the image blurred), passed (drop_on > drop_ctrl+tol),
+        reg_before, scores_before, and for plotting: M (on-target mask), x_on,
+        M_ctrl0 / x_ctrl0 (the first control mask + its occluded image).
+    """
+    if rng is None:
+        rng = random.Random(0)
+
+    scores_before, reg_before = recompute_scores(pipeline, x0)
+    top = max(scores_before, key=scores_before.get)
+    vec = pipeline.concept_explainer.get_vector(top)
+    all_v = pipeline.concept_explainer.embeddings
+    H_c = pipeline.layercam.compute_concept(
+        x0, vec, all_concept_vectors=all_v, temperature=10.0
+    )
+
+    M_on = np.clip(H_c.astype(np.float32), 0.0, 1.0)
+    if tissue_mask is not None:
+        M_on = M_on * np.clip(tissue_mask.astype(np.float32), 0.0, 1.0)
+
+    # on-target: pass the mask directly (tissue already folded in)
+    x_on, _ = occlude_image(x0, M_on, tissue_mask=None, baseline=occlusion, blur_sigma=blur_sigma)
+    s_on, _ = recompute_scores(pipeline, x_on)
+    drop_on = float(scores_before[top] - s_on[top])
+
+    # off-target controls: same mask, moved
+    ctrl_drops, M_ctrl0, x_ctrl0 = [], None, None
+    for i, Mc in enumerate(control_masks(M_on, rng, n_roll=n_roll)):
+        x_c, _ = occlude_image(x0, Mc, tissue_mask=None, baseline=occlusion, blur_sigma=blur_sigma)
+        s_c, _ = recompute_scores(pipeline, x_c)
+        ctrl_drops.append(float(scores_before[top] - s_c[top]))
+        if i == 0:
+            M_ctrl0, x_ctrl0 = Mc, x_c
+
+    drop_ctrl = float(np.mean(ctrl_drops))
+    specificity = drop_on - drop_ctrl
+    return {
+        "top": top,
+        "c_before": float(scores_before[top]),
+        "c_on": float(s_on[top]),
+        "drop_on": drop_on,
+        "drop_ctrl": drop_ctrl,
+        "ctrl_drops": ctrl_drops,
+        "specificity": float(specificity),
+        "mask_frac": float(M_on.mean()),
+        "passed": bool(drop_on > drop_ctrl + tol),
+        "reg_before": float(reg_before),
+        "scores_before": scores_before,
+        "M": M_on, "x_on": x_on, "M_ctrl0": M_ctrl0, "x_ctrl0": x_ctrl0,
+    }
+
+
+def print_specificity_summary(spec, true_name, pred_before, encoder):
+    verdict = ("LOCATION-SPECIFIC (faithful)" if spec["passed"] and spec["specificity"] > 0
+               else "NOT location-specific")
+    print("-" * 60)
+    print(f"Top concept     : {spec['top']}")
+    print(f"True / pred     : {true_name} / {pred_before}")
+    print(f"c_before        : {spec['c_before']:+.4f}")
+    print(f"drop on-target  : {spec['drop_on']:+.4f}   (blur the H_c region)")
+    print(f"drop off-target : {spec['drop_ctrl']:+.4f}   (same mask moved elsewhere, mean of {len(spec['ctrl_drops'])})")
+    print(f"specificity     : {spec['specificity']:+.4f}   (on - off; >0 ⇒ location matters)")
+    print(f"mask fraction   : {100*spec['mask_frac']:.1f}% of the image blurred")
+    print(f"VERDICT         : {verdict}")
+    if encoder != "biomedclip":
+        print("WARNING: --encoder random ⇒ concept vectors are placeholders; specificity is meaningless.")
+    print("-" * 60)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Display helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -305,6 +411,53 @@ def build_faithfulness_figure(
     fig.suptitle(
         f"ESPACOL faithfulness — concept-drop (step 1)  |  {dataset_name}  |  "
         f"top: {top_concept}  |  {verdict}",
+        fontsize=12, fontweight="bold",
+    )
+    return fig
+
+
+def build_specificity_figure(plt, image_np, on_np, off_np, spec,
+                             true_name, pred_before, dataset_name, baseline_word):
+    """
+    Step-3 figure: Original | WHERE H_c | On-target occluded | Off-target occluded.
+
+    Same-size mask, two placements: on the heatmap (panel 3) vs moved elsewhere
+    (panel 4). If only the on-target occlusion drops the concept, the heatmap
+    location is what carries it (faithful). Titles carry the drops + specificity.
+    """
+    import matplotlib.gridspec as gridspec
+
+    top = spec["top"]
+    verdict = ("LOCATION-SPECIFIC ✓" if spec["passed"] and spec["specificity"] > 0
+               else "not location-specific ✗")
+
+    M_vis = spec["M"] / (spec["M"].max() + 1e-8)  # stretch faint maps for display only
+
+    fig = plt.figure(figsize=(18, 5.2))
+    gs = gridspec.GridSpec(1, 4, wspace=0.18)
+
+    ax0 = fig.add_subplot(gs[0])
+    ax0.imshow((image_np * 255).astype(np.uint8)); ax0.axis("off")
+    ax0.set_title(f"Original\n(true: {true_name} | pred: {pred_before})")
+
+    ax1 = fig.add_subplot(gs[1])
+    ax1.imshow(LayerCAM.overlay(image_np, M_vis)); ax1.axis("off")
+    ax1.set_title(f"WHERE: {top}\n(H_c — the masked region)")
+
+    ax2 = fig.add_subplot(gs[2])
+    ax2.imshow((on_np * 255).astype(np.uint8)); ax2.axis("off")
+    ax2.set_title(f"ON-target occluded ({baseline_word})\n"
+                  f"c {spec['c_before']:+.2f}→{spec['c_on']:+.2f}  drop {spec['drop_on']:+.3f}")
+
+    ax3 = fig.add_subplot(gs[3])
+    ax3.imshow((off_np * 255).astype(np.uint8)); ax3.axis("off")
+    ax3.set_title(f"OFF-target (mask moved)\n"
+                  f"mean drop {spec['drop_ctrl']:+.3f}  ({len(spec['ctrl_drops'])} controls)")
+
+    fig.suptitle(
+        f"ESPACOL faithfulness — occlusion specificity (step 3)  |  {dataset_name}  |  "
+        f"top: {top}  |  specificity = {spec['drop_on']:+.3f} − {spec['drop_ctrl']:+.3f} "
+        f"= {spec['specificity']:+.3f}  →  {verdict}",
         fontsize=12, fontweight="bold",
     )
     return fig
