@@ -1,0 +1,746 @@
+[
+  {
+    "n": 133,
+    "drop_on_med": 0.4746,
+    "drop_on_mean": 0.43451804511278197,
+    "drop_on_iqr": [
+      0.2099,
+      0.5448
+    ],
+    "drop_off_med": 0.075,
+    "spec_med": 0.3376,
+    "spec_mean": 0.3047766917293233,
+    "spec_iqr": [
+      0.0436,
+      0.4306
+    ],
+    "spec_ci": [
+      0.2599,
+      0.3671
+    ],
+    "mask_med": 0.4008,
+    "pass_rate": 0.7819548872180451,
+    "locspec_rate": 0.849624060150376,
+    "anti_rate": 0.21804511278195488,
+    "grade_change_rate": 0.7142857142857143,
+    "p_drop": 1.007783245111201e-19,
+    "p_spec_raw": 3.175422750107742e-20,
+    "group_key": "BUSI:normal",
+    "partition": "overall",
+    "p_spec_adj": 6.350845500215485e-20,
+    "verdict": "FAITHFUL"
+  },
+  {
+    "n": 437,
+    "drop_on_med": 0.0078,
+    "drop_on_mean": 0.13173592677345536,
+    "drop_on_iqr": [
+      0.0013,
+      0.0986
+    ],
+    "drop_off_med": 0.0002,
+    "spec_med": 0.0068,
+    "spec_mean": 0.12002425629290618,
+    "spec_iqr": [
+      0.001,
+      0.0994
+    ],
+    "spec_ci": [
+      0.0053,
+      0.0093
+    ],
+    "mask_med": 0.2257,
+    "pass_rate": 0.8192219679633868,
+    "locspec_rate": 0.7917620137299771,
+    "anti_rate": 0.17620137299771166,
+    "grade_change_rate": 0.2608695652173913,
+    "p_drop": 8.191595402232801e-42,
+    "p_spec_raw": 1.329956442554909e-36,
+    "group_key": "BUSI:benign",
+    "partition": "overall",
+    "p_spec_adj": 5.319825770219636e-36,
+    "verdict": "WEAK/INCONCLUSIVE"
+  },
+  {
+    "n": 210,
+    "drop_on_med": 0.0006,
+    "drop_on_mean": 0.017961428571428573,
+    "drop_on_iqr": [
+      0.0001,
+      0.004875
+    ],
+    "drop_off_med": 0.0004,
+    "spec_med": 0.0002,
+    "spec_mean": 0.016719523809523813,
+    "spec_iqr": [
+      -0.0001,
+      0.00365
+    ],
+    "spec_ci": [
+      0.0,
+      0.00045
+    ],
+    "mask_med": 0.29515,
+    "pass_rate": 0.8238095238095238,
+    "locspec_rate": 0.5619047619047619,
+    "anti_rate": 0.05238095238095238,
+    "grade_change_rate": 0.1619047619047619,
+    "p_drop": 6.123461327045997e-28,
+    "p_spec_raw": 2.3561129886347784e-09,
+    "group_key": "BUSI:malignant",
+    "partition": "overall",
+    "p_spec_adj": 3.769780781815646e-09,
+    "verdict": "WEAK/INCONCLUSIVE"
+  },
+  {
+    "n": 25810,
+    "drop_on_med": -0.0003,
+    "drop_on_mean": 0.0026332623014335534,
+    "drop_on_iqr": [
+      -0.0017,
+      0.001
+    ],
+    "drop_off_med": -0.0001,
+    "spec_med": -0.0003,
+    "spec_mean": 0.0017550949244478887,
+    "spec_iqr": [
+      -0.0012,
+      0.0007
+    ],
+    "spec_ci": [
+      -0.0003,
+      -0.0002
+    ],
+    "mask_med": 0.2749,
+    "pass_rate": 0.4239442076714452,
+    "locspec_rate": 0.41286323130569547,
+    "anti_rate": 0.555366137156141,
+    "grade_change_rate": 0.017938783417280123,
+    "p_drop": 1.0,
+    "p_spec_raw": 1.0,
+    "group_key": "DR:grade0 (No DR)",
+    "partition": "overall",
+    "p_spec_adj": 1.0,
+    "verdict": "INERT"
+  },
+  {
+    "n": 2443,
+    "drop_on_med": -0.0668,
+    "drop_on_mean": -0.16928657388456814,
+    "drop_on_iqr": [
+      -0.36895,
+      -0.0073
+    ],
+    "drop_off_med": -0.0096,
+    "spec_med": -0.0398,
+    "spec_mean": -0.12818485468686042,
+    "spec_iqr": [
+      -0.2903,
+      -0.0011
+    ],
+    "spec_ci": [
+      -0.05650499999999999,
+      -0.03
+    ],
+    "mask_med": 0.1721,
+    "pass_rate": 0.05935325419566107,
+    "locspec_rate": 0.21121571837904216,
+    "anti_rate": 0.937781416291445,
+    "grade_change_rate": 0.44412607449856734,
+    "p_drop": 1.0,
+    "p_spec_raw": 1.0,
+    "group_key": "DR:grade1 (Mild NPDR)",
+    "partition": "overall",
+    "p_spec_adj": 1.0,
+    "verdict": "ANTI-FAITHFUL"
+  },
+  {
+    "n": 5292,
+    "drop_on_med": -0.001,
+    "drop_on_mean": 0.09897498110355255,
+    "drop_on_iqr": [
+      -0.004824999999999999,
+      0.2384
+    ],
+    "drop_off_med": -0.0008,
+    "spec_med": -0.0001,
+    "spec_mean": 0.08117942176870747,
+    "spec_iqr": [
+      -0.0039,
+      0.198825
+    ],
+    "spec_ci": [
+      -0.0002,
+      0.0001
+    ],
+    "mask_med": 0.23005,
+    "pass_rate": 0.44047619047619047,
+    "locspec_rate": 0.4877173091458806,
+    "anti_rate": 0.5538548752834467,
+    "grade_change_rate": 0.4021164021164021,
+    "p_drop": 1.0592291138305543e-74,
+    "p_spec_raw": 5.527765893730227e-88,
+    "group_key": "DR:grade2 (Moderate NPDR)",
+    "partition": "overall",
+    "p_spec_adj": 4.422212714984182e-87,
+    "verdict": "WEAK/INCONCLUSIVE"
+  },
+  {
+    "n": 873,
+    "drop_on_med": -0.0004,
+    "drop_on_mean": 0.004302634593356242,
+    "drop_on_iqr": [
+      -0.0012,
+      0.0002
+    ],
+    "drop_off_med": -0.0008,
+    "spec_med": 0.0005,
+    "spec_mean": 0.01001397479954181,
+    "spec_iqr": [
+      -0.0001,
+      0.0012
+    ],
+    "spec_ci": [
+      0.0004,
+      0.0006
+    ],
+    "mask_med": 0.1588,
+    "pass_rate": 0.3104238258877434,
+    "locspec_rate": 0.6769759450171822,
+    "anti_rate": 0.6552119129438717,
+    "grade_change_rate": 0.038946162657502864,
+    "p_drop": 1.0,
+    "p_spec_raw": 4.075004705735024e-35,
+    "group_key": "DR:grade3 (Severe NPDR)",
+    "partition": "overall",
+    "p_spec_adj": 1.0866679215293397e-34,
+    "verdict": "INERT"
+  },
+  {
+    "n": 708,
+    "drop_on_med": 0.0,
+    "drop_on_mean": 0.0030296610169491525,
+    "drop_on_iqr": [
+      -0.0001,
+      0.0001
+    ],
+    "drop_off_med": 0.0,
+    "spec_med": 0.0,
+    "spec_mean": 0.0013416666666666666,
+    "spec_iqr": [
+      -0.0001,
+      0.0001
+    ],
+    "spec_ci": [
+      0.0,
+      0.0
+    ],
+    "mask_med": 0.08235,
+    "pass_rate": 0.2853107344632768,
+    "locspec_rate": 0.3121468926553672,
+    "anti_rate": 0.327683615819209,
+    "grade_change_rate": 0.014124293785310734,
+    "p_drop": 0.940968940566717,
+    "p_spec_raw": 0.6464650262135936,
+    "group_key": "DR:grade4 (PDR)",
+    "partition": "overall",
+    "p_spec_adj": 0.8619533682847914,
+    "verdict": "INERT"
+  },
+  {
+    "n": 107,
+    "drop_on_med": 0.4735,
+    "drop_on_mean": 0.4122785046728972,
+    "drop_on_iqr": [
+      0.027100000000000003,
+      0.5379
+    ],
+    "drop_off_med": 0.0735,
+    "spec_med": 0.2983,
+    "spec_mean": 0.2933130841121495,
+    "spec_iqr": [
+      0.0154,
+      0.42905
+    ],
+    "spec_ci": [
+      0.2408,
+      0.3551
+    ],
+    "mask_med": 0.4008,
+    "pass_rate": 0.7663551401869159,
+    "locspec_rate": 0.8317757009345794,
+    "anti_rate": 0.2336448598130841,
+    "grade_change_rate": 0.6915887850467289,
+    "p_drop": 9.659448547746447e-16,
+    "p_spec_raw": 4.2006683738501797e-16,
+    "group_key": "BUSI:normal",
+    "partition": "train",
+    "p_spec_adj": 8.401336747700359e-16,
+    "verdict": "FAITHFUL"
+  },
+  {
+    "n": 350,
+    "drop_on_med": 0.00695,
+    "drop_on_mean": 0.12438314285714286,
+    "drop_on_iqr": [
+      0.0012,
+      0.095875
+    ],
+    "drop_off_med": 0.0002,
+    "spec_med": 0.0058,
+    "spec_mean": 0.11299257142857144,
+    "spec_iqr": [
+      0.0008,
+      0.092875
+    ],
+    "spec_ci": [
+      0.00435,
+      0.0076
+    ],
+    "mask_med": 0.22505,
+    "pass_rate": 0.8085714285714286,
+    "locspec_rate": 0.7828571428571428,
+    "anti_rate": 0.18571428571428572,
+    "grade_change_rate": 0.2542857142857143,
+    "p_drop": 1.5391728752860645e-30,
+    "p_spec_raw": 1.72796603891046e-26,
+    "group_key": "BUSI:benign",
+    "partition": "train",
+    "p_spec_adj": 4.6079094370945604e-26,
+    "verdict": "WEAK/INCONCLUSIVE"
+  },
+  {
+    "n": 168,
+    "drop_on_med": 0.0006,
+    "drop_on_mean": 0.019627380952380955,
+    "drop_on_iqr": [
+      0.0001,
+      0.006500000000000001
+    ],
+    "drop_off_med": 0.0003,
+    "spec_med": 0.0002,
+    "spec_mean": 0.018948214285714287,
+    "spec_iqr": [
+      -0.0001,
+      0.00455
+    ],
+    "spec_ci": [
+      0.0,
+      0.0005
+    ],
+    "mask_med": 0.2939,
+    "pass_rate": 0.8035714285714286,
+    "locspec_rate": 0.5654761904761905,
+    "anti_rate": 0.06547619047619048,
+    "grade_change_rate": 0.17857142857142858,
+    "p_drop": 1.176213835615955e-21,
+    "p_spec_raw": 4.157552650217214e-08,
+    "group_key": "BUSI:malignant",
+    "partition": "train",
+    "p_spec_adj": 6.652084240347542e-08,
+    "verdict": "WEAK/INCONCLUSIVE"
+  },
+  {
+    "n": 23229,
+    "drop_on_med": -0.0003,
+    "drop_on_mean": 0.0024835205992509365,
+    "drop_on_iqr": [
+      -0.0016,
+      0.001
+    ],
+    "drop_off_med": -0.0001,
+    "spec_med": -0.0003,
+    "spec_mean": 0.0017509320246243917,
+    "spec_iqr": [
+      -0.0012,
+      0.0007
+    ],
+    "spec_ci": [
+      -0.0003,
+      -0.0002
+    ],
+    "mask_med": 0.2753,
+    "pass_rate": 0.42515820741314736,
+    "locspec_rate": 0.41400835162942873,
+    "anti_rate": 0.5539196693787938,
+    "grade_change_rate": 0.014852124499547979,
+    "p_drop": 1.0,
+    "p_spec_raw": 1.0,
+    "group_key": "DR:grade0 (No DR)",
+    "partition": "train",
+    "p_spec_adj": 1.0,
+    "verdict": "INERT"
+  },
+  {
+    "n": 2199,
+    "drop_on_med": -0.0997,
+    "drop_on_mean": -0.1875706230104593,
+    "drop_on_iqr": [
+      -0.36995,
+      -0.0103
+    ],
+    "drop_off_med": -0.0121,
+    "spec_med": -0.0753,
+    "spec_mean": -0.14185707139608913,
+    "spec_iqr": [
+      -0.299,
+      -0.0024
+    ],
+    "spec_ci": [
+      -0.11341499999999997,
+      -0.0562
+    ],
+    "mask_med": 0.1683,
+    "pass_rate": 0.017280582082764895,
+    "locspec_rate": 0.1855388813096862,
+    "anti_rate": 0.9804456571168713,
+    "grade_change_rate": 0.4688494770350159,
+    "p_drop": 1.0,
+    "p_spec_raw": 1.0,
+    "group_key": "DR:grade1 (Mild NPDR)",
+    "partition": "train",
+    "p_spec_adj": 1.0,
+    "verdict": "ANTI-FAITHFUL"
+  },
+  {
+    "n": 4767,
+    "drop_on_med": -0.001,
+    "drop_on_mean": 0.100792678833648,
+    "drop_on_iqr": [
+      -0.0049,
+      0.2384
+    ],
+    "drop_off_med": -0.0008,
+    "spec_med": -0.0001,
+    "spec_mean": 0.08368856723306062,
+    "spec_iqr": [
+      -0.0038,
+      0.2012
+    ],
+    "spec_ci": [
+      -0.0002,
+      0.0001
+    ],
+    "mask_med": 0.2306,
+    "pass_rate": 0.43738200125865323,
+    "locspec_rate": 0.48982588630165724,
+    "anti_rate": 0.5563247325361863,
+    "grade_change_rate": 0.40885252779525905,
+    "p_drop": 5.840699521719451e-75,
+    "p_spec_raw": 1.5272057631896481e-89,
+    "group_key": "DR:grade2 (Moderate NPDR)",
+    "partition": "train",
+    "p_spec_adj": 1.2217646105517185e-88,
+    "verdict": "WEAK/INCONCLUSIVE"
+  },
+  {
+    "n": 786,
+    "drop_on_med": -0.0004,
+    "drop_on_mean": -0.004743002544529262,
+    "drop_on_iqr": [
+      -0.001,
+      0.0002
+    ],
+    "drop_off_med": -0.0008,
+    "spec_med": 0.0004,
+    "spec_mean": 0.0024592875318066153,
+    "spec_iqr": [
+      -0.0001,
+      0.0011
+    ],
+    "spec_ci": [
+      0.0004,
+      0.0005
+    ],
+    "mask_med": 0.1546,
+    "pass_rate": 0.30661577608142493,
+    "locspec_rate": 0.6857506361323156,
+    "anti_rate": 0.6564885496183206,
+    "grade_change_rate": 0.006361323155216285,
+    "p_drop": 1.0,
+    "p_spec_raw": 4.989246005384904e-39,
+    "group_key": "DR:grade3 (Severe NPDR)",
+    "partition": "train",
+    "p_spec_adj": 1.9956984021539616e-38,
+    "verdict": "INERT"
+  },
+  {
+    "n": 629,
+    "drop_on_med": 0.0,
+    "drop_on_mean": -0.0009295707472178062,
+    "drop_on_iqr": [
+      -0.0001,
+      0.0001
+    ],
+    "drop_off_med": 0.0,
+    "spec_med": 0.0,
+    "spec_mean": -0.0009106518282988869,
+    "spec_iqr": [
+      -0.0001,
+      0.0001
+    ],
+    "spec_ci": [
+      0.0,
+      0.0
+    ],
+    "mask_med": 0.0805,
+    "pass_rate": 0.27503974562798095,
+    "locspec_rate": 0.3052464228934817,
+    "anti_rate": 0.314785373608903,
+    "grade_change_rate": 0.001589825119236884,
+    "p_drop": 0.9492512867169524,
+    "p_spec_raw": 0.527416956603336,
+    "group_key": "DR:grade4 (PDR)",
+    "partition": "train",
+    "p_spec_adj": 0.703222608804448,
+    "verdict": "INERT"
+  },
+  {
+    "n": 26,
+    "drop_on_med": 0.4769,
+    "drop_on_mean": 0.5260423076923076,
+    "drop_on_iqr": [
+      0.4217,
+      0.8231999999999999
+    ],
+    "drop_off_med": 0.0829,
+    "spec_med": 0.3686,
+    "spec_mean": 0.3519538461538462,
+    "spec_iqr": [
+      0.13545000000000001,
+      0.46455
+    ],
+    "spec_ci": [
+      0.20945000000000003,
+      0.435
+    ],
+    "mask_med": 0.40915,
+    "pass_rate": 0.8461538461538461,
+    "locspec_rate": 0.9230769230769231,
+    "anti_rate": 0.15384615384615385,
+    "grade_change_rate": 0.8076923076923077,
+    "p_drop": 6.407499313354492e-07,
+    "p_spec_raw": 2.086162567138672e-07,
+    "group_key": "BUSI:normal",
+    "partition": "heldout",
+    "p_spec_adj": 8.344650268554688e-07,
+    "verdict": "FAITHFUL"
+  },
+  {
+    "n": 87,
+    "drop_on_med": 0.0126,
+    "drop_on_mean": 0.16131609195402297,
+    "drop_on_iqr": [
+      0.0028,
+      0.1976
+    ],
+    "drop_off_med": 0.0005,
+    "spec_med": 0.012,
+    "spec_mean": 0.1483126436781609,
+    "spec_iqr": [
+      0.0023,
+      0.1977
+    ],
+    "spec_ci": [
+      0.0061,
+      0.0155
+    ],
+    "mask_med": 0.2298,
+    "pass_rate": 0.8620689655172413,
+    "locspec_rate": 0.8275862068965517,
+    "anti_rate": 0.13793103448275862,
+    "grade_change_rate": 0.28735632183908044,
+    "p_drop": 2.1482770979942546e-13,
+    "p_spec_raw": 1.7244256513937015e-12,
+    "group_key": "BUSI:benign",
+    "partition": "heldout",
+    "p_spec_adj": 1.3795405211149612e-11,
+    "verdict": "WEAK/INCONCLUSIVE"
+  },
+  {
+    "n": 42,
+    "drop_on_med": 0.00095,
+    "drop_on_mean": 0.011297619047619046,
+    "drop_on_iqr": [
+      0.00015000000000000001,
+      0.003175
+    ],
+    "drop_off_med": 0.0004,
+    "spec_med": 0.0002,
+    "spec_mean": 0.007804761904761905,
+    "spec_iqr": [
+      -0.0002,
+      0.0022
+    ],
+    "spec_ci": [
+      0.0,
+      0.00065
+    ],
+    "mask_med": 0.2996,
+    "pass_rate": 0.9047619047619048,
+    "locspec_rate": 0.5476190476190477,
+    "anti_rate": 0.0,
+    "grade_change_rate": 0.09523809523809523,
+    "p_drop": 3.7738654498053474e-08,
+    "p_spec_raw": 0.00996058089109941,
+    "group_key": "BUSI:malignant",
+    "partition": "heldout",
+    "p_spec_adj": 0.015936929425759055,
+    "verdict": "WEAK/INCONCLUSIVE"
+  },
+  {
+    "n": 2581,
+    "drop_on_med": -0.0004,
+    "drop_on_mean": 0.003980937621077102,
+    "drop_on_iqr": [
+      -0.002,
+      0.0011
+    ],
+    "drop_off_med": -0.0001,
+    "spec_med": -0.0003,
+    "spec_mean": 0.0017925610228593568,
+    "spec_iqr": [
+      -0.0014,
+      0.0008
+    ],
+    "spec_ci": [
+      -0.0004,
+      -0.0002
+    ],
+    "mask_med": 0.272,
+    "pass_rate": 0.41301820999612554,
+    "locspec_rate": 0.4025571483920961,
+    "anti_rate": 0.5683843471522666,
+    "grade_change_rate": 0.04571871367686943,
+    "p_drop": 0.9999999999999996,
+    "p_spec_raw": 0.999999999999996,
+    "group_key": "DR:grade0 (No DR)",
+    "partition": "heldout",
+    "p_spec_adj": 0.999999999999996,
+    "verdict": "INERT"
+  },
+  {
+    "n": 244,
+    "drop_on_med": -0.0005,
+    "drop_on_mean": -0.0045053278688524595,
+    "drop_on_iqr": [
+      -0.005,
+      0.00215
+    ],
+    "drop_off_med": -0.0002,
+    "spec_med": -0.00045,
+    "spec_mean": -0.0049668032786885224,
+    "spec_iqr": [
+      -0.0038,
+      0.001425
+    ],
+    "spec_ci": [
+      -0.001,
+      0.0001
+    ],
+    "mask_med": 0.249,
+    "pass_rate": 0.4385245901639344,
+    "locspec_rate": 0.4426229508196721,
+    "anti_rate": 0.5532786885245902,
+    "grade_change_rate": 0.22131147540983606,
+    "p_drop": 0.9852371258918587,
+    "p_spec_raw": 0.9910775664059372,
+    "group_key": "DR:grade1 (Mild NPDR)",
+    "partition": "heldout",
+    "p_spec_adj": 0.999999999999996,
+    "verdict": "INERT"
+  },
+  {
+    "n": 525,
+    "drop_on_med": -0.0005,
+    "drop_on_mean": 0.0824702857142857,
+    "drop_on_iqr": [
+      -0.0045,
+      0.2361
+    ],
+    "drop_off_med": -0.0005,
+    "spec_med": -0.0004,
+    "spec_mean": 0.05839638095238095,
+    "spec_iqr": [
+      -0.0066,
+      0.1298
+    ],
+    "spec_ci": [
+      -0.0007,
+      0.0003
+    ],
+    "mask_med": 0.2238,
+    "pass_rate": 0.4685714285714286,
+    "locspec_rate": 0.4685714285714286,
+    "anti_rate": 0.5314285714285715,
+    "grade_change_rate": 0.34095238095238095,
+    "p_drop": 0.0004561513529600718,
+    "p_spec_raw": 0.0027064969309875376,
+    "group_key": "DR:grade2 (Moderate NPDR)",
+    "partition": "heldout",
+    "p_spec_adj": 0.0072173251493001,
+    "verdict": "WEAK/INCONCLUSIVE"
+  },
+  {
+    "n": 87,
+    "drop_on_med": -0.001,
+    "drop_on_mean": 0.08602528735632183,
+    "drop_on_iqr": [
+      -0.0049499999999999995,
+      0.10785
+    ],
+    "drop_off_med": -0.0009,
+    "spec_med": 0.0009,
+    "spec_mean": 0.07826666666666666,
+    "spec_iqr": [
+      -0.0024000000000000002,
+      0.1469
+    ],
+    "spec_ci": [
+      -0.0002074999999999868,
+      0.0079
+    ],
+    "mask_med": 0.209,
+    "pass_rate": 0.3448275862068966,
+    "locspec_rate": 0.5977011494252874,
+    "anti_rate": 0.6436781609195402,
+    "grade_change_rate": 0.3333333333333333,
+    "p_drop": 0.6897695859292262,
+    "p_spec_raw": 0.003980491195689219,
+    "group_key": "DR:grade3 (Severe NPDR)",
+    "partition": "heldout",
+    "p_spec_adj": 0.007960982391378438,
+    "verdict": "INERT"
+  },
+  {
+    "n": 79,
+    "drop_on_med": 0.0,
+    "drop_on_mean": 0.03455316455696202,
+    "drop_on_iqr": [
+      -0.00030000000000000003,
+      0.00025
+    ],
+    "drop_off_med": 0.0,
+    "spec_med": 0.0,
+    "spec_mean": 0.01927468354430379,
+    "spec_iqr": [
+      -0.0005499999999999999,
+      0.0002
+    ],
+    "spec_ci": [
+      -0.0001,
+      0.0
+    ],
+    "mask_med": 0.1095,
+    "pass_rate": 0.3670886075949367,
+    "locspec_rate": 0.3670886075949367,
+    "anti_rate": 0.43037974683544306,
+    "grade_change_rate": 0.11392405063291139,
+    "p_drop": 0.39836587636881804,
+    "p_spec_raw": 0.5775335906008409,
+    "group_key": "DR:grade4 (PDR)",
+    "partition": "heldout",
+    "p_spec_adj": 0.7700447874677878,
+    "verdict": "INERT"
+  }
+]

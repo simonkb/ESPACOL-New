@@ -1,0 +1,115 @@
+Wed Jun 24 14:37:25 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.95.05              Driver Version: 580.95.05      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H200                    Off |   00000000:BB:00.0 Off |                    0 |
+| N/A   44C    P0            126W /  700W |       0MiB / 143771MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+cuda build: 12.6
+######## Faithfulness verdict run (datasets=both, per-class=0) ########
+Device: cuda  |  out: /dpc/kuin0170/u100066980/runs/faithful_verdict_full  |  per-class: 0  |  controls: 6/image
+Loading BioMedCLIP (hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224) -- first run downloads ~350 MB ...
+BioMedCLIP loaded.
+Loaded recovered text projection: /home/kunet.ae/100066980/ESPACOL-New/Hady/BUSI_text_projection.pth
+BUSI images found: 780
+  [busi normal] n=133
+  [busi benign] n=437
+  [busi malignant] n=210
+[busi] partition: n=780  train=625  heldout=155  (heldout 19.9% of evaluated images)
+  train  : acc=97.12%  MAE=0.0288
+  heldout: acc=98.06%  MAE=0.0194   (memorisation gap heldout-train MAE = -0.0094)
+  WARNING: held-out fits BETTER than train — the held-out tag is likely capturing TRAINING images, so the reconstruction is WRONG for this dataset. Treat its train/heldout split as unreliable (the OVERALL verdict is unaffected).
+Indexing DR dataset (this can take a few seconds)...
+Loaded recovered text projection: /home/kunet.ae/100066980/ESPACOL-New/Hady/DR_text_projection.pth
+DR images found: 35126
+  [dr grade0 (No DR)] n=25810
+  [dr grade1 (Mild NPDR)] n=2443
+  [dr grade2 (Moderate NPDR)] n=5292
+  [dr grade3 (Severe NPDR)] n=873
+  [dr grade4 (PDR)] n=708
+[dr] partition: n=35126  train=31610  heldout=3516  (heldout 10.0% of evaluated images)
+  train  : acc=99.54%  MAE=0.0067
+  heldout: acc=83.36%  MAE=0.2366   (memorisation gap heldout-train MAE = +0.2299)
+# Faithfulness verdict — full dataset, train vs held-out
+
+- **Images**: 35906 total  |  all per group, 8 groups  |  seed 0
+- **Occlusion**: blur (σ=21.0), 6 off-target controls/image  |  encoder: biomedclip
+- **Tests**: paired one-sided Wilcoxon; specificity p-values BH-FDR corrected within each partition; α=0.05.
+- **Partitions**: each image is tagged by whether it was in the checkpoint's k-fold TRAINING set or its HELD-OUT fold (BUSI fold 4, DR fold 2). The held-out table is the data-leak-free verdict; train vs held-out measures in-sample (memorisation) inflation.
+
+Verdict rule: **FAITHFUL** = specificity significant & median > 0.02; **GENERIC** = drop real but specificity not (mask>0.35 ⇒ big-mask); **INERT** = |median drop|<0.02 & drop n.s.; **ANTI-FAITHFUL** = median drop_on<0.
+
+
+## Overall (all images)
+
+| group | n | drop_on med [IQR] | drop_off | specificity med (95% CI) | p_drop | p_spec(FDR) | mask% | grade-Δ% | verdict |
+|---|--:|---|--:|---|--:|--:|--:|--:|---|
+| BUSI:normal | 133 | +0.475 [+0.21,+0.54] | +0.075 | +0.338 (+0.26,+0.37) | <.001 | <.001 | 40% | 71% | **FAITHFUL** |
+| BUSI:benign | 437 | +0.008 [+0.00,+0.10] | +0.000 | +0.007 (+0.01,+0.01) | <.001 | <.001 | 23% | 26% | **WEAK/INCONCLUSIVE** |
+| BUSI:malignant | 210 | +0.001 [+0.00,+0.00] | +0.000 | +0.000 (+0.00,+0.00) | <.001 | <.001 | 30% | 16% | **WEAK/INCONCLUSIVE** |
+| DR:grade0 (No DR) | 25810 | -0.000 [-0.00,+0.00] | -0.000 | -0.000 (-0.00,-0.00) | 1.000 | 1.000 | 27% | 2% | **INERT** |
+| DR:grade1 (Mild NPDR) | 2443 | -0.067 [-0.37,-0.01] | -0.010 | -0.040 (-0.06,-0.03) | 1.000 | 1.000 | 17% | 44% | **ANTI-FAITHFUL** |
+| DR:grade2 (Moderate NPDR) | 5292 | -0.001 [-0.00,+0.24] | -0.001 | -0.000 (-0.00,+0.00) | <.001 | <.001 | 23% | 40% | **WEAK/INCONCLUSIVE** |
+| DR:grade3 (Severe NPDR) | 873 | -0.000 [-0.00,+0.00] | -0.001 | +0.000 (+0.00,+0.00) | 1.000 | <.001 | 16% | 4% | **INERT** |
+| DR:grade4 (PDR) | 708 | -0.000 [-0.00,+0.00] | -0.000 | +0.000 (-0.00,+0.00) | 0.900 | 0.437 | 8% | 1% | **INERT** |
+
+## Train-only (in-sample)
+
+| group | n | drop_on med [IQR] | drop_off | specificity med (95% CI) | p_drop | p_spec(FDR) | mask% | grade-Δ% | verdict |
+|---|--:|---|--:|---|--:|--:|--:|--:|---|
+| BUSI:normal | 107 | +0.473 [+0.03,+0.54] | +0.073 | +0.298 (+0.24,+0.36) | <.001 | <.001 | 40% | 69% | **FAITHFUL** |
+| BUSI:benign | 350 | +0.007 [+0.00,+0.10] | +0.000 | +0.006 (+0.00,+0.01) | <.001 | <.001 | 23% | 25% | **WEAK/INCONCLUSIVE** |
+| BUSI:malignant | 168 | +0.001 [+0.00,+0.01] | +0.000 | +0.000 (+0.00,+0.00) | <.001 | <.001 | 29% | 18% | **WEAK/INCONCLUSIVE** |
+| DR:grade0 (No DR) | 23229 | -0.000 [-0.00,+0.00] | -0.000 | -0.000 (-0.00,-0.00) | 1.000 | 1.000 | 28% | 1% | **INERT** |
+| DR:grade1 (Mild NPDR) | 2199 | -0.100 [-0.37,-0.01] | -0.012 | -0.075 (-0.11,-0.06) | 1.000 | 1.000 | 17% | 47% | **ANTI-FAITHFUL** |
+| DR:grade2 (Moderate NPDR) | 4767 | -0.001 [-0.00,+0.24] | -0.001 | -0.000 (-0.00,+0.00) | <.001 | <.001 | 23% | 41% | **WEAK/INCONCLUSIVE** |
+| DR:grade3 (Severe NPDR) | 786 | -0.000 [-0.00,+0.00] | -0.001 | +0.000 (+0.00,+0.00) | 1.000 | <.001 | 15% | 1% | **INERT** |
+| DR:grade4 (PDR) | 629 | -0.000 [-0.00,+0.00] | -0.000 | +0.000 (-0.00,+0.00) | 0.887 | 0.351 | 8% | 0% | **INERT** |
+
+## Held-out only (no data leak)
+
+| group | n | drop_on med [IQR] | drop_off | specificity med (95% CI) | p_drop | p_spec(FDR) | mask% | grade-Δ% | verdict |
+|---|--:|---|--:|---|--:|--:|--:|--:|---|
+| BUSI:normal | 26 | +0.477 [+0.42,+0.82] | +0.083 | +0.369 (+0.21,+0.43) | <.001 | <.001 | 41% | 81% | **FAITHFUL** |
+| BUSI:benign | 87 | +0.013 [+0.00,+0.20] | +0.001 | +0.012 (+0.01,+0.02) | <.001 | <.001 | 23% | 29% | **WEAK/INCONCLUSIVE** |
+| BUSI:malignant | 42 | +0.001 [+0.00,+0.00] | +0.000 | +0.000 (-0.00,+0.00) | <.001 | 0.012 | 30% | 10% | **WEAK/INCONCLUSIVE** |
+| DR:grade0 (No DR) | 2581 | -0.000 [-0.00,+0.00] | -0.000 | -0.000 (-0.00,-0.00) | 1.000 | 1.000 | 27% | 5% | **INERT** |
+| DR:grade1 (Mild NPDR) | 244 | -0.000 [-0.00,+0.00] | -0.000 | -0.000 (-0.00,+0.00) | 0.985 | 1.000 | 25% | 22% | **INERT** |
+| DR:grade2 (Moderate NPDR) | 525 | -0.000 [-0.00,+0.24] | -0.001 | -0.000 (-0.00,+0.00) | <.001 | 0.008 | 22% | 34% | **WEAK/INCONCLUSIVE** |
+| DR:grade3 (Severe NPDR) | 87 | -0.001 [-0.00,+0.11] | -0.001 | +0.001 (-0.00,+0.01) | 0.690 | 0.008 | 21% | 33% | **INERT** |
+| DR:grade4 (PDR) | 79 | -0.000 [-0.00,+0.00] | +0.000 | +0.000 (-0.00,+0.00) | 0.504 | 0.700 | 11% | 11% | **INERT** |
+
+**Bottom line.** FAITHFUL groups — overall: 1, train-only: 1, held-out-only: 1 (of 8). **If held-out ≈ train, running the verdict on training images did NOT inflate faithfulness** (the data-leak concern is empirically dead); a drop from train to held-out quantifies in-sample/memorisation inflation. The decisive column is `specificity med (95% CI)` with a significant `p_spec(FDR)` — not the bare `drop_on`. `grade-Δ%` is the fraction of images whose predicted grade changed under the on-target occlusion (the WHY↔grade coupling).
+
+**Caveats.** Numbers require `--encoder biomedclip` + recovered bridges. Diffuse heatmaps (high mask%) let the off-target control overlap the real region, *understating* specificity — sharpen with `--threshold` or the proposed seg loss. DR severe/PDR cosines are negative; the test is sign-agnostic (uses the change).
+
+Wrote verdict artifacts to /dpc/kuin0170/u100066980/runs/faithful_verdict_full
+######## DONE — outputs in /dpc/kuin0170/u100066980/runs/faithful_verdict_full ########
+total 5076
+drwxr-sr-x  2 100066980_ku kuin0170    4096 Jun 24 16:18 .
+drwxr-sr-x 11 100066980_ku kuin0170    4096 Jun 24 14:47 ..
+-rw-r--r--  1 100066980_ku kuin0170    9713 Jun 24 16:18 per_group_verdict.csv
+-rw-r--r--  1 100066980_ku kuin0170 4741791 Jun 24 16:18 per_image.csv
+-rw-r--r--  1 100066980_ku kuin0170     199 Jun 24 12:31 slurm-280683.out
+-rw-r--r--  1 100066980_ku kuin0170    6881 Jun 24 13:15 slurm-280705.out
+-rw-r--r--  1 100066980_ku kuin0170    7834 Jun 24 13:51 slurm-281568.out
+-rw-r--r--  1 100066980_ku kuin0170    8702 Jun 24 16:18 slurm-282301.out
+-rw-r--r--  1 100066980_ku kuin0170   65628 Jun 24 16:18 verdict_dropon_vs_off_heldout.png
+-rw-r--r--  1 100066980_ku kuin0170   65352 Jun 24 16:18 verdict_dropon_vs_off.png
+-rw-r--r--  1 100066980_ku kuin0170   20890 Jun 24 16:18 verdict.json
+-rw-r--r--  1 100066980_ku kuin0170    5336 Jun 24 16:18 verdict_report.md
+-rw-r--r--  1 100066980_ku kuin0170  117746 Jun 24 16:18 verdict_specificity_box_heldout.png
+-rw-r--r--  1 100066980_ku kuin0170  113626 Jun 24 16:18 verdict_specificity_box.png
