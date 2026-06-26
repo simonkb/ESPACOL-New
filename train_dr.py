@@ -188,6 +188,12 @@ def main():
     )
 
     parser.add_argument("--no_pretrained", action="store_true")
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Override max training epochs (default from config: 75)",
+    )
 
     parser.add_argument(
         "--use_multi_tile",
@@ -296,6 +302,9 @@ def main():
     if args.use_multi_tile:
         cfg.use_multi_tile = True
         cfg.tile_grid = args.tile_grid
+
+    if args.epochs is not None:
+        cfg.epochs = args.epochs
 
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
