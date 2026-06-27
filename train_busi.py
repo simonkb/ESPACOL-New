@@ -154,9 +154,15 @@ def main():
         help="Comma-separated fold indices to run (e.g. '0,1,2') or 'all'"
     )
     parser.add_argument("--no_pretrained", action="store_true")
+    parser.add_argument("--use_concept_spine", action="store_true",
+                        help="Enable ConceptSpine + faithfulness loop")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Override number of training epochs")
     args = parser.parse_args()
 
-    cfg = BUSIConfig(run_dir=args.run_dir)
+    cfg = BUSIConfig(run_dir=args.run_dir, use_concept_spine=args.use_concept_spine)
+    if args.epochs is not None:
+        cfg.epochs = args.epochs
     setup_logging(args.run_dir)
     log = logging.getLogger("train_busi")
     set_seed(cfg.seed)
@@ -223,6 +229,10 @@ def main():
             pretrained=not args.no_pretrained,
             proj_hidden_dim=cfg.proj_hidden_dim,
             proj_out_dim=cfg.proj_out_dim,
+            use_image_text=cfg.use_image_text,
+            use_multi_tile=getattr(cfg, "use_multi_tile", False),
+            use_concept_spine=cfg.use_concept_spine,
+            n_concepts=cfg.n_concepts,
         )
 
         train_labels = [y for _, y in train_items]

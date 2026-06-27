@@ -77,9 +77,17 @@ class PerImageConceptLoss(nn.Module):
         target = _build_concept_target(
             labels, self.concept_grade_mask, self.n_concepts, c.device
         )
+        # Soft targets: in-grade concepts get 1.0, others get 0.1
+        # This prevents hard rejection of cross-grade concepts (e.g. Moderate
+        # images having secondary activation of Severe concepts is penalised
+        # less than zero, rather than treated as a fully wrong prediction).
+        target_soft = torch.where(target > 0.5,
+                                  torch.ones_like(target),
+                                  torch.full_like(target, 0.1))
+
         return F.binary_cross_entropy_with_logits(
             c / self.temperature,
-            target,
+            target_soft,
             pos_weight=self.pos_weight,
         )
 

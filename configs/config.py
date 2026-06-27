@@ -84,6 +84,13 @@ class TrainConfig:
     faith_every_n: int = 4           # run faithfulness every N batches
     faith_margin: float = 0.1        # L_drop margin m_k
     faith_tau: float = 0.05          # L_spec cross-concept tolerance τ
+    faith_sigma: float = 7.0         # Gaussian blur σ for soft occlusion
+    faith_blur_kernel: int = 21      # Blur kernel size (must be odd)
+    # Curriculum nu ramp: nu starts at faith_nu_start and linearly increases to nu
+    # over faith_nu_ramp_epochs epochs beginning at faith_start_epoch.
+    # Set faith_nu_start=0.0 for a full warm-start; set equal to nu to disable ramp.
+    faith_nu_start: float = 0.0      # nu at faith_start_epoch
+    faith_nu_ramp_epochs: int = 10   # epochs to ramp from faith_nu_start → nu
 
 
 @dataclass
@@ -95,6 +102,11 @@ class BUSIConfig(TrainConfig):
     val_fraction: float = 0.1        # 10% of train folds for validation
     run_dir: str = "runs/busi"
     n_concepts: int = 10              # len(BUSI_CONCEPTS)
+    nu: float = 0.1                  # peak nu after ramp completes
+    eta: float = 0.1                 # restored — curriculum ramp handles the transition
+    faith_start_epoch: int = 25      # delayed — let spine stabilise first
+    faith_nu_start: float = 0.0      # nu ramp starts at 0
+    faith_nu_ramp_epochs: int = 10   # ramp over epochs 25-35
 
 
 @dataclass
@@ -131,3 +143,8 @@ class DRConfig(TrainConfig):
     use_multi_tile: bool = False
     tile_grid: int = 3
     n_concepts: int = 9               # len(DR_CONCEPTS)
+    nu: float = 0.1                  # peak nu after ramp completes
+    eta: float = 0.1                 # restored — curriculum ramp handles the transition
+    faith_start_epoch: int = 25      # delayed — let spine stabilise first
+    faith_nu_start: float = 0.0      # nu ramp starts at 0
+    faith_nu_ramp_epochs: int = 10   # ramp over epochs 25-35

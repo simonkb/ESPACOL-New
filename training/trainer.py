@@ -368,12 +368,20 @@ class Trainer:
 
         faith_start = getattr(self.cfg, "faith_start_epoch", 10)
         faith_every_n = getattr(self.cfg, "faith_every_n", 4)
-        nu = getattr(self.cfg, "nu", 0.0)
+        nu_peak = getattr(self.cfg, "nu", 0.0)
+        nu_start = getattr(self.cfg, "faith_nu_start", nu_peak)  # default: no ramp
+        nu_ramp_epochs = getattr(self.cfg, "faith_nu_ramp_epochs", 1)
+        # Compute current epoch's nu via linear curriculum ramp
+        if epoch >= faith_start and nu_peak > 0.0:
+            ramp_progress = min((epoch - faith_start) / max(nu_ramp_epochs, 1), 1.0)
+            nu = nu_start + (nu_peak - nu_start) * ramp_progress
+        else:
+            nu = 0.0
         do_faith_this_epoch = (
             use_cs
             and self.faith_loss_fn is not None
             and epoch >= faith_start
-            and nu > 0.0
+            and nu_peak > 0.0
         )
 
         total_loss = total_pcol = total_scolw = total_rmse = total_it = 0.0
@@ -458,15 +466,21 @@ class Trainer:
                 # Clear CAM gradients — main graph (for main_loss) is still alive
                 self.model.zero_grad()
 
-                # Soft occlusion of attended region
-                with torch.no_grad():
-                    if is_tiled:
-                        N_b, T_b, C_b, H_b, W_b = x.shape
-                        x_occ = soft_occlude(
-                            x.view(N_b * T_b, C_b, H_b, W_b), heatmaps
-                        ).view(N_b, T_b, C_b, H_b, W_b)
-                    else:
-                        x_occ = soft_occlude(x, heatmaps)
+                # Soft occlusion of attended region — NO torch.no_grad() so gradients
+                # flow back through the soft mask to the concept heads and heatmap head
+                if is_tiled:
+                    N_b, T_b, C_b, H_b, W_b = x.shape
+                    x_occ = soft_occlude(
+                        x.view(N_b * T_b, C_b, H_b, W_b), heatmaps,
+                        sigma=self.cfg.faith_sigma,
+                        kernel_size=self.cfg.faith_blur_kernel,
+                    ).view(N_b, T_b, C_b, H_b, W_b)
+                else:
+                    x_occ = soft_occlude(
+                        x, heatmaps,
+                        sigma=self.cfg.faith_sigma,
+                        kernel_size=self.cfg.faith_blur_kernel,
+                    )
 
                 # Second forward for faithfulness loss (gradients flow through c_prime, E_prime)
                 with autocast(device_type=self.device.type, enabled=self.use_amp):
