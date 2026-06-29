@@ -232,6 +232,19 @@ def main():
     )
 
     parser.add_argument(
+        "--alpha",
+        type=float,
+        default=None,
+        help="Weight for L_PCOL (default from config: 0.00662)",
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=None,
+        help="Weight for L_SCOLw (default from config: 0.05516)",
+    )
+
+    parser.add_argument(
         "--use_image_text",
         action="store_true",
         help="Enable ESPAOCL image-text ordinal alignment loss",
@@ -308,6 +321,11 @@ def main():
 
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
+
+    if args.alpha is not None:
+        cfg.alpha = args.alpha
+    if args.beta is not None:
+        cfg.beta = args.beta
 
     if args.use_image_text:
         cfg.use_image_text = True
