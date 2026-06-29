@@ -15,3 +15,9 @@ Datasets/DR/train.zip
 /wandb_runs/
 /wandb_storage/
 *.zip
+*.pdf
+*.tex
+kaggle.json
+analysis/training_curves.ipynb
+/Datasets/DR/train_cache_tiles_900/
+/slurm_logs/

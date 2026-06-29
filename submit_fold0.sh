@@ -7,15 +7,18 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=220G
 #SBATCH --time=2-00:00:00
-#SBATCH --output=slurm_logs/dr_fold0_%j.out
-#SBATCH --error=slurm_logs/dr_fold0_%j.err
-#SBATCH --account=YOUR_PROJECT_ACCOUNT
+#SBATCH --output=/dpc/kuin0170/ESPACOL-New/slurm_logs/dr_fold0_%j.out
+#SBATCH --error=/dpc/kuin0170/ESPACOL-New/slurm_logs/dr_fold0_%j.err
+#SBATCH --account=kuin0170
 
-mkdir -p slurm_logs
+mkdir -p /dpc/kuin0170/ESPACOL-New/slurm_logs
 
-source "$HOME/anaconda3/bin/activate" G
+source /etc/profile.d/lmod.sh
+module load miniconda/3
+module load cuda/12.6
+source activate G
 
-cd "$HOME/ESPACOL-New"
+cd /dpc/kuin0170/ESPACOL-New
 
 export HF_HUB_OFFLINE=1
 
