@@ -40,7 +40,7 @@ ablation_configs = [
         "run_dir": "runs/ablation/01_rmse_only",
         "alpha": 0.0,
         "beta": 0.0,
-        "use_image_text": False,
+        "gamma": 0.0,
         "use_concept_spine": False,
     },
     {
@@ -48,7 +48,7 @@ ablation_configs = [
         "run_dir": "runs/ablation/02_plus_scolw",
         "alpha": 0.0,
         "beta": BEST_BETA,
-        "use_image_text": False,
+        "gamma": 0.0,
         "use_concept_spine": False,
     },
     {
@@ -56,7 +56,7 @@ ablation_configs = [
         "run_dir": "runs/ablation/03_plus_pcol",
         "alpha": BEST_ALPHA,
         "beta": BEST_BETA,
-        "use_image_text": False,
+        "gamma": 0.0,
         "use_concept_spine": False,
     },
     {

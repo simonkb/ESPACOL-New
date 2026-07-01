@@ -9,7 +9,7 @@
     "run_dir": "runs/ablation/01_rmse_only",
     "alpha": 0.0,
     "beta": 0.0,
-    "use_image_text": false,
+    "gamma": 0.0,
     "use_concept_spine": false
   },
   {
@@ -22,7 +22,7 @@
     "run_dir": "runs/ablation/02_plus_scolw",
     "alpha": 0.0,
     "beta": 0.05516050165777829,
-    "use_image_text": false,
+    "gamma": 0.0,
     "use_concept_spine": false
   },
   {
@@ -35,7 +35,7 @@
     "run_dir": "runs/ablation/03_plus_pcol",
     "alpha": 0.00662474091401746,
     "beta": 0.05516050165777829,
-    "use_image_text": false,
+    "gamma": 0.0,
     "use_concept_spine": false
   },
   {
