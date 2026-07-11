@@ -22,3 +22,4 @@ analysis/training_curves.ipynb
 /Datasets/DR/train_cache_tiles_900/
 /slurm_logs/
 *.zip.*
+/slurm_logs_v2/
