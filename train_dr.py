@@ -207,6 +207,16 @@ def main():
         help="Tile grid size (default 3 → 3×3 = 9 local tiles + 1 global = 10 total)",
     )
     parser.add_argument(
+        "--use_tile_transformer",
+        action="store_true",
+        help="Replace AttentionPool with CrossTileOrdinalTransformer (CTOT)",
+    )
+    parser.add_argument(
+        "--use_ordinal_head",
+        action="store_true",
+        help="Replace RegressionHead+RMSE with OrdinalDistributionHead+CORAL loss",
+    )
+    parser.add_argument(
         "--grad_checkpoint",
         action="store_true",
         help="Enable gradient checkpointing in backbone (saves ~60%% activation memory, "
@@ -315,6 +325,12 @@ def main():
     if args.use_multi_tile:
         cfg.use_multi_tile = True
         cfg.tile_grid = args.tile_grid
+
+    if args.use_tile_transformer:
+        cfg.use_tile_transformer = True
+
+    if args.use_ordinal_head:
+        cfg.use_ordinal_head = True
 
     if args.epochs is not None:
         cfg.epochs = args.epochs
@@ -468,6 +484,12 @@ def main():
             use_concept_spine=getattr(cfg, "use_concept_spine", False),
             n_concepts=getattr(cfg, "n_concepts", 9),
             grad_checkpoint=args.grad_checkpoint,
+            use_tile_transformer=getattr(cfg, "use_tile_transformer", False),
+            transformer_dim=getattr(cfg, "tile_transformer_dim", 512),
+            transformer_nhead=getattr(cfg, "tile_transformer_nhead", 8),
+            transformer_layers=getattr(cfg, "tile_transformer_layers", 2),
+            transformer_dropout=getattr(cfg, "tile_transformer_dropout", 0.1),
+            use_ordinal_head=getattr(cfg, "use_ordinal_head", False),
         )
 
         train_labels = [y for _, y in train_items]

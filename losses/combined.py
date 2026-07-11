@@ -6,11 +6,12 @@ Combined hybrid loss:
 Baseline:
     L_total = alpha * L_PCOL + beta * L_SCOLw + L_RMSE
 
-ESPAOCL extensions:
-    L_total = alpha*L_PCOL + beta*L_SCOLw + gamma*L_IT + L_RMSE
+ESPAOCL-CT (novel architecture):
+    L_total = alpha*L_PCOL + beta*L_SCOLw + gamma*L_IT + L_ord
             + delta*L_PIC + eta*L_cons
 
-L_faith is computed and back-propagated separately in the trainer (faithfulness loop).
+L_ord (CoralOrdinalLoss) replaces L_RMSE when use_ordinal_head=True.
+L_faith has been removed — the ablation study showed it consistently harms accuracy.
 """
 
 from typing import Dict, List, Optional
@@ -23,6 +24,7 @@ from .pcol import PCOLLoss
 from .scolw import SCOLwLoss
 from .image_text import ImageTextOrdinalLoss
 from .concept_losses import PerImageConceptLoss, GradeAgreementLoss
+from .ordinal import CoralOrdinalLoss
 
 
 class HybridContrastiveOrdinalLoss(nn.Module):
@@ -42,6 +44,8 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         concept_grade_mask: Optional[Dict[int, List[int]]] = None,
         n_concepts: int = 9,
         n_classes: int = 5,
+        # Ordinal distribution head
+        use_ordinal_head: bool = False,
     ):
         super().__init__()
         self.alpha = alpha
@@ -51,6 +55,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         self.eta = eta
         self.use_image_text = use_image_text
         self.use_concept_spine = use_concept_spine
+        self.use_ordinal_head = use_ordinal_head
 
         self.pcol = PCOLLoss(temperature=temperature)
         self.scolw = SCOLwLoss(temperature=temperature)
@@ -58,6 +63,9 @@ class HybridContrastiveOrdinalLoss(nn.Module):
             temperature=temperature,
             lambda_ord=lambda_ord_it,
         )
+
+        if use_ordinal_head:
+            self.ordinal_loss = CoralOrdinalLoss(n_classes=n_classes)
 
         if use_concept_spine:
             if concept_grade_mask is None:
@@ -74,13 +82,19 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         class_weights: torch.Tensor,
         z_it: Optional[torch.Tensor] = None,
         text_prototypes: Optional[torch.Tensor] = None,
-        c: Optional[torch.Tensor] = None,   # (N, M) concept activations
-        E: Optional[torch.Tensor] = None,   # (N,) ordinal evidence
+        c: Optional[torch.Tensor] = None,              # (N, M) concept activations
+        E: Optional[torch.Tensor] = None,              # (N,) ordinal evidence
+        ordinal_probs: Optional[torch.Tensor] = None,  # (N, K-1) from OrdinalDistHead
     ) -> tuple[torch.Tensor, dict]:
 
         l_pcol = self.pcol(z_pcol, labels)
         l_scolw = self.scolw(z_scolw, labels, class_weights)
-        l_rmse = torch.sqrt(F.mse_loss(pred, labels.float()) + 1e-8)
+
+        # Regression loss — CORAL ordinal or RMSE fallback
+        if self.use_ordinal_head and ordinal_probs is not None:
+            l_reg = self.ordinal_loss(ordinal_probs, labels)
+        else:
+            l_reg = torch.sqrt(F.mse_loss(pred, labels.float()) + 1e-8)
 
         l_it = torch.tensor(0.0, device=pred.device)
         if self.use_image_text and self.gamma > 0.0:
@@ -108,17 +122,18 @@ class HybridContrastiveOrdinalLoss(nn.Module):
             self.alpha * l_pcol
             + self.beta * l_scolw
             + self.gamma * l_it
-            + l_rmse
+            + l_reg
             + self.delta * l_pic
             + self.eta * l_cons
         )
 
+        reg_key = "loss_ord" if self.use_ordinal_head else "loss_rmse"
         return total, {
             "loss_total": total.item(),
             "loss_pcol": l_pcol.item(),
             "loss_scolw": l_scolw.item(),
             "loss_it": l_it.item(),
-            "loss_rmse": l_rmse.item(),
+            reg_key: l_reg.item(),
             "loss_pic": l_pic.item(),
             "loss_cons": l_cons.item(),
         }

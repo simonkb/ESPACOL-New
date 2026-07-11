@@ -68,3 +68,32 @@ class RegressionHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc(x).squeeze(-1)    # (N,)
+
+
+class OrdinalDistributionHead(nn.Module):
+    """
+    CORAL ordinal regression head (Cao et al. 2020).
+
+    Predicts K-1 threshold probabilities P(Y > k) for k = 0..K-2 using a
+    shared linear weight with per-threshold bias offsets.  The expected grade
+    (sum of probabilities) is used as the continuous prediction.
+
+    Architecture:
+        h = Linear(input_dim, 1)(x)          # (N, 1) shared score
+        logits = h + bias                     # (N, K-1) per-threshold logits
+        probs  = sigmoid(logits)              # (N, K-1) P(Y > k)
+        pred   = probs.sum(dim=1)             # (N,)     expected grade in [0, K-1]
+    """
+
+    def __init__(self, input_dim: int = 1280, n_classes: int = 5):
+        super().__init__()
+        self.fc = nn.Linear(input_dim, 1)
+        self.bias = nn.Parameter(torch.zeros(n_classes - 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.fc(x)                                # (N, 1)
+        logits = h + self.bias.unsqueeze(0)           # (N, K-1)
+        return torch.sigmoid(logits)                  # (N, K-1)  — P(Y > k)
+
+    def predict(self, probs: torch.Tensor) -> torch.Tensor:
+        return probs.sum(dim=1)                       # (N,)  expected grade

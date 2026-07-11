@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=espacol_dr_fold0
+#SBATCH --job-name=espacol_ct_fold0
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -7,8 +7,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=220G
 #SBATCH --time=2-00:00:00
-#SBATCH --output=/dpc/kuin0170/ESPACOL-New/slurm_logs/dr_fold0_%j.out
-#SBATCH --error=/dpc/kuin0170/ESPACOL-New/slurm_logs/dr_fold0_%j.err
+#SBATCH --output=/dpc/kuin0170/ESPACOL-New/slurm_logs/ct_fold0_%j.out
+#SBATCH --error=/dpc/kuin0170/ESPACOL-New/slurm_logs/ct_fold0_%j.err
 #SBATCH --account=kuin0170
 
 mkdir -p /dpc/kuin0170/ESPACOL-New/slurm_logs
@@ -24,10 +24,12 @@ export HF_HUB_OFFLINE=1
 
 python train_dr.py \
     --dr_root Datasets/DR \
-    --run_dir runs/dr_hpc_fold0 \
+    --run_dir runs/ct_fold0 \
     --folds 0 \
     --use_multi_tile \
+    --use_tile_transformer \
+    --use_ordinal_head \
     --use_concept_spine \
     --batch_size 24 \
     --grad_checkpoint \
-    --epochs 100
+    --epochs 75

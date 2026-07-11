@@ -228,6 +228,7 @@ class Trainer:
             concept_grade_mask=concept_grade_mask,
             n_concepts=getattr(cfg, "n_concepts", 9),
             n_classes=cfg.n_classes,
+            use_ordinal_head=getattr(cfg, "use_ordinal_head", False),
         )
 
         self.class_weights = compute_class_weights(
@@ -384,9 +385,11 @@ class Trainer:
             and nu_peak > 0.0
         )
 
-        total_loss = total_pcol = total_scolw = total_rmse = total_it = 0.0
+        total_loss = total_pcol = total_scolw = total_reg = total_it = 0.0
         total_pic = total_cons = total_faith = 0.0
         n_batches = 0
+        use_ordinal = getattr(self.cfg, "use_ordinal_head", False)
+        reg_key = "loss_ord" if use_ordinal else "loss_rmse"
 
         nb = self.device.type == "cuda"
 
@@ -412,8 +415,9 @@ class Trainer:
                 z_scolw = out["z_scolw"]
                 z_it = out.get("z_it")
                 pred = out["pred"]
-                c = out.get("c")    # (N, M) or None
-                E = out.get("E")    # (N,)  or None
+                c = out.get("c")              # (N, M) or None
+                E = out.get("E")              # (N,)  or None
+                ordinal_probs = out.get("ordinal_probs")  # (N, K-1) or None
 
                 text_prototypes = None
                 if self.text_encoder is not None and self.cfg.use_image_text:
@@ -429,6 +433,7 @@ class Trainer:
                     text_prototypes=text_prototypes,
                     c=c,
                     E=E,
+                    ordinal_probs=ordinal_probs,
                 )
 
             # ── Faithfulness loop ────────────────────────────────────────────
@@ -520,7 +525,7 @@ class Trainer:
             total_loss += comps["loss_total"]
             total_pcol += comps["loss_pcol"]
             total_scolw += comps["loss_scolw"]
-            total_rmse += comps["loss_rmse"]
+            total_reg += comps.get(reg_key, 0.0)
             total_it += comps.get("loss_it", 0.0)
             total_pic += comps.get("loss_pic", 0.0)
             total_cons += comps.get("loss_cons", 0.0)
@@ -529,11 +534,12 @@ class Trainer:
 
         nb_ = max(n_batches, 1)
 
+        train_reg_key = f"train_{reg_key}"
         metrics = {
             "train_loss": total_loss / nb_,
             "train_loss_pcol": total_pcol / nb_,
             "train_loss_scolw": total_scolw / nb_,
-            "train_loss_rmse": total_rmse / nb_,
+            train_reg_key: total_reg / nb_,
         }
 
         if self.text_encoder is not None and self.cfg.use_image_text:
@@ -627,12 +633,14 @@ class Trainer:
         if "val_concept_acc" in val:
             concept_acc_text = f"  val_concept_acc={val['val_concept_acc']:.2f}%"
 
+        reg_label = "ord" if "train_loss_ord" in train else "rmse"
+        reg_val = train.get("train_loss_ord", train.get("train_loss_rmse", 0.0))
         logger.info(
             f"[Fold {self.fold}] Ep {epoch:3d} | "
             f"loss={train['train_loss']:.4f} "
             f"(pcol={train['train_loss_pcol']:.3f} "
             f"scolw={train['train_loss_scolw']:.3f} "
-            f"rmse={train['train_loss_rmse']:.3f}"
+            f"{reg_label}={reg_val:.3f}"
             f"{extras}) | "
             f"val_loss={val['val_loss']:.4f}  "
             f"val_acc={val['val_acc']:.2f}%  "

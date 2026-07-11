@@ -132,9 +132,10 @@ class DRConfig(TrainConfig):
     # alpha=0.00337: PCOL needs small alpha on the full 35K dataset.
     # With 640 grade-4 images, batch prototypes (4 samples) are noisy.
     alpha: float = 0.00662474091401746
-    beta: float = 0.05516050165777829
+    # beta=0.15, gamma=0.2: tuned from ablation sweep (sweep_029 winner)
+    beta: float = 0.15
     use_image_text: bool = True
-    gamma: float = 0.05
+    gamma: float = 0.2
     lambda_ord_it: float = 2.0
     finetune_text_encoder: bool = True
     text_finetune_layers: int = 2
@@ -143,8 +144,20 @@ class DRConfig(TrainConfig):
     use_multi_tile: bool = False
     tile_grid: int = 3
     n_concepts: int = 9               # len(DR_CONCEPTS)
-    nu: float = 0.1                  # peak nu after ramp completes
-    eta: float = 0.1                 # restored — curriculum ramp handles the transition
-    faith_start_epoch: int = 25      # delayed — let spine stabilise first
-    faith_nu_start: float = 0.0      # nu ramp starts at 0
-    faith_nu_ramp_epochs: int = 10   # ramp over epochs 25-35
+    # Concept branch weights reduced — auxiliary only, not bottlenecking main path
+    delta: float = 0.05              # weight for L_PIC
+    eta: float = 0.05                # weight for L_cons
+    nu: float = 0.0                  # faithfulness removed (ablation proved harmful)
+    faith_start_epoch: int = 25
+    faith_nu_start: float = 0.0
+    faith_nu_ramp_epochs: int = 10
+
+    # CrossTileOrdinalTransformer (CTOT) — replaces AttentionPool
+    use_tile_transformer: bool = False
+    tile_transformer_dim: int = 512
+    tile_transformer_nhead: int = 8
+    tile_transformer_layers: int = 2
+    tile_transformer_dropout: float = 0.1
+
+    # OrdinalDistributionHead (CORAL) — replaces RegressionHead + RMSE
+    use_ordinal_head: bool = False

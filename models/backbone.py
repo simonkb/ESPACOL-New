@@ -13,6 +13,7 @@ from torch.utils.checkpoint import checkpoint_sequential
 from torchvision.models import efficientnet_v2_s, EfficientNet_V2_S_Weights
 
 from .heads import AttentionPool
+from .tile_transformer import CrossTileOrdinalTransformer
 
 
 class EfficientNetV2SBackbone(nn.Module):
@@ -51,15 +52,37 @@ class TiledEfficientNetBackbone(nn.Module):
     """
     Multi-tile wrapper around EfficientNetV2SBackbone.
     Input : (N, T, C, H, W)  — T tiles per image
-    Output: (N, 1280)         — AttentionPool over tile features
+    Output: (N, 1280)         — pooled over tile features
+
+    use_transformer=True replaces AttentionPool with CrossTileOrdinalTransformer,
+    allowing tiles to exchange information via multi-head self-attention before
+    aggregation. Output shape is identical (N, 1280) for drop-in compatibility.
     """
 
     OUT_DIM = 1280
 
-    def __init__(self, pretrained: bool = True, grad_checkpoint: bool = False):
+    def __init__(
+        self,
+        pretrained: bool = True,
+        grad_checkpoint: bool = False,
+        use_transformer: bool = False,
+        transformer_dim: int = 512,
+        transformer_nhead: int = 8,
+        transformer_layers: int = 2,
+        transformer_dropout: float = 0.1,
+    ):
         super().__init__()
         self.base = EfficientNetV2SBackbone(pretrained=pretrained, grad_checkpoint=grad_checkpoint)
-        self.pool = AttentionPool(self.OUT_DIM)
+        if use_transformer:
+            self.pool = CrossTileOrdinalTransformer(
+                feat_dim=self.OUT_DIM,
+                dim=transformer_dim,
+                nhead=transformer_nhead,
+                n_layers=transformer_layers,
+                dropout=transformer_dropout,
+            )
+        else:
+            self.pool = AttentionPool(self.OUT_DIM)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         N, T, C, H, W = x.shape

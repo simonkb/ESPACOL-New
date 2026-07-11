@@ -25,7 +25,7 @@ import torch.nn as nn
 
 from .backbone import EfficientNetV2SBackbone, TiledEfficientNetBackbone
 from .concept_spine import ConceptSpine
-from .heads import MLPProjectionHead, RegressionHead
+from .heads import MLPProjectionHead, OrdinalDistributionHead, RegressionHead
 
 
 class HybridContrastiveOrdinalModel(nn.Module):
@@ -35,7 +35,7 @@ class HybridContrastiveOrdinalModel(nn.Module):
         backbone: EfficientNetV2SBackbone,
         pcol_head: MLPProjectionHead,
         scolw_head: MLPProjectionHead,
-        regression_head: RegressionHead,
+        regression_head,   # RegressionHead or OrdinalDistributionHead
         image_text_head: Optional[MLPProjectionHead] = None,
         concept_spine: Optional[ConceptSpine] = None,
     ):
@@ -46,6 +46,7 @@ class HybridContrastiveOrdinalModel(nn.Module):
         self.regression_head = regression_head
         self.image_text_head = image_text_head
         self.concept_spine = concept_spine
+        self._use_ordinal_head = isinstance(regression_head, OrdinalDistributionHead)
 
     def forward(
         self,
@@ -56,11 +57,14 @@ class HybridContrastiveOrdinalModel(nn.Module):
         Returns a dictionary for stable access in both baseline and ESPAOCL modes.
 
         Keys always present:
-            features : (N, 1280)
-            z_pcol   : (N, 128)
-            z_scolw  : (N, 128)
-            z_it     : (N, 128) or None
-            pred     : (N,)
+            features      : (N, 1280)
+            z_pcol        : (N, 128)
+            z_scolw       : (N, 128)
+            z_it          : (N, 128) or None
+            pred          : (N,)  — continuous grade (scalar for all head types)
+
+        Key added when OrdinalDistributionHead is active:
+            ordinal_probs : (N, K-1)  — P(Y > k) for k=0..K-2
 
         Keys added when concept_spine is enabled:
             c       : (N, M)   concept activations
@@ -73,7 +77,13 @@ class HybridContrastiveOrdinalModel(nn.Module):
 
         z_pcol = self.pcol_head(features)
         z_scolw = self.scolw_head(features)
-        pred = self.regression_head(features)
+
+        if self._use_ordinal_head:
+            ordinal_probs = self.regression_head(features)          # (N, K-1)
+            pred = self.regression_head.predict(ordinal_probs)      # (N,)
+        else:
+            ordinal_probs = None
+            pred = self.regression_head(features)                   # (N,)
 
         z_it = None
         if self.image_text_head is not None:
@@ -87,6 +97,9 @@ class HybridContrastiveOrdinalModel(nn.Module):
             "pred": pred,
         }
 
+        if ordinal_probs is not None:
+            out["ordinal_probs"] = ordinal_probs
+
         if self.concept_spine is not None and concept_text_emb is not None:
             c, w, E, y_soft, z_c = self.concept_spine(features, concept_text_emb)
             out.update({"c": c, "w": w, "E": E, "y_soft": y_soft, "z_c": z_c})
@@ -99,8 +112,11 @@ class HybridContrastiveOrdinalModel(nn.Module):
 
     @torch.no_grad()
     def predict(self, x: torch.Tensor) -> torch.Tensor:
-        """Inference-only: returns continuous regression output."""
+        """Inference-only: returns continuous grade (scalar)."""
         features = self.backbone(x)
+        if self._use_ordinal_head:
+            probs = self.regression_head(features)
+            return self.regression_head.predict(probs)
         return self.regression_head(features)
 
     @torch.no_grad()
@@ -147,16 +163,36 @@ def build_model(
     n_concepts: int = 9,
     absence_indices: Optional[list] = None,
     grad_checkpoint: bool = False,
+    # CrossTileOrdinalTransformer options
+    use_tile_transformer: bool = False,
+    transformer_dim: int = 512,
+    transformer_nhead: int = 8,
+    transformer_layers: int = 2,
+    transformer_dropout: float = 0.1,
+    # OrdinalDistributionHead option
+    use_ordinal_head: bool = False,
 ) -> HybridContrastiveOrdinalModel:
     if use_multi_tile:
-        backbone = TiledEfficientNetBackbone(pretrained=pretrained, grad_checkpoint=grad_checkpoint)
+        backbone = TiledEfficientNetBackbone(
+            pretrained=pretrained,
+            grad_checkpoint=grad_checkpoint,
+            use_transformer=use_tile_transformer,
+            transformer_dim=transformer_dim,
+            transformer_nhead=transformer_nhead,
+            transformer_layers=transformer_layers,
+            transformer_dropout=transformer_dropout,
+        )
     else:
         backbone = EfficientNetV2SBackbone(pretrained=pretrained, grad_checkpoint=grad_checkpoint)
     feat_dim = backbone.OUT_DIM
 
     pcol_head = MLPProjectionHead(feat_dim, proj_hidden_dim, proj_out_dim)
     scolw_head = MLPProjectionHead(feat_dim, proj_hidden_dim, proj_out_dim)
-    reg_head = RegressionHead(feat_dim)
+
+    if use_ordinal_head:
+        reg_head = OrdinalDistributionHead(feat_dim, n_classes)
+    else:
+        reg_head = RegressionHead(feat_dim)
 
     image_text_head = None
     if use_image_text:
