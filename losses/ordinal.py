@@ -25,10 +25,10 @@ class CoralOrdinalLoss(nn.Module):
         super().__init__()
         self.n_classes = n_classes
 
-    def forward(self, probs: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            probs  : (N, n_classes-1) — sigmoid outputs P(Y > k) for k=0..K-2
+            logits : (N, n_classes-1) — raw threshold logits (NO sigmoid applied)
             labels : (N,) integer class labels in [0, n_classes-1]
 
         Returns:
@@ -36,9 +36,9 @@ class CoralOrdinalLoss(nn.Module):
         """
         K = self.n_classes
         # Build binary targets: targets[n, k] = 1 if labels[n] > k
-        # labels: (N,) → expand to (N, K-1) and compare with thresholds (K-1,)
         thresholds = torch.arange(K - 1, device=labels.device)       # (K-1,)
         targets = (labels.unsqueeze(1) > thresholds).float()          # (N, K-1)
 
-        loss = F.binary_cross_entropy(probs, targets)
+        # binary_cross_entropy_with_logits is AMP-safe (unlike binary_cross_entropy)
+        loss = F.binary_cross_entropy_with_logits(logits, targets)
         return loss

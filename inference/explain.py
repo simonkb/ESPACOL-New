@@ -85,7 +85,7 @@ class ConceptExplainer:
         # Confidence from ordinal probs P(Y > k)
         confidence = None
         if "ordinal_probs" in out:
-            probs = out["ordinal_probs"]   # (N, K-1)
+            probs = torch.sigmoid(out["ordinal_probs"])   # (N, K-1) — logits → probs
             # P(Y = k) = P(Y > k-1) - P(Y > k)   (with boundary conditions)
             K = probs.shape[1] + 1
             p_exceed = torch.cat(

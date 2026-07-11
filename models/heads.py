@@ -92,8 +92,7 @@ class OrdinalDistributionHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.fc(x)                                # (N, 1)
-        logits = h + self.bias.unsqueeze(0)           # (N, K-1)
-        return torch.sigmoid(logits)                  # (N, K-1)  — P(Y > k)
+        return h + self.bias.unsqueeze(0)             # (N, K-1)  raw logits
 
-    def predict(self, probs: torch.Tensor) -> torch.Tensor:
-        return probs.sum(dim=1)                       # (N,)  expected grade
+    def predict(self, logits: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(logits).sum(dim=1)       # (N,)  expected grade
