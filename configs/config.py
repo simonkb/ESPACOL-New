@@ -132,10 +132,12 @@ class DRConfig(TrainConfig):
     # alpha=0.00337: PCOL needs small alpha on the full 35K dataset.
     # With 640 grade-4 images, batch prototypes (4 samples) are noisy.
     alpha: float = 0.00662474091401746
-    # beta=0.15, gamma=0.2: tuned from ablation sweep (sweep_029 winner)
-    beta: float = 0.15
+    # beta=0.05: keeps β*scolw ≈ L_ord (prevents contrastive from dominating)
+    # gamma=0.1: same balance principle; sweep winner β=0.15/γ=0.2 was tuned for
+    # RMSE (≈1.0), but CORAL L_ord≈0.35 so same weights make contrastive 4× too dominant
+    beta: float = 0.05
     use_image_text: bool = True
-    gamma: float = 0.2
+    gamma: float = 0.1
     lambda_ord_it: float = 2.0
     finetune_text_encoder: bool = True
     text_finetune_layers: int = 2
@@ -158,8 +160,9 @@ class DRConfig(TrainConfig):
     tile_transformer_nhead: int = 8
     tile_transformer_layers: int = 2
     tile_transformer_dropout: float = 0.1
-    # Differential lr: randomly-init modules (CTOT, heads) get lr × this multiplier
-    transformer_lr_mult: float = 5.0
+    # Differential lr: 1.5× is enough to give new modules a small head start without
+    # the large lr spikes that destabilised training at 5× (NaN at epoch 12)
+    transformer_lr_mult: float = 1.5
 
     # OrdinalDistributionHead (CORAL) — replaces RegressionHead + RMSE
     use_ordinal_head: bool = False
