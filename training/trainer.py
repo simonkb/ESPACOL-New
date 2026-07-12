@@ -188,7 +188,30 @@ class Trainer:
             )
         # ────────────────────────────────────────────────────────────────────
 
-        optim_params = [{"params": list(self.model.parameters()), "lr": cfg.lr}]
+        # Differential learning rates: pretrained EfficientNet backbone uses base lr;
+        # randomly-initialised modules (CTOT, heads) use transformer_lr_mult × base lr
+        # so they can converge at the correct speed without over-updating the backbone.
+        use_transformer = getattr(cfg, "use_tile_transformer", False)
+        transformer_lr_mult = getattr(cfg, "transformer_lr_mult", 5.0)
+
+        if use_transformer and hasattr(self.model.backbone, "base"):
+            backbone_params = list(self.model.backbone.base.parameters())
+            non_backbone_params = [
+                p for name, p in self.model.named_parameters()
+                if not name.startswith("backbone.base")
+            ]
+            new_module_lr = cfg.lr * transformer_lr_mult
+            optim_params = [
+                {"params": backbone_params, "lr": cfg.lr},
+                {"params": non_backbone_params, "lr": new_module_lr},
+            ]
+            logger.info(
+                f"Differential lr: backbone={cfg.lr:.2e}  "
+                f"new_modules={new_module_lr:.2e}  (mult={transformer_lr_mult}×)"
+            )
+        else:
+            optim_params = [{"params": list(self.model.parameters()), "lr": cfg.lr}]
+
         if self.text_encoder is not None:
             optim_params.append(
                 {"params": list(self.text_encoder.projection.parameters()), "lr": cfg.lr}

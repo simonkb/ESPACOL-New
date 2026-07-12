@@ -142,7 +142,7 @@ class DRConfig(TrainConfig):
     text_encoder_lr: float = 1e-6
     text_finetune_start_epoch: int = 20
     use_multi_tile: bool = False
-    tile_grid: int = 3
+    tile_grid: int = 4
     n_concepts: int = 9               # len(DR_CONCEPTS)
     # Concept branch weights reduced — auxiliary only, not bottlenecking main path
     delta: float = 0.05              # weight for L_PIC
@@ -158,6 +158,8 @@ class DRConfig(TrainConfig):
     tile_transformer_nhead: int = 8
     tile_transformer_layers: int = 2
     tile_transformer_dropout: float = 0.1
+    # Differential lr: randomly-init modules (CTOT, heads) get lr × this multiplier
+    transformer_lr_mult: float = 5.0
 
     # OrdinalDistributionHead (CORAL) — replaces RegressionHead + RMSE
     use_ordinal_head: bool = False
