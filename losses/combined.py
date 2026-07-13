@@ -46,6 +46,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         n_classes: int = 5,
         # Ordinal distribution head
         use_ordinal_head: bool = False,
+        ordinal_class_counts=None,   # list of per-class counts for balanced CORAL
     ):
         super().__init__()
         self.alpha = alpha
@@ -65,7 +66,10 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         )
 
         if use_ordinal_head:
-            self.ordinal_loss = CoralOrdinalLoss(n_classes=n_classes)
+            self.ordinal_loss = CoralOrdinalLoss(
+                n_classes=n_classes,
+                class_counts=ordinal_class_counts,
+            )
 
         if use_concept_spine:
             if concept_grade_mask is None:

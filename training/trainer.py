@@ -238,6 +238,15 @@ class Trainer:
             weight_decay=cfg.weight_decay,
         )
 
+        # Per-class counts for balanced CORAL pos_weight
+        use_ordinal = getattr(cfg, "use_ordinal_head", False)
+        ordinal_counts = None
+        if use_ordinal:
+            from collections import Counter
+            cnt = Counter(train_labels)
+            ordinal_counts = [cnt.get(k, 0) for k in range(cfg.n_classes)]
+            logger.info(f"[Fold {fold}] CORAL class counts for pos_weight: {ordinal_counts}")
+
         self.criterion = HybridContrastiveOrdinalLoss(
             alpha=cfg.alpha,
             beta=cfg.beta,
@@ -251,7 +260,8 @@ class Trainer:
             concept_grade_mask=concept_grade_mask,
             n_concepts=getattr(cfg, "n_concepts", 9),
             n_classes=cfg.n_classes,
-            use_ordinal_head=getattr(cfg, "use_ordinal_head", False),
+            use_ordinal_head=use_ordinal,
+            ordinal_class_counts=ordinal_counts,
         )
 
         self.class_weights = compute_class_weights(
