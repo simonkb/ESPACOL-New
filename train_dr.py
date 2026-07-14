@@ -190,6 +190,24 @@ def main():
     parser.add_argument("--no_pretrained", action="store_true")
 
     parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help="Override cfg.batch_size",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Override cfg.epochs",
+    )
+    parser.add_argument(
+        "--grad_checkpoint",
+        action="store_true",
+        help="Enable gradient checkpointing in the tiled backbone to save GPU memory",
+    )
+
+    parser.add_argument(
         "--use_multi_tile",
         action="store_true",
         help="Enable multi-tile input with AttentionPool aggregation",
@@ -243,6 +261,11 @@ def main():
         args.train_csv = os.path.join(args.dr_root, "trainLabels.csv")
 
     cfg = DRConfig(run_dir=args.run_dir)
+
+    if args.batch_size is not None:
+        cfg.batch_size = args.batch_size
+    if args.epochs is not None:
+        cfg.epochs = args.epochs
 
     if args.use_multi_tile:
         cfg.use_multi_tile = True
@@ -369,6 +392,7 @@ def main():
             proj_out_dim=cfg.proj_out_dim,
             use_image_text=cfg.use_image_text,
             use_multi_tile=cfg.use_multi_tile,
+            grad_checkpoint=args.grad_checkpoint,
         )
 
         train_labels = [y for _, y in train_items]

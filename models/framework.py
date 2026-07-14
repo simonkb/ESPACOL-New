@@ -88,9 +88,10 @@ def build_model(
     proj_out_dim: int = 128,
     use_image_text: bool = False,
     use_multi_tile: bool = False,
+    grad_checkpoint: bool = False,
 ) -> HybridContrastiveOrdinalModel:
     if use_multi_tile:
-        backbone = TiledEfficientNetBackbone(pretrained=pretrained)
+        backbone = TiledEfficientNetBackbone(pretrained=pretrained, grad_checkpoint=grad_checkpoint)
     else:
         backbone = EfficientNetV2SBackbone(pretrained=pretrained)
     feat_dim = backbone.OUT_DIM

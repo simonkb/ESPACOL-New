@@ -9,6 +9,7 @@ EfficientNet-V2S outputs 1280-dim features after GAP.
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from torchvision.models import efficientnet_v2_s, EfficientNet_V2_S_Weights
 
 from .heads import AttentionPool
@@ -44,13 +45,18 @@ class TiledEfficientNetBackbone(nn.Module):
 
     OUT_DIM = 1280
 
-    def __init__(self, pretrained: bool = True):
+    def __init__(self, pretrained: bool = True, grad_checkpoint: bool = False):
         super().__init__()
         self.base = EfficientNetV2SBackbone(pretrained=pretrained)
         self.pool = AttentionPool(self.OUT_DIM)
+        self.grad_checkpoint = grad_checkpoint
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         N, T, C, H, W = x.shape
-        feats = self.base(x.view(N * T, C, H, W))   # (N*T, 1280)
-        feats = feats.view(N, T, -1)                  # (N, T, 1280)
-        return self.pool(feats)                        # (N, 1280)
+        tiles = x.view(N * T, C, H, W)
+        if self.grad_checkpoint and self.training:
+            feats = checkpoint(self.base, tiles, use_reentrant=False)
+        else:
+            feats = self.base(tiles)
+        feats = feats.view(N, T, -1)   # (N, T, 1280)
+        return self.pool(feats)         # (N, 1280)
