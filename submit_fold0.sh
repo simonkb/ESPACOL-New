@@ -21,16 +21,17 @@ source activate G
 cd /dpc/kuin0170/ESPACOL-New
 
 export HF_HUB_OFFLINE=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# 4x4 tile grid:
-#   - fundus images downsampled to 1200x1200
-#   - split into 16 local 300x300 tiles + 1 global 300x300 tile = T=17
+# 4x4 tile grid: 1200x1200 -> 16 local 300x300 tiles + 1 global = T=17
+# batch_size=14: T=17 uses 1.7x more GPU memory than T=10 (3x3 baseline),
+# so batch_size must drop from 24 to ~14 even with grad_checkpoint
 python train_dr.py \
     --dr_root Datasets/DR \
     --run_dir runs/4x4_tiles_fold0 \
     --folds 0 \
     --use_multi_tile \
     --tile_grid 4 \
-    --batch_size 24 \
+    --batch_size 14 \
     --grad_checkpoint \
     --epochs 75
