@@ -163,6 +163,9 @@ class DRConfig(TrainConfig):
     # Differential lr: 1.5× is enough to give new modules a small head start without
     # the large lr spikes that destabilised training at 5× (NaN at epoch 12)
     transformer_lr_mult: float = 1.5
+    # Freeze backbone for first N epochs so CTOT learns from stable pretrained features
+    # before end-to-end fine-tuning. 0 = disabled (no freeze).
+    ctot_warmup_epochs: int = 10
 
     # OrdinalDistributionHead (CORAL) — replaces RegressionHead + RMSE
     use_ordinal_head: bool = False

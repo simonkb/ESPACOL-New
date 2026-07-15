@@ -238,6 +238,20 @@ class Trainer:
             weight_decay=cfg.weight_decay,
         )
 
+        # Backbone freeze warmup: keep EfficientNet frozen for the first N epochs so
+        # randomly-initialised CTOT can stabilise before corrupting pretrained features.
+        self.ctot_warmup_epochs = (
+            getattr(cfg, "ctot_warmup_epochs", 0)
+            if use_transformer and hasattr(self.model.backbone, "base")
+            else 0
+        )
+        if self.ctot_warmup_epochs > 0:
+            for p in self.model.backbone.base.parameters():
+                p.requires_grad_(False)
+            logger.info(
+                f"[Fold {fold}] Backbone frozen for first {self.ctot_warmup_epochs} epochs (CTOT warmup)"
+            )
+
         # Per-class counts for balanced CORAL pos_weight
         use_ordinal = getattr(cfg, "use_ordinal_head", False)
         ordinal_counts = None
@@ -294,6 +308,7 @@ class Trainer:
         for epoch in range(1, self.cfg.epochs + 1):
             t0 = time.time()
             self._maybe_enable_text_finetune(epoch)
+            self._maybe_unfreeze_backbone(epoch)
 
             train_metrics = self._train_epoch(epoch)
             val_metrics = self._eval_epoch(self.val_loader, prefix="val")
@@ -365,6 +380,17 @@ class Trainer:
             f"mae={test_metrics['test_mae']:.4f}"
         )
         return test_metrics
+
+    def _maybe_unfreeze_backbone(self, epoch: int) -> None:
+        if self.ctot_warmup_epochs <= 0:
+            return
+        if epoch != self.ctot_warmup_epochs + 1:
+            return
+        for p in self.model.backbone.base.parameters():
+            p.requires_grad_(True)
+        logger.info(
+            f"[Fold {self.fold}] Backbone unfrozen at epoch {epoch} — end-to-end fine-tuning begins"
+        )
 
     def _maybe_enable_text_finetune(self, epoch: int) -> None:
         if self.text_encoder is None or self._text_finetune_enabled:
