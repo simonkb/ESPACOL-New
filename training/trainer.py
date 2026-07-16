@@ -237,6 +237,8 @@ class Trainer:
             optim_params,
             weight_decay=cfg.weight_decay,
         )
+        # Snapshot the intended LRs so we can restore them after the frozen phase.
+        self._initial_lrs = [pg["lr"] for pg in self.optimizer.param_groups]
 
         # Backbone freeze warmup: keep EfficientNet frozen for the first N epochs so
         # randomly-initialised CTOT can stabilise before corrupting pretrained features.
@@ -388,8 +390,16 @@ class Trainer:
             return
         for p in self.model.backbone.base.parameters():
             p.requires_grad_(True)
+        # Restore LRs — the scheduler may have dropped them during the frozen phase
+        # because val_loss was meaningless while the backbone was fixed. Reset everything
+        # so end-to-end fine-tuning starts with the full intended learning rates.
+        for pg, lr in zip(self.optimizer.param_groups, self._initial_lrs):
+            pg["lr"] = lr
+        self.scheduler.num_bad_epochs = 0
+        self.scheduler.best = float("inf")  # mode='min' (val_loss)
         logger.info(
-            f"[Fold {self.fold}] Backbone unfrozen at epoch {epoch} — end-to-end fine-tuning begins"
+            f"[Fold {self.fold}] Backbone unfrozen at epoch {epoch} — "
+            f"LR restored to {self._initial_lrs}, scheduler reset"
         )
 
     def _maybe_enable_text_finetune(self, epoch: int) -> None:
