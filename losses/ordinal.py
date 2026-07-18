@@ -40,7 +40,7 @@ class CoralOrdinalLoss(nn.Module):
     ):
         super().__init__()
         self.n_classes = n_classes
-        self.pos_weight = None
+        self.register_buffer("pos_weight", None)
 
         if class_counts is not None:
             counts = torch.tensor(class_counts, dtype=torch.float)
