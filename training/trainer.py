@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 
 from configs.config import TrainConfig
 from losses.combined import HybridContrastiveOrdinalLoss, compute_class_weights
+from losses.prototype import GradePrototypeMemory
 from losses.faithfulness import FaithfulnessLoss, soft_occlude
 from models.text import ClinicalTextEncoder
 from utils.checkpoint import save_checkpoint, load_checkpoint
@@ -278,7 +279,25 @@ class Trainer:
             n_classes=cfg.n_classes,
             use_ordinal_head=use_ordinal,
             ordinal_class_counts=ordinal_counts,
+            lambda_tile=getattr(cfg, "lambda_tile", 0.0),
         )
+
+        # Grade Prototype Memory — EMA per-grade prototypes for stable contrastive
+        # supervision of rare DR classes (grades 3-4 appear in ~40% of batches)
+        self.lambda_proto = getattr(cfg, "lambda_proto", 0.0)
+        if self.lambda_proto > 0.0:
+            self.proto_memory = GradePrototypeMemory(
+                feat_dim=cfg.proj_out_dim,   # 128-dim SCOLw embedding
+                n_classes=cfg.n_classes,
+                momentum=0.9,
+                temperature=0.1,
+            ).to(self.device)
+            logger.info(
+                f"[Fold {fold}] Grade prototype memory: feat_dim={cfg.proj_out_dim} "
+                f"K={cfg.n_classes} λ_proto={self.lambda_proto}"
+            )
+        else:
+            self.proto_memory = None
 
         self.class_weights = compute_class_weights(
             train_labels, cfg.n_classes, device=self.device
@@ -455,7 +474,7 @@ class Trainer:
         )
 
         total_loss = total_pcol = total_scolw = total_reg = total_it = 0.0
-        total_pic = total_cons = total_faith = 0.0
+        total_pic = total_cons = total_faith = total_tile = total_proto = 0.0
         n_batches = 0
         use_ordinal = getattr(self.cfg, "use_ordinal_head", False)
         reg_key = "loss_ord" if use_ordinal else "loss_rmse"
@@ -503,7 +522,14 @@ class Trainer:
                     c=c,
                     E=E,
                     ordinal_probs=ordinal_probs,
+                    tile_preds=out.get("tile_preds"),
                 )
+
+                # Grade prototype contrastive loss (stable signal for rare grades)
+                if self.proto_memory is not None and self.proto_memory.is_ready:
+                    l_proto = self.proto_memory.prototype_loss(z_scolw, y)
+                    main_loss = main_loss + self.lambda_proto * l_proto
+                    comps["loss_proto"] = l_proto.item()
 
             # ── Faithfulness loop ────────────────────────────────────────────
             L_faith_val = 0.0
@@ -591,11 +617,18 @@ class Trainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
+            # EMA prototype update — outside autocast, float32 for stability
+            if self.proto_memory is not None:
+                with torch.no_grad():
+                    self.proto_memory.update(z_scolw.float().detach(), y)
+
             total_loss += comps["loss_total"]
             total_pcol += comps["loss_pcol"]
             total_scolw += comps["loss_scolw"]
             total_reg += comps.get(reg_key, 0.0)
             total_it += comps.get("loss_it", 0.0)
+            total_tile += comps.get("loss_tile", 0.0)
+            total_proto += comps.get("loss_proto", 0.0)
             total_pic += comps.get("loss_pic", 0.0)
             total_cons += comps.get("loss_cons", 0.0)
             total_faith += L_faith_val
@@ -613,6 +646,11 @@ class Trainer:
 
         if self.text_encoder is not None and self.cfg.use_image_text:
             metrics["train_loss_it"] = total_it / nb_
+
+        if getattr(self.cfg, "lambda_tile", 0.0) > 0.0:
+            metrics["train_loss_tile"] = total_tile / nb_
+        if self.proto_memory is not None:
+            metrics["train_loss_proto"] = total_proto / nb_
 
         if use_cs:
             metrics["train_loss_pic"] = total_pic / nb_
@@ -689,6 +727,10 @@ class Trainer:
         row = {"epoch": epoch, "elapsed": f"{elapsed:.1f}", "lr": lr, **train, **val}
 
         extras = ""
+        if "train_loss_tile" in train:
+            extras += f" tile={train['train_loss_tile']:.3f}"
+        if "train_loss_proto" in train:
+            extras += f" proto={train['train_loss_proto']:.3f}"
         if "train_loss_it" in train:
             extras += f" it={train['train_loss_it']:.3f}"
         if "train_loss_pic" in train:

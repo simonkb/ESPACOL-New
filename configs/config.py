@@ -132,12 +132,11 @@ class DRConfig(TrainConfig):
     # alpha=0.00337: PCOL needs small alpha on the full 35K dataset.
     # With 640 grade-4 images, batch prototypes (4 samples) are noisy.
     alpha: float = 0.00662474091401746
-    # beta=0.05: keeps β*scolw ≈ L_ord (prevents contrastive from dominating)
-    # gamma=0.1: same balance principle; sweep winner β=0.15/γ=0.2 was tuned for
-    # RMSE (≈1.0), but CORAL L_ord≈0.35 so same weights make contrastive 4× too dominant
-    beta: float = 0.05
+    # Sweep winner values (gave 84.25% baseline). CORAL experiments used 0.05/0.1
+    # to compensate for smaller loss scale — not needed with RMSE.
+    beta: float = 0.15
     use_image_text: bool = True
-    gamma: float = 0.1
+    gamma: float = 0.2
     lambda_ord_it: float = 2.0
     finetune_text_encoder: bool = True
     text_finetune_layers: int = 2
@@ -166,6 +165,11 @@ class DRConfig(TrainConfig):
     # Freeze backbone for first N epochs so CTOT learns from stable pretrained features
     # before end-to-end fine-tuning. 0 = disabled (no freeze).
     ctot_warmup_epochs: int = 10
+
+    # Grade-Coherent Tile Loss (GCTL): MIL-style per-tile auxiliary regression
+    lambda_tile: float = 0.3
+    # Grade Prototype Memory: EMA prototype contrastive for rare-class stability
+    lambda_proto: float = 0.1
 
     # OrdinalDistributionHead (CORAL) — replaces RegressionHead + RMSE
     use_ordinal_head: bool = False

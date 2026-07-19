@@ -84,8 +84,13 @@ class TiledEfficientNetBackbone(nn.Module):
         else:
             self.pool = AttentionPool(self.OUT_DIM)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, return_tile_feats: bool = False
+    ) -> torch.Tensor:
         N, T, C, H, W = x.shape
         feats = self.base(x.view(N * T, C, H, W))   # (N*T, 1280)
-        feats = feats.view(N, T, -1)                  # (N, T, 1280)
-        return self.pool(feats)                        # (N, 1280)
+        tile_feats = feats.view(N, T, -1)             # (N, T, 1280)
+        pooled = self.pool(tile_feats)                 # (N, 1280)
+        if return_tile_feats:
+            return pooled, tile_feats
+        return pooled

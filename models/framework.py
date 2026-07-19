@@ -25,7 +25,7 @@ import torch.nn as nn
 
 from .backbone import EfficientNetV2SBackbone, TiledEfficientNetBackbone
 from .concept_spine import ConceptSpine
-from .heads import MLPProjectionHead, OrdinalDistributionHead, RegressionHead
+from .heads import AttentionPool, MLPProjectionHead, OrdinalDistributionHead, RegressionHead
 
 
 class HybridContrastiveOrdinalModel(nn.Module):
@@ -73,7 +73,18 @@ class HybridContrastiveOrdinalModel(nn.Module):
             y_soft  : (N,)     soft ordinal grade
             z_c     : (N, 128) L2-normalised concept image embedding
         """
-        features = self.backbone(x)
+        # Expose per-tile features for GCTL loss during training.
+        # Only when backbone uses AttentionPool (not CTOT) — CTOT doesn't
+        # have a clean tile_feats / pooled split at this interface.
+        tile_feats = None
+        if (
+            self.training
+            and isinstance(self.backbone, TiledEfficientNetBackbone)
+            and isinstance(self.backbone.pool, AttentionPool)
+        ):
+            features, tile_feats = self.backbone(x, return_tile_feats=True)
+        else:
+            features = self.backbone(x)
 
         z_pcol = self.pcol_head(features)
         z_scolw = self.scolw_head(features)
@@ -103,6 +114,13 @@ class HybridContrastiveOrdinalModel(nn.Module):
         if self.concept_spine is not None and concept_text_emb is not None:
             c, w, E, y_soft, z_c = self.concept_spine(features, concept_text_emb)
             out.update({"c": c, "w": w, "E": E, "y_soft": y_soft, "z_c": z_c})
+
+        # Per-tile grade predictions for GCTL loss (only RMSE head; CORAL not supported)
+        if tile_feats is not None and not self._use_ordinal_head:
+            N, T, D = tile_feats.shape
+            out["tile_preds"] = self.regression_head(
+                tile_feats.reshape(N * T, D)
+            ).view(N, T)   # (N, T)
 
         return out
 

@@ -47,6 +47,8 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         # Ordinal distribution head
         use_ordinal_head: bool = False,
         ordinal_class_counts=None,   # list of per-class counts for balanced CORAL
+        # Grade-Coherent Tile Loss
+        lambda_tile: float = 0.0,
     ):
         super().__init__()
         self.alpha = alpha
@@ -57,6 +59,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         self.use_image_text = use_image_text
         self.use_concept_spine = use_concept_spine
         self.use_ordinal_head = use_ordinal_head
+        self.lambda_tile = lambda_tile
 
         self.pcol = PCOLLoss(temperature=temperature)
         self.scolw = SCOLwLoss(temperature=temperature)
@@ -89,6 +92,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         c: Optional[torch.Tensor] = None,              # (N, M) concept activations
         E: Optional[torch.Tensor] = None,              # (N,) ordinal evidence
         ordinal_probs: Optional[torch.Tensor] = None,  # (N, K-1) from OrdinalDistHead
+        tile_preds: Optional[torch.Tensor] = None,     # (N, T) per-tile scalar predictions
     ) -> tuple[torch.Tensor, dict]:
 
         l_pcol = self.pcol(z_pcol, labels)
@@ -122,11 +126,29 @@ class HybridContrastiveOrdinalLoss(nn.Module):
             if self.eta > 0.0:
                 l_cons = self.cons_loss(E, pred)
 
+        # Grade-Coherent Tile Loss (GCTL) — MIL semantics for DR grading:
+        #   grade-0 images: mean tile prediction → 0 (all tiles look normal)
+        #   grade k>0 images: max tile prediction → k (worst tile sets the grade)
+        # Bypasses AttentionPool, giving direct ordinal gradient to the backbone.
+        l_tile = pred.new_tensor(0.0)
+        if tile_preds is not None and self.lambda_tile > 0.0:
+            y_f = labels.float()
+            g0 = labels == 0
+            gp = ~g0
+            terms = []
+            if g0.any():
+                terms.append(F.mse_loss(tile_preds[g0].mean(dim=1), y_f[g0]))
+            if gp.any():
+                terms.append(F.mse_loss(tile_preds[gp].max(dim=1).values, y_f[gp]))
+            if terms:
+                l_tile = sum(terms) / len(terms)
+
         total = (
             self.alpha * l_pcol
             + self.beta * l_scolw
             + self.gamma * l_it
             + l_reg
+            + self.lambda_tile * l_tile
             + self.delta * l_pic
             + self.eta * l_cons
         )
@@ -138,6 +160,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
             "loss_scolw": l_scolw.item(),
             "loss_it": l_it.item(),
             reg_key: l_reg.item(),
+            "loss_tile": l_tile.item(),
             "loss_pic": l_pic.item(),
             "loss_cons": l_cons.item(),
         }
