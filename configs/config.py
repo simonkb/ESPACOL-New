@@ -173,3 +173,7 @@ class DRConfig(TrainConfig):
 
     # OrdinalDistributionHead (CORAL) — replaces RegressionHead + RMSE
     use_ordinal_head: bool = False
+
+    # Test-Time Augmentation: average 4 augmented predictions at test time
+    # (original + H-flip + V-flip + 180°). Applied only to final test, not val.
+    use_tta: bool = True

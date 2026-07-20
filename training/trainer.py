@@ -395,9 +395,11 @@ class Trainer:
             )
             logger.info(f"[Fold {self.fold}] Loaded best model from {best_ckpt_path}")
 
-        test_metrics = self._eval_epoch(test_loader, prefix="test")
+        use_tta = getattr(self.cfg, "use_tta", False)
+        test_metrics = self._eval_epoch(test_loader, prefix="test", use_tta=use_tta)
+        tta_tag = " (TTA×4)" if use_tta else ""
         logger.info(
-            f"[Fold {self.fold}] TEST  acc={test_metrics['test_acc']:.2f}%  "
+            f"[Fold {self.fold}] TEST{tta_tag}  acc={test_metrics['test_acc']:.2f}%  "
             f"mae={test_metrics['test_mae']:.4f}"
         )
         return test_metrics
@@ -660,7 +662,23 @@ class Trainer:
         return metrics
 
     @torch.no_grad()
-    def _eval_epoch(self, loader: DataLoader, prefix: str) -> dict:
+    def _tta_predict_batch(self, x: torch.Tensor) -> torch.Tensor:
+        """4-fold TTA: average original + H-flip + V-flip + 180° rotation.
+
+        Works for both single-tile (N,C,H,W) and multi-tile (N,T,C,H,W) inputs.
+        AttentionPool is order-invariant so per-tile spatial flips are valid.
+        """
+        augs = [
+            x,
+            x.flip(-1),                       # horizontal flip
+            x.flip(-2),                       # vertical flip
+            x.rot90(2, dims=[-2, -1]),        # 180° rotation
+        ]
+        preds = [self.model.predict(aug) for aug in augs]
+        return torch.stack(preds).mean(0)
+
+    @torch.no_grad()
+    def _eval_epoch(self, loader: DataLoader, prefix: str, use_tta: bool = False) -> dict:
         self.model.eval()
         if self.text_encoder is not None:
             self.text_encoder.eval()
@@ -687,6 +705,8 @@ class Trainer:
                     if "E" in out:
                         y_concept = self.model.concept_spine.predict_grade(out["E"])
                         all_concept_grades.append(y_concept.cpu())
+                elif use_tta:
+                    pred = self._tta_predict_batch(x)
                 else:
                     pred = self.model.predict(x)
                 rmse = torch.sqrt(nn.functional.mse_loss(pred, y.float()) + 1e-8)
