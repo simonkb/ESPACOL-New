@@ -98,11 +98,15 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         l_pcol = self.pcol(z_pcol, labels)
         l_scolw = self.scolw(z_scolw, labels, class_weights)
 
-        # Regression loss — CORAL ordinal or RMSE fallback
+        # Regression loss — CORAL ordinal or class-balanced RMSE.
+        # Unweighted RMSE lets 73%-grade-0 dominate the gradient; applying
+        # class_weights gives each grade equal total gradient contribution.
         if self.use_ordinal_head and ordinal_probs is not None:
             l_reg = self.ordinal_loss(ordinal_probs, labels)
         else:
-            l_reg = torch.sqrt(F.mse_loss(pred, labels.float()) + 1e-8)
+            per_sample_se = (pred - labels.float()) ** 2    # (N,)
+            sample_w = class_weights[labels]                 # (N,) inverse-freq weight
+            l_reg = torch.sqrt((per_sample_se * sample_w).mean() + 1e-8)
 
         l_it = torch.tensor(0.0, device=pred.device)
         if self.use_image_text and self.gamma > 0.0:

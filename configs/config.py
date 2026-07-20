@@ -166,10 +166,10 @@ class DRConfig(TrainConfig):
     # before end-to-end fine-tuning. 0 = disabled (no freeze).
     ctot_warmup_epochs: int = 10
 
-    # Grade-Coherent Tile Loss (GCTL): MIL-style per-tile auxiliary regression
-    lambda_tile: float = 0.3
-    # Grade Prototype Memory: EMA prototype contrastive for rare-class stability
-    lambda_proto: float = 0.1
+    # Grade-Coherent Tile Loss (GCTL): disabled — shared regression head caused conflict
+    lambda_tile: float = 0.0
+    # Grade Prototype Memory: disabled — competed with SCOLw on z_scolw
+    lambda_proto: float = 0.0
 
     # OrdinalDistributionHead (CORAL) — replaces RegressionHead + RMSE
     use_ordinal_head: bool = False
