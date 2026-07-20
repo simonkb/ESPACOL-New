@@ -81,8 +81,16 @@ def make_loaders(
 ):
     if getattr(cfg, "use_multi_tile", False):
         tile_grid = getattr(cfg, "tile_grid", 3)
-        train_tfm = build_tile_transform(tile_size=cfg.img_size, tile_grid=tile_grid, augment=True)
-        eval_tfm  = build_tile_transform(tile_size=cfg.img_size, tile_grid=tile_grid, augment=False)
+        bg = getattr(cfg, "use_ben_graham", False)
+        bg_sigma = getattr(cfg, "ben_graham_sigma", 30.0)
+        train_tfm = build_tile_transform(
+            tile_size=cfg.img_size, tile_grid=tile_grid, augment=True,
+            ben_graham=bg, ben_graham_sigma=bg_sigma,
+        )
+        eval_tfm = build_tile_transform(
+            tile_size=cfg.img_size, tile_grid=tile_grid, augment=False,
+            ben_graham=bg, ben_graham_sigma=bg_sigma,
+        )
     else:
         train_tfm = build_train_transform(cfg.img_size)
         eval_tfm  = build_transform(cfg.img_size)

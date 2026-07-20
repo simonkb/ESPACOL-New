@@ -38,6 +38,38 @@ def build_transform(img_size: int = 300) -> Callable:
     ])
 
 
+class BenGrahamFundusTransform:
+    """Local contrast normalisation from Kaggle 2015 DR winner (Ben Graham).
+
+    result = clip(4·img − 4·GaussianBlur(img, σ) + 128, 0, 255)
+
+    Subtracts the local Gaussian mean so that each pixel represents its
+    deviation from the surrounding retinal background.  This makes small
+    DR lesions (microaneurysms 5-10 px, hard exudates 20-40 px) clearly
+    visible regardless of the camera's illumination characteristics.
+
+    σ=30 on 900 px images ≡ σ=10 on 300 px images — the standard
+    Kaggle usage. Applied identically at train and test time.
+    """
+
+    def __init__(self, sigma: float = 30.0):
+        self.sigma = sigma
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        img_np = np.array(img, dtype=np.float32)
+        try:
+            import cv2
+            blurred = cv2.GaussianBlur(img_np, (0, 0), sigmaX=self.sigma)
+        except ImportError:
+            from PIL import ImageFilter
+            blurred = np.array(
+                img.filter(ImageFilter.GaussianBlur(radius=self.sigma)),
+                dtype=np.float32,
+            )
+        enhanced = np.clip(4.0 * img_np - 4.0 * blurred + 128.0, 0.0, 255.0)
+        return Image.fromarray(enhanced.astype(np.uint8))
+
+
 def build_train_transform(img_size: int = 300) -> Callable:
     """Training transform: augmentation + resize + ToTensor + ImageNet normalization.
 
@@ -87,21 +119,35 @@ def build_tile_transform(
     tile_size: int = 300,
     tile_grid: int = 3,
     augment: bool = False,
+    ben_graham: bool = False,
+    ben_graham_sigma: float = 30.0,
 ) -> Callable:
     """
     Returns a transform PIL Image → (T, C, tile_size, tile_size) tensor.
     T = tile_grid^2 + 1  (local grid tiles + 1 global context tile).
+
+    ben_graham: apply local-contrast normalisation before tiling (both
+    train and test).  Rotation fill=128 matches Ben Graham's neutral
+    midpoint so rotated corners are indistinguishable from low-contrast
+    retinal background rather than hard black borders.
     """
     canvas_size = tile_grid * tile_size
 
+    # Ben Graham is preprocessing (not augmentation) — applied at train AND test time
+    preprocess_ops = [BenGrahamFundusTransform(sigma=ben_graham_sigma)] if ben_graham else []
+
+    # Fundus images are rotationally invariant (any orientation is clinically
+    # valid), so ±90° gives 9× more orientation diversity than the old ±10°.
+    # Stronger color jitter simulates camera and pigmentation variation.
     aug_ops = [
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomVerticalFlip(p=0.5),
-        transforms.RandomRotation(degrees=10),
-        transforms.ColorJitter(brightness=0.1, contrast=0.1),
+        transforms.RandomRotation(degrees=90, fill=128),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
     ] if augment else []
 
     canvas_tfm = transforms.Compose([
+        *preprocess_ops,
         transforms.Resize((canvas_size, canvas_size)),
         *aug_ops,
         transforms.ToTensor(),
