@@ -425,10 +425,21 @@ def main():
     if not args.no_cache:
         n_threads = 16
 
+        # Ben Graham: pre-apply at cache build time so sigma=30 runs once per image
+        # (900×900 GaussianBlur is ~800 ms/image on CPU — kills throughput if on-the-fly).
+        # A separate cache dir keeps raw and BG caches independent.
+        bg = getattr(cfg, "use_ben_graham", False)
+        bg_sigma = getattr(cfg, "ben_graham_sigma", 30.0)
+        bg_preprocess_fn = None
+        if bg and cfg.use_multi_tile:
+            from Datasets.dataloaders import BenGrahamFundusTransform
+            bg_preprocess_fn = BenGrahamFundusTransform(sigma=bg_sigma)
+
         # Auto-derive tile-specific cache dir when using default path
         if cfg.use_multi_tile and args.cache_dir == "Datasets/DR/train_cache":
             canvas_size = cfg.tile_grid * cfg.img_size
-            cache_dir = f"Datasets/DR/train_cache_tiles_{canvas_size}"
+            bg_tag = "_bengham" if bg_preprocess_fn is not None else ""
+            cache_dir = f"Datasets/DR/train_cache{bg_tag}_tiles_{canvas_size}"
         else:
             cache_dir = args.cache_dir if args.cache_dir else None
 
@@ -445,8 +456,14 @@ def main():
             n_threads=n_threads,
             cache_dir=cache_dir,
             crop_fundus=cfg.use_multi_tile,
+            preprocess_fn=bg_preprocess_fn,
         )
         log.info(f"Image cache ready: {len(img_cache)} images")
+
+        # Ben Graham is now baked into cached tensors — disable in transform to
+        # avoid double-application (the transform sees already-preprocessed images).
+        if bg_preprocess_fn is not None:
+            cfg.use_ben_graham = False
 
     fold_results = []
 

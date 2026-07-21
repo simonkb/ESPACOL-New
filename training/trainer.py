@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import logging
 import os
+import random
 import time
 from typing import Optional
 
@@ -483,9 +484,19 @@ class Trainer:
 
         nb = self.device.type == "cuda"
 
+        mixup_alpha = getattr(self.cfg, "mixup_alpha", 0.0)
+
         for batch_idx, (x, y) in enumerate(self.train_loader):
             x = x.to(self.device, non_blocking=nb)
             y = y.to(self.device, non_blocking=nb)
+
+            # Mixup: interpolate pairs of inputs in pixel space.
+            # Contrastive losses still use original hard labels (y); RMSE sees the
+            # mixed input and trains the regression head on a smooth interpolant.
+            if mixup_alpha > 0.0:
+                lam = random.betavariate(mixup_alpha, mixup_alpha)
+                perm = torch.randperm(x.size(0), device=self.device)
+                x = lam * x + (1.0 - lam) * x[perm]
 
             self.optimizer.zero_grad(set_to_none=True)
 

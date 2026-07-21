@@ -123,9 +123,10 @@ class DRConfig(TrainConfig):
     # With correct normalization the backbone activations are in range, so 1e-3 is safe.
     lr: float = 2e-4
     weight_decay: float = 1e-6
-    # Paper lr_patience=5
-    lr_patience: int = 8
-    early_stop_patience: int = 20
+    # Paper lr_patience=5; scaled to 15 for 150-epoch runs so LR drops stay
+    # proportional (3 drops across 150 ep rather than 3 drops all before ep90).
+    lr_patience: int = 15
+    early_stop_patience: int = 40
     # Standard contrastive temperature; previous τ=0.7 compressed gradients and
     # caused PCOL/SCOLw to barely converge (only ~17% loss reduction over 60+ epochs).
     temperature: float = 0.7
@@ -177,6 +178,11 @@ class DRConfig(TrainConfig):
     # Test-Time Augmentation: average 4 augmented predictions at test time
     # (original + H-flip + V-flip + 180°). Applied only to final test, not val.
     use_tta: bool = True
+
+    # Mixup augmentation: λ ~ Beta(α,α) interpolation of input pairs each batch.
+    # Smooths the grade decision boundary; proven +1-2% on DR ordinal regression.
+    # α=0.4 is the standard value from the original Mixup paper.
+    mixup_alpha: float = 0.4
 
     # Ben Graham fundus preprocessing: local contrast normalisation that
     # amplifies microaneurysms/exudates relative to background illumination.

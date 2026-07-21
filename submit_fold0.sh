@@ -24,10 +24,10 @@ export HF_HUB_OFFLINE=1
 
 python train_dr.py \
     --dr_root Datasets/DR \
-    --run_dir runs/bengham_aug_fold0 \
+    --run_dir runs/mixup_bengham_fold0 \
     --folds 0 \
     --use_multi_tile \
     --tile_grid 3 \
     --batch_size 24 \
     --grad_checkpoint \
-    --epochs 75
+    --epochs 150

@@ -635,6 +635,7 @@ def preload_dr_images(
     n_threads: int = 16,
     cache_dir: Optional[str] = None,
     crop_fundus: bool = False,
+    preprocess_fn: Optional[Callable] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Load all DR images into RAM as resized uint8 tensors.
@@ -643,6 +644,10 @@ def preload_dr_images(
       - First call: decode JPEGs, resize, save as .pt files in cache_dir (~30 min).
       - Later calls: load .pt files directly (~30 sec). Survives process restarts.
     Without cache_dir: always decodes from source (no disk persistence).
+
+    preprocess_fn: optional transform applied AFTER resize (e.g. BenGrahamFundusTransform).
+    When provided, the cache stores the preprocessed images so the transform runs only once.
+    Use a separate cache_dir for each preprocessing configuration.
 
     Returns {path: uint8 tensor (C, H, W)}.
     """
@@ -669,6 +674,8 @@ def preload_dr_images(
         if crop_fundus:
             img = crop_fundus_circle(img)
         img = resize(img)
+        if preprocess_fn is not None:
+            img = preprocess_fn(img)  # e.g. Ben Graham; sigma calibrated for img_size
         t = torch.from_numpy(np.array(img)).permute(2, 0, 1).contiguous()
         if cache_dir:
             torch.save(t, _pt_path(path))
