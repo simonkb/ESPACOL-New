@@ -136,14 +136,11 @@ def build_tile_transform(
     # Ben Graham is preprocessing (not augmentation) — applied at train AND test time
     preprocess_ops = [BenGrahamFundusTransform(sigma=ben_graham_sigma)] if ben_graham else []
 
-    # Fundus images are rotationally invariant (any orientation is clinically
-    # valid), so ±90° gives 9× more orientation diversity than the old ±10°.
-    # Stronger color jitter simulates camera and pigmentation variation.
     aug_ops = [
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomVerticalFlip(p=0.5),
-        transforms.RandomRotation(degrees=90, fill=128),
-        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
+        transforms.RandomRotation(degrees=10),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1),
     ] if augment else []
 
     canvas_tfm = transforms.Compose([

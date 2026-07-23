@@ -24,7 +24,7 @@ export HF_HUB_OFFLINE=1
 
 python train_dr.py \
     --dr_root Datasets/DR \
-    --run_dir runs/mixup_bengham_fold0 \
+    --run_dir runs/clean150_fold0 \
     --folds 0 \
     --use_multi_tile \
     --tile_grid 3 \

@@ -179,14 +179,7 @@ class DRConfig(TrainConfig):
     # (original + H-flip + V-flip + 180°). Applied only to final test, not val.
     use_tta: bool = True
 
-    # Mixup augmentation: λ ~ Beta(α,α) interpolation of input pairs each batch.
-    # Smooths the grade decision boundary; proven +1-2% on DR ordinal regression.
-    # α=0.4 is the standard value from the original Mixup paper.
-    mixup_alpha: float = 0.4
+    mixup_alpha: float = 0.0
 
-    # Ben Graham fundus preprocessing: local contrast normalisation that
-    # amplifies microaneurysms/exudates relative to background illumination.
-    # Applied identically at train and test time (σ=30 on 900 px images
-    # ≡ σ=10 on 300 px images — the standard Kaggle DR usage).
-    use_ben_graham: bool = True
+    use_ben_graham: bool = False
     ben_graham_sigma: float = 30.0
