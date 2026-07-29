@@ -33,5 +33,4 @@ python train_dr.py \
     --use_multi_tile \
     --tile_grid 3 \
     --batch_size 24 \
-    --grad_checkpoint \
     --epochs 75

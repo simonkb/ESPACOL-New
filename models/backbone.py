@@ -35,7 +35,7 @@ class EfficientNetV2SBackbone(nn.Module):
         if self.grad_checkpoint and self.training and torch.is_grad_enabled():
             # Split features into 4 segments — saves ~60% activation memory
             # by recomputing each segment's internals during backward pass
-            x = checkpoint_sequential(self.features, 4, x, use_reentrant=True)
+            x = checkpoint_sequential(self.features, 4, x, use_reentrant=False)
         else:
             x = self.features(x)
         x = self.avgpool(x)
