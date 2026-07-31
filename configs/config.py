@@ -83,6 +83,8 @@ class BUSIConfig(TrainConfig):
     n_folds: int = 5                 # paper: 5-fold CV
     val_fraction: float = 0.1        # 10% of train folds for validation
     run_dir: str = "runs/busi"
+    use_multi_tile: bool = False
+    tile_grid: int = 3
 
 
 @dataclass

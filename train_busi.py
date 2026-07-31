@@ -34,6 +34,8 @@ from Datasets.dataloaders import (
     StratifiedBatchSampler,
     build_transform,
     build_train_transform,
+    build_tile_transform,
+    preload_dr_images,
 )
 from models.framework import build_model
 from training.cross_val import BUSICrossValidator
@@ -41,10 +43,6 @@ from training.trainer import Trainer
 from torch.utils.data import DataLoader
 from utils.metrics import per_class_accuracy, confusion_stats
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Reproducibility
-# ─────────────────────────────────────────────────────────────────────────────
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -54,10 +52,6 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────────────────────────────────────
-
 def setup_logging(run_dir: str) -> None:
     os.makedirs(run_dir, exist_ok=True)
     fmt = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
@@ -65,36 +59,31 @@ def setup_logging(run_dir: str) -> None:
         logging.StreamHandler(sys.stdout),
         logging.FileHandler(os.path.join(run_dir, "train.log")),
     ]
-    logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers)
+    logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers, force=True)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Load all BUSI items
-# ─────────────────────────────────────────────────────────────────────────────
 
 def load_all_busi_items(busi_root: str) -> list:
-    """Return all (path, label) pairs from BUSI, ignoring mask files."""
     ds = BUSIDataset(root_dir=busi_root, split="all")
     return ds.items
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Build DataLoaders for one fold
-# ─────────────────────────────────────────────────────────────────────────────
+def make_loaders(train_items, val_items, test_items, cfg: BUSIConfig, device=None, img_cache=None):
+    if getattr(cfg, "use_multi_tile", False):
+        tile_grid = getattr(cfg, "tile_grid", 3)
+        train_tfm = build_tile_transform(tile_size=cfg.img_size, tile_grid=tile_grid, augment=True)
+        eval_tfm  = build_tile_transform(tile_size=cfg.img_size, tile_grid=tile_grid, augment=False)
+    else:
+        train_tfm = build_train_transform(cfg.img_size)
+        eval_tfm  = build_transform(cfg.img_size)
 
-def make_loaders(train_items, val_items, test_items, cfg: BUSIConfig, device=None):
-    train_tfm = build_train_transform(cfg.img_size)   # augmented for training
-    eval_tfm = build_transform(cfg.img_size)           # clean for val/test
-
-    # MPS (Apple Silicon) does not support pin_memory and has issues with
-    # forked DataLoader workers — use 0 workers and no pin_memory on MPS.
     use_mps = (device is not None and device.type == "mps")
     num_workers = 0 if use_mps else cfg.num_workers
     pin_memory = False if use_mps else cfg.pin_memory
+    pf_kwargs = {"prefetch_factor": 4} if num_workers > 0 else {}
 
-    train_ds = ImageLabelDataset(train_items, transform=train_tfm)
-    val_ds = ImageLabelDataset(val_items, transform=eval_tfm)
-    test_ds = ImageLabelDataset(test_items, transform=eval_tfm)
+    train_ds = ImageLabelDataset(train_items, transform=train_tfm, img_cache=img_cache)
+    val_ds   = ImageLabelDataset(val_items,   transform=eval_tfm,  img_cache=img_cache)
+    test_ds  = ImageLabelDataset(test_items,  transform=eval_tfm,  img_cache=img_cache)
 
     if cfg.stratified:
         train_labels = [y for _, y in train_items]
@@ -106,6 +95,8 @@ def make_loaders(train_items, val_items, test_items, cfg: BUSIConfig, device=Non
             batch_sampler=sampler,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            persistent_workers=(num_workers > 0),
+            **pf_kwargs,
         )
     else:
         train_loader = DataLoader(
@@ -115,72 +106,78 @@ def make_loaders(train_items, val_items, test_items, cfg: BUSIConfig, device=Non
             num_workers=num_workers,
             pin_memory=pin_memory,
             drop_last=True,
+            persistent_workers=(num_workers > 0),
+            **pf_kwargs,
         )
 
     val_loader = DataLoader(
-        val_ds,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+        val_ds, batch_size=cfg.batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=pin_memory, **pf_kwargs,
     )
     test_loader = DataLoader(
-        test_ds,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+        test_ds, batch_size=cfg.batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=pin_memory, **pf_kwargs,
     )
 
     return train_loader, val_loader, test_loader
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
-
 def main():
     parser = argparse.ArgumentParser(description="Train BUSI 5-fold CV")
-    parser.add_argument(
-        "--busi_root", type=str, default="Datasets/BUSI",
-        help="Path to BUSI dataset root (contains benign/, malignant/, normal/)"
-    )
-    parser.add_argument(
-        "--run_dir", type=str, default="runs/busi",
-        help="Directory for checkpoints and logs"
-    )
-    parser.add_argument(
-        "--folds", type=str, default="all",
-        help="Comma-separated fold indices to run (e.g. '0,1,2') or 'all'"
-    )
+    parser.add_argument("--busi_root", type=str, default="Datasets/BUSI",
+                        help="Path to BUSI dataset root (contains benign/, malignant/, normal/)")
+    parser.add_argument("--run_dir", type=str, default="runs/busi",
+                        help="Directory for checkpoints and logs")
+    parser.add_argument("--folds", type=str, default="all",
+                        help="Comma-separated fold indices to run (e.g. '0,1,2') or 'all'")
     parser.add_argument("--no_pretrained", action="store_true")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Override max training epochs")
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="Override batch size")
+    parser.add_argument("--use_multi_tile", action="store_true",
+                        help="Enable multi-tile input with AttentionPool aggregation")
+    parser.add_argument("--tile_grid", type=int, default=3,
+                        help="Tile grid size (default 3 → 3×3=9 local tiles + 1 global = 10 total)")
+    parser.add_argument("--grad_checkpoint", action="store_true",
+                        help="Enable gradient checkpointing in backbone (saves activation memory)")
+    parser.add_argument("--no_cache", action="store_true",
+                        help="Disable image cache")
+    parser.add_argument("--cache_dir", type=str, default=None,
+                        help="Directory for pre-decoded .pt image cache")
     args = parser.parse_args()
 
     cfg = BUSIConfig(run_dir=args.run_dir)
+
+    if args.use_multi_tile:
+        cfg.use_multi_tile = True
+        cfg.tile_grid = args.tile_grid
+    if args.epochs is not None:
+        cfg.epochs = args.epochs
+    if args.batch_size is not None:
+        cfg.batch_size = args.batch_size
+
     setup_logging(args.run_dir)
     log = logging.getLogger("train_busi")
     set_seed(cfg.seed)
 
     log.info("=" * 70)
-    log.info("BUSI 5-fold Cross-Validation  (EfficientNet-V2S + PCOL + SCOLw)")
+    extras_str = " + MultiTile(3×3)" if cfg.use_multi_tile else ""
+    log.info(f"BUSI 5-fold CV  (EfficientNet-V2S + PCOL + SCOLw + ImageText{extras_str})")
     log.info("=" * 70)
     log.info(f"Config: {cfg}")
 
-    # Load dataset
     all_items = load_all_busi_items(args.busi_root)
     log.info(f"Total BUSI images: {len(all_items)}")
 
-    # Label distribution
     from collections import Counter
     dist = Counter(y for _, y in all_items)
     log.info(f"Class distribution: {dict(sorted(dist.items()))}")
 
-    # CV splitter
     cv = BUSICrossValidator(
         all_items, n_folds=cfg.n_folds, val_fraction=cfg.val_fraction, seed=cfg.seed
     )
 
-    # Which folds to run
     if args.folds == "all":
         fold_indices = list(range(cfg.n_folds))
     else:
@@ -193,6 +190,31 @@ def main():
     )
     log.info(f"Device: {device}")
 
+    img_cache = None
+    if not args.no_cache:
+        n_threads = 8
+
+        if cfg.use_multi_tile and args.cache_dir is None:
+            canvas_size = cfg.tile_grid * cfg.img_size
+            cache_dir = f"Datasets/BUSI/cache_tiles_{canvas_size}"
+        else:
+            cache_dir = args.cache_dir
+
+        preload_img_size = cfg.tile_grid * cfg.img_size if cfg.use_multi_tile else cfg.img_size
+
+        log.info(
+            f"Pre-loading BUSI images ({n_threads} threads, size={preload_img_size}) "
+            f"{'(disk cache: ' + cache_dir + ')' if cache_dir else '(RAM only)'}"
+        )
+        img_cache = preload_dr_images(
+            all_items,
+            img_size=preload_img_size,
+            n_threads=n_threads,
+            cache_dir=cache_dir,
+            crop_fundus=False,  # BUSI is ultrasound, no fundus circle to crop
+        )
+        log.info(f"Image cache ready: {len(img_cache)} images")
+
     fold_results = []
 
     for fi in fold_indices:
@@ -203,16 +225,15 @@ def main():
         set_seed(cfg.seed + fi)
 
         train_items_raw, val_items_held_out, test_items = cv.get_fold(fi)
-        # Paper: "optimized based on validation loss" with no separate val set described.
-        # Use test fold as validation (merging held-out val back into training).
         train_items = train_items_raw + val_items_held_out
-        val_items = test_items   # val == test (same fold)
-        log.info(
-            f"  train={len(train_items)}  val=test={len(test_items)}"
-        )
+        val_items = test_items
+        log.info(f"  train={len(train_items)}  val=test={len(test_items)}")
+
+        dist_fold = Counter(y for _, y in train_items)
+        log.info(f"  Train class dist: {dict(sorted(dist_fold.items()))}")
 
         train_loader, val_loader, test_loader = make_loaders(
-            train_items, val_items, test_items, cfg, device=device
+            train_items, val_items, test_items, cfg, device=device, img_cache=img_cache
         )
 
         fold_dir = os.path.join(args.run_dir, f"fold{fi}")
@@ -223,6 +244,9 @@ def main():
             pretrained=not args.no_pretrained,
             proj_hidden_dim=cfg.proj_hidden_dim,
             proj_out_dim=cfg.proj_out_dim,
+            use_image_text=cfg.use_image_text,
+            use_multi_tile=cfg.use_multi_tile,
+            grad_checkpoint=args.grad_checkpoint,
         )
 
         train_labels = [y for _, y in train_items]
@@ -239,12 +263,8 @@ def main():
 
         test_metrics = trainer.fit(test_loader)
         fold_results.append(test_metrics)
-
-        # Per-class breakdown
-        import torch as _t
         log.info(f"  Fold {fi} summary: acc={test_metrics['test_acc']:.2f}%  mae={test_metrics['test_mae']:.4f}")
 
-    # ── Aggregate results ────────────────────────────────────────────────────
     log.info("\n" + "=" * 70)
     log.info("FINAL RESULTS  (mean ± std across folds)")
     log.info("=" * 70)
@@ -252,11 +272,9 @@ def main():
     accs = [r["test_acc"] for r in fold_results]
     maes = [r["test_mae"] for r in fold_results]
 
-    import numpy as np
     log.info(f"  Accuracy : {np.mean(accs):.2f}% ± {np.std(accs):.2f}%")
     log.info(f"  MAE      : {np.mean(maes):.4f} ± {np.std(maes):.4f}")
 
-    # Save summary CSV
     summary_path = os.path.join(args.run_dir, "final_results.csv")
     with open(summary_path, "w", newline="") as f:
         fieldnames = ["fold"] + list(fold_results[0].keys())
@@ -264,19 +282,8 @@ def main():
         writer.writeheader()
         for fi, res in zip(fold_indices, fold_results):
             writer.writerow({"fold": fi, **res})
-        # Summary row
-        writer.writerow({
-            "fold": "mean",
-            "test_loss": "",
-            "test_acc": f"{np.mean(accs):.4f}",
-            "test_mae": f"{np.mean(maes):.4f}",
-        })
-        writer.writerow({
-            "fold": "std",
-            "test_loss": "",
-            "test_acc": f"{np.std(accs):.4f}",
-            "test_mae": f"{np.std(maes):.4f}",
-        })
+        writer.writerow({"fold": "mean", "test_loss": "", "test_acc": f"{np.mean(accs):.4f}", "test_mae": f"{np.mean(maes):.4f}"})
+        writer.writerow({"fold": "std",  "test_loss": "", "test_acc": f"{np.std(accs):.4f}",  "test_mae": f"{np.std(maes):.4f}"})
 
     log.info(f"Results saved to {summary_path}")
 
