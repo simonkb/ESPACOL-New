@@ -68,3 +68,35 @@ class RegressionHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc(x).squeeze(-1)    # (N,)
+
+
+class OrdinalDistributionHead(nn.Module):
+    """
+    CORAL-style ordinal distribution head (Cao 2020).
+
+    Predicts P(Y > k) for k = 0 .. n_classes-2 via a shared linear weight
+    and per-threshold bias terms. This encodes the ordinal constraint that
+    P(Y > 0) >= P(Y > 1) >= ... >= P(Y > K-2) is encouraged but not enforced
+    — the CORAL loss does the enforcement during training.
+
+    Input : (N, input_dim)
+    Output from forward(): (N, K-1)  — sigmoid probabilities P(Y > k)
+    Output from predict(): (N,)      — expected grade = sum_k P(Y > k) ∈ [0, K-1]
+    """
+
+    def __init__(self, input_dim: int = 1280, n_classes: int = 5):
+        super().__init__()
+        self.n_classes = n_classes
+        self.fc = nn.Linear(input_dim, 1, bias=False)
+        # Initialise bias to approximate uniform class spacing
+        bias_init = torch.arange(n_classes - 1).float() - (n_classes - 2) / 2.0
+        self.bias = nn.Parameter(bias_init)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.fc(x)                           # (N, 1)
+        logits = h + self.bias.unsqueeze(0)      # (N, K-1)
+        return torch.sigmoid(logits)             # (N, K-1) — P(Y > k)
+
+    def predict(self, x: torch.Tensor) -> torch.Tensor:
+        probs = self.forward(x)
+        return probs.sum(dim=1)                  # (N,) — expected grade ∈ [0, K-1]

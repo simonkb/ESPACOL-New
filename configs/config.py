@@ -66,13 +66,36 @@ class TrainConfig:
     amp: bool = True
 
     use_image_text: bool = True
-    gamma: float = 0.0929   
+    gamma: float = 0.0929
     lambda_ord_it: float = 1.0
     text_encoder_name: str = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
     finetune_text_encoder: bool = False
     text_finetune_layers: int = 0
     text_encoder_lr: float = 1e-6
     text_finetune_start_epoch: int = 20
+
+    # ── OPTIC architecture flags (all default off → identical to baseline) ──
+    # CrossTileOrdinalTransformer: replaces AttentionPool with tile-aware Transformer
+    use_tile_transformer: bool = False
+    tile_transformer_dim: int = 512
+    tile_transformer_nhead: int = 8
+    tile_transformer_layers: int = 2
+    tile_transformer_dropout: float = 0.1
+
+    # GradePrototypeAttention: per-tile grade evidence for intrinsic explainability
+    use_grade_prototypes: bool = False
+
+    # OrdinalDistributionHead: CORAL-style distributional prediction (replaces RMSE)
+    use_ordinal_head: bool = False
+
+    # OrdinalStochasticDominanceLoss: pairwise CDF-level ranking loss
+    use_osd_loss: bool = False
+    lambda_osd: float = 0.5
+    osd_margin: float = 0.0
+
+    # TileConsistencyLoss: penalise tile evidence conflicting with image prediction
+    use_tile_consistency: bool = False
+    lambda_tcl: float = 0.1
 
 
 @dataclass

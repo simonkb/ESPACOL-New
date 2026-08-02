@@ -255,6 +255,45 @@ def main():
         help="Optional override for BioMedCLIP/open_clip text encoder name",
     )
 
+    # ── OPTIC architecture flags ──────────────────────────────────────────────
+    parser.add_argument(
+        "--use_tile_transformer",
+        action="store_true",
+        help="Replace AttentionPool with CrossTileOrdinalTransformer (CTOT)",
+    )
+    parser.add_argument(
+        "--use_grade_prototypes",
+        action="store_true",
+        help="Enable GradePrototypeAttention for tile-level explainability (requires CTOT)",
+    )
+    parser.add_argument(
+        "--use_ordinal_head",
+        action="store_true",
+        help="Replace RMSE regression with CORAL OrdinalDistributionHead",
+    )
+    parser.add_argument(
+        "--use_osd_loss",
+        action="store_true",
+        help="Add OrdinalStochasticDominanceLoss (requires ordinal head)",
+    )
+    parser.add_argument(
+        "--lambda_osd",
+        type=float,
+        default=None,
+        help="Weight for OSD loss (default from DRConfig)",
+    )
+    parser.add_argument(
+        "--use_tile_consistency",
+        action="store_true",
+        help="Add TileConsistencyLoss (requires grade prototypes)",
+    )
+    parser.add_argument(
+        "--lambda_tcl",
+        type=float,
+        default=None,
+        help="Weight for TileConsistencyLoss (default from DRConfig)",
+    )
+
     args = parser.parse_args()
 
     if args.train_csv is None:
@@ -283,6 +322,22 @@ def main():
 
     if args.text_encoder_name is not None:
         cfg.text_encoder_name = args.text_encoder_name
+
+    # OPTIC flags
+    if args.use_tile_transformer:
+        cfg.use_tile_transformer = True
+    if args.use_grade_prototypes:
+        cfg.use_grade_prototypes = True
+    if args.use_ordinal_head:
+        cfg.use_ordinal_head = True
+    if args.use_osd_loss:
+        cfg.use_osd_loss = True
+    if args.lambda_osd is not None:
+        cfg.lambda_osd = args.lambda_osd
+    if args.use_tile_consistency:
+        cfg.use_tile_consistency = True
+    if args.lambda_tcl is not None:
+        cfg.lambda_tcl = args.lambda_tcl
 
     setup_logging(args.run_dir)
     log = logging.getLogger("train_dr")
@@ -393,6 +448,14 @@ def main():
             use_image_text=cfg.use_image_text,
             use_multi_tile=cfg.use_multi_tile,
             grad_checkpoint=args.grad_checkpoint,
+            tile_grid=cfg.tile_grid,
+            use_tile_transformer=cfg.use_tile_transformer,
+            tile_transformer_dim=cfg.tile_transformer_dim,
+            tile_transformer_nhead=cfg.tile_transformer_nhead,
+            tile_transformer_layers=cfg.tile_transformer_layers,
+            tile_transformer_dropout=cfg.tile_transformer_dropout,
+            use_grade_prototypes=cfg.use_grade_prototypes,
+            use_ordinal_head=cfg.use_ordinal_head,
         )
 
         train_labels = [y for _, y in train_items]
@@ -423,9 +486,11 @@ def main():
 
     accs = [r["test_acc"] for r in fold_results]
     maes = [r["test_mae"] for r in fold_results]
+    qwks = [r.get("test_qwk", 0.0) for r in fold_results]
 
     log.info(f"  Accuracy : {np.mean(accs):.2f}% ± {np.std(accs):.2f}%")
     log.info(f"  MAE      : {np.mean(maes):.4f} ± {np.std(maes):.4f}")
+    log.info(f"  QWK      : {np.mean(qwks):.4f} ± {np.std(qwks):.4f}")
 
     summary_path = os.path.join(args.run_dir, "final_results.csv")
 

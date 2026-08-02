@@ -130,6 +130,9 @@ class Trainer:
             temperature=cfg.temperature,
             use_image_text=cfg.use_image_text,
             lambda_ord_it=cfg.lambda_ord_it,
+            lambda_osd=getattr(cfg, "lambda_osd", 0.0),
+            osd_margin=getattr(cfg, "osd_margin", 0.0),
+            lambda_tcl=getattr(cfg, "lambda_tcl", 0.0),
         )
 
         self.class_weights = compute_class_weights(
@@ -228,9 +231,11 @@ class Trainer:
             logger.info(f"[Fold {self.fold}] Loaded best model from {best_ckpt_path}")
 
         test_metrics = self._eval_epoch(test_loader, prefix="test")
+        qwk_str = f"  qwk={test_metrics.get('test_qwk', 0.0):.4f}" if "test_qwk" in test_metrics else ""
+        ece_str = f"  ece={test_metrics['test_ece']:.4f}" if "test_ece" in test_metrics else ""
         logger.info(
             f"[Fold {self.fold}] TEST  acc={test_metrics['test_acc']:.2f}%  "
-            f"mae={test_metrics['test_mae']:.4f}"
+            f"mae={test_metrics['test_mae']:.4f}{qwk_str}{ece_str}"
         )
         return test_metrics
 
@@ -263,6 +268,9 @@ class Trainer:
         total_pcol = 0.0
         total_scolw = 0.0
         total_rmse = 0.0
+        total_ord = 0.0
+        total_osd = 0.0
+        total_tcl = 0.0
         total_it = 0.0
         n_batches = 0
 
@@ -288,11 +296,14 @@ class Trainer:
                     z_scolw = out["z_scolw"]
                     z_it = out.get("z_it", None)
                     pred = out["pred"]
+                    ordinal_probs = out.get("ordinal_probs", None)
+                    tile_evidence = out.get("tile_evidence", None)
                 elif len(out) == 5:
                     _, z_pcol, z_scolw, z_it, pred = out
+                    ordinal_probs = tile_evidence = None
                 else:
                     z_pcol, z_scolw, pred = out
-                    z_it = None
+                    z_it = ordinal_probs = tile_evidence = None
 
                 text_prototypes = None
                 if self.text_encoder is not None and self.cfg.use_image_text:
@@ -306,6 +317,8 @@ class Trainer:
                     class_weights=batch_weights,
                     z_it=z_it,
                     text_prototypes=text_prototypes,
+                    ordinal_probs=ordinal_probs,
+                    tile_evidence=tile_evidence,
                 )
 
             self.scaler.scale(loss).backward()
@@ -326,11 +339,13 @@ class Trainer:
             total_pcol += comps["loss_pcol"]
             total_scolw += comps["loss_scolw"]
             total_rmse += comps["loss_rmse"]
+            total_ord += comps.get("loss_ord", 0.0)
+            total_osd += comps.get("loss_osd", 0.0)
+            total_tcl += comps.get("loss_tcl", 0.0)
             total_it += comps.get("loss_it", 0.0)
             n_batches += 1
 
         nbatches = max(n_batches, 1)
-
         metrics = {
             "train_loss": total_loss / nbatches,
             "train_loss_pcol": total_pcol / nbatches,
@@ -338,6 +353,12 @@ class Trainer:
             "train_loss_rmse": total_rmse / nbatches,
         }
 
+        if total_ord > 0:
+            metrics["train_loss_ord"] = total_ord / nbatches
+        if total_osd > 0:
+            metrics["train_loss_osd"] = total_osd / nbatches
+        if total_tcl > 0:
+            metrics["train_loss_tcl"] = total_tcl / nbatches
         if self.text_encoder is not None and self.cfg.use_image_text:
             metrics["train_loss_it"] = total_it / nbatches
 
@@ -351,36 +372,49 @@ class Trainer:
 
         all_preds = []
         all_labels = []
+        all_ordinal_probs = []
         total_rmse = 0.0
         n_batches = 0
 
         nb = self.device.type == "cuda"
+        has_ordinal = hasattr(self.model, "ordinal_head") and self.model.ordinal_head is not None
 
         for x, y in loader:
             x = x.to(self.device, non_blocking=nb)
             y = y.to(self.device, non_blocking=nb)
 
             with autocast(device_type=self.device.type, enabled=self.use_amp):
-                pred = self.model.predict(x)
+                if has_ordinal:
+                    # Single forward pass to get both pred and ordinal_probs
+                    out = self.model(x)
+                    pred = out["pred"]
+                    all_ordinal_probs.append(out["ordinal_probs"].cpu())
+                else:
+                    pred = self.model.predict(x)
                 rmse = torch.sqrt(nn.functional.mse_loss(pred, y.float()) + 1e-8)
 
             total_rmse += rmse.item()
             n_batches += 1
-
             all_preds.append(pred.cpu())
             all_labels.append(y.cpu())
 
         all_preds = torch.cat(all_preds)
         all_labels = torch.cat(all_labels)
+        ordinal_probs = torch.cat(all_ordinal_probs) if all_ordinal_probs else None
 
-        m = evaluate_predictions(all_preds, all_labels, self.cfg.n_classes)
-        nbatches = max(n_batches, 1)
+        m = evaluate_predictions(all_preds, all_labels, self.cfg.n_classes,
+                                  ordinal_probs=ordinal_probs)
+        nb_val = max(n_batches, 1)
 
-        return {
-            f"{prefix}_loss": total_rmse / nbatches,
+        result = {
+            f"{prefix}_loss": total_rmse / nb_val,
             f"{prefix}_acc": m["acc"],
             f"{prefix}_mae": m["mae"],
+            f"{prefix}_qwk": m.get("qwk", 0.0),
         }
+        if "ece" in m:
+            result[f"{prefix}_ece"] = m["ece"]
+        return result
 
     def _log_epoch(
         self,
@@ -392,20 +426,33 @@ class Trainer:
     ) -> None:
         row = {"epoch": epoch, "elapsed": f"{elapsed:.1f}", "lr": lr, **train, **val}
 
-        it_text = ""
+        extra = ""
+        if "train_loss_ord" in train:
+            extra += f" ord={train['train_loss_ord']:.3f}"
+        if "train_loss_osd" in train:
+            extra += f" osd={train['train_loss_osd']:.3f}"
+        if "train_loss_tcl" in train:
+            extra += f" tcl={train['train_loss_tcl']:.3f}"
         if "train_loss_it" in train:
-            it_text = f" it={train['train_loss_it']:.3f}"
+            extra += f" it={train['train_loss_it']:.3f}"
+
+        reg_key = "train_loss_ord" if "train_loss_ord" in train else "train_loss_rmse"
+        reg_label = "ord" if "train_loss_ord" in train else "rmse"
+
+        qwk_text = f"  val_qwk={val.get('val_qwk', 0.0):.4f}" if "val_qwk" in val else ""
+        ece_text = f"  val_ece={val['val_ece']:.4f}" if "val_ece" in val else ""
 
         logger.info(
             f"[Fold {self.fold}] Ep {epoch:3d} | "
             f"loss={train['train_loss']:.4f} "
             f"(pcol={train['train_loss_pcol']:.3f} "
             f"scolw={train['train_loss_scolw']:.3f} "
-            f"rmse={train['train_loss_rmse']:.3f}"
-            f"{it_text}) | "
+            f"{reg_label}={train[reg_key]:.3f}"
+            f"{extra}) | "
             f"val_loss={val['val_loss']:.4f}  "
             f"val_acc={val['val_acc']:.2f}%  "
-            f"val_mae={val['val_mae']:.4f}  "
+            f"val_mae={val['val_mae']:.4f}"
+            f"{qwk_text}{ece_text}  "
             f"lr={lr:.2e}  t={elapsed:.1f}s"
         )
 
