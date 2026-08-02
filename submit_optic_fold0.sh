@@ -32,7 +32,7 @@ python train_dr.py \
     --folds 0 \
     --use_multi_tile \
     --tile_grid 3 \
-    --batch_size 14 \
+    --batch_size 24 \
     --grad_checkpoint \
     --epochs 75 \
     --use_tile_transformer \
