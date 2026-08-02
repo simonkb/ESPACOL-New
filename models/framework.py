@@ -125,10 +125,10 @@ class OPTICModel(HybridContrastiveOrdinalModel):
         z_pcol = self.pcol_head(features)
         z_scolw = self.scolw_head(features)
 
-        ordinal_probs = None
+        ordinal_logits = None
         if self.ordinal_head is not None:
-            ordinal_probs = self.ordinal_head(features)   # (N, K-1)
-            pred = ordinal_probs.sum(dim=1)               # (N,) expected grade
+            ordinal_logits = self.ordinal_head(features)          # (N, K-1) raw logits
+            pred = torch.sigmoid(ordinal_logits).sum(dim=1)       # (N,) expected grade
         else:
             pred = self.regression_head(features)
 
@@ -142,7 +142,7 @@ class OPTICModel(HybridContrastiveOrdinalModel):
             "z_scolw": z_scolw,
             "z_it": z_it,
             "pred": pred,
-            "ordinal_probs": ordinal_probs,
+            "ordinal_logits": ordinal_logits,
             "tile_evidence": tile_evidence,
             "tile_weights": tile_weights,
             "grade_features": grade_features,

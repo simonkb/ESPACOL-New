@@ -296,14 +296,14 @@ class Trainer:
                     z_scolw = out["z_scolw"]
                     z_it = out.get("z_it", None)
                     pred = out["pred"]
-                    ordinal_probs = out.get("ordinal_probs", None)
+                    ordinal_logits = out.get("ordinal_logits", None)
                     tile_evidence = out.get("tile_evidence", None)
                 elif len(out) == 5:
                     _, z_pcol, z_scolw, z_it, pred = out
-                    ordinal_probs = tile_evidence = None
+                    ordinal_logits = tile_evidence = None
                 else:
                     z_pcol, z_scolw, pred = out
-                    z_it = ordinal_probs = tile_evidence = None
+                    z_it = ordinal_logits = tile_evidence = None
 
                 text_prototypes = None
                 if self.text_encoder is not None and self.cfg.use_image_text:
@@ -317,7 +317,7 @@ class Trainer:
                     class_weights=batch_weights,
                     z_it=z_it,
                     text_prototypes=text_prototypes,
-                    ordinal_probs=ordinal_probs,
+                    ordinal_logits=ordinal_logits,
                     tile_evidence=tile_evidence,
                 )
 
@@ -385,10 +385,12 @@ class Trainer:
 
             with autocast(device_type=self.device.type, enabled=self.use_amp):
                 if has_ordinal:
-                    # Single forward pass to get both pred and ordinal_probs
+                    # Single forward pass to get both pred and ordinal logits
                     out = self.model(x)
                     pred = out["pred"]
-                    all_ordinal_probs.append(out["ordinal_probs"].cpu())
+                    # Sigmoid here (float32) so ECE gets proper probabilities
+                    probs = torch.sigmoid(out["ordinal_logits"].float())
+                    all_ordinal_probs.append(probs.cpu())
                 else:
                     pred = self.model.predict(x)
                 rmse = torch.sqrt(nn.functional.mse_loss(pred, y.float()) + 1e-8)

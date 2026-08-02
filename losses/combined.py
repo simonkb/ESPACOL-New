@@ -69,7 +69,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         class_weights: torch.Tensor,
         z_it: torch.Tensor | None = None,
         text_prototypes: torch.Tensor | None = None,
-        ordinal_probs: torch.Tensor | None = None,
+        ordinal_logits: torch.Tensor | None = None,
         tile_evidence: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
 
@@ -77,8 +77,8 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         l_scolw = self.scolw(z_scolw, labels, class_weights)
 
         # Ordinal head active: use CORAL loss instead of RMSE
-        if ordinal_probs is not None:
-            l_ord = self.coral(ordinal_probs, labels)
+        if ordinal_logits is not None:
+            l_ord = self.coral(ordinal_logits, labels)
             l_rmse = torch.tensor(0.0, device=pred.device)
         else:
             l_rmse = torch.sqrt(F.mse_loss(pred, labels.float()) + 1e-8)
@@ -97,8 +97,8 @@ class HybridContrastiveOrdinalLoss(nn.Module):
             )
 
         l_osd = torch.tensor(0.0, device=pred.device)
-        if self.osd is not None and ordinal_probs is not None and self.lambda_osd > 0:
-            l_osd = self.osd(ordinal_probs, labels)
+        if self.osd is not None and ordinal_logits is not None and self.lambda_osd > 0:
+            l_osd = self.osd(ordinal_logits, labels)
 
         l_tcl = torch.tensor(0.0, device=pred.device)
         if self.tcl is not None and tile_evidence is not None and self.lambda_tcl > 0:
@@ -108,7 +108,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
             self.alpha * l_pcol
             + self.beta * l_scolw
             + self.gamma * l_it
-            + (l_ord if ordinal_probs is not None else l_rmse)
+            + (l_ord if ordinal_logits is not None else l_rmse)
             + self.lambda_osd * l_osd
             + self.lambda_tcl * l_tcl
         )

@@ -33,18 +33,19 @@ import torch.nn.functional as F
 class CoralOrdinalLoss(nn.Module):
     """
     Input:
-        probs  (N, K-1) = sigmoid probabilities P(Y > k) for k = 0 .. K-2
+        logits (N, K-1) = raw threshold logits from OrdinalDistributionHead.forward()
         labels (N,)     = integer class labels in [0, K-1]
     Returns:
         Scalar mean BCE loss averaged over all N × (K-1) binary targets.
+
+    Uses binary_cross_entropy_with_logits (numerically stable, AMP-safe).
     """
 
-    def forward(self, probs: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        K = probs.shape[1] + 1   # n_classes
-        # targets[n, k] = 1  iff  labels[n] > k
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        K = logits.shape[1] + 1   # n_classes
         k_range = torch.arange(K - 1, device=labels.device)   # (K-1,)
         targets = (labels.unsqueeze(1) > k_range.unsqueeze(0)).float()  # (N, K-1)
-        return F.binary_cross_entropy(probs, targets)
+        return F.binary_cross_entropy_with_logits(logits, targets)
 
 
 class OrdinalStochasticDominanceLoss(nn.Module):
@@ -62,11 +63,12 @@ class OrdinalStochasticDominanceLoss(nn.Module):
         super().__init__()
         self.margin = margin
 
-    def forward(self, probs: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """
-        probs : (N, K-1) = P(Y > k), k = 0 .. K-2
-        labels: (N,) integer labels
+        logits : (N, K-1) = raw threshold logits from OrdinalDistributionHead.forward()
+        labels : (N,) integer labels
         """
+        probs = torch.sigmoid(logits.float())   # float32 for numerical stability
         cdf = 1.0 - probs   # F(k) = P(Y <= k) = 1 - P(Y > k), shape (N, K-1)
 
         labels_i = labels.unsqueeze(1)   # (N, 1)
