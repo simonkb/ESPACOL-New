@@ -40,6 +40,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         lambda_osd: float = 0.0,
         osd_margin: float = 0.0,
         lambda_tcl: float = 0.0,
+        tcl_margin: float = 0.0,
     ):
         super().__init__()
         self.alpha = alpha
@@ -58,7 +59,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         self.coral = CoralOrdinalLoss()
 
         self.osd = OrdinalStochasticDominanceLoss(margin=osd_margin) if lambda_osd > 0 else None
-        self.tcl = TileConsistencyLoss() if lambda_tcl > 0 else None
+        self.tcl = TileConsistencyLoss(margin=tcl_margin) if lambda_tcl > 0 else None
 
     def forward(
         self,

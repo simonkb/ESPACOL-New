@@ -133,6 +133,7 @@ class Trainer:
             lambda_osd=getattr(cfg, "lambda_osd", 0.0),
             osd_margin=getattr(cfg, "osd_margin", 0.0),
             lambda_tcl=getattr(cfg, "lambda_tcl", 0.0),
+            tcl_margin=getattr(cfg, "tcl_margin", 0.0),
         )
 
         self.class_weights = compute_class_weights(

@@ -293,6 +293,18 @@ def main():
         default=None,
         help="Weight for TileConsistencyLoss (default from DRConfig)",
     )
+    parser.add_argument(
+        "--osd_margin",
+        type=float,
+        default=None,
+        help="Margin for OSD loss — 0 penalises any CDF violation; >0 enforces minimum CDF gap between grade CDFs",
+    )
+    parser.add_argument(
+        "--tcl_margin",
+        type=float,
+        default=None,
+        help="Margin for TileConsistencyLoss — 0 penalises any tile-image disagreement (recommended)",
+    )
 
     args = parser.parse_args()
 
@@ -338,6 +350,10 @@ def main():
         cfg.use_tile_consistency = True
     if args.lambda_tcl is not None:
         cfg.lambda_tcl = args.lambda_tcl
+    if args.osd_margin is not None:
+        cfg.osd_margin = args.osd_margin
+    if args.tcl_margin is not None:
+        cfg.tcl_margin = args.tcl_margin
 
     setup_logging(args.run_dir)
     log = logging.getLogger("train_dr")

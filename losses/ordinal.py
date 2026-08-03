@@ -92,20 +92,26 @@ class OrdinalStochasticDominanceLoss(nn.Module):
 
 class TileConsistencyLoss(nn.Module):
     """
-    Penalises tiles whose expected grade strongly disagrees with the image prediction.
+    Penalises tiles whose expected grade disagrees with the image-level prediction.
 
     For each tile t, the expected grade is:
         tile_pred[n, t] = sum_k k * tile_evidence[n, t, k]
     where tile_evidence is the GPA softmax over K grades.
 
-    Loss = mean over (n, t) of  relu(|tile_pred - pred_grade| - margin)^2
-    The margin of 1 tolerates adjacent-grade discrepancy (expected for boundary tiles).
+    `pred` is detached so gradients flow only through tile_evidence (GPA), not the
+    ordinal head — this makes TCL a one-way teacher-student signal: ODH teaches GPA
+    what grade each image is, without TCL interfering with the ordinal head's own loss.
+
+    Loss = mean over (n, t) of  relu(|tile_pred - pred.detach()| - margin)^2
 
     Args:
-        margin: allowable per-tile grade deviation before penalisation (default 1).
+        margin: allowable per-tile grade deviation before penalisation (default 0).
+                margin=0 penalises any disagreement; margin=1 tolerates ±1 grade
+                (not recommended — in practice tile_pred and pred stay within 1.0
+                of each other so the loss never activates).
     """
 
-    def __init__(self, margin: float = 1.0):
+    def __init__(self, margin: float = 0.0):
         super().__init__()
         self.margin = margin
 
@@ -117,5 +123,6 @@ class TileConsistencyLoss(nn.Module):
         K = tile_evidence.shape[-1]
         k_range = torch.arange(K, device=tile_evidence.device, dtype=tile_evidence.dtype)
         tile_pred = (tile_evidence * k_range).sum(dim=-1)   # (N, T)
-        diff = (tile_pred - pred.unsqueeze(1)).abs()         # (N, T)
+        # detach pred: only GPA (tile_evidence) receives gradient from TCL
+        diff = (tile_pred - pred.detach().unsqueeze(1)).abs()  # (N, T)
         return F.relu(diff - self.margin).pow(2).mean()

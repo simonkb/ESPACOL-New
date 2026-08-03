@@ -96,6 +96,7 @@ class TrainConfig:
     # TileConsistencyLoss: penalise tile evidence conflicting with image prediction
     use_tile_consistency: bool = False
     lambda_tcl: float = 0.1
+    tcl_margin: float = 0.0   # 0 = penalise any tile-image disagreement (recommended)
 
 
 @dataclass

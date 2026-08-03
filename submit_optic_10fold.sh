@@ -40,5 +40,6 @@ python train_dr.py \
     --use_ordinal_head \
     --use_osd_loss \
     --lambda_osd 0.5 \
+    --osd_margin 0.1 \
     --use_tile_consistency \
     --lambda_tcl 0.1
