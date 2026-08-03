@@ -161,8 +161,34 @@ class Trainer:
     def fit(self, test_loader: DataLoader) -> dict:
         best_val_acc = -float("inf")
         best_ckpt_path = os.path.join(self.run_dir, f"fold{self.fold}_best.pth")
+        start_epoch = 1
 
-        for epoch in range(1, self.cfg.epochs + 1):
+        # Auto-resume from best checkpoint if it exists (e.g. after SLURM preemption)
+        if os.path.exists(best_ckpt_path):
+            state = load_checkpoint(
+                path=best_ckpt_path,
+                model=self.model,
+                optimizer=self.optimizer,
+                text_encoder=self.text_encoder,
+                device=self.device,
+            )
+            start_epoch = state["epoch"] + 1
+            best_val_acc = state["metrics"].get("val_acc", -float("inf"))
+            if "scheduler_state" in state:
+                self.scheduler.load_state_dict(state["scheduler_state"])
+            if "scaler_state" in state:
+                self.scaler.load_state_dict(state["scaler_state"])
+            if "early_stopping_best" in state:
+                self.early_stopping.best = state["early_stopping_best"]
+                self.early_stopping.counter = state.get("early_stopping_counter", 0)
+            self._text_finetune_enabled = state.get("text_finetune_enabled", False)
+            self._csv_header_written = True   # history file already has a header
+            logger.info(
+                f"[Fold {self.fold}] Resumed from epoch {start_epoch - 1}  "
+                f"best_val_acc={best_val_acc:.2f}%  lr={self.optimizer.param_groups[0]['lr']:.2e}"
+            )
+
+        for epoch in range(start_epoch, self.cfg.epochs + 1):
             t0 = time.time()
             self._maybe_enable_text_finetune(epoch)
 
@@ -183,6 +209,12 @@ class Trainer:
 
             ckpt_path = os.path.join(self.run_dir, f"fold{self.fold}_epoch{epoch}.pth")
 
+            resume_extra = {
+                "early_stopping_best": self.early_stopping.best,
+                "early_stopping_counter": self.early_stopping.counter,
+                "text_finetune_enabled": self._text_finetune_enabled,
+            }
+
             save_checkpoint(
                 path=ckpt_path,
                 model=self.model,
@@ -191,6 +223,9 @@ class Trainer:
                 metrics={**train_metrics, **val_metrics},
                 is_best=is_best,
                 text_encoder=self.text_encoder,
+                scheduler=self.scheduler,
+                scaler=self.scaler,
+                extra=resume_extra,
             )
 
             if is_best:
@@ -202,6 +237,9 @@ class Trainer:
                     metrics={**train_metrics, **val_metrics},
                     is_best=False,
                     text_encoder=self.text_encoder,
+                    scheduler=self.scheduler,
+                    scaler=self.scaler,
+                    extra=resume_extra,
                 )
 
             if epoch > 1:
@@ -428,18 +466,16 @@ class Trainer:
     ) -> None:
         row = {"epoch": epoch, "elapsed": f"{elapsed:.1f}", "lr": lr, **train, **val}
 
+        reg_key = "train_loss_ord" if "train_loss_ord" in train else "train_loss_rmse"
+        reg_label = "ord" if "train_loss_ord" in train else "rmse"
+
         extra = ""
-        if "train_loss_ord" in train:
-            extra += f" ord={train['train_loss_ord']:.3f}"
         if "train_loss_osd" in train:
             extra += f" osd={train['train_loss_osd']:.3f}"
         if "train_loss_tcl" in train:
             extra += f" tcl={train['train_loss_tcl']:.3f}"
         if "train_loss_it" in train:
             extra += f" it={train['train_loss_it']:.3f}"
-
-        reg_key = "train_loss_ord" if "train_loss_ord" in train else "train_loss_rmse"
-        reg_label = "ord" if "train_loss_ord" in train else "rmse"
 
         qwk_text = f"  val_qwk={val.get('val_qwk', 0.0):.4f}" if "val_qwk" in val else ""
         ece_text = f"  val_ece={val['val_ece']:.4f}" if "val_ece" in val else ""

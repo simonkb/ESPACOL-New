@@ -16,12 +16,11 @@ def save_checkpoint(
     metrics: dict,
     is_best: bool = False,
     text_encoder: Optional[torch.nn.Module] = None,
+    scheduler: Optional[object] = None,
+    scaler: Optional[object] = None,
+    extra: Optional[dict] = None,
 ) -> None:
-    """Save model, optimizer, metrics, and optional text encoder state.
-
-    If is_best is True, also write a copy named best_model.pth in
-    the same directory.
-    """
+    """Save model, optimizer, metrics, and optional training state for resume."""
     state = {
         "epoch": epoch,
         "model_state": model.state_dict(),
@@ -31,6 +30,12 @@ def save_checkpoint(
 
     if text_encoder is not None:
         state["text_encoder_state"] = text_encoder.state_dict()
+    if scheduler is not None:
+        state["scheduler_state"] = scheduler.state_dict()
+    if scaler is not None:
+        state["scaler_state"] = scaler.state_dict()
+    if extra is not None:
+        state.update(extra)
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(state, path)

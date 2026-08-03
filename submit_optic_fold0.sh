@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --mem=220G
-#SBATCH --time=0-12:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --output=/dpc/kuin0170/ESPACOL-New/slurm_logs/optic_fold0_%j.out
 #SBATCH --error=/dpc/kuin0170/ESPACOL-New/slurm_logs/optic_fold0_%j.err
 #SBATCH --account=kuin0170
