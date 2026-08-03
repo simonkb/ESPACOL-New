@@ -188,6 +188,12 @@ def main():
     )
 
     parser.add_argument("--no_pretrained", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from existing best checkpoint (for SLURM preemption recovery). "
+             "Without this flag the trainer always starts from epoch 1.",
+    )
 
     parser.add_argument(
         "--batch_size",
@@ -354,6 +360,8 @@ def main():
         cfg.osd_margin = args.osd_margin
     if args.tcl_margin is not None:
         cfg.tcl_margin = args.tcl_margin
+    if args.resume:
+        cfg.resume = True
 
     setup_logging(args.run_dir)
     log = logging.getLogger("train_dr")

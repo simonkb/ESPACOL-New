@@ -28,7 +28,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Baseline achieves 84.25% on fold 0. Target: >= 85.5%
 python train_dr.py \
     --dr_root Datasets/DR \
-    --run_dir runs/optic_dr_fold0 \
+    --run_dir runs/optic_dr_fold0_v2 \
     --folds 0 \
     --use_multi_tile \
     --tile_grid 3 \

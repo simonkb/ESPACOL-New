@@ -56,6 +56,10 @@ class TrainConfig:
     # Checkpoint directory (set per experiment)
     run_dir: str = "runs/experiment"
 
+    # Resume training from existing best checkpoint (e.g. after SLURM preemption).
+    # Default False — new jobs always start from epoch 1.
+    resume: bool = False
+
     # Stratified batch sampling (paper: class-stratified batch sampling)
     stratified: bool = True
 

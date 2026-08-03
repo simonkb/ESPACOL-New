@@ -164,8 +164,9 @@ class Trainer:
         best_ckpt_path = os.path.join(self.run_dir, f"fold{self.fold}_best.pth")
         start_epoch = 1
 
-        # Auto-resume from best checkpoint if it exists (e.g. after SLURM preemption)
-        if os.path.exists(best_ckpt_path):
+        # Resume from best checkpoint only when explicitly requested (e.g. after SLURM preemption).
+        # Without --resume the trainer always starts from epoch 1, even if a checkpoint exists.
+        if getattr(self.cfg, "resume", False) and os.path.exists(best_ckpt_path):
             state = load_checkpoint(
                 path=best_ckpt_path,
                 model=self.model,
