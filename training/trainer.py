@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 from configs.config import TrainConfig
 from losses.combined import HybridContrastiveOrdinalLoss, compute_class_weights
 from models.text import ClinicalTextEncoder
+from models.tile_transformer import CrossTileOrdinalTransformer
 from utils.checkpoint import save_checkpoint, load_checkpoint
 from utils.metrics import evaluate_predictions
 
@@ -96,7 +97,34 @@ class Trainer:
                 finetune_layers=getattr(cfg, "text_finetune_layers", 0),
             ).to(self.device)
 
-        optim_params = [{"params": list(self.model.parameters()), "lr": cfg.lr}]
+        # ── Parameter groups ──────────────────────────────────────────────────
+        # When OPTIC components (CTOT, GPA, ODH) are present, give them a higher
+        # LR than the pretrained EfficientNet backbone. Randomly initialised
+        # components need more gradient signal to converge; the pretrained backbone
+        # only needs fine-tuning. ReduceLROnPlateau scales all groups by the same
+        # factor, so the ratio is preserved throughout training.
+        new_lr_mult = getattr(cfg, "new_component_lr_mult", 1.0)
+        has_ctot = (
+            hasattr(self.model, "backbone")
+            and hasattr(self.model.backbone, "pool")
+            and isinstance(self.model.backbone.pool, CrossTileOrdinalTransformer)
+        )
+
+        if has_ctot and new_lr_mult != 1.0:
+            pretrained_ids = {id(p) for p in self.model.backbone.base.parameters()}
+            pretrained_params = list(self.model.backbone.base.parameters())
+            new_params = [p for p in self.model.parameters() if id(p) not in pretrained_ids]
+            optim_params = [
+                {"params": pretrained_params, "lr": cfg.lr, "name": "backbone"},
+                {"params": new_params, "lr": cfg.lr * new_lr_mult, "name": "optic_new"},
+            ]
+            logger.info(
+                f"Differential LR: backbone={cfg.lr:.2e}  "
+                f"optic_new={cfg.lr * new_lr_mult:.2e}  (mult={new_lr_mult}x)"
+            )
+        else:
+            optim_params = [{"params": list(self.model.parameters()), "lr": cfg.lr}]
+
         if self.text_encoder is not None:
             optim_params.append(
                 {"params": list(self.text_encoder.projection.parameters()), "lr": cfg.lr}
@@ -118,6 +146,28 @@ class Trainer:
                     f"trainable_params={n_text_params}"
                 )
 
+        # ── Cache parameter lists for per-component gradient norm monitoring ──
+        self._backbone_params = (
+            list(self.model.backbone.base.parameters())
+            if hasattr(self.model, "backbone") and hasattr(self.model.backbone, "base")
+            else []
+        )
+        self._ctot_params = (
+            list(self.model.backbone.pool.parameters())
+            if has_ctot
+            else []
+        )
+        self._gpa_params = (
+            list(self.model.gpa.parameters())
+            if hasattr(self.model, "gpa") and self.model.gpa is not None
+            else []
+        )
+        self._odh_params = (
+            list(self.model.ordinal_head.parameters())
+            if hasattr(self.model, "ordinal_head") and self.model.ordinal_head is not None
+            else []
+        )
+
         self.optimizer = torch.optim.Adam(
             optim_params,
             weight_decay=cfg.weight_decay,
@@ -134,6 +184,7 @@ class Trainer:
             osd_margin=getattr(cfg, "osd_margin", 0.0),
             lambda_tcl=getattr(cfg, "lambda_tcl", 0.0),
             tcl_margin=getattr(cfg, "tcl_margin", 0.0),
+            lambda_gpa=getattr(cfg, "lambda_gpa", 0.0),
         )
 
         self.class_weights = compute_class_weights(
@@ -294,6 +345,12 @@ class Trainer:
             f"({n_text_params} trainable text params, lr={getattr(self.cfg, 'text_encoder_lr', 1e-6):.2e})"
         )
 
+    @staticmethod
+    def _grad_norm_of(params: list) -> float:
+        """L2 norm of all gradients in a parameter list. Returns 0 if no grads."""
+        total_sq = sum(p.grad.detach().norm() ** 2 for p in params if p.grad is not None)
+        return float(total_sq ** 0.5)
+
     def _train_epoch(self, epoch: int) -> dict:
         self.model.train()
         if self.text_encoder is not None:
@@ -311,7 +368,12 @@ class Trainer:
         total_ord = 0.0
         total_osd = 0.0
         total_tcl = 0.0
+        total_gpa = 0.0
         total_it = 0.0
+        total_gn_backbone = 0.0
+        total_gn_ctot = 0.0
+        total_gn_gpa = 0.0
+        total_gn_odh = 0.0
         n_batches = 0
 
         nb = self.device.type == "cuda"
@@ -372,6 +434,12 @@ class Trainer:
 
             nn.utils.clip_grad_norm_(clip_params, max_norm=1.0)
 
+            # Per-component gradient norms (after unscale, after clipping)
+            total_gn_backbone += self._grad_norm_of(self._backbone_params)
+            total_gn_ctot    += self._grad_norm_of(self._ctot_params)
+            total_gn_gpa     += self._grad_norm_of(self._gpa_params)
+            total_gn_odh     += self._grad_norm_of(self._odh_params)
+
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
@@ -382,6 +450,7 @@ class Trainer:
             total_ord += comps.get("loss_ord", 0.0)
             total_osd += comps.get("loss_osd", 0.0)
             total_tcl += comps.get("loss_tcl", 0.0)
+            total_gpa += comps.get("loss_gpa", 0.0)
             total_it += comps.get("loss_it", 0.0)
             n_batches += 1
 
@@ -399,8 +468,20 @@ class Trainer:
             metrics["train_loss_osd"] = total_osd / nbatches
         if total_tcl > 0:
             metrics["train_loss_tcl"] = total_tcl / nbatches
+        if total_gpa > 0:
+            metrics["train_loss_gpa"] = total_gpa / nbatches
         if self.text_encoder is not None and self.cfg.use_image_text:
             metrics["train_loss_it"] = total_it / nbatches
+
+        # Gradient norms — only log components that exist (non-zero param list)
+        if self._backbone_params:
+            metrics["gn_backbone"] = total_gn_backbone / nbatches
+        if self._ctot_params:
+            metrics["gn_ctot"] = total_gn_ctot / nbatches
+        if self._gpa_params:
+            metrics["gn_gpa"] = total_gn_gpa / nbatches
+        if self._odh_params:
+            metrics["gn_odh"] = total_gn_odh / nbatches
 
         return metrics
 
@@ -476,6 +557,8 @@ class Trainer:
             extra += f" osd={train['train_loss_osd']:.3f}"
         if "train_loss_tcl" in train:
             extra += f" tcl={train['train_loss_tcl']:.3f}"
+        if "train_loss_gpa" in train:
+            extra += f" gpa={train['train_loss_gpa']:.3f}"
         if "train_loss_it" in train:
             extra += f" it={train['train_loss_it']:.3f}"
 
@@ -495,6 +578,19 @@ class Trainer:
             f"{qwk_text}{ece_text}  "
             f"lr={lr:.2e}  t={elapsed:.1f}s"
         )
+
+        # Per-component gradient norms — diagnose whether new components are learning
+        gn_parts = []
+        if "gn_backbone" in train:
+            gn_parts.append(f"backbone={train['gn_backbone']:.4f}")
+        if "gn_ctot" in train:
+            gn_parts.append(f"ctot={train['gn_ctot']:.4f}")
+        if "gn_gpa" in train:
+            gn_parts.append(f"gpa={train['gn_gpa']:.4f}")
+        if "gn_odh" in train:
+            gn_parts.append(f"odh={train['gn_odh']:.4f}")
+        if gn_parts:
+            logger.info(f"[Fold {self.fold}]          grad_norms: {' '.join(gn_parts)}")
 
         with open(self._log_path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=list(row.keys()))

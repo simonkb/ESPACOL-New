@@ -90,6 +90,32 @@ class OrdinalStochasticDominanceLoss(nn.Module):
         return loss
 
 
+class GradePrototypeCELoss(nn.Module):
+    """
+    Direct supervision for GradePrototypeAttention (GPA).
+
+    For each image, averages tile_evidence across tiles to get an image-level
+    grade distribution, then applies NLL loss against the true label.
+
+        mean_evidence[n, k] = mean_t tile_evidence[n, t, k]   # (N, K)
+        L_gpa = NLL(log(mean_evidence), labels)
+
+    This forces the K grade prototypes to become grade-discriminative:
+    tiles in a grade-k image should collectively vote for grade k.
+    Without this loss GPA prototypes receive only ~0.0003 weighted gradient
+    from TCL and are essentially not trained.
+    """
+
+    def forward(
+        self,
+        tile_evidence: torch.Tensor,  # (N, T, K) — GPA softmax output
+        labels: torch.Tensor,         # (N,) integer grade labels
+    ) -> torch.Tensor:
+        mean_evidence = tile_evidence.mean(dim=1)              # (N, K)
+        log_evidence = torch.log(mean_evidence + 1e-8)         # (N, K)
+        return F.nll_loss(log_evidence, labels)
+
+
 class TileConsistencyLoss(nn.Module):
     """
     Penalises tiles whose expected grade disagrees with the image-level prediction.

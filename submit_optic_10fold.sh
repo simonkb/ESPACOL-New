@@ -42,4 +42,6 @@ python train_dr.py \
     --lambda_osd 0.5 \
     --osd_margin 0.1 \
     --use_tile_consistency \
-    --lambda_tcl 0.1
+    --lambda_tcl 0.1 \
+    --new_component_lr_mult 2.5 \
+    --lambda_gpa 0.5

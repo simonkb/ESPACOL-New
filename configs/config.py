@@ -60,6 +60,12 @@ class TrainConfig:
     # Default False — new jobs always start from epoch 1.
     resume: bool = False
 
+    # LR multiplier for randomly-initialised OPTIC components (CTOT, GPA, ODH)
+    # relative to the pretrained EfficientNet backbone. 1.0 = same LR for all.
+    # Recommended: 2.5 when use_tile_transformer=True so the Transformer gets
+    # enough gradient signal before ReduceLROnPlateau cuts the LR.
+    new_component_lr_mult: float = 1.0
+
     # Stratified batch sampling (paper: class-stratified batch sampling)
     stratified: bool = True
 
@@ -101,6 +107,12 @@ class TrainConfig:
     use_tile_consistency: bool = False
     lambda_tcl: float = 0.1
     tcl_margin: float = 0.0   # 0 = penalise any tile-image disagreement (recommended)
+
+    # GradePrototypeCELoss: direct supervision on GPA tile evidence
+    # Forces grade prototypes to be discriminative: mean tile evidence across
+    # tiles should predict the correct grade. Without this, GPA receives <0.001
+    # weighted gradient and its prototypes are essentially untrained.
+    lambda_gpa: float = 0.0
 
 
 @dataclass

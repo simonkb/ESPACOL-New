@@ -194,6 +194,19 @@ def main():
         help="Resume training from existing best checkpoint (for SLURM preemption recovery). "
              "Without this flag the trainer always starts from epoch 1.",
     )
+    parser.add_argument(
+        "--new_component_lr_mult",
+        type=float,
+        default=None,
+        help="LR multiplier for new OPTIC components (CTOT/GPA/ODH) vs pretrained backbone. "
+             "E.g. 2.5 gives new components 2.5× higher LR.",
+    )
+    parser.add_argument(
+        "--lambda_gpa",
+        type=float,
+        default=None,
+        help="Weight for GradePrototypeCELoss — direct supervision on GPA tile evidence.",
+    )
 
     parser.add_argument(
         "--batch_size",
@@ -362,6 +375,10 @@ def main():
         cfg.tcl_margin = args.tcl_margin
     if args.resume:
         cfg.resume = True
+    if args.new_component_lr_mult is not None:
+        cfg.new_component_lr_mult = args.new_component_lr_mult
+    if args.lambda_gpa is not None:
+        cfg.lambda_gpa = args.lambda_gpa
 
     setup_logging(args.run_dir)
     log = logging.getLogger("train_dr")

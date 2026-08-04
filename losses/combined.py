@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .image_text import ImageTextOrdinalLoss
-from .ordinal import CoralOrdinalLoss, OrdinalStochasticDominanceLoss, TileConsistencyLoss
+from .ordinal import CoralOrdinalLoss, GradePrototypeCELoss, OrdinalStochasticDominanceLoss, TileConsistencyLoss
 from .pcol import PCOLLoss
 from .scolw import SCOLwLoss
 
@@ -41,6 +41,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         osd_margin: float = 0.0,
         lambda_tcl: float = 0.0,
         tcl_margin: float = 0.0,
+        lambda_gpa: float = 0.0,
     ):
         super().__init__()
         self.alpha = alpha
@@ -49,6 +50,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         self.use_image_text = use_image_text
         self.lambda_osd = lambda_osd
         self.lambda_tcl = lambda_tcl
+        self.lambda_gpa = lambda_gpa
 
         self.pcol = PCOLLoss(temperature=temperature)
         self.scolw = SCOLwLoss(temperature=temperature)
@@ -60,6 +62,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
 
         self.osd = OrdinalStochasticDominanceLoss(margin=osd_margin) if lambda_osd > 0 else None
         self.tcl = TileConsistencyLoss(margin=tcl_margin) if lambda_tcl > 0 else None
+        self.gpa_ce = GradePrototypeCELoss() if lambda_gpa > 0 else None
 
     def forward(
         self,
@@ -105,6 +108,10 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         if self.tcl is not None and tile_evidence is not None and self.lambda_tcl > 0:
             l_tcl = self.tcl(tile_evidence, pred)
 
+        l_gpa = torch.tensor(0.0, device=pred.device)
+        if self.gpa_ce is not None and tile_evidence is not None and self.lambda_gpa > 0:
+            l_gpa = self.gpa_ce(tile_evidence, labels)
+
         total = (
             self.alpha * l_pcol
             + self.beta * l_scolw
@@ -112,6 +119,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
             + (l_ord if ordinal_logits is not None else l_rmse)
             + self.lambda_osd * l_osd
             + self.lambda_tcl * l_tcl
+            + self.lambda_gpa * l_gpa
         )
 
         return total, {
@@ -123,6 +131,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
             "loss_ord": l_ord.item(),
             "loss_osd": l_osd.item(),
             "loss_tcl": l_tcl.item(),
+            "loss_gpa": l_gpa.item(),
         }
 
 
