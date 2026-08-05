@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import math
 import os
 import time
 from typing import Optional
@@ -347,9 +348,16 @@ class Trainer:
 
     @staticmethod
     def _grad_norm_of(params: list) -> float:
-        """L2 norm of all gradients in a parameter list. Returns 0 if no grads."""
-        total_sq = sum(p.grad.detach().norm() ** 2 for p in params if p.grad is not None)
-        return float(total_sq ** 0.5)
+        """L2 norm of all gradients in a parameter list.
+        Casts to float32 before norming so AMP float16 overflow doesn't produce NaN.
+        Returns 0 if no gradients exist."""
+        total_sq = 0.0
+        for p in params:
+            if p.grad is not None:
+                n = p.grad.detach().float().norm().item()
+                if n == n:  # skip NaN (NaN != NaN)
+                    total_sq += n * n
+        return math.sqrt(total_sq)
 
     def _train_epoch(self, epoch: int) -> dict:
         self.model.train()
