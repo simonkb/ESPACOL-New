@@ -44,4 +44,5 @@ python train_dr.py \
     --use_tile_consistency \
     --lambda_tcl 0.1 \
     --new_component_lr_mult 2.5 \
-    --lambda_gpa 0.5
+    --lambda_gpa 0.1 \
+    --lr_patience 15

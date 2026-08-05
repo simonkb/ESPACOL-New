@@ -195,6 +195,13 @@ def main():
              "Without this flag the trainer always starts from epoch 1.",
     )
     parser.add_argument(
+        "--lr_patience",
+        type=int,
+        default=None,
+        help="Epochs of no val improvement before LR reduction (default from DRConfig=8). "
+             "Use 15 when training new randomly-initialised components alongside a pretrained backbone.",
+    )
+    parser.add_argument(
         "--new_component_lr_mult",
         type=float,
         default=None,
@@ -375,6 +382,8 @@ def main():
         cfg.tcl_margin = args.tcl_margin
     if args.resume:
         cfg.resume = True
+    if args.lr_patience is not None:
+        cfg.lr_patience = args.lr_patience
     if args.new_component_lr_mult is not None:
         cfg.new_component_lr_mult = args.new_component_lr_mult
     if args.lambda_gpa is not None:
