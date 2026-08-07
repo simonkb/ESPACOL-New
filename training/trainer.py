@@ -211,6 +211,19 @@ class Trainer:
         self._csv_header_written = False
         self._text_finetune_enabled = False
 
+        # ── Backbone freeze (phase-1 feature-extraction phase) ────────────────
+        # Freeze the pretrained EfficientNet for the first N epochs so randomly-
+        # initialised components (CTOT, GPA) can learn to aggregate stable, well-
+        # structured features before joint fine-tuning perturbs them.
+        freeze_epochs = getattr(cfg, "backbone_freeze_epochs", 0)
+        if freeze_epochs > 0 and self._backbone_params:
+            for p in self._backbone_params:
+                p.requires_grad = False
+            logger.info(
+                f"Backbone frozen for first {freeze_epochs} epochs "
+                f"— CTOT/GPA feature-extraction phase"
+            )
+
     def fit(self, test_loader: DataLoader) -> dict:
         best_val_acc = -float("inf")
         best_ckpt_path = os.path.join(self.run_dir, f"fold{self.fold}_best.pth")
@@ -242,8 +255,20 @@ class Trainer:
                 f"best_val_acc={best_val_acc:.2f}%  lr={self.optimizer.param_groups[0]['lr']:.2e}"
             )
 
+        freeze_epochs = getattr(self.cfg, "backbone_freeze_epochs", 0)
+
         for epoch in range(start_epoch, self.cfg.epochs + 1):
             t0 = time.time()
+
+            # Unfreeze backbone at the start of epoch freeze_epochs+1
+            if freeze_epochs > 0 and epoch == freeze_epochs + 1 and self._backbone_params:
+                for p in self._backbone_params:
+                    p.requires_grad = True
+                logger.info(
+                    f"[Fold {self.fold}] Backbone unfrozen at epoch {epoch} "
+                    f"— joint fine-tuning phase begins"
+                )
+
             self._maybe_enable_text_finetune(epoch)
 
             train_metrics = self._train_epoch(epoch)

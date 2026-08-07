@@ -114,6 +114,11 @@ class TrainConfig:
     # weighted gradient and its prototypes are essentially untrained.
     lambda_gpa: float = 0.0
 
+    # Backbone freeze schedule: freeze EfficientNet for the first N epochs so
+    # randomly-initialised components (CTOT, GPA) can stabilise on fixed pretrained
+    # features before joint fine-tuning begins. 0 = no freeze (default).
+    backbone_freeze_epochs: int = 0
+
 
 @dataclass
 class BUSIConfig(TrainConfig):

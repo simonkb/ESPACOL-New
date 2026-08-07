@@ -331,6 +331,25 @@ def main():
         default=None,
         help="Margin for TileConsistencyLoss — 0 penalises any tile-image disagreement (recommended)",
     )
+    parser.add_argument(
+        "--backbone_freeze_epochs",
+        type=int,
+        default=None,
+        help="Freeze EfficientNet backbone for this many epochs so CTOT/GPA can stabilise "
+             "on fixed pretrained features before joint fine-tuning. 0 = no freeze.",
+    )
+    parser.add_argument(
+        "--early_stop_patience",
+        type=int,
+        default=None,
+        help="Epochs of no val_acc improvement before early stopping (default from DRConfig=20).",
+    )
+    parser.add_argument(
+        "--text_finetune_start_epoch",
+        type=int,
+        default=None,
+        help="Epoch at which text encoder fine-tuning begins (default from DRConfig=20).",
+    )
 
     args = parser.parse_args()
 
@@ -388,6 +407,12 @@ def main():
         cfg.new_component_lr_mult = args.new_component_lr_mult
     if args.lambda_gpa is not None:
         cfg.lambda_gpa = args.lambda_gpa
+    if args.backbone_freeze_epochs is not None:
+        cfg.backbone_freeze_epochs = args.backbone_freeze_epochs
+    if args.early_stop_patience is not None:
+        cfg.early_stop_patience = args.early_stop_patience
+    if args.text_finetune_start_epoch is not None:
+        cfg.text_finetune_start_epoch = args.text_finetune_start_epoch
 
     setup_logging(args.run_dir)
     log = logging.getLogger("train_dr")
