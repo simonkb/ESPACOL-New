@@ -189,6 +189,18 @@ def main():
 
     parser.add_argument("--no_pretrained", action="store_true")
     parser.add_argument(
+        "--alpha",
+        type=float,
+        default=None,
+        help="Weight for PCOL loss. Set 0 to disable PCOL entirely (no computation).",
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=None,
+        help="Weight for SCOLw loss. Set 0 to disable SCOLw entirely (no computation).",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Resume training from existing best checkpoint (for SLURM preemption recovery). "
@@ -451,6 +463,11 @@ def main():
         cfg.text_finetune_start_epoch = args.text_finetune_start_epoch
 
     # OPTIC-C concept prototype flags
+    if args.alpha is not None:
+        cfg.alpha = args.alpha
+    if args.beta is not None:
+        cfg.beta = args.beta
+
     if args.use_concept_prototype:
         cfg.use_concept_prototype = True
     if args.lambda_proto_ce is not None:
