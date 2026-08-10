@@ -351,6 +351,42 @@ def main():
         help="Epoch at which text encoder fine-tuning begins (default from DRConfig=20).",
     )
 
+    # ── OPTIC-C: Concept-Grounded Grade Prototype flags ──────────────────────
+    parser.add_argument(
+        "--use_concept_prototype",
+        action="store_true",
+        help="Enable ConceptGradePrototypeModule (OPTIC-C). Requires use_tile_transformer. "
+             "Set alpha=0 beta=0 to remove PCOL/SCOLw and make novel losses dominant.",
+    )
+    parser.add_argument(
+        "--lambda_proto_ce",
+        type=float,
+        default=None,
+        help="Weight for L_proto_CE — cosine prototype CrossEntropy (dominant novel loss). "
+             "Recommended: 1.5",
+    )
+    parser.add_argument(
+        "--lambda_concept_align",
+        type=float,
+        default=None,
+        help="Weight for L_concept_align — grade prototype ↔ grade text cosine alignment. "
+             "Recommended: 0.5",
+    )
+    parser.add_argument(
+        "--lambda_tile_concept",
+        type=float,
+        default=None,
+        help="Weight for L_tile_concept — per-tile concept BCE vs clinical grade-concept targets. "
+             "Recommended: 0.3",
+    )
+    parser.add_argument(
+        "--proto_temperature",
+        type=float,
+        default=None,
+        help="Cosine similarity temperature for grade prototype logits (default: 0.1). "
+             "Lower = sharper prototype boundaries.",
+    )
+
     args = parser.parse_args()
 
     if args.train_csv is None:
@@ -413,6 +449,18 @@ def main():
         cfg.early_stop_patience = args.early_stop_patience
     if args.text_finetune_start_epoch is not None:
         cfg.text_finetune_start_epoch = args.text_finetune_start_epoch
+
+    # OPTIC-C concept prototype flags
+    if args.use_concept_prototype:
+        cfg.use_concept_prototype = True
+    if args.lambda_proto_ce is not None:
+        cfg.lambda_proto_ce = args.lambda_proto_ce
+    if args.lambda_concept_align is not None:
+        cfg.lambda_concept_align = args.lambda_concept_align
+    if args.lambda_tile_concept is not None:
+        cfg.lambda_tile_concept = args.lambda_tile_concept
+    if args.proto_temperature is not None:
+        cfg.proto_temperature = args.proto_temperature
 
     setup_logging(args.run_dir)
     log = logging.getLogger("train_dr")
@@ -531,6 +579,9 @@ def main():
             tile_transformer_dropout=cfg.tile_transformer_dropout,
             use_grade_prototypes=cfg.use_grade_prototypes,
             use_ordinal_head=cfg.use_ordinal_head,
+            use_concept_prototype=cfg.use_concept_prototype,
+            n_concepts=cfg.n_concepts,
+            proto_temperature=cfg.proto_temperature,
         )
 
         train_labels = [y for _, y in train_items]

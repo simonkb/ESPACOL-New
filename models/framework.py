@@ -27,6 +27,7 @@ import torch
 import torch.nn as nn
 
 from .backbone import EfficientNetV2SBackbone, TiledEfficientNetBackbone
+from .concept_prototype import ConceptGradePrototypeModule
 from .grade_prototype import GradePrototypeAttention
 from .heads import MLPProjectionHead, OrdinalDistributionHead, RegressionHead
 
@@ -117,7 +118,7 @@ class OPTICModel(HybridContrastiveOrdinalModel):
         tile_evidence = tile_weights = grade_features = None
 
         if self.gpa is not None:
-            features, ctot_feats = self.backbone.forward_tiles(x)
+            features, ctot_feats, _raw_tiles = self.backbone.forward_tiles(x)
             grade_features, tile_evidence, tile_weights = self.gpa(ctot_feats)
         else:
             features = self.backbone(x)
@@ -156,6 +157,108 @@ class OPTICModel(HybridContrastiveOrdinalModel):
         return self.regression_head(features)
 
 
+class OPTICConceptModel(OPTICModel):
+    """
+    OPTIC-C: Concept-Grounded Grade Prototype extension.
+
+    Adds ConceptGradePrototypeModule on top of OPTICModel.
+    Novel losses dominate (~98% of gradient signal):
+      - L_proto_CE:     cosine prototype CrossEntropy (image ↔ grade prototypes)
+      - L_concept:      prototype ↔ grade text alignment
+      - L_tile_concept: per-tile concept BCE vs clinical grade-concept targets
+    SCOLw and PCOL are disabled (alpha=0, beta=0).
+
+    Additional forward() keys:
+        proto_logits        (N, K)     — cosine prototype similarity / temperature
+        concept_align_loss  scalar     — prototype-text alignment loss (pre-computed)
+        tile_concept_scores (N, T, C)  — per-tile concept probabilities (explainability)
+        tile_concept_loss   scalar     — tile concept BCE loss (pre-computed)
+        raw_tile_features   (N, T, D)  — raw backbone tile features for debugging
+    """
+
+    def __init__(
+        self,
+        backbone: TiledEfficientNetBackbone,
+        pcol_head: MLPProjectionHead,
+        scolw_head: MLPProjectionHead,
+        regression_head: RegressionHead,
+        concept_module: ConceptGradePrototypeModule,
+        image_text_head: MLPProjectionHead | None = None,
+        gpa: GradePrototypeAttention | None = None,
+        ordinal_head: OrdinalDistributionHead | None = None,
+    ):
+        super().__init__(
+            backbone=backbone,
+            pcol_head=pcol_head,
+            scolw_head=scolw_head,
+            regression_head=regression_head,
+            image_text_head=image_text_head,
+            gpa=gpa,
+            ordinal_head=ordinal_head,
+        )
+        self.concept_module = concept_module
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        labels: torch.Tensor | None = None,
+        concept_embeds: torch.Tensor | None = None,
+        grade_text_embeds: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor | None]:
+        tile_evidence = tile_weights = grade_features = None
+
+        # Always run forward_tiles to get raw_tile_features for concept scoring
+        features, ctot_feats, raw_tile_features = self.backbone.forward_tiles(x)
+
+        if self.gpa is not None and ctot_feats is not None:
+            grade_features, tile_evidence, tile_weights = self.gpa(ctot_feats)
+
+        z_pcol = self.pcol_head(features)
+        z_scolw = self.scolw_head(features)
+
+        ordinal_logits = None
+        if self.ordinal_head is not None:
+            ordinal_logits = self.ordinal_head(features)
+            pred = torch.sigmoid(ordinal_logits).sum(dim=1)
+        else:
+            pred = self.regression_head(features)
+
+        z_it = None
+        if self.image_text_head is not None:
+            z_it = self.image_text_head(features)
+
+        # Concept prototype forward — losses pre-computed here
+        proto_logits = concept_align_loss = tile_concept_scores = tile_concept_loss = None
+        if labels is not None:
+            proto_logits, concept_align_loss, tile_concept_scores, tile_concept_loss = (
+                self.concept_module(
+                    image_features=features,
+                    raw_tile_features=raw_tile_features,
+                    concept_embeds=concept_embeds,
+                    grade_text_embeds=grade_text_embeds,
+                    labels=labels,
+                )
+            )
+
+        return {
+            "features": features,
+            "z_pcol": z_pcol,
+            "z_scolw": z_scolw,
+            "z_it": z_it,
+            "pred": pred,
+            "ordinal_logits": ordinal_logits,
+            "tile_evidence": tile_evidence,
+            "tile_weights": tile_weights,
+            "grade_features": grade_features,
+            "raw_tile_features": raw_tile_features,
+            # Concept outputs
+            "proto_logits": proto_logits,
+            "concept_align_loss": concept_align_loss,
+            "tile_concept_scores": tile_concept_scores,
+            "tile_concept_loss": tile_concept_loss,
+        }
+
+
 def build_model(
     n_classes: int,
     pretrained: bool = True,
@@ -173,12 +276,18 @@ def build_model(
     tile_transformer_dropout: float = 0.1,
     use_grade_prototypes: bool = False,
     use_ordinal_head: bool = False,
+    # OPTIC-C: concept prototype flags
+    use_concept_prototype: bool = False,
+    n_concepts: int = 9,
+    proto_temperature: float = 0.1,
 ) -> HybridContrastiveOrdinalModel:
 
     if use_tile_transformer and not use_multi_tile:
         raise ValueError("CrossTileOrdinalTransformer requires use_multi_tile=True")
     if use_grade_prototypes and not use_tile_transformer:
         raise ValueError("GradePrototypeAttention requires use_tile_transformer=True")
+    if use_concept_prototype and not use_tile_transformer:
+        raise ValueError("OPTICConceptModel requires use_tile_transformer=True")
 
     if use_multi_tile:
         backbone = TiledEfficientNetBackbone(
@@ -206,9 +315,6 @@ def build_model(
     if use_image_text:
         image_text_head = MLPProjectionHead(feat_dim, proj_hidden_dim, proj_out_dim)
 
-    # Use OPTICModel when any new component is enabled
-    use_optic = use_tile_transformer or use_grade_prototypes or use_ordinal_head
-
     gpa = None
     if use_grade_prototypes:
         gpa = GradePrototypeAttention(d_model=tile_transformer_dim, n_classes=n_classes)
@@ -217,6 +323,26 @@ def build_model(
     if use_ordinal_head:
         ordinal_head = OrdinalDistributionHead(input_dim=feat_dim, n_classes=n_classes)
 
+    if use_concept_prototype:
+        concept_module = ConceptGradePrototypeModule(
+            feat_dim=feat_dim,
+            n_classes=n_classes,
+            n_concepts=n_concepts,
+            proj_dim=proj_out_dim,
+            temperature=proto_temperature,
+        )
+        return OPTICConceptModel(
+            backbone=backbone,
+            pcol_head=pcol_head,
+            scolw_head=scolw_head,
+            regression_head=reg_head,
+            concept_module=concept_module,
+            image_text_head=image_text_head,
+            gpa=gpa,
+            ordinal_head=ordinal_head,
+        )
+
+    use_optic = use_tile_transformer or use_grade_prototypes or use_ordinal_head
     if use_optic:
         return OPTICModel(
             backbone=backbone,

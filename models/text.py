@@ -29,6 +29,7 @@ class ClinicalTextEncoder(nn.Module):
         device: torch.device,
         finetune_text_encoder: bool = False,
         finetune_layers: int = 0,
+        concept_descriptions: list[str] | None = None,
     ):
         super().__init__()
         try:
@@ -62,6 +63,16 @@ class ClinicalTextEncoder(nn.Module):
 
         self.register_buffer("text_tokens", text_tokens)
         self.register_buffer("raw_text_embeddings", raw)
+
+        # Optional concept embeddings for zero-shot concept scoring
+        if concept_descriptions is not None:
+            with torch.no_grad():
+                concept_tokens = self.tokenizer(concept_descriptions).to(device)
+                raw_concepts = self.text_model.encode_text(concept_tokens).float()
+                raw_concepts = F.normalize(raw_concepts, dim=-1)
+            self.register_buffer("raw_concept_embeddings", raw_concepts)
+        else:
+            self.raw_concept_embeddings = None
 
         self.projection = TextProjectionHead(text_dim, proj_out_dim)
 
@@ -161,3 +172,9 @@ class ClinicalTextEncoder(nn.Module):
             return F.normalize(self.projection(raw), dim=-1)
 
         return F.normalize(self.projection(self.raw_text_embeddings), dim=-1)
+
+    def get_concept_embeds(self) -> torch.Tensor | None:
+        """Returns projected concept embeddings (C, proj_out_dim), or None if not initialized."""
+        if self.raw_concept_embeddings is None:
+            return None
+        return F.normalize(self.projection(self.raw_concept_embeddings), dim=-1)

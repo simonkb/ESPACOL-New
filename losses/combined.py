@@ -14,6 +14,14 @@ OPTIC extension (additive on top of ESPAOCL):
             + L_ord                           [replaces L_RMSE when ordinal_probs provided]
             + lambda_osd * L_OSD              [optional]
             + lambda_tcl * L_TCL              [optional]
+
+OPTIC-C extension (concept prototype, alpha=0, beta=0):
+    L_total = lambda_proto_ce * L_proto_CE    [dominant — cosine prototype classification]
+            + L_ord                           [CORAL ordinal regression]
+            + lambda_concept_align * L_concept [prototype ↔ grade text alignment]
+            + lambda_tile_concept * L_tile    [tile concept BCE vs clinical targets]
+            + lambda_gpa * L_GPA             [GPA entropy regularization]
+            + gamma * L_IT                    [BiomedCLIP image-text alignment]
 """
 
 import torch
@@ -42,6 +50,10 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         lambda_tcl: float = 0.0,
         tcl_margin: float = 0.0,
         lambda_gpa: float = 0.0,
+        # OPTIC-C concept prototype losses (pre-computed by model.forward)
+        lambda_proto_ce: float = 0.0,
+        lambda_concept_align: float = 0.0,
+        lambda_tile_concept: float = 0.0,
     ):
         super().__init__()
         self.alpha = alpha
@@ -51,6 +63,9 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         self.lambda_osd = lambda_osd
         self.lambda_tcl = lambda_tcl
         self.lambda_gpa = lambda_gpa
+        self.lambda_proto_ce = lambda_proto_ce
+        self.lambda_concept_align = lambda_concept_align
+        self.lambda_tile_concept = lambda_tile_concept
 
         self.pcol = PCOLLoss(temperature=temperature)
         self.scolw = SCOLwLoss(temperature=temperature)
@@ -75,10 +90,14 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         text_prototypes: torch.Tensor | None = None,
         ordinal_logits: torch.Tensor | None = None,
         tile_evidence: torch.Tensor | None = None,
+        # Pre-computed concept losses from OPTICConceptModel.forward
+        proto_logits: torch.Tensor | None = None,
+        concept_align_loss: torch.Tensor | None = None,
+        tile_concept_loss: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
 
-        l_pcol = self.pcol(z_pcol, labels)
-        l_scolw = self.scolw(z_scolw, labels, class_weights)
+        l_pcol = self.pcol(z_pcol, labels) if self.alpha > 0 else torch.tensor(0.0, device=pred.device)
+        l_scolw = self.scolw(z_scolw, labels, class_weights) if self.beta > 0 else torch.tensor(0.0, device=pred.device)
 
         # Ordinal head active: use CORAL loss instead of RMSE
         if ordinal_logits is not None:
@@ -112,6 +131,19 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         if self.gpa_ce is not None and tile_evidence is not None and self.lambda_gpa > 0:
             l_gpa = self.gpa_ce(tile_evidence, labels)
 
+        # OPTIC-C concept prototype losses (pre-computed by model, weighted here)
+        l_proto_ce = torch.tensor(0.0, device=pred.device)
+        if proto_logits is not None and self.lambda_proto_ce > 0:
+            l_proto_ce = F.cross_entropy(proto_logits, labels)
+
+        l_concept_align = torch.tensor(0.0, device=pred.device)
+        if concept_align_loss is not None and self.lambda_concept_align > 0:
+            l_concept_align = concept_align_loss
+
+        l_tile_concept = torch.tensor(0.0, device=pred.device)
+        if tile_concept_loss is not None and self.lambda_tile_concept > 0:
+            l_tile_concept = tile_concept_loss
+
         total = (
             self.alpha * l_pcol
             + self.beta * l_scolw
@@ -120,6 +152,9 @@ class HybridContrastiveOrdinalLoss(nn.Module):
             + self.lambda_osd * l_osd
             + self.lambda_tcl * l_tcl
             + self.lambda_gpa * l_gpa
+            + self.lambda_proto_ce * l_proto_ce
+            + self.lambda_concept_align * l_concept_align
+            + self.lambda_tile_concept * l_tile_concept
         )
 
         return total, {
@@ -132,6 +167,9 @@ class HybridContrastiveOrdinalLoss(nn.Module):
             "loss_osd": l_osd.item(),
             "loss_tcl": l_tcl.item(),
             "loss_gpa": l_gpa.item(),
+            "loss_proto_ce": l_proto_ce.item(),
+            "loss_concept_align": l_concept_align.item(),
+            "loss_tile_concept": l_tile_concept.item(),
         }
 
 

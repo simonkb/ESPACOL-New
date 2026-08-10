@@ -119,6 +119,26 @@ class TrainConfig:
     # features before joint fine-tuning begins. 0 = no freeze (default).
     backbone_freeze_epochs: int = 0
 
+    # ── OPTIC-C: Concept-Grounded Grade Prototype flags ──
+    # ConceptGradePrototypeModule replaces SCOLw as the dominant gradient signal.
+    # Set alpha=0, beta=0 when use_concept_prototype=True.
+    use_concept_prototype: bool = False
+
+    # L_proto_CE: cosine prototype CrossEntropy — dominant novel loss
+    lambda_proto_ce: float = 0.0
+
+    # L_concept_align: grade prototype ↔ grade text embedding cosine alignment
+    lambda_concept_align: float = 0.0
+
+    # L_tile_concept: per-tile concept BCE vs clinical grade-concept soft targets
+    lambda_tile_concept: float = 0.0
+
+    # Number of DR concepts (must match len(DR_CONCEPTS) in clinical_text.py)
+    n_concepts: int = 9
+
+    # Temperature for cosine prototype similarity (lower = sharper prototype boundaries)
+    proto_temperature: float = 0.1
+
 
 @dataclass
 class BUSIConfig(TrainConfig):

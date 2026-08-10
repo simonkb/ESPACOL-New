@@ -81,13 +81,20 @@ class Trainer:
         self.use_amp = cfg.amp and self.device.type == "cuda"
         self.scaler = GradScaler(device="cuda", enabled=self.use_amp)
 
+        self.use_concept_prototype = getattr(cfg, "use_concept_prototype", False)
         self.text_encoder = None
-        if getattr(cfg, "use_image_text", False):
-            from configs.clinical_text import BUSI_CLASS_DESCRIPTIONS, DR_CLASS_DESCRIPTIONS
+        if getattr(cfg, "use_image_text", False) or self.use_concept_prototype:
+            from configs.clinical_text import (
+                BUSI_CLASS_DESCRIPTIONS, DR_CLASS_DESCRIPTIONS,
+                DR_CONCEPTS, BUSI_CONCEPTS,
+            )
 
             class_descriptions = (
                 DR_CLASS_DESCRIPTIONS if cfg.dataset == "DR" else BUSI_CLASS_DESCRIPTIONS
             )
+            concept_descriptions = (
+                DR_CONCEPTS if cfg.dataset == "DR" else BUSI_CONCEPTS
+            ) if self.use_concept_prototype else None
 
             self.text_encoder = ClinicalTextEncoder(
                 model_name=cfg.text_encoder_name,
@@ -96,6 +103,7 @@ class Trainer:
                 device=self.device,
                 finetune_text_encoder=getattr(cfg, "finetune_text_encoder", False),
                 finetune_layers=getattr(cfg, "text_finetune_layers", 0),
+                concept_descriptions=concept_descriptions,
             ).to(self.device)
 
         # ── Parameter groups ──────────────────────────────────────────────────
@@ -168,6 +176,11 @@ class Trainer:
             if hasattr(self.model, "ordinal_head") and self.model.ordinal_head is not None
             else []
         )
+        self._concept_params = (
+            list(self.model.concept_module.parameters())
+            if hasattr(self.model, "concept_module")
+            else []
+        )
 
         self.optimizer = torch.optim.Adam(
             optim_params,
@@ -179,13 +192,16 @@ class Trainer:
             beta=cfg.beta,
             gamma=cfg.gamma,
             temperature=cfg.temperature,
-            use_image_text=cfg.use_image_text,
+            use_image_text=getattr(cfg, "use_image_text", False),
             lambda_ord_it=cfg.lambda_ord_it,
             lambda_osd=getattr(cfg, "lambda_osd", 0.0),
             osd_margin=getattr(cfg, "osd_margin", 0.0),
             lambda_tcl=getattr(cfg, "lambda_tcl", 0.0),
             tcl_margin=getattr(cfg, "tcl_margin", 0.0),
             lambda_gpa=getattr(cfg, "lambda_gpa", 0.0),
+            lambda_proto_ce=getattr(cfg, "lambda_proto_ce", 0.0),
+            lambda_concept_align=getattr(cfg, "lambda_concept_align", 0.0),
+            lambda_tile_concept=getattr(cfg, "lambda_tile_concept", 0.0),
         )
 
         self.class_weights = compute_class_weights(
@@ -403,10 +419,14 @@ class Trainer:
         total_tcl = 0.0
         total_gpa = 0.0
         total_it = 0.0
+        total_proto_ce = 0.0
+        total_concept_align = 0.0
+        total_tile_concept = 0.0
         total_gn_backbone = 0.0
         total_gn_ctot = 0.0
         total_gn_gpa = 0.0
         total_gn_odh = 0.0
+        total_gn_concept = 0.0
         n_batches = 0
 
         nb = self.device.type == "cuda"
@@ -424,7 +444,24 @@ class Trainer:
             )
 
             with autocast(device_type=self.device.type, enabled=self.use_amp):
-                out = self.model(x)
+                text_prototypes = None
+                concept_embeds = None
+                if self.text_encoder is not None:
+                    if getattr(self.cfg, "use_image_text", False):
+                        text_prototypes = self.text_encoder()
+                    if self.use_concept_prototype:
+                        concept_embeds = self.text_encoder.get_concept_embeds()
+
+                # OPTICConceptModel requires labels + concept embeddings at forward time
+                if self.use_concept_prototype:
+                    out = self.model(
+                        x,
+                        labels=y,
+                        concept_embeds=concept_embeds,
+                        grade_text_embeds=text_prototypes,
+                    )
+                else:
+                    out = self.model(x)
 
                 if isinstance(out, dict):
                     z_pcol = out["z_pcol"]
@@ -433,16 +470,17 @@ class Trainer:
                     pred = out["pred"]
                     ordinal_logits = out.get("ordinal_logits", None)
                     tile_evidence = out.get("tile_evidence", None)
+                    proto_logits = out.get("proto_logits", None)
+                    concept_align_loss = out.get("concept_align_loss", None)
+                    tile_concept_loss = out.get("tile_concept_loss", None)
                 elif len(out) == 5:
                     _, z_pcol, z_scolw, z_it, pred = out
                     ordinal_logits = tile_evidence = None
+                    proto_logits = concept_align_loss = tile_concept_loss = None
                 else:
                     z_pcol, z_scolw, pred = out
                     z_it = ordinal_logits = tile_evidence = None
-
-                text_prototypes = None
-                if self.text_encoder is not None and self.cfg.use_image_text:
-                    text_prototypes = self.text_encoder()
+                    proto_logits = concept_align_loss = tile_concept_loss = None
 
                 loss, comps = self.criterion(
                     z_pcol=z_pcol,
@@ -454,6 +492,9 @@ class Trainer:
                     text_prototypes=text_prototypes,
                     ordinal_logits=ordinal_logits,
                     tile_evidence=tile_evidence,
+                    proto_logits=proto_logits,
+                    concept_align_loss=concept_align_loss,
+                    tile_concept_loss=tile_concept_loss,
                 )
 
             self.scaler.scale(loss).backward()
@@ -472,6 +513,7 @@ class Trainer:
             total_gn_ctot    += self._grad_norm_of(self._ctot_params)
             total_gn_gpa     += self._grad_norm_of(self._gpa_params)
             total_gn_odh     += self._grad_norm_of(self._odh_params)
+            total_gn_concept += self._grad_norm_of(self._concept_params)
 
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -485,6 +527,9 @@ class Trainer:
             total_tcl += comps.get("loss_tcl", 0.0)
             total_gpa += comps.get("loss_gpa", 0.0)
             total_it += comps.get("loss_it", 0.0)
+            total_proto_ce += comps.get("loss_proto_ce", 0.0)
+            total_concept_align += comps.get("loss_concept_align", 0.0)
+            total_tile_concept += comps.get("loss_tile_concept", 0.0)
             n_batches += 1
 
         nbatches = max(n_batches, 1)
@@ -503,8 +548,14 @@ class Trainer:
             metrics["train_loss_tcl"] = total_tcl / nbatches
         if total_gpa > 0:
             metrics["train_loss_gpa"] = total_gpa / nbatches
-        if self.text_encoder is not None and self.cfg.use_image_text:
+        if self.text_encoder is not None and getattr(self.cfg, "use_image_text", False):
             metrics["train_loss_it"] = total_it / nbatches
+        if total_proto_ce > 0:
+            metrics["train_loss_proto_ce"] = total_proto_ce / nbatches
+        if total_concept_align > 0:
+            metrics["train_loss_concept_align"] = total_concept_align / nbatches
+        if total_tile_concept > 0:
+            metrics["train_loss_tile_concept"] = total_tile_concept / nbatches
 
         # Gradient norms — only log components that exist (non-zero param list)
         if self._backbone_params:
@@ -515,6 +566,8 @@ class Trainer:
             metrics["gn_gpa"] = total_gn_gpa / nbatches
         if self._odh_params:
             metrics["gn_odh"] = total_gn_odh / nbatches
+        if self._concept_params:
+            metrics["gn_concept"] = total_gn_concept / nbatches
 
         return metrics
 
@@ -539,7 +592,7 @@ class Trainer:
 
             with autocast(device_type=self.device.type, enabled=self.use_amp):
                 if has_ordinal:
-                    # Single forward pass to get both pred and ordinal logits
+                    # labels=None → concept losses skipped; only pred/ordinal_logits needed
                     out = self.model(x)
                     pred = out["pred"]
                     # Sigmoid here (float32) so ECE gets proper probabilities
@@ -594,6 +647,12 @@ class Trainer:
             extra += f" gpa={train['train_loss_gpa']:.3f}"
         if "train_loss_it" in train:
             extra += f" it={train['train_loss_it']:.3f}"
+        if "train_loss_proto_ce" in train:
+            extra += f" proto_ce={train['train_loss_proto_ce']:.3f}"
+        if "train_loss_concept_align" in train:
+            extra += f" ca={train['train_loss_concept_align']:.3f}"
+        if "train_loss_tile_concept" in train:
+            extra += f" tc={train['train_loss_tile_concept']:.3f}"
 
         qwk_text = f"  val_qwk={val.get('val_qwk', 0.0):.4f}" if "val_qwk" in val else ""
         ece_text = f"  val_ece={val['val_ece']:.4f}" if "val_ece" in val else ""
@@ -622,6 +681,8 @@ class Trainer:
             gn_parts.append(f"gpa={train['gn_gpa']:.4f}")
         if "gn_odh" in train:
             gn_parts.append(f"odh={train['gn_odh']:.4f}")
+        if "gn_concept" in train:
+            gn_parts.append(f"concept={train['gn_concept']:.4f}")
         if gn_parts:
             logger.info(f"[Fold {self.fold}]          grad_norms: {' '.join(gn_parts)}")
 

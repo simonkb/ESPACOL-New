@@ -95,16 +95,17 @@ class TiledEfficientNetBackbone(nn.Module):
 
     def forward_tiles(
         self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         """
-        Returns (aggregated_features, ctot_tile_features).
+        Returns (aggregated_features, ctot_tile_features, raw_tile_features).
 
         ctot_tile_features is (N, T+1, d_model) when use_transformer=True;
         None otherwise (AttentionPool provides no per-tile post-attention features).
+        raw_tile_features is always (N, T, 1280) — backbone features before pooling.
         """
-        tile_feats = self._encode_tiles(x)
+        tile_feats = self._encode_tiles(x)   # (N, T, 1280)
         if self.use_transformer:
             agg, ctot_feats = self.pool(tile_feats, return_tile_features=True)
-            return agg, ctot_feats
+            return agg, ctot_feats, tile_feats
         else:
-            return self.pool(tile_feats), None
+            return self.pool(tile_feats), None, tile_feats
