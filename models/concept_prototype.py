@@ -116,12 +116,12 @@ class ConceptGradePrototypeModule(nn.Module):
             concept_norm = F.normalize(concept_embeds, dim=-1)                     # (C, proj_dim)
             # Cosine similarity: (N, T, C)
             tile_concept_scores = torch.einsum("ntd,cd->ntc", proj_tiles, concept_norm)
-            # Scale to [0,1] for BCE
-            tile_concept_scores_sigmoid = torch.sigmoid(tile_concept_scores * 10.0)
 
-            # Aggregate over tiles then supervise with clinical grade-concept targets
-            mean_scores = tile_concept_scores_sigmoid.mean(dim=1)     # (N, C)
+            # BCEWithLogits: scale cosine sims to sharper logits, aggregate over tiles,
+            # supervise against clinical grade-concept soft targets. AMP-safe.
+            scaled_logits = tile_concept_scores * 10.0                # (N, T, C)
+            mean_logits = scaled_logits.mean(dim=1)                   # (N, C)
             targets = self.grade_concept_targets[labels]               # (N, C)
-            tile_concept_loss = F.binary_cross_entropy(mean_scores, targets)
+            tile_concept_loss = F.binary_cross_entropy_with_logits(mean_logits, targets)
 
         return proto_logits, concept_align_loss, tile_concept_scores, tile_concept_loss
