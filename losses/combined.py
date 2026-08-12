@@ -54,6 +54,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         lambda_proto_ce: float = 0.0,
         lambda_concept_align: float = 0.0,
         lambda_tile_concept: float = 0.0,
+        proto_label_smoothing: float = 0.0,
     ):
         super().__init__()
         self.alpha = alpha
@@ -64,6 +65,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         self.lambda_tcl = lambda_tcl
         self.lambda_gpa = lambda_gpa
         self.lambda_proto_ce = lambda_proto_ce
+        self.proto_label_smoothing = proto_label_smoothing
         self.lambda_concept_align = lambda_concept_align
         self.lambda_tile_concept = lambda_tile_concept
 
@@ -134,7 +136,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         # OPTIC-C concept prototype losses (pre-computed by model, weighted here)
         l_proto_ce = torch.tensor(0.0, device=pred.device)
         if proto_logits is not None and self.lambda_proto_ce > 0:
-            l_proto_ce = F.cross_entropy(proto_logits, labels)
+            l_proto_ce = F.cross_entropy(proto_logits, labels, label_smoothing=self.proto_label_smoothing)
 
         l_concept_align = torch.tensor(0.0, device=pred.device)
         if concept_align_loss is not None and self.lambda_concept_align > 0:

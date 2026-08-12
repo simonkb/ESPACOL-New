@@ -139,6 +139,10 @@ class TrainConfig:
     # Temperature for cosine prototype similarity (lower = sharper prototype boundaries)
     proto_temperature: float = 0.1
 
+    # Label smoothing for proto_CE cross-entropy — regularises the dominant loss
+    # and prevents it from collapsing to near-zero on training data (overfitting).
+    proto_label_smoothing: float = 0.0
+
 
 @dataclass
 class BUSIConfig(TrainConfig):

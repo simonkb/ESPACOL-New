@@ -202,6 +202,7 @@ class Trainer:
             lambda_proto_ce=getattr(cfg, "lambda_proto_ce", 0.0),
             lambda_concept_align=getattr(cfg, "lambda_concept_align", 0.0),
             lambda_tile_concept=getattr(cfg, "lambda_tile_concept", 0.0),
+            proto_label_smoothing=getattr(cfg, "proto_label_smoothing", 0.0),
         )
 
         self.class_weights = compute_class_weights(
@@ -418,6 +419,8 @@ class Trainer:
         total_osd = 0.0
         total_tcl = 0.0
         total_gpa = 0.0
+        total_gpa_entropy = 0.0
+        n_gpa_batches = 0
         total_it = 0.0
         total_proto_ce = 0.0
         total_concept_align = 0.0
@@ -470,16 +473,17 @@ class Trainer:
                     pred = out["pred"]
                     ordinal_logits = out.get("ordinal_logits", None)
                     tile_evidence = out.get("tile_evidence", None)
+                    tile_weights = out.get("tile_weights", None)
                     proto_logits = out.get("proto_logits", None)
                     concept_align_loss = out.get("concept_align_loss", None)
                     tile_concept_loss = out.get("tile_concept_loss", None)
                 elif len(out) == 5:
                     _, z_pcol, z_scolw, z_it, pred = out
-                    ordinal_logits = tile_evidence = None
+                    ordinal_logits = tile_evidence = tile_weights = None
                     proto_logits = concept_align_loss = tile_concept_loss = None
                 else:
                     z_pcol, z_scolw, pred = out
-                    z_it = ordinal_logits = tile_evidence = None
+                    z_it = ordinal_logits = tile_evidence = tile_weights = None
                     proto_logits = concept_align_loss = tile_concept_loss = None
 
                 loss, comps = self.criterion(
@@ -518,6 +522,14 @@ class Trainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
+            # GPA tile-attention entropy: low = focused on specific tiles, high = diffuse
+            if tile_weights is not None:
+                with torch.no_grad():
+                    tw = tile_weights.detach().float().clamp(min=1e-8)
+                    H = -(tw * tw.log()).sum(dim=-1).mean().item()
+                    total_gpa_entropy += H
+                    n_gpa_batches += 1
+
             total_loss += comps["loss_total"]
             total_pcol += comps["loss_pcol"]
             total_scolw += comps["loss_scolw"]
@@ -548,6 +560,8 @@ class Trainer:
             metrics["train_loss_tcl"] = total_tcl / nbatches
         if total_gpa > 0:
             metrics["train_loss_gpa"] = total_gpa / nbatches
+        if n_gpa_batches > 0:
+            metrics["gpa_attn_entropy"] = total_gpa_entropy / n_gpa_batches
         if self.text_encoder is not None and getattr(self.cfg, "use_image_text", False):
             metrics["train_loss_it"] = total_it / nbatches
         if total_proto_ce > 0:
@@ -645,6 +659,8 @@ class Trainer:
             extra += f" tcl={train['train_loss_tcl']:.3f}"
         if "train_loss_gpa" in train:
             extra += f" gpa={train['train_loss_gpa']:.3f}"
+        if "gpa_attn_entropy" in train:
+            extra += f" gpa_ent={train['gpa_attn_entropy']:.3f}"
         if "train_loss_it" in train:
             extra += f" it={train['train_loss_it']:.3f}"
         if "train_loss_proto_ce" in train:

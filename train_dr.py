@@ -398,6 +398,13 @@ def main():
         help="Cosine similarity temperature for grade prototype logits (default: 0.1). "
              "Lower = sharper prototype boundaries.",
     )
+    parser.add_argument(
+        "--proto_label_smoothing",
+        type=float,
+        default=None,
+        help="Label smoothing for proto_CE cross-entropy (default: 0.0). "
+             "Use 0.1 to regularise when proto_CE collapses to near-zero on training data.",
+    )
 
     args = parser.parse_args()
 
@@ -478,6 +485,8 @@ def main():
         cfg.lambda_tile_concept = args.lambda_tile_concept
     if args.proto_temperature is not None:
         cfg.proto_temperature = args.proto_temperature
+    if args.proto_label_smoothing is not None:
+        cfg.proto_label_smoothing = args.proto_label_smoothing
 
     setup_logging(args.run_dir)
     log = logging.getLogger("train_dr")
