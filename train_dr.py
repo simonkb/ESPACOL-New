@@ -405,6 +405,12 @@ def main():
         help="Label smoothing for proto_CE cross-entropy (default: 0.0). "
              "Use 0.1 to regularise when proto_CE collapses to near-zero on training data.",
     )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=None,
+        help="AdamW weight decay (default: 1e-6). Increase to 1e-5 when backbone LR is higher.",
+    )
 
     args = parser.parse_args()
 
@@ -487,6 +493,8 @@ def main():
         cfg.proto_temperature = args.proto_temperature
     if args.proto_label_smoothing is not None:
         cfg.proto_label_smoothing = args.proto_label_smoothing
+    if args.weight_decay is not None:
+        cfg.weight_decay = args.weight_decay
 
     setup_logging(args.run_dir)
     log = logging.getLogger("train_dr")
