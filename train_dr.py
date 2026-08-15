@@ -232,6 +232,19 @@ def main():
     )
 
     parser.add_argument(
+        "--alpha",
+        type=float,
+        default=None,
+        help="Weight for PCOL (default from config). Pass 0 to disable PCOL entirely.",
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=None,
+        help="Weight for SCOLw (default from config). Pass 0 to disable SCOLw entirely.",
+    )
+
+    parser.add_argument(
         "--use_image_text",
         action="store_true",
         help="Enable ESPAOCL image-text ordinal alignment loss",
@@ -291,6 +304,13 @@ def main():
         default=None,
         help="Run faithfulness loop every N batches (default 4)",
     )
+    parser.add_argument(
+        "--faith_threshold",
+        type=float,
+        default=None,
+        help="CAM threshold for the occlusion mask (default 0.5). Lower it if the "
+             "'mask=' figure in the epoch log shows near-zero pixel coverage.",
+    )
 
     args = parser.parse_args()
 
@@ -308,6 +328,15 @@ def main():
 
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
+
+    # Contrastive loss weights — written into the config after construction so the
+    # DRConfig defaults stay untouched. alpha=0 / beta=0 turns PCOL / SCOLw fully
+    # off, leaving RMSE (+ any enabled ESPAOCL terms) as the only gradient source.
+    if args.alpha is not None:
+        cfg.alpha = args.alpha
+
+    if args.beta is not None:
+        cfg.beta = args.beta
 
     if args.use_image_text:
         cfg.use_image_text = True
@@ -336,6 +365,8 @@ def main():
         cfg.faith_start_epoch = args.faith_start_epoch
     if args.faith_every_n is not None:
         cfg.faith_every_n = args.faith_every_n
+    if args.faith_threshold is not None:
+        cfg.faith_threshold = args.faith_threshold
 
     setup_logging(args.run_dir)
     log = logging.getLogger("train_dr")
@@ -343,12 +374,18 @@ def main():
     set_seed(cfg.seed)
 
     log.info("=" * 70)
+    base_str = "EfficientNet-V2S"
+    if cfg.alpha > 0.0:
+        base_str += " + PCOL"
+    if cfg.beta > 0.0:
+        base_str += " + SCOLw"
     extras_str = ""
     if cfg.use_image_text:
         extras_str += " + ImageText"
     if getattr(cfg, "use_concept_spine", False):
         extras_str += " + ConceptSpine(L_PIC+L_cons+L_faith)"
-    log.info(f"DR 10-fold CV  (EfficientNet-V2S + PCOL + SCOLw{extras_str})")
+    log.info(f"DR 10-fold CV  ({base_str}{extras_str})")
+    log.info(f"Loss weights: alpha={cfg.alpha:g} beta={cfg.beta:g} gamma={cfg.gamma:g}")
     log.info("=" * 70)
     log.info(f"Config: {cfg}")
 

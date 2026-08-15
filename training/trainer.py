@@ -368,6 +368,7 @@ class Trainer:
 
         faith_start = getattr(self.cfg, "faith_start_epoch", 10)
         faith_every_n = getattr(self.cfg, "faith_every_n", 4)
+        faith_threshold = getattr(self.cfg, "faith_threshold", 0.5)
         nu_peak = getattr(self.cfg, "nu", 0.0)
         nu_start = getattr(self.cfg, "faith_nu_start", nu_peak)  # default: no ramp
         nu_ramp_epochs = getattr(self.cfg, "faith_nu_ramp_epochs", 1)
@@ -386,7 +387,9 @@ class Trainer:
 
         total_loss = total_pcol = total_scolw = total_rmse = total_it = 0.0
         total_pic = total_cons = total_faith = 0.0
+        total_drop = total_dir = total_spec = total_occ = total_mask = 0.0
         n_batches = 0
+        n_faith_batches = 0
 
         nb = self.device.type == "cuda"
 
@@ -433,6 +436,9 @@ class Trainer:
 
             # ── Faithfulness loop ────────────────────────────────────────────
             L_faith_val = 0.0
+            faith_batch_comps = None
+            occ_effect = 0.0
+            mask_frac = 0.0
             do_faith = do_faith_this_epoch and (batch_idx % faith_every_n == 0)
 
             if do_faith and c is not None and E is not None:
@@ -463,6 +469,12 @@ class Trainer:
                     H, W, self.device,
                 )  # (N*T, H, W) for tiled, (N, H, W) for single
 
+                # Diagnostic: what fraction of pixels does the hard mask actually
+                # cover? Separates "threshold masks almost nothing because the CAMs
+                # are diffuse" (mask ≈ 0) from "occlusion lands but the concepts are
+                # insensitive to it" (mask healthy, occ ≈ 0).
+                mask_frac = (heatmaps > faith_threshold).float().mean().item()
+
                 # Clear CAM gradients — main graph (for main_loss) is still alive
                 self.model.zero_grad()
 
@@ -474,17 +486,23 @@ class Trainer:
                         x.view(N_b * T_b, C_b, H_b, W_b), heatmaps,
                         sigma=self.cfg.faith_sigma,
                         kernel_size=self.cfg.faith_blur_kernel,
+                        threshold=faith_threshold,
                     ).view(N_b, T_b, C_b, H_b, W_b)
                 else:
                     x_occ = soft_occlude(
                         x, heatmaps,
                         sigma=self.cfg.faith_sigma,
                         kernel_size=self.cfg.faith_blur_kernel,
+                        threshold=faith_threshold,
                     )
 
                 # Second forward for faithfulness loss (gradients flow through c_prime, E_prime)
                 with autocast(device_type=self.device.type, enabled=self.use_amp):
                     out_occ = self.model(x_occ, concept_text_emb=self.concept_text_emb)
+                    # Diagnostic: does occlusion move the concept activations at all?
+                    # occ ≈ 0 while drop sits at faith_margin ⇒ the occluder is inert
+                    # and L_faith is pinned at its constant floor, learning nothing.
+                    occ_effect = (out_occ["c"].detach() - c.detach()).abs().mean().item()
                     L_faith, faith_comps = self.faith_loss_fn(
                         c=c.detach(),
                         c_prime=out_occ["c"],
@@ -495,6 +513,7 @@ class Trainer:
                     )
 
                 L_faith_val = faith_comps["loss_faith"]
+                faith_batch_comps = faith_comps
                 # Split backward: backward main first, then faith.
                 # Each graph is freed as soon as its backward completes,
                 # so peak memory = max(main_graph, occ_graph) not their sum.
@@ -525,6 +544,13 @@ class Trainer:
             total_pic += comps.get("loss_pic", 0.0)
             total_cons += comps.get("loss_cons", 0.0)
             total_faith += L_faith_val
+            if faith_batch_comps is not None:
+                total_drop += faith_batch_comps["loss_drop"]
+                total_dir  += faith_batch_comps["loss_dir"]
+                total_spec += faith_batch_comps["loss_spec"]
+                total_occ  += occ_effect
+                total_mask += mask_frac
+                n_faith_batches += 1
             n_batches += 1
 
         nb_ = max(n_batches, 1)
@@ -543,6 +569,18 @@ class Trainer:
             metrics["train_loss_pic"] = total_pic / nb_
             metrics["train_loss_cons"] = total_cons / nb_
             metrics["train_loss_faith"] = total_faith / nb_
+
+            # The faithfulness loop only runs every faith_every_n batches, so the
+            # components are averaged over those batches alone. That keeps them on
+            # the same scale as faith_margin / faith_tau, which is what makes
+            # "drop is pinned at the margin" readable. train_loss_faith keeps its
+            # all-batch denominator so it stays comparable with earlier runs.
+            nf_ = max(n_faith_batches, 1)
+            metrics["train_loss_drop"] = total_drop / nf_
+            metrics["train_loss_dir"] = total_dir / nf_
+            metrics["train_loss_spec"] = total_spec / nf_
+            metrics["train_occ_effect"] = total_occ / nf_
+            metrics["train_mask_frac"] = total_mask / nf_
 
         return metrics
 
@@ -622,6 +660,16 @@ class Trainer:
             extras += f" cons={train['train_loss_cons']:.3f}"
         if "train_loss_faith" in train:
             extras += f" faith={train['train_loss_faith']:.3f}"
+        if "train_loss_drop" in train:
+            extras += (
+                f" drop={train['train_loss_drop']:.4f}"
+                f" dir={train['train_loss_dir']:.4f}"
+                f" spec={train['train_loss_spec']:.4f}"
+            )
+        if "train_occ_effect" in train:
+            extras += f" occ={train['train_occ_effect']:.4f}"
+        if "train_mask_frac" in train:
+            extras += f" mask={train['train_mask_frac']:.4f}"
 
         concept_acc_text = ""
         if "val_concept_acc" in val:

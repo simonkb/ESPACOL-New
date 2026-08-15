@@ -45,18 +45,20 @@ def _gaussian_kernel(kernel_size: int, sigma: float, device: torch.device) -> to
 
 def soft_occlude(
     x: torch.Tensor,           # (N, 3, H, W)  float, [0, 1] range
-    heatmap: torch.Tensor,     # (N, H, W)     float [0, 1], no detach required
+    heatmap: torch.Tensor,     # (N, H, W)     float [0, 1], detached
     sigma: float = 7.0,
     kernel_size: int = 21,
+    threshold: float = 0.5,
 ) -> torch.Tensor:
     """
-    Soft occlusion via differentiable Gaussian blur blending.
+    Replace pixels where heatmap > threshold with a Gaussian-blurred version.
 
-    I_occ = mask * blur(x) + (1 - mask) * x
-    where mask = heatmap used directly as a continuous soft weight in [0, 1].
-    No hard threshold — fully differentiable w.r.t. heatmap.
+    Returns occluded x with the same shape and dtype.
+    heatmap must already be detached (it is treated as a fixed mask, not differentiable).
 
-    Gradient path: ∇(L_faith) → E', c' → x_occ → heatmap → concept/localization heads.
+    A hard mask is used deliberately: the continuous variant blends only
+    proportionally to the CAM value, which perturbs the image too weakly to move
+    c'_k, leaving L_drop pinned at its constant floor.
     """
     N, C, H, W = x.shape
     # Build per-channel blur kernel
@@ -66,8 +68,8 @@ def soft_occlude(
 
     blurred = F.conv2d(x, kernel, padding=pad, groups=C)     # (N, C, H, W)
 
-    # Soft mask — heatmap used directly, NO hard threshold
-    mask = heatmap.unsqueeze(1)                               # (N, 1, H, W)
+    mask = (heatmap > threshold).float()                      # (N, H, W) hard mask
+    mask = mask.unsqueeze(1)                                  # (N, 1, H, W)
 
     return mask * blurred + (1.0 - mask) * x
 

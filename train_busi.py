@@ -158,18 +158,60 @@ def main():
                         help="Enable ConceptSpine + faithfulness loop")
     parser.add_argument("--epochs", type=int, default=None,
                         help="Override number of training epochs")
+    parser.add_argument(
+        "--alpha", type=float, default=None,
+        help="Weight for PCOL (default from config). Pass 0 to disable PCOL entirely."
+    )
+    parser.add_argument(
+        "--beta", type=float, default=None,
+        help="Weight for SCOLw (default from config). Pass 0 to disable SCOLw entirely."
+    )
+    parser.add_argument(
+        "--gamma", type=float, default=None,
+        help="Weight for the image-text ordinal loss (default from config). "
+             "Pass 0 to disable it; the text encoder still loads when "
+             "--use_concept_spine is set, since concept embeddings need it."
+    )
     args = parser.parse_args()
 
     cfg = BUSIConfig(run_dir=args.run_dir, use_concept_spine=args.use_concept_spine)
     if args.epochs is not None:
         cfg.epochs = args.epochs
+
+    # Loss weights — written into the config after construction so the BUSIConfig
+    # defaults stay untouched. alpha=0 / beta=0 turns PCOL / SCOLw fully off.
+    if args.alpha is not None:
+        cfg.alpha = args.alpha
+
+    if args.beta is not None:
+        cfg.beta = args.beta
+
+    if args.gamma is not None:
+        cfg.gamma = args.gamma
+        cfg.use_image_text = cfg.gamma > 0.0
+
+    # The concept spine builds its concept embeddings from the text tower, so the
+    # encoder must stay enabled even when its loss weight is zero. Applied after
+    # the gamma block so --gamma 0 --use_concept_spine keeps the encoder loaded.
+    if cfg.use_concept_spine:
+        cfg.use_image_text = True
     setup_logging(args.run_dir)
     log = logging.getLogger("train_busi")
     set_seed(cfg.seed)
 
     log.info("=" * 70)
-    log.info("BUSI 5-fold Cross-Validation  (EfficientNet-V2S + PCOL + SCOLw)")
+    base_str = "EfficientNet-V2S"
+    if cfg.alpha > 0.0:
+        base_str += " + PCOL"
+    if cfg.beta > 0.0:
+        base_str += " + SCOLw"
+    if cfg.use_image_text and cfg.gamma > 0.0:
+        base_str += " + ImageText"
+    if cfg.use_concept_spine:
+        base_str += " + ConceptSpine(L_PIC+L_cons+L_faith)"
+    log.info(f"BUSI 5-fold Cross-Validation  ({base_str})")
     log.info("=" * 70)
+    log.info(f"Loss weights: alpha={cfg.alpha:g} beta={cfg.beta:g} gamma={cfg.gamma:g}")
     log.info(f"Config: {cfg}")
 
     # Load dataset

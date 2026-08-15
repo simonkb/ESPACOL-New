@@ -86,6 +86,9 @@ class TrainConfig:
     faith_tau: float = 0.05          # L_spec cross-concept tolerance τ
     faith_sigma: float = 7.0         # Gaussian blur σ for soft occlusion
     faith_blur_kernel: int = 21      # Blur kernel size (must be odd)
+    faith_threshold: float = 0.5     # CAM value above which a pixel is occluded.
+                                     # Lower it if `mask=` in the epoch log shows the
+                                     # hard mask covering almost no pixels (diffuse CAMs).
     # Curriculum nu ramp: nu starts at faith_nu_start and linearly increases to nu
     # over faith_nu_ramp_epochs epochs beginning at faith_start_epoch.
     # Set faith_nu_start=0.0 for a full warm-start; set equal to nu to disable ramp.
