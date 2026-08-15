@@ -267,6 +267,14 @@ def main():
         default=None,
         help="Optional override for BioMedCLIP/open_clip text encoder name",
     )
+    parser.add_argument(
+        "--no_finetune_text_encoder",
+        action="store_true",
+        help="Keep the text encoder frozen for the whole run (DRConfig defaults to "
+             "unfreezing its last layers at text_finetune_start_epoch). Use this when "
+             "measuring the faithfulness window: unfreezing ~15M params mid-run "
+             "perturbs L_cons right where L_faith ramps in.",
+    )
 
     # Concept Activation Spine (ESPAOCL)
     parser.add_argument(
@@ -350,6 +358,10 @@ def main():
 
     if args.text_encoder_name is not None:
         cfg.text_encoder_name = args.text_encoder_name
+
+    if args.no_finetune_text_encoder:
+        cfg.finetune_text_encoder = False
+        cfg.text_finetune_layers = 0
 
     if args.use_concept_spine:
         cfg.use_concept_spine = True
