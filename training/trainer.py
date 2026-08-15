@@ -285,6 +285,16 @@ class Trainer:
                     f"[Fold {self.fold}] Backbone unfrozen at epoch {epoch} "
                     f"— joint fine-tuning phase begins"
                 )
+                # Reset the LR scheduler so freeze-phase plateau history is discarded.
+                # ReduceLROnPlateau can't distinguish "val_loss flat because backbone
+                # frozen" from "val_loss flat because model plateaued". Resetting here
+                # means lr_patience counts only post-unfreeze epochs, which is correct.
+                self.scheduler.best = float("inf")
+                self.scheduler.num_bad_epochs = 0
+                logger.info(
+                    f"[Fold {self.fold}] LR scheduler reset at unfreeze — "
+                    f"patience counter starts fresh"
+                )
 
             self._maybe_enable_text_finetune(epoch)
 

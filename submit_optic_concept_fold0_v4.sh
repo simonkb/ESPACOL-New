@@ -30,10 +30,9 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 #   1. ReduceLROnPlateau fired at ep17 DURING freeze (ep1-25).
 #      Val_loss couldn't improve because backbone was frozen — not a real plateau.
 #      Result: backbone unfroze at ep26 with LR=4e-5 instead of intended 2e-4.
-#      The backbone was trained at 1/5 of its designed LR for the entire run.
-#      Fix: lr_patience=30 (> 25 freeze epochs). LR cannot fire during freeze.
-#      After ep26 unfreeze, val_loss improves and resets the plateau counter,
-#      so the backbone actually trains at the intended 2e-4 LR.
+#      Fix (trainer.py): reset scheduler.best and num_bad_epochs at unfreeze so
+#      freeze-phase history is discarded. lr_patience=15 now applies only to
+#      post-unfreeze epochs, which is the correct behaviour.
 #
 #   2. proto_ce ended at 0.396; label smoothing floor (ε=0.1, 5 classes) ≈ 0.325.
 #      Only 0.07 headroom left — model is constrained by the floor, not by capacity.
@@ -72,6 +71,6 @@ python train_dr.py \
     --lambda_tile_concept 0.5 \
     --proto_temperature 0.15 \
     --proto_label_smoothing 0.07 \
-    --lr_patience 30 \
+    --lr_patience 15 \
     --early_stop_patience 30 \
     --weight_decay 1e-5
