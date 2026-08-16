@@ -67,13 +67,28 @@ Cost: the control doubles the Grad-CAM backwards and occluded forwards, so
 expect roughly 2x the runtime of the real-concept measurement alone.
 
 ------------------------------------------------------------------------------
-DIFFERENCES FROM THE TRAINING-TIME COMPUTATION  (both deliberate)
+--mode eval (default) vs --mode train
 ------------------------------------------------------------------------------
+eval (default) departs from the training-time computation in two deliberate ways:
   - model.eval() — BatchNorm uses running statistics, so a per-image value does
-    not depend on which other images share its batch. Training-time numbers are
-    computed in train() mode.
+    not depend on which other images share its batch.
   - float32 throughout, no autocast. Removes AMP nondeterminism from a
     measurement whose entire purpose is a small between-checkpoint difference.
+This is the mode to use for the faith_on/faith_off comparison.
+
+train reproduces the trainer's conditions instead — model.train() plus autocast,
+placed exactly where trainer.py places it (main forward and the occluded forward
++ loss inside; the Grad-CAM pass outside). Use it to test whether those
+conditions account for a gap between the trainer's logged drop and the eval-mode
+value on the same checkpoint. Three things change together, so a match confirms
+the combination rather than isolating a cause:
+  - BatchNorm normalises with batch statistics -> per-image values now depend on
+    batch composition, so --batch_size must match training (24) to compare
+  - EfficientNet's stochastic depth becomes active -> outputs are stochastic;
+    the run is seeded, but two different seeds will not agree exactly
+  - fp16 autocast arithmetic replaces float32
+Nothing is optimised in either mode. BN running buffers drift in train mode but
+do not feed the outputs, and the checkpoint on disk is never rewritten.
 
 Per-image components come from calling FaithfulnessLoss on one-image slices
 (it reduces with .mean() internally, so a batched call would return batch means
@@ -87,6 +102,17 @@ Subsetting is stratified, never head-of-list: --per_grade N takes N images from
 every grade (preferred here, since grades 3 and 4 are thin), --max_images N
 takes N total allocated proportionally. Both are seeded, so the two checkpoints
 measure exactly the same images.
+
+--split selects which images. `val` (default) is the held-out fold that
+train_dr.py uses as val==test. `train` is train_items_raw + val_items_held_out,
+i.e. exactly the images the trainer fit and measured its logged drop over — use
+it to test whether a train/val gap rather than eval-vs-train mode explains that
+number. One residual difference remains in `train`: this script always uses eval
+transforms, while the trainer saw the same images augmented.
+
+After the tables the script prints the trainer's own logged row from
+fold{fold}_history.csv at the checkpoint's stored epoch, so the comparison is
+like-for-like rather than against a remembered log line from another epoch.
 
 Usage:
     # preflight: verify a checkpoint will load, without touching the dataset
@@ -108,6 +134,8 @@ import sys
 
 import numpy as np
 import torch
+from contextlib import nullcontext
+from torch.amp import autocast
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -189,6 +217,30 @@ def detect_architecture(sd: dict) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # Permutation control
 # ─────────────────────────────────────────────────────────────────────────────
+
+def trainer_reference(ckpt_path: str, fold: int, epoch: int | None) -> dict | None:
+    """
+    Pull the trainer's own logged faithfulness row for a given epoch.
+
+    The trainer writes <run_dir>/fold{fold}_history.csv per epoch (trainer.py:252),
+    and run_dir is the checkpoint's own directory, so the history sits beside the
+    .pth. Returns the row whose `epoch` matches, or None if unavailable.
+    """
+    if epoch is None:
+        return None
+    path = os.path.join(os.path.dirname(os.path.abspath(ckpt_path)),
+                        f"fold{fold}_history.csv")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row.get("epoch", "").strip() == str(epoch):
+                    return row
+    except (OSError, csv.Error):
+        return None
+    return None
+
 
 def select_subset(
     pairs: list, n_classes: int, seed: int,
@@ -275,17 +327,26 @@ def control_concept(top_k: int, n_concepts: int, image_index: int, seed: int) ->
 def measure_for_concept(
     model, layer_cam, faith_loss_fn,
     x, concept_idx, concept_text_emb,
-    c, E, w, cfg, faith_threshold, device,
+    c, E, w, cfg, faith_threshold, device, amp_enabled: bool = False,
 ) -> list[dict]:
     """
     Grad-CAM for concept_idx -> hard-mask occlusion -> re-forward -> components.
 
     concept_idx: (N,) long — which concept to attribute and occlude per image.
     Returns one dict of scalars per image in the batch.
+
+    autocast placement mirrors the trainer exactly: the CAM forward/backward runs
+    OUTSIDE autocast (trainer.py wraps it in enable_grad only), while the occluded
+    forward and the FaithfulnessLoss call run INSIDE it (trainer.py:500-513).
     """
     N = x.shape[0]
 
-    # Grad-CAM++ — the only step that needs gradients
+    def amp():
+        return (autocast(device_type=device.type, enabled=True)
+                if amp_enabled else nullcontext())
+
+    # Grad-CAM++ — the only step that needs gradients. No autocast: the trainer
+    # does not wrap this pass either.
     model.zero_grad(set_to_none=True)
     with torch.enable_grad():
         out_cam = model(x.detach(), concept_text_emb=concept_text_emb)
@@ -317,7 +378,8 @@ def measure_for_concept(
                 kernel_size=cfg.faith_blur_kernel,
                 threshold=faith_threshold,
             )
-        out_occ = model(x_occ, concept_text_emb=concept_text_emb)
+        with amp():
+            out_occ = model(x_occ, concept_text_emb=concept_text_emb)
 
     c_prime = out_occ["c"].detach()
     E_prime = out_occ["E"].detach()
@@ -325,7 +387,7 @@ def measure_for_concept(
 
     results = []
     for i in range(N):
-        with torch.no_grad():
+        with torch.no_grad(), amp():
             _lf, comps = faith_loss_fn(
                 c=c[i : i + 1],
                 c_prime=c_prime[i : i + 1],
@@ -379,7 +441,13 @@ def main() -> None:
     p.add_argument("--dr_root", type=str, default="Datasets/DR",
                    help="DR dataset root containing train/ and trainLabels.csv")
     p.add_argument("--folds", type=str, default="0",
-                   help="Single fold index whose val split is measured")
+                   help="Single fold index to measure")
+    p.add_argument("--split", choices=["train", "val"], default="val",
+                   help="val (default): the held-out fold, i.e. what train_dr.py uses "
+                        "as val==test. train: the images the trainer actually fit and "
+                        "measured its logged drop on (train_items_raw + val_held_out). "
+                        "Use train to test whether a train/val gap, rather than "
+                        "eval-vs-train mode, explains the trainer's number.")
     sampling = p.add_mutually_exclusive_group()
     sampling.add_argument("--max_images", type=int, default=None,
                           help="Measure N images total, sampled proportionally across "
@@ -395,8 +463,17 @@ def main() -> None:
                    help="Label CSV. Default: <dr_root>/trainLabels.csv")
     p.add_argument("--out_csv", type=str, default=None,
                    help="Per-image CSV. Default: <ckpt dir>/faithfulness_eval.csv")
+    p.add_argument("--mode", choices=["eval", "train"], default="eval",
+                   help="eval (default): model.eval(), float32, no autocast — per-image "
+                        "values are batch-independent and reproducible. "
+                        "train: model.train() + autocast, reproducing the trainer's "
+                        "exact conditions (BatchNorm batch statistics, AMP, active "
+                        "stochastic depth) to test whether they explain a gap between "
+                        "the trainer's logged drop and this script's eval-mode value.")
     p.add_argument("--batch_size", type=int, default=8,
-                   help="Forward batch size (per-image values are unaffected)")
+                   help="Forward batch size. In --mode eval this does not affect "
+                        "per-image values; in --mode train it does (BatchNorm uses "
+                        "batch statistics), so match the training batch size — 24.")
     p.add_argument("--num_workers", type=int, default=1,
                    help="DataLoader workers. Kept at 1: the compute here is 5 model "
                         "passes per batch, not image decoding, and the HPC node warns "
@@ -465,7 +542,22 @@ def main() -> None:
             f"  missing:    {sorted(missing)[:10]}\n"
             f"  unexpected: {sorted(unexpected)[:10]}"
         )
-    model.to(device).eval()
+    model.to(device)
+
+    # --mode train reproduces the trainer's conditions: BatchNorm normalises with
+    # batch statistics rather than running estimates, EfficientNet's stochastic
+    # depth becomes active, and AMP is enabled on CUDA exactly as cfg.amp does.
+    # Nothing is optimised in either mode; BN running buffers drift in train mode
+    # but that does not feed the outputs, which use batch statistics.
+    amp_enabled = (args.mode == "train") and cfg.amp and device.type == "cuda"
+    if args.mode == "train":
+        model.train()
+    else:
+        model.eval()
+
+    def amp_ctx():
+        return (autocast(device_type=device.type, enabled=True)
+                if amp_enabled else nullcontext())
 
     # ── Text encoder: required for the concept embeddings ────────────────────
     if not arch["use_image_text"]:
@@ -520,8 +612,16 @@ def main() -> None:
     print(f"    faith_sigma       {getattr(cfg, 'faith_sigma', 7.0)}")
     print(f"    faith_blur_kernel {getattr(cfg, 'faith_blur_kernel', 21)}")
     print(f"    faith_threshold   {faith_threshold}")
+    print(f"    split             {args.split}")
     print(f"    seed              {args.seed}  (also keys the control-concept draw)")
-    print(f"    mode              eval(), float32, no autocast")
+    if args.mode == "train":
+        print(f"    mode              train()  [trainer conditions: BN batch stats, "
+              f"stochastic depth active]")
+        print(f"    autocast          {amp_enabled}  (cfg.amp={cfg.amp}, device={device.type})")
+        print(f"    batch_size        {args.batch_size}  <- affects BN stats; training used "
+              f"{cfg.batch_size}")
+    else:
+        print(f"    mode              eval()   [float32, no autocast, batch-independent]")
 
     # ── Fold val split — mirrors train_dr.py (val == test fold) ──────────────
     items = DRDataset(root_dir=args.dr_root, split="train", csv_path=args.train_csv).items
@@ -530,20 +630,30 @@ def main() -> None:
     )
     _train_raw, _val_held_out, test_items = cv.get_fold(fold)
 
+    # train_dr.py: train_items = train_items_raw + val_items_held_out; val = test fold.
+    # The trainer's logged drop was measured over the train split, so reproduce it here.
+    if args.split == "train":
+        pool = _train_raw + _val_held_out
+    else:
+        pool = test_items
+
     if args.max_images is not None or args.per_grade is not None:
         orig_index = select_subset(
-            test_items, cfg.n_classes, args.seed, args.max_images, args.per_grade
+            pool, cfg.n_classes, args.seed, args.max_images, args.per_grade
         )
     else:
-        orig_index = list(range(len(test_items)))
-    val_items = [test_items[i] for i in orig_index]
+        orig_index = list(range(len(pool)))
+    val_items = [pool[i] for i in orig_index]
 
     split_dist = {g: 0 for g in range(cfg.n_classes)}
     for _p, lab in val_items:
         split_dist[int(lab)] += 1
-    print(f"\nFold {fold} val split: {len(test_items)} images, "
+    print(f"\nFold {fold} {args.split} split: {len(pool)} images, "
           f"measuring {len(val_items)}")
     print(f"  grade distribution of the measured set: {split_dist}")
+    if args.split == "train":
+        print("  NOTE: eval transforms (no augmentation). The trainer measured these "
+              "images with random flips/rotation/jitter applied.")
 
     if arch["use_multi_tile"]:
         tfm = build_tile_transform(
@@ -568,8 +678,9 @@ def main() -> None:
         x = x.to(device, non_blocking=True)
         N = x.shape[0]
 
-        # Clean forward — concept activations, evidence, weights
-        with torch.no_grad():
+        # Clean forward — concept activations, evidence, weights.
+        # autocast here mirrors the trainer's main forward (trainer.py:408).
+        with torch.no_grad(), amp_ctx():
             out = model(x, concept_text_emb=concept_text_emb)
         c = out["c"].detach()                       # (N, M)
         E = out["E"].detach()                       # (N,)
@@ -591,11 +702,11 @@ def main() -> None:
 
         real = measure_for_concept(
             model, layer_cam, faith_loss_fn, x, top_k_idx, concept_text_emb,
-            c, E, w, cfg, faith_threshold, device,
+            c, E, w, cfg, faith_threshold, device, amp_enabled,
         )
         ctrl = measure_for_concept(
             model, layer_cam, faith_loss_fn, x, ctrl_idx, concept_text_emb,
-            c, E, w, cfg, faith_threshold, device,
+            c, E, w, cfg, faith_threshold, device, amp_enabled,
         )
 
         for i in range(N):
@@ -669,6 +780,33 @@ def main() -> None:
           f"{overall['ctrl_dir']:>12.5f}{overall['real_spec']:>12.5f}"
           f"{overall['ctrl_spec']:>12.5f}{overall['real_faith']:>12.5f}"
           f"{overall['ctrl_faith']:>12.5f}")
+
+    # ── Trainer's own logged row, for a like-for-like comparison ─────────────
+    ckpt_epoch = state.get("epoch")
+    ref = trainer_reference(args.ckpt, fold, ckpt_epoch)
+    print()
+    print(f"  TRAINER REFERENCE — fold{fold}_history.csv @ epoch {ckpt_epoch} "
+          f"(the checkpoint's stored epoch)")
+    if ref is None:
+        print("    unavailable: no fold history CSV beside the checkpoint, or no row "
+              f"for epoch {ckpt_epoch}")
+    else:
+        cols = [
+            ("train_loss_drop", "drop"), ("train_loss_dir", "dir"),
+            ("train_loss_spec", "spec"), ("train_loss_faith", "faith"),
+            ("train_occ_effect", "occ"), ("train_mask_frac", "mask"),
+        ]
+        shown = [(lbl, ref[key]) for key, lbl in cols if key in ref and ref[key] != ""]
+        if shown:
+            print("    " + "  ".join(f"{lbl}={val}" for lbl, val in shown))
+        else:
+            print("    row found but no faithfulness columns "
+                  "(run trained with nu=0, or an older trainer)")
+        print("    measured by the trainer in train() mode, with AMP, over the TRAIN "
+              "split, with augmentation, at batch_size="
+              f"{cfg.batch_size}, averaged over faithfulness batches only.")
+        print(f"    this run: mode={args.mode} split={args.split} "
+              f"batch_size={args.batch_size} augment=False")
 
     print()
     print(f"  drop_gap = drop_ctrl - drop_real  ->  {overall['drop_gap']:+.5f}")
