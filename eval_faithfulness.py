@@ -83,6 +83,11 @@ is per-image, and it is pure tensor arithmetic.
 Grades are grouped by TRUE label, not predicted grade — the grouping must be
 identical across the two checkpoints for the comparison to be meaningful.
 
+Subsetting is stratified, never head-of-list: --per_grade N takes N images from
+every grade (preferred here, since grades 3 and 4 are thin), --max_images N
+takes N total allocated proportionally. Both are seeded, so the two checkpoints
+measure exactly the same images.
+
 Usage:
     # preflight: verify a checkpoint will load, without touching the dataset
     python eval_faithfulness.py --ckpt runs/faith_off/fold0/fold0_best.pth --inspect
@@ -184,6 +189,71 @@ def detect_architecture(sd: dict) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # Permutation control
 # ─────────────────────────────────────────────────────────────────────────────
+
+def select_subset(
+    pairs: list, n_classes: int, seed: int,
+    max_images: int | None, per_grade: int | None,
+) -> list[int]:
+    """
+    Choose which val-split images to measure, returning ORIGINAL indices, sorted.
+
+    Taking the first N would follow the CV split's ordering and leave grades 3
+    and 4 (778 / 640 images across all of train) barely represented, so both
+    modes stratify by true grade:
+
+      --per_grade N   N images from every grade — equal representation, so the
+                      rare-grade rows in the summary carry the same weight as
+                      grade 0. Use this for the faith_on/faith_off comparison.
+      --max_images N  N images total, allocated proportionally to each grade's
+                      share of the split (largest-remainder), preserving the
+                      natural class balance.
+
+    Sampling is seeded, so both checkpoints measure exactly the same images.
+    Indices are original val-split positions, which is what keys the
+    control-concept draw — a given image gets the same control concept whether
+    it was reached via --per_grade, --max_images, or a full run.
+    """
+    by_grade: dict[int, list[int]] = {g: [] for g in range(n_classes)}
+    for i, (_path, label) in enumerate(pairs):
+        by_grade[int(label)].append(i)
+
+    rng = np.random.default_rng(seed)
+
+    if per_grade is not None:
+        quotas = {g: min(per_grade, len(by_grade[g])) for g in range(n_classes)}
+    else:
+        total = len(pairs)
+        exact = {g: max_images * len(by_grade[g]) / total for g in range(n_classes)}
+        quotas = {g: min(int(np.floor(v)), len(by_grade[g])) for g, v in exact.items()}
+        # largest-remainder pass so the quotas sum to max_images where pools allow
+        shortfall = max_images - sum(quotas.values())
+        order = sorted(range(n_classes), key=lambda g: exact[g] - np.floor(exact[g]),
+                       reverse=True)
+        while shortfall > 0:
+            progressed = False
+            for g in order:
+                if shortfall == 0:
+                    break
+                if quotas[g] < len(by_grade[g]):
+                    quotas[g] += 1
+                    shortfall -= 1
+                    progressed = True
+            if not progressed:      # every pool exhausted
+                break
+
+    picked: list[int] = []
+    for g in range(n_classes):
+        pool, k = by_grade[g], quotas[g]
+        if k <= 0:
+            continue
+        if k >= len(pool):
+            picked.extend(pool)
+        else:
+            chosen = rng.choice(len(pool), size=k, replace=False)
+            picked.extend(pool[j] for j in chosen)
+
+    return sorted(picked)
+
 
 def control_concept(top_k: int, n_concepts: int, image_index: int, seed: int) -> int:
     """
@@ -310,8 +380,14 @@ def main() -> None:
                    help="DR dataset root containing train/ and trainLabels.csv")
     p.add_argument("--folds", type=str, default="0",
                    help="Single fold index whose val split is measured")
-    p.add_argument("--max_images", type=int, default=None,
-                   help="Cap images (smoke test). Default: whole val split")
+    sampling = p.add_mutually_exclusive_group()
+    sampling.add_argument("--max_images", type=int, default=None,
+                          help="Measure N images total, sampled proportionally across "
+                               "true grades. Default: whole val split")
+    sampling.add_argument("--per_grade", type=int, default=None,
+                          help="Measure N images from EACH true grade, so grades 3 and 4 "
+                               "carry the same weight as grade 0. Preferred for the "
+                               "faith_on/faith_off comparison")
     p.add_argument("--inspect", action="store_true",
                    help="Print the checkpoint's key structure and whether it can be "
                         "loaded, then exit. Does not touch the dataset.")
@@ -321,7 +397,10 @@ def main() -> None:
                    help="Per-image CSV. Default: <ckpt dir>/faithfulness_eval.csv")
     p.add_argument("--batch_size", type=int, default=8,
                    help="Forward batch size (per-image values are unaffected)")
-    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--num_workers", type=int, default=1,
+                   help="DataLoader workers. Kept at 1: the compute here is 5 model "
+                        "passes per batch, not image decoding, and the HPC node warns "
+                        "when more workers are requested than it has available")
     p.add_argument("--faith_threshold", type=float, default=None,
                    help="Occlusion mask threshold. Default: config value (0.5). "
                         "MUST match across the two checkpoints being compared.")
@@ -450,10 +529,21 @@ def main() -> None:
         items, n_folds=cfg.n_folds, val_fraction=cfg.val_fraction, seed=args.seed
     )
     _train_raw, _val_held_out, test_items = cv.get_fold(fold)
-    val_items = test_items
-    if args.max_images:
-        val_items = val_items[: args.max_images]
-    print(f"\nFold {fold} val split: {len(val_items)} images")
+
+    if args.max_images is not None or args.per_grade is not None:
+        orig_index = select_subset(
+            test_items, cfg.n_classes, args.seed, args.max_images, args.per_grade
+        )
+    else:
+        orig_index = list(range(len(test_items)))
+    val_items = [test_items[i] for i in orig_index]
+
+    split_dist = {g: 0 for g in range(cfg.n_classes)}
+    for _p, lab in val_items:
+        split_dist[int(lab)] += 1
+    print(f"\nFold {fold} val split: {len(test_items)} images, "
+          f"measuring {len(val_items)}")
+    print(f"  grade distribution of the measured set: {split_dist}")
 
     if arch["use_multi_tile"]:
         tfm = build_tile_transform(
@@ -488,9 +578,13 @@ def main() -> None:
         # REAL: dominant concept by |w * c|
         top_k_idx = (w * c).abs().argmax(dim=1)     # (N,)
 
-        # CONTROL: deterministic non-dominant concept per image
+        # CONTROL: deterministic non-dominant concept per image. Keyed on the
+        # ORIGINAL val-split index, so an image draws the same control concept
+        # whether it arrived via --per_grade, --max_images, or a full run.
         ctrl_list = [
-            control_concept(int(top_k_idx[i].item()), M, n_seen + i, args.seed)
+            control_concept(
+                int(top_k_idx[i].item()), M, orig_index[n_seen + i], args.seed
+            )
             for i in range(N)
         ]
         ctrl_idx = torch.tensor(ctrl_list, dtype=torch.long, device=device)
@@ -507,7 +601,7 @@ def main() -> None:
         for i in range(N):
             k_real, k_ctrl = int(top_k_idx[i].item()), ctrl_list[i]
             rows.append({
-                "index": n_seen + i,
+                "index": orig_index[n_seen + i],
                 "path": val_items[n_seen + i][0],
                 "label": int(y[i].item()),
                 "real_concept_idx": k_real,
