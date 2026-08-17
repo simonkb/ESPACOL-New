@@ -7,8 +7,6 @@ Baseline (HybridContrastiveOrdinalModel):
               |----> PCOL Head       (1280->1280->128, L2-norm)
               |----> SCOLw Head      (1280->1280->128, L2-norm)
               |----> Regression Head (1280->1, scalar)
-              |----> Image-Text Head (1280->1280->128, L2-norm)  [optional]
-
 OPTIC extension (OPTICModel):
   Same as baseline but with optional components:
               |----> OrdinalDistributionHead   (CORAL; replaces RMSE regression)
@@ -40,14 +38,12 @@ class HybridContrastiveOrdinalModel(nn.Module):
         pcol_head: MLPProjectionHead,
         scolw_head: MLPProjectionHead,
         regression_head: RegressionHead,
-        image_text_head: MLPProjectionHead | None = None,
     ):
         super().__init__()
         self.backbone = backbone
         self.pcol_head = pcol_head
         self.scolw_head = scolw_head
         self.regression_head = regression_head
-        self.image_text_head = image_text_head
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor | None]:
         features = self.backbone(x)
@@ -56,15 +52,10 @@ class HybridContrastiveOrdinalModel(nn.Module):
         z_scolw = self.scolw_head(features)
         pred = self.regression_head(features)
 
-        z_it = None
-        if self.image_text_head is not None:
-            z_it = self.image_text_head(features)
-
         return {
             "features": features,
             "z_pcol": z_pcol,
             "z_scolw": z_scolw,
-            "z_it": z_it,
             "pred": pred,
         }
 
@@ -100,7 +91,6 @@ class OPTICModel(HybridContrastiveOrdinalModel):
         pcol_head: MLPProjectionHead,
         scolw_head: MLPProjectionHead,
         regression_head: RegressionHead,
-        image_text_head: MLPProjectionHead | None = None,
         gpa: GradePrototypeAttention | None = None,
         ordinal_head: OrdinalDistributionHead | None = None,
     ):
@@ -109,7 +99,6 @@ class OPTICModel(HybridContrastiveOrdinalModel):
             pcol_head=pcol_head,
             scolw_head=scolw_head,
             regression_head=regression_head,
-            image_text_head=image_text_head,
         )
         self.gpa = gpa
         self.ordinal_head = ordinal_head
@@ -133,15 +122,10 @@ class OPTICModel(HybridContrastiveOrdinalModel):
         else:
             pred = self.regression_head(features)
 
-        z_it = None
-        if self.image_text_head is not None:
-            z_it = self.image_text_head(features)
-
         return {
             "features": features,
             "z_pcol": z_pcol,
             "z_scolw": z_scolw,
-            "z_it": z_it,
             "pred": pred,
             "ordinal_logits": ordinal_logits,
             "tile_evidence": tile_evidence,
@@ -183,7 +167,6 @@ class OPTICConceptModel(OPTICModel):
         scolw_head: MLPProjectionHead,
         regression_head: RegressionHead,
         concept_module: ConceptGradePrototypeModule,
-        image_text_head: MLPProjectionHead | None = None,
         gpa: GradePrototypeAttention | None = None,
         ordinal_head: OrdinalDistributionHead | None = None,
     ):
@@ -192,7 +175,6 @@ class OPTICConceptModel(OPTICModel):
             pcol_head=pcol_head,
             scolw_head=scolw_head,
             regression_head=regression_head,
-            image_text_head=image_text_head,
             gpa=gpa,
             ordinal_head=ordinal_head,
         )
@@ -223,10 +205,6 @@ class OPTICConceptModel(OPTICModel):
         else:
             pred = self.regression_head(features)
 
-        z_it = None
-        if self.image_text_head is not None:
-            z_it = self.image_text_head(features)
-
         # Concept prototype forward — losses pre-computed here
         proto_logits = concept_align_loss = tile_concept_scores = tile_concept_loss = None
         if labels is not None:
@@ -244,7 +222,6 @@ class OPTICConceptModel(OPTICModel):
             "features": features,
             "z_pcol": z_pcol,
             "z_scolw": z_scolw,
-            "z_it": z_it,
             "pred": pred,
             "ordinal_logits": ordinal_logits,
             "tile_evidence": tile_evidence,
@@ -264,7 +241,6 @@ def build_model(
     pretrained: bool = True,
     proj_hidden_dim: int = 1280,
     proj_out_dim: int = 128,
-    use_image_text: bool = False,
     use_multi_tile: bool = False,
     grad_checkpoint: bool = False,
     tile_grid: int = 3,
@@ -311,10 +287,6 @@ def build_model(
     scolw_head = MLPProjectionHead(feat_dim, proj_hidden_dim, proj_out_dim)
     reg_head = RegressionHead(feat_dim)
 
-    image_text_head = None
-    if use_image_text:
-        image_text_head = MLPProjectionHead(feat_dim, proj_hidden_dim, proj_out_dim)
-
     gpa = None
     if use_grade_prototypes:
         gpa = GradePrototypeAttention(d_model=tile_transformer_dim, n_classes=n_classes)
@@ -337,7 +309,6 @@ def build_model(
             scolw_head=scolw_head,
             regression_head=reg_head,
             concept_module=concept_module,
-            image_text_head=image_text_head,
             gpa=gpa,
             ordinal_head=ordinal_head,
         )
@@ -349,7 +320,6 @@ def build_model(
             pcol_head=pcol_head,
             scolw_head=scolw_head,
             regression_head=reg_head,
-            image_text_head=image_text_head,
             gpa=gpa,
             ordinal_head=ordinal_head,
         )
@@ -359,5 +329,4 @@ def build_model(
         pcol_head=pcol_head,
         scolw_head=scolw_head,
         regression_head=reg_head,
-        image_text_head=image_text_head,
     )

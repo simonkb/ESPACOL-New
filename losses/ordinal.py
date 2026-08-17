@@ -152,3 +152,33 @@ class TileConsistencyLoss(nn.Module):
         # detach pred: only GPA (tile_evidence) receives gradient from TCL
         diff = (tile_pred - pred.detach().unsqueeze(1)).abs()  # (N, T)
         return F.relu(diff - self.margin).pow(2).mean()
+
+
+class OrdinalPrototypeLoss(nn.Module):
+    """
+    Cross-entropy with ordinal distance penalty in the softmax denominator.
+
+    For each sample, |y - k| is added to class k's logit before the softmax.
+    Because |y - y| = 0 for the true class, the numerator is unchanged.
+    Only wrong classes are penalised — and farther grades contribute more to the
+    denominator, making the loss harder to minimise when the model assigns high
+    similarity to far-away grade prototypes.
+
+    This is the same denominator-penalty strategy used by PCOL and SCOLw
+    (r_{a,n} = |y_a - y_n| added to negative logits), applied here to the
+    cosine prototype classification loss.
+
+    label_smoothing is applied after the ordinal penalty, exactly as in the
+    original proto_CE cross-entropy.
+    """
+
+    def __init__(self, label_smoothing: float = 0.0):
+        super().__init__()
+        self.label_smoothing = label_smoothing
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        K = logits.shape[-1]
+        k_range = torch.arange(K, device=labels.device, dtype=logits.dtype)
+        ord_dist = (labels.float().unsqueeze(1) - k_range.unsqueeze(0)).abs()  # (N, K)
+        penalized = logits + ord_dist   # true class unchanged (dist = 0)
+        return F.cross_entropy(penalized, labels, label_smoothing=self.label_smoothing)

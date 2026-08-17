@@ -270,21 +270,10 @@ def main():
     )
 
     parser.add_argument(
-        "--use_image_text",
-        action="store_true",
-        help="Enable ESPAOCL image-text ordinal alignment loss",
-    )
-    parser.add_argument(
         "--gamma",
         type=float,
         default=None,
-        help="Weight for image-text ordinal loss",
-    )
-    parser.add_argument(
-        "--lambda_ord_it",
-        type=float,
-        default=None,
-        help="Ordinal penalty strength inside image-text loss",
+        help="(unused — kept for script compatibility)",
     )
     parser.add_argument(
         "--text_encoder_name",
@@ -428,15 +417,8 @@ def main():
         cfg.use_multi_tile = True
         cfg.tile_grid = args.tile_grid
 
-    if args.use_image_text:
-        cfg.use_image_text = True
-
     if args.gamma is not None:
         cfg.gamma = args.gamma
-        cfg.use_image_text = cfg.gamma > 0.0
-
-    if args.lambda_ord_it is not None:
-        cfg.lambda_ord_it = args.lambda_ord_it
 
     if args.text_encoder_name is not None:
         cfg.text_encoder_name = args.text_encoder_name
@@ -502,10 +484,7 @@ def main():
     set_seed(cfg.seed)
 
     log.info("=" * 70)
-    if cfg.use_image_text:
-        log.info("DR 10-fold CV  (EfficientNet-V2S + PCOL + SCOLw + ImageText)")
-    else:
-        log.info("DR 10-fold CV  (EfficientNet-V2S + PCOL + SCOLw)")
+    log.info("DR 10-fold CV  (EfficientNet-V2S + PCOL + SCOLw)")
     log.info("=" * 70)
     log.info(f"Config: {cfg}")
 
@@ -602,7 +581,6 @@ def main():
             pretrained=not args.no_pretrained,
             proj_hidden_dim=cfg.proj_hidden_dim,
             proj_out_dim=cfg.proj_out_dim,
-            use_image_text=cfg.use_image_text,
             use_multi_tile=cfg.use_multi_tile,
             grad_checkpoint=args.grad_checkpoint,
             tile_grid=cfg.tile_grid,

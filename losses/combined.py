@@ -6,30 +6,25 @@ Combined hybrid loss:
 Baseline:
     L_total = alpha * L_PCOL + beta * L_SCOLw + L_RMSE
 
-ESPAOCL extension:
-    L_total = alpha * L_PCOL + beta * L_SCOLw + gamma * L_IT + L_RMSE
-
-OPTIC extension (additive on top of ESPAOCL):
-    L_total = alpha * L_PCOL + beta * L_SCOLw + gamma * L_IT
+OPTIC extension:
+    L_total = alpha * L_PCOL + beta * L_SCOLw
             + L_ord                           [replaces L_RMSE when ordinal_probs provided]
             + lambda_osd * L_OSD              [optional]
             + lambda_tcl * L_TCL              [optional]
 
 OPTIC-C extension (concept prototype, alpha=0, beta=0):
-    L_total = lambda_proto_ce * L_proto_CE    [dominant — cosine prototype classification]
+    L_total = lambda_proto_ce * L_proto_CE    [dominant — CE + ordinal denominator penalty]
             + L_ord                           [CORAL ordinal regression]
             + lambda_concept_align * L_concept [prototype ↔ grade text alignment]
             + lambda_tile_concept * L_tile    [tile concept BCE vs clinical targets]
             + lambda_gpa * L_GPA             [GPA entropy regularization]
-            + gamma * L_IT                    [BiomedCLIP image-text alignment]
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .image_text import ImageTextOrdinalLoss
-from .ordinal import CoralOrdinalLoss, GradePrototypeCELoss, OrdinalStochasticDominanceLoss, TileConsistencyLoss
+from .ordinal import CoralOrdinalLoss, GradePrototypeCELoss, OrdinalPrototypeLoss, OrdinalStochasticDominanceLoss, TileConsistencyLoss
 from .pcol import PCOLLoss
 from .scolw import SCOLwLoss
 
@@ -40,10 +35,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         self,
         alpha: float = 1.0,
         beta: float = 1.0,
-        gamma: float = 0.0,
         temperature: float = 0.07,
-        use_image_text: bool = False,
-        lambda_ord_it: float = 1.0,
         # OPTIC loss components
         lambda_osd: float = 0.0,
         osd_margin: float = 0.0,
@@ -59,8 +51,6 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         super().__init__()
         self.alpha = alpha
         self.beta = beta
-        self.gamma = gamma
-        self.use_image_text = use_image_text
         self.lambda_osd = lambda_osd
         self.lambda_tcl = lambda_tcl
         self.lambda_gpa = lambda_gpa
@@ -71,15 +61,12 @@ class HybridContrastiveOrdinalLoss(nn.Module):
 
         self.pcol = PCOLLoss(temperature=temperature)
         self.scolw = SCOLwLoss(temperature=temperature)
-        self.image_text = ImageTextOrdinalLoss(
-            temperature=temperature,
-            lambda_ord=lambda_ord_it,
-        )
         self.coral = CoralOrdinalLoss()
 
         self.osd = OrdinalStochasticDominanceLoss(margin=osd_margin) if lambda_osd > 0 else None
         self.tcl = TileConsistencyLoss(margin=tcl_margin) if lambda_tcl > 0 else None
         self.gpa_ce = GradePrototypeCELoss() if lambda_gpa > 0 else None
+        self.proto_loss = OrdinalPrototypeLoss(label_smoothing=proto_label_smoothing)
 
     def forward(
         self,
@@ -88,8 +75,6 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         pred: torch.Tensor,
         labels: torch.Tensor,
         class_weights: torch.Tensor,
-        z_it: torch.Tensor | None = None,
-        text_prototypes: torch.Tensor | None = None,
         ordinal_logits: torch.Tensor | None = None,
         tile_evidence: torch.Tensor | None = None,
         # Pre-computed concept losses from OPTICConceptModel.forward
@@ -109,18 +94,6 @@ class HybridContrastiveOrdinalLoss(nn.Module):
             l_rmse = torch.sqrt(F.mse_loss(pred, labels.float()) + 1e-8)
             l_ord = torch.tensor(0.0, device=pred.device)
 
-        l_it = torch.tensor(0.0, device=pred.device)
-        if self.use_image_text and self.gamma > 0.0:
-            if z_it is None:
-                raise ValueError("z_it must be provided when use_image_text=True.")
-            if text_prototypes is None:
-                raise ValueError("text_prototypes must be provided when use_image_text=True.")
-            l_it = self.image_text(
-                image_embeddings=z_it,
-                labels=labels,
-                text_prototypes=text_prototypes,
-            )
-
         l_osd = torch.tensor(0.0, device=pred.device)
         if self.osd is not None and ordinal_logits is not None and self.lambda_osd > 0:
             l_osd = self.osd(ordinal_logits, labels)
@@ -136,7 +109,7 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         # OPTIC-C concept prototype losses (pre-computed by model, weighted here)
         l_proto_ce = torch.tensor(0.0, device=pred.device)
         if proto_logits is not None and self.lambda_proto_ce > 0:
-            l_proto_ce = F.cross_entropy(proto_logits, labels, label_smoothing=self.proto_label_smoothing)
+            l_proto_ce = self.proto_loss(proto_logits, labels)
 
         l_concept_align = torch.tensor(0.0, device=pred.device)
         if concept_align_loss is not None and self.lambda_concept_align > 0:
@@ -149,7 +122,6 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         total = (
             self.alpha * l_pcol
             + self.beta * l_scolw
-            + self.gamma * l_it
             + (l_ord if ordinal_logits is not None else l_rmse)
             + self.lambda_osd * l_osd
             + self.lambda_tcl * l_tcl
@@ -163,7 +135,6 @@ class HybridContrastiveOrdinalLoss(nn.Module):
             "loss_total": total.item(),
             "loss_pcol": l_pcol.item(),
             "loss_scolw": l_scolw.item(),
-            "loss_it": l_it.item(),
             "loss_rmse": l_rmse.item(),
             "loss_ord": l_ord.item(),
             "loss_osd": l_osd.item(),

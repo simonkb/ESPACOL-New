@@ -83,7 +83,7 @@ class Trainer:
 
         self.use_concept_prototype = getattr(cfg, "use_concept_prototype", False)
         self.text_encoder = None
-        if getattr(cfg, "use_image_text", False) or self.use_concept_prototype:
+        if self.use_concept_prototype:
             from configs.clinical_text import (
                 BUSI_CLASS_DESCRIPTIONS, DR_CLASS_DESCRIPTIONS,
                 DR_CONCEPTS, BUSI_CONCEPTS,
@@ -190,10 +190,7 @@ class Trainer:
         self.criterion = HybridContrastiveOrdinalLoss(
             alpha=cfg.alpha,
             beta=cfg.beta,
-            gamma=cfg.gamma,
             temperature=cfg.temperature,
-            use_image_text=getattr(cfg, "use_image_text", False),
-            lambda_ord_it=cfg.lambda_ord_it,
             lambda_osd=getattr(cfg, "lambda_osd", 0.0),
             osd_margin=getattr(cfg, "osd_margin", 0.0),
             lambda_tcl=getattr(cfg, "lambda_tcl", 0.0),
@@ -431,7 +428,6 @@ class Trainer:
         total_gpa = 0.0
         total_gpa_entropy = 0.0
         n_gpa_batches = 0
-        total_it = 0.0
         total_proto_ce = 0.0
         total_concept_align = 0.0
         total_tile_concept = 0.0
@@ -457,13 +453,11 @@ class Trainer:
             )
 
             with autocast(device_type=self.device.type, enabled=self.use_amp):
-                text_prototypes = None
+                grade_text_embeds = None
                 concept_embeds = None
-                if self.text_encoder is not None:
-                    if getattr(self.cfg, "use_image_text", False):
-                        text_prototypes = self.text_encoder()
-                    if self.use_concept_prototype:
-                        concept_embeds = self.text_encoder.get_concept_embeds()
+                if self.text_encoder is not None and self.use_concept_prototype:
+                    grade_text_embeds = self.text_encoder()
+                    concept_embeds = self.text_encoder.get_concept_embeds()
 
                 # OPTICConceptModel requires labels + concept embeddings at forward time
                 if self.use_concept_prototype:
@@ -471,7 +465,7 @@ class Trainer:
                         x,
                         labels=y,
                         concept_embeds=concept_embeds,
-                        grade_text_embeds=text_prototypes,
+                        grade_text_embeds=grade_text_embeds,
                     )
                 else:
                     out = self.model(x)
@@ -479,7 +473,6 @@ class Trainer:
                 if isinstance(out, dict):
                     z_pcol = out["z_pcol"]
                     z_scolw = out["z_scolw"]
-                    z_it = out.get("z_it", None)
                     pred = out["pred"]
                     ordinal_logits = out.get("ordinal_logits", None)
                     tile_evidence = out.get("tile_evidence", None)
@@ -487,13 +480,9 @@ class Trainer:
                     proto_logits = out.get("proto_logits", None)
                     concept_align_loss = out.get("concept_align_loss", None)
                     tile_concept_loss = out.get("tile_concept_loss", None)
-                elif len(out) == 5:
-                    _, z_pcol, z_scolw, z_it, pred = out
-                    ordinal_logits = tile_evidence = tile_weights = None
-                    proto_logits = concept_align_loss = tile_concept_loss = None
                 else:
                     z_pcol, z_scolw, pred = out
-                    z_it = ordinal_logits = tile_evidence = tile_weights = None
+                    ordinal_logits = tile_evidence = tile_weights = None
                     proto_logits = concept_align_loss = tile_concept_loss = None
 
                 loss, comps = self.criterion(
@@ -502,8 +491,6 @@ class Trainer:
                     pred=pred,
                     labels=y,
                     class_weights=batch_weights,
-                    z_it=z_it,
-                    text_prototypes=text_prototypes,
                     ordinal_logits=ordinal_logits,
                     tile_evidence=tile_evidence,
                     proto_logits=proto_logits,
@@ -548,7 +535,6 @@ class Trainer:
             total_osd += comps.get("loss_osd", 0.0)
             total_tcl += comps.get("loss_tcl", 0.0)
             total_gpa += comps.get("loss_gpa", 0.0)
-            total_it += comps.get("loss_it", 0.0)
             total_proto_ce += comps.get("loss_proto_ce", 0.0)
             total_concept_align += comps.get("loss_concept_align", 0.0)
             total_tile_concept += comps.get("loss_tile_concept", 0.0)
@@ -572,8 +558,6 @@ class Trainer:
             metrics["train_loss_gpa"] = total_gpa / nbatches
         if n_gpa_batches > 0:
             metrics["gpa_attn_entropy"] = total_gpa_entropy / n_gpa_batches
-        if self.text_encoder is not None and getattr(self.cfg, "use_image_text", False):
-            metrics["train_loss_it"] = total_it / nbatches
         if total_proto_ce > 0:
             metrics["train_loss_proto_ce"] = total_proto_ce / nbatches
         if total_concept_align > 0:
