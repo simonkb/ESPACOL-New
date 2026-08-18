@@ -141,6 +141,13 @@ class TrainConfig:
     # and prevents it from collapsing to near-zero on training data (overfitting).
     proto_label_smoothing: float = 0.0
 
+    # Switch to CosineAnnealingLR at the backbone unfreeze point instead of
+    # continuing with ReduceLROnPlateau. Deterministic decay from base LR to
+    # lr_min over the remaining (epochs - backbone_freeze_epochs) epochs.
+    # Eliminates the patience-based timing luck that causes some folds to miss
+    # their second LR drop when val_acc oscillates at the first reduced LR.
+    use_cosine_lr: bool = False
+
 
 @dataclass
 class BUSIConfig(TrainConfig):

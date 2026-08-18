@@ -10,7 +10,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from torch.amp import GradScaler, autocast
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
 from configs.config import TrainConfig
@@ -187,6 +187,13 @@ class Trainer:
             weight_decay=cfg.weight_decay,
         )
 
+        # Store each param group's initial LR so cosine annealing always starts
+        # from the correct base regardless of what ReduceLROnPlateau did during
+        # the frozen phase.
+        self._base_lrs = [group["lr"] for group in self.optimizer.param_groups]
+        self._use_cosine_lr = getattr(cfg, "use_cosine_lr", False)
+        self._using_cosine = False
+
         self.criterion = HybridContrastiveOrdinalLoss(
             alpha=cfg.alpha,
             beta=cfg.beta,
@@ -207,13 +214,27 @@ class Trainer:
         )
         logger.info(f"Class weights: {self.class_weights.tolist()}")
 
-        self.scheduler = ReduceLROnPlateau(
-            self.optimizer,
-            mode="min",
-            factor=cfg.lr_factor,
-            patience=cfg.lr_patience,
-            min_lr=cfg.lr_min,
-        )
+        freeze_epochs_init = getattr(cfg, "backbone_freeze_epochs", 0)
+        if self._use_cosine_lr and freeze_epochs_init == 0:
+            # No frozen phase — start cosine immediately over the full run.
+            self.scheduler = CosineAnnealingLR(
+                self.optimizer,
+                T_max=cfg.epochs,
+                eta_min=cfg.lr_min,
+            )
+            self._using_cosine = True
+            logger.info(
+                f"CosineAnnealingLR from epoch 1: T_max={cfg.epochs}, "
+                f"eta_min={cfg.lr_min:.1e}"
+            )
+        else:
+            self.scheduler = ReduceLROnPlateau(
+                self.optimizer,
+                mode="min",
+                factor=cfg.lr_factor,
+                patience=cfg.lr_patience,
+                min_lr=cfg.lr_min,
+            )
 
         self.early_stopping = EarlyStopping(
             patience=cfg.early_stop_patience,
@@ -282,16 +303,31 @@ class Trainer:
                     f"[Fold {self.fold}] Backbone unfrozen at epoch {epoch} "
                     f"— joint fine-tuning phase begins"
                 )
-                # Reset the LR scheduler so freeze-phase plateau history is discarded.
-                # ReduceLROnPlateau can't distinguish "val_loss flat because backbone
-                # frozen" from "val_loss flat because model plateaued". Resetting here
-                # means lr_patience counts only post-unfreeze epochs, which is correct.
-                self.scheduler.best = float("inf")
-                self.scheduler.num_bad_epochs = 0
-                logger.info(
-                    f"[Fold {self.fold}] LR scheduler reset at unfreeze — "
-                    f"patience counter starts fresh"
-                )
+                if self._use_cosine_lr:
+                    # Reset all param group LRs to their original base values so the
+                    # cosine decay starts from the intended peak regardless of any
+                    # ReduceLROnPlateau drops that may have occurred during the frozen phase.
+                    for group, base_lr in zip(self.optimizer.param_groups, self._base_lrs):
+                        group["lr"] = base_lr
+                    remaining = self.cfg.epochs - freeze_epochs
+                    self.scheduler = CosineAnnealingLR(
+                        self.optimizer,
+                        T_max=remaining,
+                        eta_min=self.cfg.lr_min,
+                    )
+                    self._using_cosine = True
+                    logger.info(
+                        f"[Fold {self.fold}] Switched to CosineAnnealingLR at unfreeze: "
+                        f"T_max={remaining} epochs  eta_min={self.cfg.lr_min:.1e}"
+                    )
+                else:
+                    # Reset ReduceLROnPlateau so freeze-phase plateau history is discarded.
+                    self.scheduler.best = float("inf")
+                    self.scheduler.num_bad_epochs = 0
+                    logger.info(
+                        f"[Fold {self.fold}] LR scheduler reset at unfreeze — "
+                        f"patience counter starts fresh"
+                    )
 
             self._maybe_enable_text_finetune(epoch)
 
@@ -352,7 +388,10 @@ class Trainer:
                 if os.path.exists(prev_ckpt) and prev_ckpt != best_ckpt_path:
                     os.remove(prev_ckpt)
 
-            self.scheduler.step(val_loss)
+            if self._using_cosine:
+                self.scheduler.step()
+            else:
+                self.scheduler.step(val_loss)
 
             if self.early_stopping.step(val_acc):
                 logger.info(

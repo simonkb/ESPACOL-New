@@ -400,6 +400,13 @@ def main():
         default=None,
         help="AdamW weight decay (default: 1e-6). Increase to 1e-5 when backbone LR is higher.",
     )
+    parser.add_argument(
+        "--use_cosine_lr",
+        action="store_true",
+        default=False,
+        help="Switch to CosineAnnealingLR at backbone unfreeze instead of continuing with "
+             "ReduceLROnPlateau. Eliminates LR-drop timing luck across folds.",
+    )
 
     args = parser.parse_args()
 
@@ -477,6 +484,8 @@ def main():
         cfg.proto_label_smoothing = args.proto_label_smoothing
     if args.weight_decay is not None:
         cfg.weight_decay = args.weight_decay
+    if args.use_cosine_lr:
+        cfg.use_cosine_lr = True
 
     setup_logging(args.run_dir)
     log = logging.getLogger("train_dr")
