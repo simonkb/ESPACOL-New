@@ -1,14 +1,15 @@
 #!/bin/bash
-#SBATCH --job-name=optic_concept_cv_v6
+#SBATCH --job-name=optic_v6_cv
 #SBATCH --partition=gpu
+#SBATCH --array=0-9
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --mem=220G
-#SBATCH --time=10-00:00:00
-#SBATCH --output=/dpc/kuin0170/ESPACOL-New/slurm_logs/optic_concept_cv_v6_%j.out
-#SBATCH --error=/dpc/kuin0170/ESPACOL-New/slurm_logs/optic_concept_cv_v6_%j.err
+#SBATCH --time=2-00:00:00
+#SBATCH --output=/dpc/kuin0170/ESPACOL-New/slurm_logs/optic_v6_cv_%a_%j.out
+#SBATCH --error=/dpc/kuin0170/ESPACOL-New/slurm_logs/optic_v6_cv_%a_%j.err
 #SBATCH --account=kuin0170
 
 mkdir -p /dpc/kuin0170/ESPACOL-New/slurm_logs
@@ -23,32 +24,21 @@ cd /dpc/kuin0170/ESPACOL-New
 export HF_HUB_OFFLINE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# OPTIC-C v6 — full 10-fold CV
+# OPTIC-C v6 — full 10-fold CV (SLURM array job, folds 0-9)
 #
 # Changes vs v5:
-#
-#   1. CosineAnnealingLR replaces ReduceLROnPlateau after backbone unfreeze.
-#      At epoch 26 (unfreeze), LRs reset to their base values (backbone=2e-4,
-#      optic_new=5e-4) and a cosine schedule decays them to lr_min=1e-6 over
-#      the remaining 75 epochs. This is deterministic — every fold gets the
-#      same LR trajectory regardless of how noisy its validation accuracy is.
-#
-#      In v4, 4 of 9 folds (2, 5, 7, 9) never received their second LR drop
-#      within 100 epochs because val_acc oscillations kept resetting the
-#      lr_patience=15 counter. Those folds plateaued at lr=4e-5 and scored
-#      77-80% vs 83-85% for folds that did get a second drop. Cosine removes
-#      this timing dependency entirely.
-#
-#      ReduceLROnPlateau is still used during the frozen phase (epochs 1-25)
-#      as a safety net, but in practice never triggers (25 < patience=15+
-#      sufficient improvement epochs).
-#
-#   2. All other hyperparameters identical to v5 (ordinal CE penalty, concept
-#      alignment active, image-text head removed).
+#   - CosineAnnealingLR replaces ReduceLROnPlateau after backbone unfreeze.
+#     At epoch 26, LRs reset to base (backbone=2e-4, optic_new=5e-4) and
+#     decay deterministically to lr_min=1e-6 over the remaining 75 epochs.
+#     In v4, folds 2/5/7/9 stayed at lr=4e-5 for all 100 epochs because
+#     val_acc oscillations reset the patience counter — those folds scored
+#     77-80% vs 83-85% for folds that got a second LR drop. Cosine gives
+#     every fold the same LR trajectory regardless of validation noise.
+#   - All other hyperparameters identical to v5.
 python train_dr.py \
     --dr_root Datasets/DR \
     --run_dir runs/optic_concept_cv_v6 \
-    --folds all \
+    --folds ${SLURM_ARRAY_TASK_ID} \
     --use_multi_tile \
     --tile_grid 3 \
     --batch_size 24 \
