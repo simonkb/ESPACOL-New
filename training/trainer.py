@@ -329,6 +329,19 @@ class Trainer:
                         f"patience counter starts fresh"
                     )
 
+                # Reset early stopping at unfreeze. The frozen-phase best val_acc
+                # is not a meaningful baseline for the joint fine-tuning phase —
+                # a lucky frozen-phase spike would otherwise consume patience
+                # through the post-unfreeze disruption period before the model
+                # has had any real chance to converge.
+                self.early_stopping.best = -float("inf")
+                self.early_stopping.counter = 0
+                self.early_stopping.stop = False
+                logger.info(
+                    f"[Fold {self.fold}] Early stopping reset at unfreeze — "
+                    f"patience counter starts fresh"
+                )
+
             self._maybe_enable_text_finetune(epoch)
 
             train_metrics = self._train_epoch(epoch)
