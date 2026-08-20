@@ -321,12 +321,19 @@ class Trainer:
                         f"T_max={remaining} epochs  eta_min={self.cfg.lr_min:.1e}"
                     )
                 else:
-                    # Reset ReduceLROnPlateau so freeze-phase plateau history is discarded.
+                    # Restore LR to base values. Frozen-phase val_loss oscillations
+                    # may have triggered one or more ReduceLROnPlateau drops before
+                    # the backbone ever trained, leaving the optimizer at a depleted
+                    # LR at the start of joint fine-tuning. Same logic as the cosine
+                    # branch above (lines that write group["lr"] = base_lr).
+                    for group, base_lr in zip(self.optimizer.param_groups, self._base_lrs):
+                        group["lr"] = base_lr
+                    # Reset plateau history so the scheduler starts fresh.
                     self.scheduler.best = float("inf")
                     self.scheduler.num_bad_epochs = 0
                     logger.info(
                         f"[Fold {self.fold}] LR scheduler reset at unfreeze — "
-                        f"patience counter starts fresh"
+                        f"LRs restored to base {self._base_lrs}, patience counter starts fresh"
                     )
 
                 # Reset early stopping at unfreeze. The frozen-phase best val_acc
