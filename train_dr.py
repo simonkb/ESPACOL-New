@@ -46,7 +46,17 @@ def set_seed(seed: int) -> None:
 
 
 def setup_logging(run_dir: str) -> None:
-    os.makedirs(run_dir, exist_ok=True)
+    # Retry loop guards against NFS race condition: on shared cluster filesystems
+    # exist_ok=True can still raise FileExistsError when multiple fold processes
+    # race to create the same parent directory simultaneously.
+    for _attempt in range(10):
+        try:
+            os.makedirs(run_dir, exist_ok=True)
+            break
+        except FileExistsError:
+            if os.path.isdir(run_dir):
+                break
+            import time; time.sleep(0.5 * (_attempt + 1))
 
     fmt = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
     handlers = [

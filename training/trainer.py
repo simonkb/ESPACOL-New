@@ -321,19 +321,22 @@ class Trainer:
                         f"T_max={remaining} epochs  eta_min={self.cfg.lr_min:.1e}"
                     )
                 else:
-                    # Restore LR to base values. Frozen-phase val_loss oscillations
-                    # may have triggered one or more ReduceLROnPlateau drops before
-                    # the backbone ever trained, leaving the optimizer at a depleted
-                    # LR at the start of joint fine-tuning. Same logic as the cosine
-                    # branch above (lines that write group["lr"] = base_lr).
+                    # Restore LR to lr_factor * base (one step below base). Restoring
+                    # to the full base (2e-4) is too aggressive for a pretrained backbone
+                    # on its first gradient update — v8 showed this causes 77-79% across
+                    # all folds. The first frozen-phase drop would have landed here anyway;
+                    # restoring to this level gives all folds the same consistent starting
+                    # conditions as v4's best fold (fold 8, 85.04%), which entered
+                    # fine-tuning at 4e-5 after one frozen-phase drop.
                     for group, base_lr in zip(self.optimizer.param_groups, self._base_lrs):
-                        group["lr"] = base_lr
+                        group["lr"] = max(base_lr * self.cfg.lr_factor, self.cfg.lr_min)
                     # Reset plateau history so the scheduler starts fresh.
                     self.scheduler.best = float("inf")
                     self.scheduler.num_bad_epochs = 0
+                    restored = [max(lr * self.cfg.lr_factor, self.cfg.lr_min) for lr in self._base_lrs]
                     logger.info(
                         f"[Fold {self.fold}] LR scheduler reset at unfreeze — "
-                        f"LRs restored to base {self._base_lrs}, patience counter starts fresh"
+                        f"LRs restored to {restored}, patience counter starts fresh"
                     )
 
                 # Reset early stopping at unfreeze. The frozen-phase best val_acc
