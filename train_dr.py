@@ -224,6 +224,13 @@ def main():
              "Use 15 when training new randomly-initialised components alongside a pretrained backbone.",
     )
     parser.add_argument(
+        "--lr_min",
+        type=float,
+        default=None,
+        help="Minimum LR floor for ReduceLROnPlateau (default from DRConfig=1e-6). "
+             "Set to 8e-6 to cap at one fine-tuning drop (4e-5 → 8e-6) and prevent dead-LR cascades.",
+    )
+    parser.add_argument(
         "--new_component_lr_mult",
         type=float,
         default=None,
@@ -463,6 +470,8 @@ def main():
         cfg.resume = True
     if args.lr_patience is not None:
         cfg.lr_patience = args.lr_patience
+    if args.lr_min is not None:
+        cfg.lr_min = args.lr_min
     if args.new_component_lr_mult is not None:
         cfg.new_component_lr_mult = args.new_component_lr_mult
     if args.lambda_gpa is not None:
