@@ -62,7 +62,6 @@ python train_dr.py \
     --lambda_tcl 0 \
     --lambda_gpa 0.1 \
     --lambda_proto_ce 1.0 \
-    --lambda_concept_align 0.5 \
     --lambda_tile_concept 0.5 \
     --proto_temperature 0.15 \
     --proto_label_smoothing 0.07 \

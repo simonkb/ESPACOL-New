@@ -1,10 +1,9 @@
 """
 ConceptGradePrototypeModule: grade prototypes in concept space.
 
-Provides three novel contributions:
+Provides two novel contributions:
   1. L_proto_CE  — cosine prototype matching with label supervision (dominant signal)
-  2. L_concept   — aligns grade prototypes with clinical grade text embeddings
-  3. L_tile      — supervises per-tile concept scores against grade-concept targets
+  2. L_tile      — supervises per-tile concept scores against grade-concept targets
 
 Dual explainability outputs (spatial heatmap done by GPA; this adds concept axis):
   tile_concept_scores (N, T, C) — per-tile concept presence probability
@@ -74,20 +73,17 @@ class ConceptGradePrototypeModule(nn.Module):
         image_features: torch.Tensor,
         raw_tile_features: torch.Tensor,
         concept_embeds: torch.Tensor | None,
-        grade_text_embeds: torch.Tensor | None,
         labels: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """
         Args:
             image_features:   (N, feat_dim)   — aggregated image representation
             raw_tile_features:(N, T, feat_dim) — per-tile backbone features
             concept_embeds:   (C, proj_dim)   — concept text embeddings (frozen BiomedCLIP)
-            grade_text_embeds:(K, proj_dim)   — grade text embeddings (from ClinicalTextEncoder)
             labels:           (N,) long        — ground truth grade indices
 
         Returns:
             proto_logits:       (N, K)   — cosine prototype similarity / temperature
-            concept_align_loss: scalar   — prototype-to-grade-text alignment (None if no text embeds)
             tile_concept_scores:(N, T, C) — per-tile per-concept cosine similarity (None if no concept embeds)
             tile_concept_loss:  scalar   — BCE tile concept vs clinical targets (None if no concept embeds)
         """
@@ -96,15 +92,7 @@ class ConceptGradePrototypeModule(nn.Module):
         proto_norm = F.normalize(self.grade_prototypes, dim=-1)   # (K, D)
         proto_logits = torch.matmul(img_norm, proto_norm.T) / self.temperature  # (N, K)
 
-        # --- 2. Concept alignment loss: prototypes ↔ grade text embeddings ---
-        concept_align_loss = None
-        if grade_text_embeds is not None:
-            proj_protos = F.normalize(self.concept_projection(self.grade_prototypes), dim=-1)  # (K, proj_dim)
-            # Each grade prototype should match its grade text embedding
-            cosine_align = (proj_protos * grade_text_embeds).sum(dim=-1)   # (K,)
-            concept_align_loss = (1.0 - cosine_align).mean()
-
-        # --- 3. Tile concept scores + loss ---
+        # --- 2. Tile concept scores + loss ---
         tile_concept_scores = None
         tile_concept_loss = None
         if concept_embeds is not None:
@@ -124,4 +112,4 @@ class ConceptGradePrototypeModule(nn.Module):
             targets = self.grade_concept_targets[labels]               # (N, C)
             tile_concept_loss = F.binary_cross_entropy_with_logits(mean_logits, targets)
 
-        return proto_logits, concept_align_loss, tile_concept_scores, tile_concept_loss
+        return proto_logits, tile_concept_scores, tile_concept_loss

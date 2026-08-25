@@ -15,7 +15,6 @@ OPTIC extension:
 OPTIC-C extension (concept prototype, alpha=0, beta=0):
     L_total = lambda_proto_ce * L_proto_CE    [dominant — CE + ordinal denominator penalty]
             + L_ord                           [CORAL ordinal regression]
-            + lambda_concept_align * L_concept [prototype ↔ grade text alignment]
             + lambda_tile_concept * L_tile    [tile concept BCE vs clinical targets]
             + lambda_gpa * L_GPA             [GPA entropy regularization]
 """
@@ -44,7 +43,6 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         lambda_gpa: float = 0.0,
         # OPTIC-C concept prototype losses (pre-computed by model.forward)
         lambda_proto_ce: float = 0.0,
-        lambda_concept_align: float = 0.0,
         lambda_tile_concept: float = 0.0,
         proto_label_smoothing: float = 0.0,
     ):
@@ -56,7 +54,6 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         self.lambda_gpa = lambda_gpa
         self.lambda_proto_ce = lambda_proto_ce
         self.proto_label_smoothing = proto_label_smoothing
-        self.lambda_concept_align = lambda_concept_align
         self.lambda_tile_concept = lambda_tile_concept
 
         self.pcol = PCOLLoss(temperature=temperature)
@@ -79,7 +76,6 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         tile_evidence: torch.Tensor | None = None,
         # Pre-computed concept losses from OPTICConceptModel.forward
         proto_logits: torch.Tensor | None = None,
-        concept_align_loss: torch.Tensor | None = None,
         tile_concept_loss: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
 
@@ -111,10 +107,6 @@ class HybridContrastiveOrdinalLoss(nn.Module):
         if proto_logits is not None and self.lambda_proto_ce > 0:
             l_proto_ce = self.proto_loss(proto_logits, labels)
 
-        l_concept_align = torch.tensor(0.0, device=pred.device)
-        if concept_align_loss is not None and self.lambda_concept_align > 0:
-            l_concept_align = concept_align_loss
-
         l_tile_concept = torch.tensor(0.0, device=pred.device)
         if tile_concept_loss is not None and self.lambda_tile_concept > 0:
             l_tile_concept = tile_concept_loss
@@ -127,7 +119,6 @@ class HybridContrastiveOrdinalLoss(nn.Module):
             + self.lambda_tcl * l_tcl
             + self.lambda_gpa * l_gpa
             + self.lambda_proto_ce * l_proto_ce
-            + self.lambda_concept_align * l_concept_align
             + self.lambda_tile_concept * l_tile_concept
         )
 
@@ -141,7 +132,6 @@ class HybridContrastiveOrdinalLoss(nn.Module):
             "loss_tcl": l_tcl.item(),
             "loss_gpa": l_gpa.item(),
             "loss_proto_ce": l_proto_ce.item(),
-            "loss_concept_align": l_concept_align.item(),
             "loss_tile_concept": l_tile_concept.item(),
         }
 

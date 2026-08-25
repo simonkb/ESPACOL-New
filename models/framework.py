@@ -148,13 +148,11 @@ class OPTICConceptModel(OPTICModel):
     Adds ConceptGradePrototypeModule on top of OPTICModel.
     Novel losses dominate (~98% of gradient signal):
       - L_proto_CE:     cosine prototype CrossEntropy (image ↔ grade prototypes)
-      - L_concept:      prototype ↔ grade text alignment
       - L_tile_concept: per-tile concept BCE vs clinical grade-concept targets
     SCOLw and PCOL are disabled (alpha=0, beta=0).
 
     Additional forward() keys:
         proto_logits        (N, K)     — cosine prototype similarity / temperature
-        concept_align_loss  scalar     — prototype-text alignment loss (pre-computed)
         tile_concept_scores (N, T, C)  — per-tile concept probabilities (explainability)
         tile_concept_loss   scalar     — tile concept BCE loss (pre-computed)
         raw_tile_features   (N, T, D)  — raw backbone tile features for debugging
@@ -185,7 +183,6 @@ class OPTICConceptModel(OPTICModel):
         x: torch.Tensor,
         labels: torch.Tensor | None = None,
         concept_embeds: torch.Tensor | None = None,
-        grade_text_embeds: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | None]:
         tile_evidence = tile_weights = grade_features = None
 
@@ -206,14 +203,13 @@ class OPTICConceptModel(OPTICModel):
             pred = self.regression_head(features)
 
         # Concept prototype forward — losses pre-computed here
-        proto_logits = concept_align_loss = tile_concept_scores = tile_concept_loss = None
+        proto_logits = tile_concept_scores = tile_concept_loss = None
         if labels is not None:
-            proto_logits, concept_align_loss, tile_concept_scores, tile_concept_loss = (
+            proto_logits, tile_concept_scores, tile_concept_loss = (
                 self.concept_module(
                     image_features=features,
                     raw_tile_features=raw_tile_features,
                     concept_embeds=concept_embeds,
-                    grade_text_embeds=grade_text_embeds,
                     labels=labels,
                 )
             )
@@ -230,7 +226,6 @@ class OPTICConceptModel(OPTICModel):
             "raw_tile_features": raw_tile_features,
             # Concept outputs
             "proto_logits": proto_logits,
-            "concept_align_loss": concept_align_loss,
             "tile_concept_scores": tile_concept_scores,
             "tile_concept_loss": tile_concept_loss,
         }

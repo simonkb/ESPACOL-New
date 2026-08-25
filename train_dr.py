@@ -384,13 +384,6 @@ def main():
              "Recommended: 1.5",
     )
     parser.add_argument(
-        "--lambda_concept_align",
-        type=float,
-        default=None,
-        help="Weight for L_concept_align — grade prototype ↔ grade text cosine alignment. "
-             "Recommended: 0.5",
-    )
-    parser.add_argument(
         "--lambda_tile_concept",
         type=float,
         default=None,
@@ -493,8 +486,6 @@ def main():
         cfg.use_concept_prototype = True
     if args.lambda_proto_ce is not None:
         cfg.lambda_proto_ce = args.lambda_proto_ce
-    if args.lambda_concept_align is not None:
-        cfg.lambda_concept_align = args.lambda_concept_align
     if args.lambda_tile_concept is not None:
         cfg.lambda_tile_concept = args.lambda_tile_concept
     if args.proto_temperature is not None:

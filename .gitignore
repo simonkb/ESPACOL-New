@@ -24,3 +24,8 @@ analysis/training_curves.ipynb
 *.zip.*
 /slurm_logs_v2/
 /Datasets/DR/train_cache_tiles_1200/
+.claude/plan_paper_completion.md
+/paper/
+/Datasets/DR/train_cache_bengham_tiles_900/
+/Datasets/BUSI/cache_tiles_900/
+Optic_Arch_Optic_Arch.jpg

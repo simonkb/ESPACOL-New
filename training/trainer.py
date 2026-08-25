@@ -204,7 +204,6 @@ class Trainer:
             tcl_margin=getattr(cfg, "tcl_margin", 0.0),
             lambda_gpa=getattr(cfg, "lambda_gpa", 0.0),
             lambda_proto_ce=getattr(cfg, "lambda_proto_ce", 0.0),
-            lambda_concept_align=getattr(cfg, "lambda_concept_align", 0.0),
             lambda_tile_concept=getattr(cfg, "lambda_tile_concept", 0.0),
             proto_label_smoothing=getattr(cfg, "proto_label_smoothing", 0.0),
         )
@@ -491,7 +490,6 @@ class Trainer:
         total_gpa_entropy = 0.0
         n_gpa_batches = 0
         total_proto_ce = 0.0
-        total_concept_align = 0.0
         total_tile_concept = 0.0
         total_gn_backbone = 0.0
         total_gn_ctot = 0.0
@@ -515,10 +513,8 @@ class Trainer:
             )
 
             with autocast(device_type=self.device.type, enabled=self.use_amp):
-                grade_text_embeds = None
                 concept_embeds = None
                 if self.text_encoder is not None and self.use_concept_prototype:
-                    grade_text_embeds = self.text_encoder()
                     concept_embeds = self.text_encoder.get_concept_embeds()
 
                 # OPTICConceptModel requires labels + concept embeddings at forward time
@@ -527,7 +523,6 @@ class Trainer:
                         x,
                         labels=y,
                         concept_embeds=concept_embeds,
-                        grade_text_embeds=grade_text_embeds,
                     )
                 else:
                     out = self.model(x)
@@ -540,12 +535,11 @@ class Trainer:
                     tile_evidence = out.get("tile_evidence", None)
                     tile_weights = out.get("tile_weights", None)
                     proto_logits = out.get("proto_logits", None)
-                    concept_align_loss = out.get("concept_align_loss", None)
                     tile_concept_loss = out.get("tile_concept_loss", None)
                 else:
                     z_pcol, z_scolw, pred = out
                     ordinal_logits = tile_evidence = tile_weights = None
-                    proto_logits = concept_align_loss = tile_concept_loss = None
+                    proto_logits = tile_concept_loss = None
 
                 loss, comps = self.criterion(
                     z_pcol=z_pcol,
@@ -556,7 +550,6 @@ class Trainer:
                     ordinal_logits=ordinal_logits,
                     tile_evidence=tile_evidence,
                     proto_logits=proto_logits,
-                    concept_align_loss=concept_align_loss,
                     tile_concept_loss=tile_concept_loss,
                 )
 
@@ -598,7 +591,6 @@ class Trainer:
             total_tcl += comps.get("loss_tcl", 0.0)
             total_gpa += comps.get("loss_gpa", 0.0)
             total_proto_ce += comps.get("loss_proto_ce", 0.0)
-            total_concept_align += comps.get("loss_concept_align", 0.0)
             total_tile_concept += comps.get("loss_tile_concept", 0.0)
             n_batches += 1
 
@@ -622,8 +614,6 @@ class Trainer:
             metrics["gpa_attn_entropy"] = total_gpa_entropy / n_gpa_batches
         if total_proto_ce > 0:
             metrics["train_loss_proto_ce"] = total_proto_ce / nbatches
-        if total_concept_align > 0:
-            metrics["train_loss_concept_align"] = total_concept_align / nbatches
         if total_tile_concept > 0:
             metrics["train_loss_tile_concept"] = total_tile_concept / nbatches
 
@@ -721,8 +711,6 @@ class Trainer:
             extra += f" it={train['train_loss_it']:.3f}"
         if "train_loss_proto_ce" in train:
             extra += f" proto_ce={train['train_loss_proto_ce']:.3f}"
-        if "train_loss_concept_align" in train:
-            extra += f" ca={train['train_loss_concept_align']:.3f}"
         if "train_loss_tile_concept" in train:
             extra += f" tc={train['train_loss_tile_concept']:.3f}"
 

@@ -125,9 +125,6 @@ class TrainConfig:
     # L_proto_CE: cosine prototype CrossEntropy — dominant novel loss
     lambda_proto_ce: float = 0.0
 
-    # L_concept_align: grade prototype ↔ grade text embedding cosine alignment
-    lambda_concept_align: float = 0.0
-
     # L_tile_concept: per-tile concept BCE vs clinical grade-concept soft targets
     lambda_tile_concept: float = 0.0
 
