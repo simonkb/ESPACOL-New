@@ -219,3 +219,45 @@ class DRCrossValidator:
             train_items_raw, self.val_fraction, seed=self.seed + fold_idx
         )
         return train_items, val_items, test_items
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# APTOS cross-validator
+# ─────────────────────────────────────────────────────────────────────────────
+
+class APTOSCrossValidator:
+    """
+    5-fold stratified cross-validation for APTOS 2019.
+
+    3,662 images; one patient per image; stratified by DR grade.
+    Same image-level stratified k-fold as BUSI and IDRiD.
+    """
+
+    def __init__(
+        self,
+        all_items: List[Item],
+        n_folds: int = 5,
+        val_fraction: float = 0.1,
+        seed: int = 42,
+    ):
+        self.all_items = all_items
+        self.n_folds = n_folds
+        self.val_fraction = val_fraction
+        self.seed = seed
+        self._folds = _stratified_kfold(all_items, n_folds, seed)
+
+    def __len__(self) -> int:
+        return self.n_folds
+
+    def get_fold(self, fold_idx: int) -> Tuple[List[Item], List[Item], List[Item]]:
+        """Return (train_items, val_items, test_items) for fold *fold_idx*."""
+        test_items = self._folds[fold_idx]
+        train_items_raw = []
+        for i, fold in enumerate(self._folds):
+            if i != fold_idx:
+                train_items_raw.extend(fold)
+
+        train_items, val_items = _split_train_val(
+            train_items_raw, self.val_fraction, seed=self.seed + fold_idx
+        )
+        return train_items, val_items, test_items
