@@ -31,8 +31,9 @@ from Datasets.dataloaders import (
     build_tile_transform,
     preload_dr_images,
 )
+from Datasets.idrid_loader import load_all_idrid_items
 from models.framework import build_model
-from training.cross_val import DRCrossValidator
+from training.cross_val import DRCrossValidator, IDRiDCrossValidator
 from training.trainer import Trainer
 
 
@@ -170,19 +171,26 @@ def make_loaders(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train DR 10-fold CV")
+    parser = argparse.ArgumentParser(description="Train DR/IDRiD CV")
 
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="dr",
+        choices=["dr", "idrid"],
+        help="Dataset to train on: 'dr' (Kaggle DR, 10-fold) or 'idrid' (IDRiD, 5-fold)",
+    )
     parser.add_argument(
         "--dr_root",
         type=str,
         default="Datasets/DR",
-        help="Path to DR dataset root containing train/ and trainLabels.csv",
+        help="Path to DR or IDRiD dataset root",
     )
     parser.add_argument(
         "--train_csv",
         type=str,
         default=None,
-        help="Path to training label CSV. Default: <dr_root>/trainLabels.csv",
+        help="(DR only) Path to training label CSV. Default: <dr_root>/trainLabels.csv",
     )
     parser.add_argument(
         "--run_dir",
@@ -502,25 +510,37 @@ def main():
 
     set_seed(cfg.seed)
 
+    dataset_name = args.dataset.upper()
     log.info("=" * 70)
-    log.info("DR 10-fold CV  (EfficientNet-V2S + PCOL + SCOLw)")
+    log.info(f"{dataset_name} CV  (EfficientNet-V2S + OPTIC-C)")
     log.info("=" * 70)
     log.info(f"Config: {cfg}")
 
-    all_items = load_all_dr_items(args.dr_root, args.train_csv)
-    log.info(f"Total DR training images: {len(all_items)}")
-
     from collections import Counter
 
-    dist = Counter(y for _, y in all_items)
-    log.info(f"Class distribution: {dict(sorted(dist.items()))}")
-
-    cv = DRCrossValidator(
-        all_items,
-        n_folds=cfg.n_folds,
-        val_fraction=cfg.val_fraction,
-        seed=cfg.seed,
-    )
+    if args.dataset == "idrid":
+        all_items = load_all_idrid_items(args.dr_root)
+        cfg.n_folds = 5
+        log.info(f"Total IDRiD images: {len(all_items)}")
+        dist = Counter(y for _, y in all_items)
+        log.info(f"Class distribution: {dict(sorted(dist.items()))}")
+        cv = IDRiDCrossValidator(
+            all_items,
+            n_folds=cfg.n_folds,
+            val_fraction=cfg.val_fraction,
+            seed=cfg.seed,
+        )
+    else:
+        all_items = load_all_dr_items(args.dr_root, args.train_csv)
+        log.info(f"Total DR training images: {len(all_items)}")
+        dist = Counter(y for _, y in all_items)
+        log.info(f"Class distribution: {dict(sorted(dist.items()))}")
+        cv = DRCrossValidator(
+            all_items,
+            n_folds=cfg.n_folds,
+            val_fraction=cfg.val_fraction,
+            seed=cfg.seed,
+        )
 
     if args.folds == "all":
         fold_indices = list(range(cfg.n_folds))
@@ -538,8 +558,10 @@ def main():
     if not args.no_cache:
         n_threads = 16
 
-        # Auto-derive tile-specific cache dir when using default path
-        if cfg.use_multi_tile and args.cache_dir == "Datasets/DR/train_cache":
+        if args.dataset == "idrid":
+            # IDRiD is small (516 images) — RAM cache only, no disk persistence needed
+            cache_dir = None
+        elif cfg.use_multi_tile and args.cache_dir == "Datasets/DR/train_cache":
             canvas_size = cfg.tile_grid * cfg.img_size
             cache_dir = f"Datasets/DR/train_cache_tiles_{canvas_size}"
         else:
@@ -548,7 +570,7 @@ def main():
         preload_img_size = cfg.tile_grid * cfg.img_size if cfg.use_multi_tile else cfg.img_size
 
         log.info(
-            f"Pre-loading DR images ({n_threads} threads, size={preload_img_size}) "
+            f"Pre-loading images ({n_threads} threads, size={preload_img_size}) "
             f"{'(disk cache: ' + cache_dir + ')' if cache_dir else '(no disk cache)'}"
         )
 

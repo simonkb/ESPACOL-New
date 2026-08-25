@@ -3,11 +3,12 @@ from __future__ import annotations
 """
 Subject-independent cross-validation utilities.
 
-BUSI: 5-fold stratified CV on image level (no explicit patient IDs).
-DR:   10-fold subject-independent CV; left and right eyes of the same patient
-      are kept in the same fold (patient ID extracted from filename stem).
+BUSI:  5-fold stratified CV on image level (no explicit patient IDs).
+DR:    10-fold subject-independent CV; left and right eyes of the same patient
+       are kept in the same fold (patient ID extracted from filename stem).
+IDRiD: 5-fold stratified CV on image level (one patient per image).
 
-Both validators return fold splits as lists of (path, label) tuples,
+All validators return fold splits as lists of (path, label) tuples,
 ready for use with ImageLabelDataset.
 """
 
@@ -203,6 +204,48 @@ class DRCrossValidator:
         self._folds = _patient_stratified_kfold(
             all_items, n_folds, _dr_patient_id, seed
         )
+
+    def __len__(self) -> int:
+        return self.n_folds
+
+    def get_fold(self, fold_idx: int) -> Tuple[List[Item], List[Item], List[Item]]:
+        """Return (train_items, val_items, test_items) for fold *fold_idx*."""
+        test_items = self._folds[fold_idx]
+        train_items_raw = []
+        for i, fold in enumerate(self._folds):
+            if i != fold_idx:
+                train_items_raw.extend(fold)
+
+        train_items, val_items = _split_train_val(
+            train_items_raw, self.val_fraction, seed=self.seed + fold_idx
+        )
+        return train_items, val_items, test_items
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IDRiD cross-validator
+# ─────────────────────────────────────────────────────────────────────────────
+
+class IDRiDCrossValidator:
+    """
+    5-fold stratified cross-validation for IDRiD disease grading.
+
+    IDRiD has one image per patient, so plain image-level stratified k-fold
+    is equivalent to subject-independent CV.
+    """
+
+    def __init__(
+        self,
+        all_items: List[Item],
+        n_folds: int = 5,
+        val_fraction: float = 0.1,
+        seed: int = 42,
+    ):
+        self.all_items = all_items
+        self.n_folds = n_folds
+        self.val_fraction = val_fraction
+        self.seed = seed
+        self._folds = _stratified_kfold(all_items, n_folds, seed)
 
     def __len__(self) -> int:
         return self.n_folds
