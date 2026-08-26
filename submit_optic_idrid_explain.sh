@@ -21,6 +21,7 @@ source activate G
 cd /dpc/kuin0170/ESPACOL-New
 
 export HF_HUB_OFFLINE=1
+export PYTHONPATH=/dpc/kuin0170/ESPACOL-New:${PYTHONPATH}
 
 # Zero-shot explainability: DR-trained model (v9 best fold) on all 81 IDRiD
 # segmentation images. The model never saw any IDRiD data, so no leakage
