@@ -147,6 +147,8 @@ def main():
     parser.add_argument("--cache_dir", type=str, default=None,
                         help="Directory for pre-decoded .pt image cache")
 
+    parser.add_argument("--lr", type=float, default=None,
+                        help="Override base learning rate (default: BUSIConfig.lr=5e-4)")
     parser.add_argument("--alpha", type=float, default=None,
                         help="Weight for PCOL loss. Set 0 to disable.")
     parser.add_argument("--beta", type=float, default=None,
@@ -206,6 +208,8 @@ def main():
         cfg.epochs = args.epochs
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
+    if args.lr is not None:
+        cfg.lr = args.lr
     if args.alpha is not None:
         cfg.alpha = args.alpha
     if args.beta is not None:
