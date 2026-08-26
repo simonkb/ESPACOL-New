@@ -80,7 +80,7 @@ def load_model(model_dir: str, device: torch.device):
 
     text_encoder = None
     try:
-        from models.clinical_text import ClinicalTextEncoder
+        from models.text import ClinicalTextEncoder
         text_encoder = ClinicalTextEncoder(
             model_name="hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224",
             proj_out_dim=128,
