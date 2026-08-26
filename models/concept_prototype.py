@@ -20,16 +20,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# Clinical soft targets: grade_concept_targets[grade, concept]
+# DR clinical soft targets: grade_concept_targets[grade, concept]
 # Concepts: microaneurysms, dot/blot hemorrhages, hard exudates, cotton wool spots,
 #           venous beading, IRMA, neovascularization, preretinal hemorrhage, vitreous hemo
-_GRADE_CONCEPT_TARGETS = [
+DR_GRADE_CONCEPT_TARGETS = [
     [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],  # Grade 0: no lesions
     [0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],  # Grade 1: microaneurysms only
     [0.7, 0.7, 0.6, 0.3, 0.0, 0.0, 0.0, 0.0, 0.0],  # Grade 2: moderate NPDR
     [0.5, 0.9, 0.4, 0.5, 0.8, 0.7, 0.0, 0.0, 0.0],  # Grade 3: severe NPDR
     [0.3, 0.8, 0.2, 0.2, 0.5, 0.5, 0.9, 0.8, 0.7],  # Grade 4: PDR
 ]
+
+# BUSI clinical soft targets: class_concept_targets[class, concept]
+# Concepts (10): no mass, no distortion, oval shape, circumscribed margin,
+#   parallel orientation, posterior enhancement, irregular shape,
+#   spiculated margins, nonparallel orientation, posterior acoustic shadowing
+BUSI_GRADE_CONCEPT_TARGETS = [
+    [0.9, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],  # Class 0: Normal
+    [0.0, 0.0, 0.8, 0.8, 0.7, 0.5, 0.1, 0.0, 0.0, 0.0],  # Class 1: Benign
+    [0.0, 0.0, 0.1, 0.1, 0.0, 0.0, 0.9, 0.8, 0.7, 0.6],  # Class 2: Malignant
+]
+
+# Keep old name as alias for backward compatibility
+_GRADE_CONCEPT_TARGETS = DR_GRADE_CONCEPT_TARGETS
 
 
 class ConceptGradePrototypeModule(nn.Module):
@@ -49,6 +62,7 @@ class ConceptGradePrototypeModule(nn.Module):
         n_concepts: int = 9,
         proj_dim: int = 128,
         temperature: float = 0.1,
+        grade_concept_targets: list | None = None,
     ):
         super().__init__()
         self.temperature = temperature
@@ -64,8 +78,13 @@ class ConceptGradePrototypeModule(nn.Module):
             nn.Linear(feat_dim, proj_dim),
         )
 
-        # Clinical grade-concept soft supervision (no annotation required)
-        targets = torch.tensor(_GRADE_CONCEPT_TARGETS, dtype=torch.float32)
+        # Clinical grade-concept soft supervision targets
+        if grade_concept_targets is None:
+            grade_concept_targets = DR_GRADE_CONCEPT_TARGETS
+        targets = torch.tensor(grade_concept_targets, dtype=torch.float32)
+        assert targets.shape == (n_classes, n_concepts), (
+            f"grade_concept_targets shape {targets.shape} != ({n_classes}, {n_concepts})"
+        )
         self.register_buffer("grade_concept_targets", targets)  # (n_classes, n_concepts)
 
     def forward(

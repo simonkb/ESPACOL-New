@@ -38,6 +38,7 @@ from Datasets.dataloaders import (
     preload_dr_images,
 )
 from models.framework import build_model
+from models.concept_prototype import BUSI_GRADE_CONCEPT_TARGETS
 from training.cross_val import BUSICrossValidator
 from training.trainer import Trainer
 from torch.utils.data import DataLoader
@@ -360,6 +361,7 @@ def main():
             use_concept_prototype=cfg.use_concept_prototype,
             n_concepts=cfg.n_concepts,
             proto_temperature=cfg.proto_temperature,
+            grade_concept_targets=BUSI_GRADE_CONCEPT_TARGETS,
         )
 
         train_labels = [y for _, y in train_items]

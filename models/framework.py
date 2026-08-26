@@ -251,6 +251,7 @@ def build_model(
     use_concept_prototype: bool = False,
     n_concepts: int = 9,
     proto_temperature: float = 0.1,
+    grade_concept_targets: list | None = None,
 ) -> HybridContrastiveOrdinalModel:
 
     if use_tile_transformer and not use_multi_tile:
@@ -297,6 +298,7 @@ def build_model(
             n_concepts=n_concepts,
             proj_dim=proj_out_dim,
             temperature=proto_temperature,
+            grade_concept_targets=grade_concept_targets,
         )
         return OPTICConceptModel(
             backbone=backbone,
