@@ -107,7 +107,16 @@ def run_inference(args):
     )
     print(f"Segmentation images ({args.seg_split} split): {len(ds)}")
 
-    loader = DataLoader(ds, batch_size=4, shuffle=False, num_workers=4, pin_memory=True)
+    def collate_skip_masks(batch):
+        # Masks are variable-size (real masks vs [1,1] sentinels) — keep as list.
+        xs      = torch.stack([b[0] for b in batch])
+        labels  = torch.tensor([b[1] for b in batch])
+        img_ids = [b[2] for b in batch]
+        masks   = [b[3] for b in batch]   # list of dicts, not stacked
+        return xs, labels, img_ids, masks
+
+    loader = DataLoader(ds, batch_size=4, shuffle=False, num_workers=4,
+                        pin_memory=True, collate_fn=collate_skip_masks)
 
     model, text_encoder = load_model(args.model_dir, device)
 
