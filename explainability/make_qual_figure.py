@@ -41,9 +41,9 @@ TILE_GRID = 3
 TILE_SIZE = 300
 
 # Font sizes — all doubled vs first draft for legibility in the paper
-FONT_TITLE = 18
-FONT_CBAR_LABEL = 14
-FONT_CBAR_TICK = 12
+FONT_TITLE = 36
+FONT_CBAR_LABEL = 28
+FONT_CBAR_TICK = 24
 
 CONCEPT_NAMES = [
     "Microaneurysms", "D/B Haemorrhages", "Hard Exudates",
@@ -230,7 +230,7 @@ def make_figure(args):
     n_grades = len(reps)
     fig, axes = plt.subplots(
         n_grades, 3,
-        figsize=(14, 4.5 * n_grades),
+        figsize=(16, 5.5 * n_grades),
         gridspec_kw={"wspace": 0.04},
     )
     if n_grades == 1:
