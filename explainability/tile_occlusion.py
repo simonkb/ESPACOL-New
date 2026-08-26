@@ -35,7 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from Datasets.dataloaders import build_tile_transform
 from Datasets.idrid_loader import IDRiDSegmentationDataset
-from Models.framework import build_model
+from models.framework import build_model
 from configs.config import DRConfig
 
 TILE_GRID = 3

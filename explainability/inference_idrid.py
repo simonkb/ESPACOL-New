@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from Datasets.dataloaders import build_tile_transform
 from Datasets.idrid_loader import IDRiDSegmentationDataset
-from Models.framework import build_model
+from models.framework import build_model
 from configs.config import DRConfig
 
 
@@ -80,7 +80,7 @@ def load_model(model_dir: str, device: torch.device):
 
     text_encoder = None
     try:
-        from Models.clinical_text import ClinicalTextEncoder
+        from models.clinical_text import ClinicalTextEncoder
         text_encoder = ClinicalTextEncoder(
             model_name="hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224",
             proj_out_dim=128,
