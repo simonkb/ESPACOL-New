@@ -31,8 +31,9 @@ from Datasets.dataloaders import (
     build_tile_transform,
     preload_dr_images,
 )
+from Datasets.idrid_loader import load_all_idrid_items, load_idrid_official_split
 from models.framework import build_model
-from training.cross_val import DRCrossValidator
+from training.cross_val import DRCrossValidator, IDRiDCrossValidator, _split_train_val
 from training.trainer import Trainer
 
 
@@ -170,19 +171,26 @@ def make_loaders(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train DR 10-fold CV")
+    parser = argparse.ArgumentParser(description="Train DR/IDRiD CV")
 
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="dr",
+        choices=["dr", "idrid"],
+        help="Dataset to train on: 'dr' (Kaggle DR, 10-fold) or 'idrid' (IDRiD, 5-fold)",
+    )
     parser.add_argument(
         "--dr_root",
         type=str,
         default="Datasets/DR",
-        help="Path to DR dataset root containing train/ and trainLabels.csv",
+        help="Path to DR or IDRiD dataset root",
     )
     parser.add_argument(
         "--train_csv",
         type=str,
         default=None,
-        help="Path to training label CSV. Default: <dr_root>/trainLabels.csv",
+        help="(DR only) Path to training label CSV. Default: <dr_root>/trainLabels.csv",
     )
     parser.add_argument(
         "--run_dir",
@@ -417,6 +425,13 @@ def main():
         help="Switch to CosineAnnealingLR at backbone unfreeze instead of continuing with "
              "ReduceLROnPlateau. Eliminates LR-drop timing luck across folds.",
     )
+    parser.add_argument(
+        "--val_fraction",
+        type=float,
+        default=None,
+        help="Fraction of training images held out as validation (default from DRConfig: 0.1). "
+             "Increase to 0.2 for more stable early stopping on small datasets like IDRiD.",
+    )
 
     args = parser.parse_args()
 
@@ -496,31 +511,42 @@ def main():
         cfg.weight_decay = args.weight_decay
     if args.use_cosine_lr:
         cfg.use_cosine_lr = True
+    if args.val_fraction is not None:
+        cfg.val_fraction = args.val_fraction
 
     setup_logging(args.run_dir)
     log = logging.getLogger("train_dr")
 
     set_seed(cfg.seed)
 
+    dataset_name = args.dataset.upper()
     log.info("=" * 70)
-    log.info("DR 10-fold CV  (EfficientNet-V2S + PCOL + SCOLw)")
+    log.info(f"{dataset_name} CV  (EfficientNet-V2S + OPTIC-C)")
     log.info("=" * 70)
     log.info(f"Config: {cfg}")
 
-    all_items = load_all_dr_items(args.dr_root, args.train_csv)
-    log.info(f"Total DR training images: {len(all_items)}")
-
     from collections import Counter
 
-    dist = Counter(y for _, y in all_items)
-    log.info(f"Class distribution: {dict(sorted(dist.items()))}")
-
-    cv = DRCrossValidator(
-        all_items,
-        n_folds=cfg.n_folds,
-        val_fraction=cfg.val_fraction,
-        seed=cfg.seed,
-    )
+    if args.dataset == "idrid":
+        # Official IDRiD challenge split: 413 train / 103 test
+        idrid_train_items, idrid_test_items = load_idrid_official_split(args.dr_root)
+        all_items = idrid_train_items + idrid_test_items  # for image cache only
+        cfg.n_folds = 1
+        log.info(f"IDRiD official split: {len(idrid_train_items)} train, {len(idrid_test_items)} test")
+        dist = Counter(y for _, y in all_items)
+        log.info(f"Class distribution (all): {dict(sorted(dist.items()))}")
+        cv = None  # not used for IDRiD official split
+    else:
+        all_items = load_all_dr_items(args.dr_root, args.train_csv)
+        log.info(f"Total DR training images: {len(all_items)}")
+        dist = Counter(y for _, y in all_items)
+        log.info(f"Class distribution: {dict(sorted(dist.items()))}")
+        cv = DRCrossValidator(
+            all_items,
+            n_folds=cfg.n_folds,
+            val_fraction=cfg.val_fraction,
+            seed=cfg.seed,
+        )
 
     if args.folds == "all":
         fold_indices = list(range(cfg.n_folds))
@@ -538,8 +564,10 @@ def main():
     if not args.no_cache:
         n_threads = 16
 
-        # Auto-derive tile-specific cache dir when using default path
-        if cfg.use_multi_tile and args.cache_dir == "Datasets/DR/train_cache":
+        if args.dataset == "idrid":
+            # IDRiD is small (516 images) — RAM cache only, no disk persistence needed
+            cache_dir = None
+        elif cfg.use_multi_tile and args.cache_dir == "Datasets/DR/train_cache":
             canvas_size = cfg.tile_grid * cfg.img_size
             cache_dir = f"Datasets/DR/train_cache_tiles_{canvas_size}"
         else:
@@ -548,7 +576,7 @@ def main():
         preload_img_size = cfg.tile_grid * cfg.img_size if cfg.use_multi_tile else cfg.img_size
 
         log.info(
-            f"Pre-loading DR images ({n_threads} threads, size={preload_img_size}) "
+            f"Pre-loading images ({n_threads} threads, size={preload_img_size}) "
             f"{'(disk cache: ' + cache_dir + ')' if cache_dir else '(no disk cache)'}"
         )
 
@@ -566,19 +594,27 @@ def main():
     for fi in fold_indices:
         log.info("")
         log.info("-" * 60)
-        log.info(f"FOLD {fi + 1} / {cfg.n_folds}")
+        if args.dataset == "idrid":
+            log.info("IDRiD OFFICIAL SPLIT  (413 train / 103 test)")
+        else:
+            log.info(f"FOLD {fi + 1} / {cfg.n_folds}")
         log.info("-" * 60)
 
         set_seed(cfg.seed + fi)
 
-        train_items_raw, val_items_held_out, test_items = cv.get_fold(fi)
-
-        # Follow the existing replication protocol:
-        # use the held-out CV fold as validation/test fold.
-        train_items = train_items_raw + val_items_held_out
-        val_items = test_items
-
-        log.info(f"  train={len(train_items)}  val=test={len(test_items)}")
+        if args.dataset == "idrid":
+            train_items, val_items = _split_train_val(
+                idrid_train_items, cfg.val_fraction, seed=cfg.seed
+            )
+            test_items = idrid_test_items
+            log.info(f"  train={len(train_items)}  val={len(val_items)}  test={len(test_items)}")
+        else:
+            train_items_raw, val_items_held_out, test_items = cv.get_fold(fi)
+            # Follow the existing replication protocol:
+            # use the held-out CV fold as validation/test fold.
+            train_items = train_items_raw + val_items_held_out
+            val_items = test_items
+            log.info(f"  train={len(train_items)}  val=test={len(test_items)}")
 
         dist_fold = Counter(y for _, y in train_items)
         log.info(f"  Train class dist: {dict(sorted(dist_fold.items()))}")
@@ -592,7 +628,10 @@ def main():
             img_cache=img_cache,
         )
 
-        fold_dir = os.path.join(args.run_dir, f"fold{fi}")
+        fold_dir = os.path.join(
+            args.run_dir,
+            "official" if args.dataset == "idrid" else f"fold{fi}",
+        )
         os.makedirs(fold_dir, exist_ok=True)
 
         model = build_model(
