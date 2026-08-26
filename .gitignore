@@ -29,9 +29,11 @@ analysis/training_curves.ipynb
 /Datasets/DR/train_cache_bengham_tiles_900/
 /Datasets/BUSI/cache_tiles_900/
 Optic_Arch_Optic_Arch.jpg
+/Datasets/IDRiD/
+explainability/idrid_outputs/official_outputs.npz
 Datasets/aptos2019-blindness-detection/sample_submission.csv
 Datasets/aptos2019-blindness-detection/test.csv
 Datasets/aptos2019-blindness-detection/train.csv
-Datasets/IDRiD/A. Segmentation/
-Datasets/IDRiD/B. Disease Grading/
-Datasets/IDRiD/C. Localization/
+explainability/pointing_game_results.csv
+explainability/concept_scores_per_grade.csv
+explainability/tile_occlusion_results.csv
