@@ -31,9 +31,9 @@ from Datasets.dataloaders import (
     build_tile_transform,
     preload_dr_images,
 )
-from Datasets.idrid_loader import load_all_idrid_items
+from Datasets.idrid_loader import load_all_idrid_items, load_idrid_official_split
 from models.framework import build_model
-from training.cross_val import DRCrossValidator, IDRiDCrossValidator
+from training.cross_val import DRCrossValidator, IDRiDCrossValidator, _split_train_val
 from training.trainer import Trainer
 
 
@@ -519,17 +519,14 @@ def main():
     from collections import Counter
 
     if args.dataset == "idrid":
-        all_items = load_all_idrid_items(args.dr_root)
-        cfg.n_folds = 5
-        log.info(f"Total IDRiD images: {len(all_items)}")
+        # Official IDRiD challenge split: 413 train / 103 test
+        idrid_train_items, idrid_test_items = load_idrid_official_split(args.dr_root)
+        all_items = idrid_train_items + idrid_test_items  # for image cache only
+        cfg.n_folds = 1
+        log.info(f"IDRiD official split: {len(idrid_train_items)} train, {len(idrid_test_items)} test")
         dist = Counter(y for _, y in all_items)
-        log.info(f"Class distribution: {dict(sorted(dist.items()))}")
-        cv = IDRiDCrossValidator(
-            all_items,
-            n_folds=cfg.n_folds,
-            val_fraction=cfg.val_fraction,
-            seed=cfg.seed,
-        )
+        log.info(f"Class distribution (all): {dict(sorted(dist.items()))}")
+        cv = None  # not used for IDRiD official split
     else:
         all_items = load_all_dr_items(args.dr_root, args.train_csv)
         log.info(f"Total DR training images: {len(all_items)}")
@@ -588,19 +585,27 @@ def main():
     for fi in fold_indices:
         log.info("")
         log.info("-" * 60)
-        log.info(f"FOLD {fi + 1} / {cfg.n_folds}")
+        if args.dataset == "idrid":
+            log.info("IDRiD OFFICIAL SPLIT  (413 train / 103 test)")
+        else:
+            log.info(f"FOLD {fi + 1} / {cfg.n_folds}")
         log.info("-" * 60)
 
         set_seed(cfg.seed + fi)
 
-        train_items_raw, val_items_held_out, test_items = cv.get_fold(fi)
-
-        # Follow the existing replication protocol:
-        # use the held-out CV fold as validation/test fold.
-        train_items = train_items_raw + val_items_held_out
-        val_items = test_items
-
-        log.info(f"  train={len(train_items)}  val=test={len(test_items)}")
+        if args.dataset == "idrid":
+            train_items, val_items = _split_train_val(
+                idrid_train_items, cfg.val_fraction, seed=cfg.seed
+            )
+            test_items = idrid_test_items
+            log.info(f"  train={len(train_items)}  val={len(val_items)}  test={len(test_items)}")
+        else:
+            train_items_raw, val_items_held_out, test_items = cv.get_fold(fi)
+            # Follow the existing replication protocol:
+            # use the held-out CV fold as validation/test fold.
+            train_items = train_items_raw + val_items_held_out
+            val_items = test_items
+            log.info(f"  train={len(train_items)}  val=test={len(test_items)}")
 
         dist_fold = Counter(y for _, y in train_items)
         log.info(f"  Train class dist: {dict(sorted(dist_fold.items()))}")
@@ -614,7 +619,10 @@ def main():
             img_cache=img_cache,
         )
 
-        fold_dir = os.path.join(args.run_dir, f"fold{fi}")
+        fold_dir = os.path.join(
+            args.run_dir,
+            "official" if args.dataset == "idrid" else f"fold{fi}",
+        )
         os.makedirs(fold_dir, exist_ok=True)
 
         model = build_model(

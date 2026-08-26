@@ -66,52 +66,57 @@ LESION_DIR: Dict[str, str] = {
 }
 
 
-def load_all_idrid_items(idrid_root: str) -> List[Tuple[str, int]]:
+def _load_grading_csv(img_dir: str, csv_path: str) -> List[Tuple[str, int]]:
+    """Shared helper: reads one IDRiD grading CSV and resolves image paths."""
+    if not os.path.isfile(csv_path):
+        raise FileNotFoundError(f"IDRiD grading CSV not found: {csv_path}")
+    df = pd.read_csv(csv_path)
+    df.columns = [c.strip() for c in df.columns]
+    items: List[Tuple[str, int]] = []
+    for _, row in df.iterrows():
+        img_name = str(row["Image name"]).strip()
+        grade = int(row["Retinopathy grade"])
+        for ext in (".jpg", ".jpeg", ".JPG", ".png"):
+            candidate = os.path.join(img_dir, img_name + ext)
+            if os.path.isfile(candidate):
+                items.append((candidate, grade))
+                break
+        else:
+            candidate = os.path.join(img_dir, img_name)
+            if os.path.isfile(candidate):
+                items.append((candidate, grade))
+            else:
+                raise FileNotFoundError(
+                    f"IDRiD image not found: {img_name} in {img_dir}"
+                )
+    return items
+
+
+def load_idrid_official_split(
+    idrid_root: str,
+) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
     """
-    Combine train + test grading images into one flat list.
-    Returns list of (abs_image_path, grade) tuples.
+    Official IDRiD challenge split: 413 training + 103 test images.
+    Returns (train_items, test_items) — use this for the grading benchmark.
     """
     grading_root = os.path.join(idrid_root, "B. Disease Grading")
     img_root = os.path.join(grading_root, "1. Original Images")
     gt_root = os.path.join(grading_root, "2. Groundtruths")
+    train_items = _load_grading_csv(
+        os.path.join(img_root, "a. Training Set"),
+        os.path.join(gt_root, "a. IDRiD_Disease Grading_Training Labels.csv"),
+    )
+    test_items = _load_grading_csv(
+        os.path.join(img_root, "b. Testing Set"),
+        os.path.join(gt_root, "b. IDRiD_Disease Grading_Testing Labels.csv"),
+    )
+    return train_items, test_items
 
-    splits = [
-        (
-            os.path.join(img_root, "a. Training Set"),
-            os.path.join(gt_root, "a. IDRiD_Disease Grading_Training Labels.csv"),
-        ),
-        (
-            os.path.join(img_root, "b. Testing Set"),
-            os.path.join(gt_root, "b. IDRiD_Disease Grading_Testing Labels.csv"),
-        ),
-    ]
 
-    items: List[Tuple[str, int]] = []
-    for img_dir, csv_path in splits:
-        if not os.path.isfile(csv_path):
-            raise FileNotFoundError(f"IDRiD grading CSV not found: {csv_path}")
-        df = pd.read_csv(csv_path)
-        # Normalise column names (strip whitespace)
-        df.columns = [c.strip() for c in df.columns]
-        for _, row in df.iterrows():
-            img_name = str(row["Image name"]).strip()
-            grade = int(row["Retinopathy grade"])
-            # Try with .jpg extension
-            for ext in (".jpg", ".jpeg", ".JPG", ".png"):
-                candidate = os.path.join(img_dir, img_name + ext)
-                if os.path.isfile(candidate):
-                    items.append((candidate, grade))
-                    break
-            else:
-                # Try exact name
-                candidate = os.path.join(img_dir, img_name)
-                if os.path.isfile(candidate):
-                    items.append((candidate, grade))
-                else:
-                    raise FileNotFoundError(
-                        f"IDRiD image not found: {img_name} in {img_dir}"
-                    )
-    return items
+def load_all_idrid_items(idrid_root: str) -> List[Tuple[str, int]]:
+    """Combine train + test grading images into one flat list (used for CV)."""
+    train_items, test_items = load_idrid_official_split(idrid_root)
+    return train_items + test_items
 
 
 class IDRiDGradingDataset(Dataset):
