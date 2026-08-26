@@ -135,7 +135,11 @@ def run_inference(args):
             if text_encoder is not None:
                 concept_embeds = text_encoder.get_concept_embeds()
 
-            out = model(x, concept_embeds=concept_embeds)
+            # Pass dummy labels so the concept prototype module activates and
+            # produces tile_concept_scores (the module guard is `if labels is not None`).
+            # Label values only affect tile_concept_loss, which we discard here.
+            dummy_labels = torch.zeros(x.size(0), dtype=torch.long, device=device)
+            out = model(x, labels=dummy_labels, concept_embeds=concept_embeds)
 
             preds = out["pred"].cpu().float().numpy()
             pred_grades = np.clip(np.round(preds).astype(int), 0, 4)
