@@ -13,8 +13,12 @@
 
 mkdir -p /dpc/kuin0170/ESPACOL-New/slurm_logs
 
+source /etc/profile.d/lmod.sh
+module load miniconda/3
+module load cuda/12.6
+source activate G
+
 cd /dpc/kuin0170/ESPACOL-New
-conda activate G
 
 python explainability/make_qual_figure.py \
     --idrid_root    Datasets/IDRiD \
