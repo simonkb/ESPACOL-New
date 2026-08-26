@@ -27,12 +27,13 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 #
 # Uses the official IDRiD Disease Grading split rather than CV because
 # the test labels are publicly available.
-# ~372 training images (after 10% val split), 41 val, 103 test.
+# val_fraction=0.2 → ~330 training images, 83 val, 103 test.
+# Larger val set gives more stable early stopping on this small dataset.
 # Single run; no SLURM array needed.
 python train_dr.py \
     --dataset idrid \
     --dr_root Datasets/IDRiD \
-    --run_dir runs/optic_concept_idrid \
+    --run_dir runs/optic_concept_idrid_v2 \
     --use_multi_tile \
     --tile_grid 3 \
     --batch_size 24 \
@@ -57,4 +58,5 @@ python train_dr.py \
     --lr_patience 12 \
     --lr_min 8e-6 \
     --early_stop_patience 30 \
-    --weight_decay 1e-5
+    --weight_decay 1e-5 \
+    --val_fraction 0.2

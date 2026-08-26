@@ -71,9 +71,11 @@ def evaluate(args):
             img_id_to_pred[str(data["img_ids"][i])] = int(data["pred_grades"][i])
 
     # Load the single model
-    ckpt_path = os.path.join(args.model_dir, "best_model.pt")
+    ckpt_path = os.path.join(args.model_dir, "fold0_best.pth")
     if not os.path.isfile(ckpt_path):
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        ckpt_path = os.path.join(args.model_dir, "best_model.pt")
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found in {args.model_dir}")
     cfg = DRConfig()
     model = build_model(
         n_classes=cfg.n_classes,

@@ -22,7 +22,7 @@ cd /dpc/kuin0170/ESPACOL-New
 
 export HF_HUB_OFFLINE=1
 
-MODEL_DIR=runs/optic_concept_idrid/official
+MODEL_DIR=runs/optic_concept_idrid_v2/official
 IDRID_ROOT=Datasets/IDRiD
 OUTPUT_DIR=explainability/idrid_outputs
 FIGURE_DIR=explainability/figures

@@ -42,9 +42,13 @@ from configs.config import DRConfig
 
 
 def load_model(model_dir: str, device: torch.device):
-    ckpt_path = os.path.join(model_dir, "best_model.pt")
+    # Trainer saves fold0_best.pth for official split (fold index = 0)
+    ckpt_path = os.path.join(model_dir, "fold0_best.pth")
     if not os.path.isfile(ckpt_path):
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        # Fallback for legacy name
+        ckpt_path = os.path.join(model_dir, "best_model.pt")
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found in {model_dir} (tried fold0_best.pth and best_model.pt)")
     ckpt = torch.load(ckpt_path, map_location=device)
 
     cfg = DRConfig()

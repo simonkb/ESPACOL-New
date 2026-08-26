@@ -425,6 +425,13 @@ def main():
         help="Switch to CosineAnnealingLR at backbone unfreeze instead of continuing with "
              "ReduceLROnPlateau. Eliminates LR-drop timing luck across folds.",
     )
+    parser.add_argument(
+        "--val_fraction",
+        type=float,
+        default=None,
+        help="Fraction of training images held out as validation (default from DRConfig: 0.1). "
+             "Increase to 0.2 for more stable early stopping on small datasets like IDRiD.",
+    )
 
     args = parser.parse_args()
 
@@ -504,6 +511,8 @@ def main():
         cfg.weight_decay = args.weight_decay
     if args.use_cosine_lr:
         cfg.use_cosine_lr = True
+    if args.val_fraction is not None:
+        cfg.val_fraction = args.val_fraction
 
     setup_logging(args.run_dir)
     log = logging.getLogger("train_dr")
