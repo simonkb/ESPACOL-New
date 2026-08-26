@@ -228,11 +228,10 @@ def make_figure(args):
         return
 
     n_grades = len(reps)
-    # hspace/wspace: tight inter-image gaps; figsize wider to absorb larger fonts
     fig, axes = plt.subplots(
         n_grades, 3,
-        figsize=(14, 4.2 * n_grades),
-        gridspec_kw={"hspace": 0.06, "wspace": 0.04},
+        figsize=(14, 4.5 * n_grades),
+        gridspec_kw={"wspace": 0.04},
     )
     if n_grades == 1:
         axes = axes[np.newaxis, :]
@@ -260,7 +259,7 @@ def make_figure(args):
         mask_label = MASK_PANEL_LABELS.get(g, "/".join(GRADE_TO_LESION_KEYS.get(g, ["none"])))
         draw_mask_overlay(ax_row[2], img_900, rep["mask"], f"(c) IDRiD lesion mask\n({mask_label})")
 
-    plt.tight_layout(pad=0.3, h_pad=0.4, w_pad=0.3)
+    plt.tight_layout(pad=0.3, h_pad=2.5, w_pad=0.3)
 
     out_pdf = os.path.join(args.output_dir, "optic_c_qualitative.pdf")
     out_png = os.path.join(args.output_dir, "optic_c_qualitative.png")
