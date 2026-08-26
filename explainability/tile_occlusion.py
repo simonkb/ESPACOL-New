@@ -93,7 +93,7 @@ def evaluate(args):
         proto_temperature=cfg.proto_temperature,
     )
     ckpt = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(ckpt["model_state"])
     model.to(device)
     model.eval()
 

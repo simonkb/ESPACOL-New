@@ -74,7 +74,7 @@ def load_model(model_dir: str, device: torch.device):
         use_concept_prototype=True,
         proto_temperature=cfg.proto_temperature,
     )
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(ckpt["model_state"])
     model.to(device)
     model.eval()
 
@@ -86,8 +86,8 @@ def load_model(model_dir: str, device: torch.device):
             proj_out_dim=128,
             n_grade_classes=5,
         ).to(device)
-        if "text_encoder_state_dict" in ckpt:
-            text_encoder.load_state_dict(ckpt["text_encoder_state_dict"])
+        if "text_encoder_state" in ckpt:
+            text_encoder.load_state_dict(ckpt["text_encoder_state"])
         text_encoder.eval()
     except Exception as e:
         print(f"Warning: could not load text encoder ({e}). Concept scores will be zeros.")
