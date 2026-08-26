@@ -57,14 +57,14 @@ def evaluate(args):
 
     for fname in npz_files:
         data = np.load(os.path.join(args.inference_dir, fname), allow_pickle=True)
-        labels = data["labels"]                         # (N,)
+        pred_grades = data["pred_grades"]               # (N,) — use predicted grade
         tcs = data["tile_concept_scores"]               # (N, T, C)
 
         # Mean over tiles for each image -> (N, C)
         mean_scores = tcs.mean(axis=1)
 
-        for i in range(len(labels)):
-            g = int(labels[i])
+        for i in range(len(pred_grades)):
+            g = int(pred_grades[i])
             if 0 <= g <= 4:
                 grade_scores[g].append(mean_scores[i])
 

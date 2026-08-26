@@ -81,14 +81,18 @@ def load_model(model_dir: str, device: torch.device):
     text_encoder = None
     try:
         from models.text import ClinicalTextEncoder
+        from configs.clinical_text import DR_CLASS_DESCRIPTIONS, DR_CONCEPTS
         text_encoder = ClinicalTextEncoder(
             model_name="hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224",
+            class_descriptions=DR_CLASS_DESCRIPTIONS,
             proj_out_dim=128,
-            n_grade_classes=5,
+            device=device,
+            concept_descriptions=DR_CONCEPTS,
         ).to(device)
         if "text_encoder_state" in ckpt:
             text_encoder.load_state_dict(ckpt["text_encoder_state"])
         text_encoder.eval()
+        print("Text encoder loaded successfully.")
     except Exception as e:
         print(f"Warning: could not load text encoder ({e}). Concept scores will be zeros.")
 

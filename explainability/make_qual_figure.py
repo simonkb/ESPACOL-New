@@ -110,9 +110,9 @@ def select_representative(
     target_grade: int,
     idrid_root: str,
 ) -> Optional[dict]:
-    """Find first image where true_grade == target_grade and mask exists."""
+    """Find first image where pred_grade == target_grade and mask exists."""
     for i in range(len(img_ids)):
-        if int(labels[i]) != target_grade:
+        if int(pred_grades[i]) != target_grade:
             continue
         img_id = str(img_ids[i])
         mask = load_mask_for_grade(idrid_root, img_id, target_grade)
