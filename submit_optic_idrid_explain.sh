@@ -22,18 +22,20 @@ cd /dpc/kuin0170/ESPACOL-New
 
 export HF_HUB_OFFLINE=1
 
-MODEL_DIR=runs/optic_concept_idrid_v2/official
+# Zero-shot explainability: DR-trained model (v9 best fold) on all 81 IDRiD
+# segmentation images. The model never saw any IDRiD data, so no leakage
+# and we can use all 81 images (54 train + 27 test segmentation subset).
+MODEL_DIR=runs/optic_concept_cv_v9/fold1
 IDRID_ROOT=Datasets/IDRiD
 OUTPUT_DIR=explainability/idrid_outputs
 FIGURE_DIR=explainability/figures
 
-# ── Step 1: Run inference on IDRiD segmentation TEST images (27 images) ──────
-# Uses seg_split=test to avoid evaluating on images seen during training.
+# ── Step 1: Run inference on all 81 IDRiD segmentation images ────────────────
 python explainability/inference_idrid.py \
     --idrid_root  $IDRID_ROOT \
     --model_dir   $MODEL_DIR \
     --output_dir  $OUTPUT_DIR \
-    --seg_split   test
+    --seg_split   all
 
 # ── Step 2: GPA Pointing Game ─────────────────────────────────────────────────
 python explainability/gpa_pointing_game.py \
@@ -46,7 +48,7 @@ python explainability/tile_occlusion.py \
     --idrid_root    $IDRID_ROOT \
     --model_dir     $MODEL_DIR \
     --inference_dir $OUTPUT_DIR \
-    --seg_split     test \
+    --seg_split     all \
     --output_csv    explainability/tile_occlusion_results.csv
 
 # ── Step 4: Concept Score Analysis ────────────────────────────────────────────

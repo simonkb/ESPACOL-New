@@ -70,12 +70,16 @@ def evaluate(args):
             img_id_to_tw[str(data["img_ids"][i])] = data["tile_weights"][i]
             img_id_to_pred[str(data["img_ids"][i])] = int(data["pred_grades"][i])
 
-    # Load the single model
-    ckpt_path = os.path.join(args.model_dir, "fold0_best.pth")
-    if not os.path.isfile(ckpt_path):
+    # Load the single model — find whichever fold*_best.pth exists
+    import glob as _glob
+    candidates = sorted(_glob.glob(os.path.join(args.model_dir, "fold*_best.pth")))
+    if candidates:
+        ckpt_path = candidates[0]
+    else:
         ckpt_path = os.path.join(args.model_dir, "best_model.pt")
     if not os.path.isfile(ckpt_path):
-        raise FileNotFoundError(f"Checkpoint not found in {args.model_dir}")
+        raise FileNotFoundError(f"No checkpoint found in {args.model_dir}")
+    print(f"Loading checkpoint: {ckpt_path}")
     cfg = DRConfig()
     model = build_model(
         n_classes=cfg.n_classes,

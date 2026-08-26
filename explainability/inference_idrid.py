@@ -41,14 +41,25 @@ from Models.framework import build_model
 from configs.config import DRConfig
 
 
+def _find_checkpoint(model_dir: str) -> str:
+    """Find the best checkpoint in model_dir — handles any fold index."""
+    import glob
+    # Prefer explicit best checkpoints for any fold
+    candidates = sorted(glob.glob(os.path.join(model_dir, "fold*_best.pth")))
+    if candidates:
+        return candidates[0]  # fold0_best.pth < fold1_best.pth etc.
+    fallback = os.path.join(model_dir, "best_model.pt")
+    if os.path.isfile(fallback):
+        return fallback
+    raise FileNotFoundError(
+        f"No checkpoint found in {model_dir}. "
+        "Expected fold<N>_best.pth or best_model.pt."
+    )
+
+
 def load_model(model_dir: str, device: torch.device):
-    # Trainer saves fold0_best.pth for official split (fold index = 0)
-    ckpt_path = os.path.join(model_dir, "fold0_best.pth")
-    if not os.path.isfile(ckpt_path):
-        # Fallback for legacy name
-        ckpt_path = os.path.join(model_dir, "best_model.pt")
-    if not os.path.isfile(ckpt_path):
-        raise FileNotFoundError(f"Checkpoint not found in {model_dir} (tried fold0_best.pth and best_model.pt)")
+    ckpt_path = _find_checkpoint(model_dir)
+    print(f"Loading checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device)
 
     cfg = DRConfig()
