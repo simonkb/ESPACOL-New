@@ -31,7 +31,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from Datasets.dataloaders import build_tile_transform
 from Datasets.idrid_loader import IDRiDSegmentationDataset

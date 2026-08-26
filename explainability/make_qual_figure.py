@@ -32,7 +32,7 @@ from matplotlib.colors import Normalize
 from matplotlib.cm import ScalarMappable
 from PIL import Image
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from Datasets.dataloaders import _pil_loader, crop_fundus_circle
 from Datasets.idrid_loader import GRADE_TO_LESION_KEYS, LESION_DIR
 from explainability.gpa_pointing_game import load_mask_for_grade
