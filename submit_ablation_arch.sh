@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=optic_ablation
 #SBATCH --partition=gpu
-#SBATCH --array=0-17           # 6 variants × 3 folds (folds 0,1,2)
+#SBATCH --array=0-5            # 6 variants × fold 0 only
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -24,15 +24,15 @@ cd /dpc/kuin0170/ESPACOL-New
 export HF_HUB_OFFLINE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Array index layout: VARIANT * 3 + FOLD
-#   Tasks  0-2  → V0 (Eff-V2S + CORAL, single-tile),     folds 0,1,2
-#   Tasks  3-5  → V1 (+Multi-tile, AttentionPool),         folds 0,1,2
-#   Tasks  6-8  → V2 (+CTOT),                              folds 0,1,2
-#   Tasks  9-11 → V3 (+GPA),                               folds 0,1,2
-#   Tasks 12-14 → V4 (+Proto CE, tile concept off),        folds 0,1,2
-#   Tasks 15-17 → V5 (Full OPTIC-C, identical to v10),    folds 0,1,2
-VARIANT=$((SLURM_ARRAY_TASK_ID / 3))
-FOLD=$((SLURM_ARRAY_TASK_ID % 3))
+# Array index = variant (0-5), all run on fold 0.
+#   Task 0 → V0: Eff-V2S + CORAL, single-tile
+#   Task 1 → V1: +Multi-tile (AttentionPool)
+#   Task 2 → V2: +CTOT
+#   Task 3 → V3: +GPA
+#   Task 4 → V4: +Proto CE (tile concept off)
+#   Task 5 → V5: Full OPTIC-C (identical to v10)
+VARIANT=${SLURM_ARRAY_TASK_ID}
+FOLD=0
 
 # ── Hyperparameters held constant across ALL variants ───────────────────────
 # These match the v10 full-run settings exactly so the only thing that changes
