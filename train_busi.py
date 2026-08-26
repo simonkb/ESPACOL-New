@@ -146,6 +146,26 @@ def main():
     parser.add_argument("--cache_dir", type=str, default=None,
                         help="Directory for pre-decoded .pt image cache")
 
+    parser.add_argument("--alpha", type=float, default=None,
+                        help="Weight for PCOL loss. Set 0 to disable.")
+    parser.add_argument("--beta", type=float, default=None,
+                        help="Weight for SCOLw loss. Set 0 to disable.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from existing best checkpoint (SLURM preemption recovery)")
+    parser.add_argument("--lr_patience", type=int, default=None)
+    parser.add_argument("--lr_min", type=float, default=None)
+    parser.add_argument("--new_component_lr_mult", type=float, default=None,
+                        help="LR multiplier for new OPTIC components vs pretrained backbone")
+    parser.add_argument("--lambda_gpa", type=float, default=None)
+    parser.add_argument("--backbone_freeze_epochs", type=int, default=None,
+                        help="Freeze backbone for N epochs so new components stabilise first")
+    parser.add_argument("--early_stop_patience", type=int, default=None)
+    parser.add_argument("--text_encoder_name", type=str, default=None)
+    parser.add_argument("--gamma", type=float, default=None,
+                        help="(unused — kept for script compatibility)")
+    parser.add_argument("--text_finetune_start_epoch", type=int, default=None)
+    parser.add_argument("--weight_decay", type=float, default=None)
+
     # ── OPTIC architecture flags ──────────────────────────────────────────────
     parser.add_argument("--use_tile_transformer", action="store_true",
                         help="Replace AttentionPool with CrossTileOrdinalTransformer (CTOT)")
@@ -159,6 +179,20 @@ def main():
     parser.add_argument("--use_tile_consistency", action="store_true",
                         help="Add TileConsistencyLoss (requires grade prototypes)")
     parser.add_argument("--lambda_tcl", type=float, default=None)
+    parser.add_argument("--use_cosine_lr", action="store_true", default=False,
+                        help="Switch to CosineAnnealingLR at backbone unfreeze")
+
+    # ── OPTIC-C concept prototype flags ──────────────────────────────────────
+    parser.add_argument("--use_concept_prototype", action="store_true",
+                        help="Enable ConceptGradePrototypeModule (OPTIC-C). Set alpha=0 beta=0.")
+    parser.add_argument("--lambda_proto_ce", type=float, default=None,
+                        help="Weight for L_proto_CE (cosine prototype CrossEntropy)")
+    parser.add_argument("--lambda_tile_concept", type=float, default=None,
+                        help="Weight for L_tile_concept (per-tile concept BCE vs clinical targets)")
+    parser.add_argument("--proto_temperature", type=float, default=None,
+                        help="Cosine similarity temperature for grade prototype logits")
+    parser.add_argument("--proto_label_smoothing", type=float, default=None,
+                        help="Label smoothing for proto_CE cross-entropy")
 
     args = parser.parse_args()
 
@@ -171,6 +205,30 @@ def main():
         cfg.epochs = args.epochs
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
+    if args.alpha is not None:
+        cfg.alpha = args.alpha
+    if args.beta is not None:
+        cfg.beta = args.beta
+    if args.resume:
+        cfg.resume = True
+    if args.lr_patience is not None:
+        cfg.lr_patience = args.lr_patience
+    if args.lr_min is not None:
+        cfg.lr_min = args.lr_min
+    if args.new_component_lr_mult is not None:
+        cfg.new_component_lr_mult = args.new_component_lr_mult
+    if args.lambda_gpa is not None:
+        cfg.lambda_gpa = args.lambda_gpa
+    if args.backbone_freeze_epochs is not None:
+        cfg.backbone_freeze_epochs = args.backbone_freeze_epochs
+    if args.early_stop_patience is not None:
+        cfg.early_stop_patience = args.early_stop_patience
+    if args.text_encoder_name is not None:
+        cfg.text_encoder_name = args.text_encoder_name
+    if args.weight_decay is not None:
+        cfg.weight_decay = args.weight_decay
+    if args.text_finetune_start_epoch is not None:
+        cfg.text_finetune_start_epoch = args.text_finetune_start_epoch
 
     # OPTIC flags
     if args.use_tile_transformer:
@@ -187,6 +245,20 @@ def main():
         cfg.use_tile_consistency = True
     if args.lambda_tcl is not None:
         cfg.lambda_tcl = args.lambda_tcl
+    if args.use_cosine_lr:
+        cfg.use_cosine_lr = True
+
+    # OPTIC-C concept prototype flags
+    if args.use_concept_prototype:
+        cfg.use_concept_prototype = True
+    if args.lambda_proto_ce is not None:
+        cfg.lambda_proto_ce = args.lambda_proto_ce
+    if args.lambda_tile_concept is not None:
+        cfg.lambda_tile_concept = args.lambda_tile_concept
+    if args.proto_temperature is not None:
+        cfg.proto_temperature = args.proto_temperature
+    if args.proto_label_smoothing is not None:
+        cfg.proto_label_smoothing = args.proto_label_smoothing
 
     setup_logging(args.run_dir)
     log = logging.getLogger("train_busi")
@@ -275,7 +347,6 @@ def main():
             pretrained=not args.no_pretrained,
             proj_hidden_dim=cfg.proj_hidden_dim,
             proj_out_dim=cfg.proj_out_dim,
-            use_image_text=cfg.use_image_text,
             use_multi_tile=cfg.use_multi_tile,
             grad_checkpoint=args.grad_checkpoint,
             tile_grid=cfg.tile_grid,
@@ -286,6 +357,9 @@ def main():
             tile_transformer_dropout=cfg.tile_transformer_dropout,
             use_grade_prototypes=cfg.use_grade_prototypes,
             use_ordinal_head=cfg.use_ordinal_head,
+            use_concept_prototype=cfg.use_concept_prototype,
+            n_concepts=cfg.n_concepts,
+            proto_temperature=cfg.proto_temperature,
         )
 
         train_labels = [y for _, y in train_items]
