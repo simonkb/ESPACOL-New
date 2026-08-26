@@ -39,6 +39,12 @@ from explainability.gpa_pointing_game import load_mask_for_grade
 
 TILE_GRID = 3
 TILE_SIZE = 300
+
+# Font sizes — all doubled vs first draft for legibility in the paper
+FONT_TITLE = 18
+FONT_CBAR_LABEL = 14
+FONT_CBAR_TICK = 12
+
 CONCEPT_NAMES = [
     "Microaneurysms", "D/B Haemorrhages", "Hard Exudates",
     "Cotton Wool Spots", "Venous Beading", "IRMA",
@@ -65,7 +71,7 @@ def draw_tile_heatmap(ax, img: Image.Image, tile_weights_1d: np.ndarray, title: 
     stay nearly transparent (fundus visible underneath).
     """
     ax.imshow(img)
-    ax.set_title(title, fontsize=9, pad=3)
+    ax.set_title(title, fontsize=FONT_TITLE, pad=4)
     ax.axis("off")
 
     spatial = tile_weights_1d[:TILE_GRID * TILE_GRID]
@@ -98,16 +104,16 @@ def draw_tile_heatmap(ax, img: Image.Image, tile_weights_1d: np.ndarray, title: 
     # Colorbar legend
     sm = ScalarMappable(cmap=cmap, norm=Normalize(vmin=0, vmax=1))
     sm.set_array([])
-    cbar = plt.colorbar(sm, ax=ax, fraction=0.035, pad=0.03, orientation="vertical")
-    cbar.set_label("Attention", fontsize=7)
+    cbar = plt.colorbar(sm, ax=ax, fraction=0.040, pad=0.02, orientation="vertical")
+    cbar.set_label("Attention", fontsize=FONT_CBAR_LABEL)
     cbar.set_ticks([0, 0.5, 1])
-    cbar.set_ticklabels(["Low", "Mid", "High"], fontsize=6)
+    cbar.set_ticklabels(["Low", "Mid", "High"], fontsize=FONT_CBAR_TICK)
 
 
 def draw_mask_overlay(ax, img: Image.Image, mask: Optional[np.ndarray], title: str):
     """Overlay lesion mask on fundus image."""
     ax.imshow(img)
-    ax.set_title(title, fontsize=9, pad=3)
+    ax.set_title(title, fontsize=FONT_TITLE, pad=4)
     ax.axis("off")
     if mask is not None and mask.any():
         mask_img = np.zeros((*mask.shape, 4), dtype=np.uint8)
@@ -222,11 +228,14 @@ def make_figure(args):
         return
 
     n_grades = len(reps)
-    fig, axes = plt.subplots(n_grades, 3, figsize=(12, 3.5 * n_grades))
+    # hspace/wspace: tight inter-image gaps; figsize wider to absorb larger fonts
+    fig, axes = plt.subplots(
+        n_grades, 3,
+        figsize=(14, 4.2 * n_grades),
+        gridspec_kw={"hspace": 0.06, "wspace": 0.04},
+    )
     if n_grades == 1:
         axes = axes[np.newaxis, :]
-
-    fig.suptitle("OPTIC-C Spatial Explanations vs IDRiD Lesion Masks", fontsize=12, y=1.01)
 
     for row_idx, g in enumerate(sorted(reps.keys())):
         rep = reps[g]
@@ -236,28 +245,27 @@ def make_figure(args):
         grade_label = GRADE_LABELS.get(g, f"Grade {g}")
         ax_row = axes[row_idx]
 
-        # Panel (a): original
+        # Panel (a): original fundus
         ax_row[0].imshow(img_900)
-        ax_row[0].set_title(f"{grade_label}\nOriginal fundus", fontsize=9, pad=3)
+        ax_row[0].set_title(f"(a) {grade_label}\nOriginal fundus", fontsize=FONT_TITLE, pad=4)
         ax_row[0].axis("off")
-        if row_idx == 0:
-            ax_row[0].set_title(f"(a) Fundus\n{grade_label}", fontsize=9, pad=3)
 
-        # Panel (b): GPA heatmap
-        draw_tile_heatmap(ax_row[1], img_900, rep["tile_weights"], f"(b) GPA tile weights\n(predicted grade {rep['pred_grade']})")
+        # Panel (b): GPA tile heatmap
+        draw_tile_heatmap(
+            ax_row[1], img_900, rep["tile_weights"],
+            f"(b) GPA tile weights\n(predicted grade {rep['pred_grade']})",
+        )
 
-        # Panel (c): mask overlay
+        # Panel (c): lesion mask overlay
         mask_label = MASK_PANEL_LABELS.get(g, "/".join(GRADE_TO_LESION_KEYS.get(g, ["none"])))
         draw_mask_overlay(ax_row[2], img_900, rep["mask"], f"(c) IDRiD lesion mask\n({mask_label})")
 
-    plt.tight_layout()
-    fig.text(0.01, 0.0, "† IDRiD does not provide NV/VH segmentation masks; grade 4 mask uses HE/EX/SE annotations only.",
-             fontsize=6, color="gray", va="bottom")
+    plt.tight_layout(pad=0.3, h_pad=0.4, w_pad=0.3)
 
     out_pdf = os.path.join(args.output_dir, "optic_c_qualitative.pdf")
     out_png = os.path.join(args.output_dir, "optic_c_qualitative.png")
-    fig.savefig(out_pdf, bbox_inches="tight", dpi=300)
-    fig.savefig(out_png, bbox_inches="tight", dpi=150)
+    fig.savefig(out_pdf, bbox_inches="tight", pad_inches=0.05, dpi=300)
+    fig.savefig(out_png, bbox_inches="tight", pad_inches=0.05, dpi=150)
     plt.close(fig)
     print(f"Figure saved to {out_pdf}")
     print(f"Figure saved to {out_png}")
