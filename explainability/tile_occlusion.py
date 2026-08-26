@@ -14,7 +14,7 @@ Metrics:
 Usage:
   python explainability/tile_occlusion.py \
       --idrid_root    Datasets/IDRiD \
-      --run_dir       runs/optic_concept_idrid_cv \
+      --model_dir     runs/optic_concept_idrid/official \
       --inference_dir explainability/idrid_outputs \
       --output_csv    explainability/tile_occlusion_results.csv
 """
@@ -56,104 +56,101 @@ def occlude_tile(x: torch.Tensor, tile_idx: int) -> torch.Tensor:
 def evaluate(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load inference outputs (for tile_weights)
-    fold_files = sorted(f for f in os.listdir(args.inference_dir) if f.endswith("_outputs.npz"))
-    if not fold_files:
+    # Load inference outputs (for pre-computed tile_weights)
+    npz_files = sorted(f for f in os.listdir(args.inference_dir) if f.endswith("_outputs.npz"))
+    if not npz_files:
         raise FileNotFoundError(f"No outputs in {args.inference_dir}")
 
+    # Aggregate tile_weights and pred_grades from all npz files
+    img_id_to_tw: dict = {}
+    img_id_to_pred: dict = {}
+    for npz_fname in npz_files:
+        data = np.load(os.path.join(args.inference_dir, npz_fname), allow_pickle=True)
+        for i in range(len(data["img_ids"])):
+            img_id_to_tw[str(data["img_ids"][i])] = data["tile_weights"][i]
+            img_id_to_pred[str(data["img_ids"][i])] = int(data["pred_grades"][i])
+
+    # Load the single model
+    ckpt_path = os.path.join(args.model_dir, "best_model.pt")
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    cfg = DRConfig()
+    model = build_model(
+        n_classes=cfg.n_classes,
+        pretrained=False,
+        use_multi_tile=True,
+        tile_grid=3,
+        use_tile_transformer=True,
+        use_grade_prototypes=True,
+        use_ordinal_head=True,
+        use_concept_prototype=True,
+        proto_temperature=cfg.proto_temperature,
+    )
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.to(device)
+    model.eval()
+
+    # Use same split as inference to avoid leakage
     tile_tfm = build_tile_transform(tile_size=300, tile_grid=3, augment=False)
-    ds = IDRiDSegmentationDataset(idrid_root=args.idrid_root, tile_transform=tile_tfm)
+    ds = IDRiDSegmentationDataset(
+        idrid_root=args.idrid_root,
+        tile_transform=tile_tfm,
+        split=args.seg_split,
+    )
 
     rows: List[dict] = []
     correct_orig, correct_occ, n_total = 0, 0, 0
     grade_shifts: List[float] = []
     faithfulness_hits = 0
 
-    for npz_fname in fold_files:
-        fold_idx = int(npz_fname.replace("fold", "").replace("_outputs.npz", ""))
-        data = np.load(os.path.join(args.inference_dir, npz_fname), allow_pickle=True)
-        img_id_to_tw = {
-            str(data["img_ids"][i]): data["tile_weights"][i]
-            for i in range(len(data["img_ids"]))
-        }
-        img_id_to_pred = {
-            str(data["img_ids"][i]): int(data["pred_grades"][i])
-            for i in range(len(data["img_ids"]))
-        }
+    from Datasets.dataloaders import _pil_loader
 
-        # Load model for this fold
-        fold_dir = os.path.join(args.run_dir, f"fold{fold_idx}")
-        ckpt_path = os.path.join(fold_dir, "best_model.pt")
-        if not os.path.isfile(ckpt_path):
-            print(f"Skipping fold {fold_idx}: checkpoint not found")
-            continue
+    with torch.no_grad():
+        for img_path, grade, img_id, _ in ds.items:
+            if img_id not in img_id_to_tw:
+                continue
 
-        cfg = DRConfig()
-        model = build_model(
-            n_classes=cfg.n_classes,
-            pretrained=False,
-            use_multi_tile=True,
-            tile_grid=3,
-            use_tile_transformer=True,
-            use_grade_prototypes=True,
-            use_ordinal_head=True,
-            use_concept_prototype=True,
-            proto_temperature=cfg.proto_temperature,
-        )
-        ckpt = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        model.to(device)
-        model.eval()
+            tw = img_id_to_tw[img_id]   # (K, T)
+            pred_g = img_id_to_pred[img_id]
 
-        with torch.no_grad():
-            for img_path, grade, img_id, _ in ds.items:
-                if img_id not in img_id_to_tw:
-                    continue
+            img = _pil_loader(img_path, rgb=True)
+            x = tile_tfm(img).unsqueeze(0).to(device)  # (1, T, C, H, W)
 
-                tw = img_id_to_tw[img_id]   # (K, T)
-                pred_g = img_id_to_pred[img_id]
+            # Highest-weight spatial tile for predicted grade
+            spatial_tw = tw[pred_g, :TILE_GRID * TILE_GRID]
+            top_tile = int(np.argmax(spatial_tw))
 
-                # Original tile tensor
-                from PIL import Image as PILImage
-                from Datasets.dataloaders import _pil_loader
-                img = _pil_loader(img_path, rgb=True)
-                x = tile_tfm(img).unsqueeze(0).to(device)  # (1, T, C, H, W)
+            # Occlude top tile (replace with ImageNet mean = normalized zero)
+            x_occ = x.clone()
+            x_occ[0, top_tile] = 0.0
 
-                # Highest-weight spatial tile for predicted grade
-                spatial_tw = tw[pred_g, :TILE_GRID * TILE_GRID]
-                top_tile = int(np.argmax(spatial_tw))
+            pred_orig = model(x)["pred"].item()
+            pred_occ = model(x_occ)["pred"].item()
 
-                # Occlude top tile
-                x_occ = x.clone()
-                x_occ[0, top_tile] = 0.0
+            grade_orig = int(np.clip(round(pred_orig), 0, 4))
+            grade_occ = int(np.clip(round(pred_occ), 0, 4))
 
-                pred_orig = model(x)["pred"].item()
-                pred_occ = model(x_occ)["pred"].item()
+            shift = abs(pred_occ - pred_orig)
+            changed = int(grade_occ != grade_orig)
 
-                grade_orig = int(np.clip(round(pred_orig), 0, 4))
-                grade_occ = int(np.clip(round(pred_occ), 0, 4))
+            correct_orig += int(grade_orig == grade)
+            correct_occ += int(grade_occ == grade)
+            n_total += 1
+            grade_shifts.append(shift)
+            faithfulness_hits += changed
 
-                shift = abs(pred_occ - pred_orig)
-                changed = int(grade_occ != grade_orig)
-
-                correct_orig += int(grade_orig == grade)
-                correct_occ += int(grade_occ == grade)
-                n_total += 1
-                grade_shifts.append(shift)
-                faithfulness_hits += changed
-
-                rows.append({
-                    "fold": fold_idx,
-                    "img_id": img_id,
-                    "true_grade": grade,
-                    "top_tile": top_tile,
-                    "pred_orig": f"{pred_orig:.3f}",
-                    "pred_occ": f"{pred_occ:.3f}",
-                    "grade_orig": grade_orig,
-                    "grade_occ": grade_occ,
-                    "grade_shift": f"{shift:.3f}",
-                    "changed": changed,
-                })
+            rows.append({
+                "img_id": img_id,
+                "true_grade": grade,
+                "top_tile": top_tile,
+                "pred_orig": f"{pred_orig:.3f}",
+                "pred_occ": f"{pred_occ:.3f}",
+                "grade_orig": grade_orig,
+                "grade_occ": grade_occ,
+                "grade_shift": f"{shift:.3f}",
+                "changed": changed,
+            })
 
     if n_total == 0:
         print("No images processed.")
@@ -183,9 +180,10 @@ def evaluate(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--idrid_root", default="Datasets/IDRiD")
-    parser.add_argument("--run_dir", default="runs/optic_concept_idrid_cv")
+    parser.add_argument("--idrid_root",    default="Datasets/IDRiD")
+    parser.add_argument("--model_dir",     default="runs/optic_concept_idrid/official")
     parser.add_argument("--inference_dir", default="explainability/idrid_outputs")
-    parser.add_argument("--output_csv", default="explainability/tile_occlusion_results.csv")
+    parser.add_argument("--seg_split",     default="test", choices=["test", "train", "all"])
+    parser.add_argument("--output_csv",    default="explainability/tile_occlusion_results.csv")
     args = parser.parse_args()
     evaluate(args)

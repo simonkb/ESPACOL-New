@@ -163,7 +163,18 @@ class IDRiDSegmentationDataset(Dataset):
         idrid_root: str,
         transform: Optional[Callable] = None,
         tile_transform: Optional[Callable] = None,
+        split: str = "all",
     ):
+        """
+        split: "all"   — all 81 segmentation images (54 train + 27 test)
+               "train" — 54 segmentation training images only
+               "test"  — 27 segmentation test images only
+        Use split="test" when evaluating with a model trained on the official
+        IDRiD grading training set (413 images) to avoid data leakage.
+        """
+        if split not in ("all", "train", "test"):
+            raise ValueError(f"split must be 'all', 'train', or 'test', got '{split}'")
+
         seg_root = os.path.join(idrid_root, "A. Segmentation")
         img_root_seg = os.path.join(seg_root, "1. Original Images")
         gt_root_seg = os.path.join(seg_root, "2. All Segmentation Groundtruths")
@@ -199,7 +210,13 @@ class IDRiDSegmentationDataset(Dataset):
 
         self.items: List[Tuple[str, int, str, str]] = []  # (img_path, grade, img_id, split_key)
 
-        for split_key in ("a. Training Set", "b. Testing Set"):
+        split_keys = {
+            "all":   ("a. Training Set", "b. Testing Set"),
+            "train": ("a. Training Set",),
+            "test":  ("b. Testing Set",),
+        }[split]
+
+        for split_key in split_keys:
             split_img_dir = os.path.join(img_root_seg, split_key)
             if not os.path.isdir(split_img_dir):
                 continue

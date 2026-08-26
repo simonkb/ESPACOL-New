@@ -1,23 +1,26 @@
 """
-Run inference on IDRiD segmentation set (81 images) using a trained OPTIC-C
-checkpoint and save tile_weights + tile_concept_scores for downstream
-explainability evaluation.
+Run inference on IDRiD segmentation images using a trained OPTIC-C checkpoint
+and save tile_weights + tile_concept_scores for downstream explainability eval.
 
-Usage (per fold checkpoint):
+Usage:
   python explainability/inference_idrid.py \
-      --idrid_root Datasets/IDRiD \
-      --run_dir    runs/optic_concept_idrid_cv \
-      --output_dir explainability/idrid_outputs \
-      --fold       0
+      --idrid_root  Datasets/IDRiD \
+      --model_dir   runs/optic_concept_idrid/official \
+      --output_dir  explainability/idrid_outputs \
+      --seg_split   test
 
-Outputs (one .npz per fold in output_dir):
-  fold{k}_outputs.npz with keys:
-    img_ids          (N,) str — IDRiD image IDs, e.g. "IDRiD_01"
-    labels           (N,) int — grade labels (-1 if not in grading set)
-    preds            (N,) float — expected grade (continuous)
-    pred_grades      (N,) int — rounded predicted grade
-    tile_weights     (N, K, T) float32 — grade-specific tile attention weights
-    tile_concept_scores (N, T, C) float32 — per-tile concept cosine similarities
+  --seg_split test  (default): 27 segmentation test images — use this when the
+                    model was trained on the official IDRiD grading split (413
+                    images) to avoid evaluating on training data.
+  --seg_split all : all 81 segmentation images (train + test).
+
+Output: <output_dir>/official_outputs.npz with keys:
+  img_ids             (N,) str   — IDRiD image IDs, e.g. "IDRiD_01"
+  labels              (N,) int   — grade labels (-1 if not found)
+  preds               (N,) float — continuous predicted grade
+  pred_grades         (N,) int   — rounded predicted grade
+  tile_weights        (N, K, T)  — grade-specific GPA attention weights
+  tile_concept_scores (N, T, C)  — per-tile concept cosine similarities
 """
 
 from __future__ import annotations
@@ -38,29 +41,11 @@ from Models.framework import build_model
 from configs.config import DRConfig
 
 
-def load_checkpoint(fold_dir: str, device: torch.device):
-    """Load best model checkpoint from a fold directory."""
-    ckpt_path = os.path.join(fold_dir, "best_model.pt")
+def load_model(model_dir: str, device: torch.device):
+    ckpt_path = os.path.join(model_dir, "best_model.pt")
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device)
-    return ckpt
-
-
-def run_inference(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    tile_tfm = build_tile_transform(tile_size=300, tile_grid=3, augment=False)
-
-    ds = IDRiDSegmentationDataset(
-        idrid_root=args.idrid_root,
-        tile_transform=tile_tfm,
-    )
-    loader = DataLoader(ds, batch_size=4, shuffle=False, num_workers=4, pin_memory=True)
-
-    fold_dir = os.path.join(args.run_dir, f"fold{args.fold}")
-    ckpt = load_checkpoint(fold_dir, device)
 
     cfg = DRConfig()
     model = build_model(
@@ -78,7 +63,6 @@ def run_inference(args):
     model.to(device)
     model.eval()
 
-    # Load text encoder for concept embeddings
     text_encoder = None
     try:
         from Models.clinical_text import ClinicalTextEncoder
@@ -93,16 +77,30 @@ def run_inference(args):
     except Exception as e:
         print(f"Warning: could not load text encoder ({e}). Concept scores will be zeros.")
 
-    all_img_ids = []
-    all_labels = []
-    all_preds = []
-    all_pred_grades = []
-    all_tile_weights = []
-    all_tile_concept_scores = []
+    return model, text_encoder
+
+
+def run_inference(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    tile_tfm = build_tile_transform(tile_size=300, tile_grid=3, augment=False)
+    ds = IDRiDSegmentationDataset(
+        idrid_root=args.idrid_root,
+        tile_transform=tile_tfm,
+        split=args.seg_split,
+    )
+    print(f"Segmentation images ({args.seg_split} split): {len(ds)}")
+
+    loader = DataLoader(ds, batch_size=4, shuffle=False, num_workers=4, pin_memory=True)
+
+    model, text_encoder = load_model(args.model_dir, device)
+
+    all_img_ids, all_labels, all_preds, all_pred_grades = [], [], [], []
+    all_tile_weights, all_tile_concept_scores = [], []
 
     with torch.no_grad():
-        for batch in loader:
-            x, labels, img_ids, _ = batch
+        for x, labels, img_ids, _ in loader:
             x = x.to(device)
 
             concept_embeds = None
@@ -113,9 +111,8 @@ def run_inference(args):
 
             preds = out["pred"].cpu().float().numpy()
             pred_grades = np.clip(np.round(preds).astype(int), 0, 4)
-
-            tw = out.get("tile_weights", None)
-            tcs = out.get("tile_concept_scores", None)
+            tw = out.get("tile_weights")
+            tcs = out.get("tile_concept_scores")
 
             all_img_ids.extend(list(img_ids))
             all_labels.extend(labels.numpy().tolist())
@@ -124,24 +121,32 @@ def run_inference(args):
             all_tile_weights.append(tw.cpu().numpy() if tw is not None else None)
             all_tile_concept_scores.append(tcs.cpu().numpy() if tcs is not None else None)
 
-    out_path = os.path.join(args.output_dir, f"fold{args.fold}_outputs.npz")
+    N = len(all_img_ids)
+    tw_arr = (np.concatenate(all_tile_weights, axis=0) if all_tile_weights[0] is not None
+              else np.zeros((N, 5, 10), dtype=np.float32))
+    tcs_arr = (np.concatenate(all_tile_concept_scores, axis=0) if all_tile_concept_scores[0] is not None
+               else np.zeros((N, 10, 9), dtype=np.float32))
+
+    out_path = os.path.join(args.output_dir, "official_outputs.npz")
     np.savez(
         out_path,
         img_ids=np.array(all_img_ids),
         labels=np.array(all_labels, dtype=np.int32),
         preds=np.array(all_preds, dtype=np.float32),
         pred_grades=np.array(all_pred_grades, dtype=np.int32),
-        tile_weights=np.concatenate(all_tile_weights, axis=0) if all_tile_weights[0] is not None else np.zeros((len(all_img_ids), 5, 10)),
-        tile_concept_scores=np.concatenate(all_tile_concept_scores, axis=0) if all_tile_concept_scores[0] is not None else np.zeros((len(all_img_ids), 10, 9)),
+        tile_weights=tw_arr,
+        tile_concept_scores=tcs_arr,
     )
-    print(f"Saved {len(all_img_ids)} inference outputs to {out_path}")
+    print(f"Saved {N} inference outputs → {out_path}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--idrid_root", default="Datasets/IDRiD")
-    parser.add_argument("--run_dir", default="runs/optic_concept_idrid_cv")
-    parser.add_argument("--output_dir", default="explainability/idrid_outputs")
-    parser.add_argument("--fold", type=int, required=True)
+    parser.add_argument("--idrid_root",  default="Datasets/IDRiD")
+    parser.add_argument("--model_dir",   default="runs/optic_concept_idrid/official")
+    parser.add_argument("--output_dir",  default="explainability/idrid_outputs")
+    parser.add_argument("--seg_split",   default="test", choices=["test", "train", "all"],
+                        help="Which segmentation images to run: 'test' (default, 27 images, "
+                             "no leakage), 'all' (81 images).")
     args = parser.parse_args()
     run_inference(args)
