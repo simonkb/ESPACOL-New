@@ -47,33 +47,61 @@ CONCEPT_NAMES = [
 GRADE_LABELS = {1: "Grade 1\n(Mild)", 2: "Grade 2\n(Moderate)",
                 3: "Grade 3\n(Severe)", 4: "Grade 4\n(PDR)"}
 
+# Display labels for the lesion mask panel — grade 4 PDR annotated same as grade 3
+# in IDRiD (no NV/VH masks provided); add dagger to flag this.
+MASK_PANEL_LABELS = {
+    1: "MA",
+    2: "MA/HE/EX",
+    3: "HE/EX/SE",
+    4: "HE/EX/SE†",   # † = NV/VH not available in IDRiD segmentation
+}
+
 
 def draw_tile_heatmap(ax, img: Image.Image, tile_weights_1d: np.ndarray, title: str):
-    """Overlay 3x3 tile heatmap on fundus image."""
+    """Overlay 3x3 tile heatmap on fundus image.
+
+    Uses Blues colormap (white=low → deep blue=high) so attention is visible
+    against the orange-red fundus. Alpha scales with weight so low-weight tiles
+    stay nearly transparent (fundus visible underneath).
+    """
     ax.imshow(img)
     ax.set_title(title, fontsize=9, pad=3)
     ax.axis("off")
 
     spatial = tile_weights_1d[:TILE_GRID * TILE_GRID]
-    vmin, vmax = spatial.min(), spatial.max()
-    norm = Normalize(vmin=vmin, vmax=vmax)
-    cmap = plt.cm.hot
+    w_min, w_max = spatial.min(), spatial.max()
+    norm_w = (spatial - w_min) / (w_max - w_min + 1e-8)   # [0, 1]
+    top_tile = int(np.argmax(spatial))
+
+    cmap = plt.cm.Blues
 
     for t in range(TILE_GRID * TILE_GRID):
         row, col = divmod(t, TILE_GRID)
-        # Normalise to fraction of display image size
         h, w = img.size[1], img.size[0]
         x = col * w / TILE_GRID
         y = row * h / TILE_GRID
         tw = w / TILE_GRID
         th = h / TILE_GRID
-        color = cmap(norm(spatial[t]))
+
+        color = cmap(norm_w[t])
+        # Variable alpha: low-weight tiles nearly transparent, high-weight opaque
+        alpha = 0.12 + 0.55 * norm_w[t]   # [0.12, 0.67]
+        is_top = (t == top_tile)
         rect = patches.Rectangle(
             (x, y), tw, th,
-            linewidth=1, edgecolor="white",
-            facecolor=color, alpha=0.45,
+            linewidth=2.5 if is_top else 0.8,
+            edgecolor="#FFD700" if is_top else "white",   # gold border for max tile
+            facecolor=color, alpha=alpha,
         )
         ax.add_patch(rect)
+
+    # Colorbar legend
+    sm = ScalarMappable(cmap=cmap, norm=Normalize(vmin=0, vmax=1))
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, fraction=0.035, pad=0.03, orientation="vertical")
+    cbar.set_label("Attention", fontsize=7)
+    cbar.set_ticks([0, 0.5, 1])
+    cbar.set_ticklabels(["Low", "Mid", "High"], fontsize=6)
 
 
 def draw_mask_overlay(ax, img: Image.Image, mask: Optional[np.ndarray], title: str):
@@ -83,7 +111,7 @@ def draw_mask_overlay(ax, img: Image.Image, mask: Optional[np.ndarray], title: s
     ax.axis("off")
     if mask is not None and mask.any():
         mask_img = np.zeros((*mask.shape, 4), dtype=np.uint8)
-        mask_img[mask > 0] = [255, 50, 50, 160]  # red, semi-transparent
+        mask_img[mask > 0] = [0, 230, 130, 200]  # bright green — contrasts with orange fundus
         ax.imshow(mask_img)
 
 
@@ -219,9 +247,12 @@ def make_figure(args):
         draw_tile_heatmap(ax_row[1], img_900, rep["tile_weights"], f"(b) GPA tile weights\n(predicted grade {rep['pred_grade']})")
 
         # Panel (c): mask overlay
-        draw_mask_overlay(ax_row[2], img_900, rep["mask"], f"(c) IDRiD lesion mask\n({'/'.join(GRADE_TO_LESION_KEYS.get(g, ['none']))})")
+        mask_label = MASK_PANEL_LABELS.get(g, "/".join(GRADE_TO_LESION_KEYS.get(g, ["none"])))
+        draw_mask_overlay(ax_row[2], img_900, rep["mask"], f"(c) IDRiD lesion mask\n({mask_label})")
 
     plt.tight_layout()
+    fig.text(0.01, 0.0, "† IDRiD does not provide NV/VH segmentation masks; grade 4 mask uses HE/EX/SE annotations only.",
+             fontsize=6, color="gray", va="bottom")
 
     out_pdf = os.path.join(args.output_dir, "optic_c_qualitative.pdf")
     out_png = os.path.join(args.output_dir, "optic_c_qualitative.png")
