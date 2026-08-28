@@ -126,6 +126,7 @@ def sigmoid(x: np.ndarray) -> np.ndarray:
 def select_best_image(
     img_ids: np.ndarray,
     labels: np.ndarray,
+    pred_grades: np.ndarray,
     tcs: np.ndarray,
     target_grade: int,
     concept_idx: int,
@@ -133,15 +134,21 @@ def select_best_image(
     idrid_root: str,
 ) -> Optional[str]:
     """
-    Among images with true_grade == target_grade, pick the one where
-    the max-tile score for concept_idx is highest and the image file exists.
-    Falls back to any image of that grade.
+    Among images with the target grade, pick the one where the max-tile
+    concept score is highest and the image file is accessible.
+
+    Preference order:
+      1. True labels == target_grade  (if any labels != -1)
+      2. Predicted grades == target_grade  (fallback when labels are all -1,
+         which happens when segmentation IDs don't match the grading CSV)
     """
+    # Try true labels first; fall back to predicted grades
     candidate_idxs = np.where(labels == target_grade)[0]
+    if len(candidate_idxs) == 0:
+        candidate_idxs = np.where(pred_grades == target_grade)[0]
     if len(candidate_idxs) == 0:
         return None
 
-    # Score each candidate by max spatial tile score for the concept
     scores = []
     for ci in candidate_idxs:
         s = tcs[ci, :n_spatial, concept_idx]
@@ -268,9 +275,10 @@ def make_figure(args) -> None:
         )
 
     data = np.load(args.npz, allow_pickle=True)
-    img_ids     = data["img_ids"]             # (N,)
-    tcs         = data["tile_concept_scores"] # (N, T, C)
-    labels      = data["labels"]              # (N,)
+    img_ids     = np.array([str(x) for x in data["img_ids"]])   # (N,) clean Python str
+    tcs         = data["tile_concept_scores"]                    # (N, T, C)
+    labels      = data["labels"]                                 # (N,) — may be all -1
+    pred_grades = data["pred_grades"]                            # (N,) — always valid
 
     n_spatial = args.tile_grid ** 2
     grades_to_show = [1, 2, 3, 4]
@@ -289,7 +297,7 @@ def make_figure(args) -> None:
         concept_name = CONCEPT_NAMES[c_idx]
 
         img_id = select_best_image(
-            img_ids, labels, tcs, grade, c_idx, n_spatial, args.idrid_root
+            img_ids, labels, pred_grades, tcs, grade, c_idx, n_spatial, args.idrid_root
         )
         if img_id is None:
             print(f"  Warning: no image found for grade {grade} — skipping row")
@@ -300,7 +308,7 @@ def make_figure(args) -> None:
         print(f"  Grade {grade}: using {img_id}  (concept: {concept_name})")
 
         img = load_original_image(args.idrid_root, img_id)
-        scores_all = tcs[np.where(img_ids == img_id)[0][0], :n_spatial, :]  # (9, C)
+        scores_all = tcs[np.where(img_ids == img_id)[0][0], :n_spatial, :]   # (9, C)
         scores_concept = scores_all[:, c_idx]   # (9,)
 
         mask = None
