@@ -24,7 +24,6 @@ import sys
 import time
 
 import numpy as np
-import pandas as pd
 import torch
 import wandb
 from torch.utils.data import DataLoader
@@ -32,13 +31,14 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from configs.config import DRConfig
+from Datasets.aptos_loader import load_all_aptos_items
 from Datasets.dataloaders import (
     ImageLabelDataset,
     StratifiedBatchSampler,
     build_tile_transform,
 )
 from models.framework import build_model
-from training.cross_val import DRCrossValidator
+from training.cross_val import APTOSCrossValidator
 from training.trainer import Trainer
 from utils.checkpoint import save_checkpoint, load_checkpoint
 
@@ -49,19 +49,6 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def load_aptos_items(aptos_root: str) -> list:
-    """Read train.csv → list of (image_path, label) tuples."""
-    csv_path = os.path.join(aptos_root, "train.csv")
-    img_dir  = os.path.join(aptos_root, "train_images")
-    df = pd.read_csv(csv_path)
-    items = []
-    for _, row in df.iterrows():
-        path  = os.path.join(img_dir, str(row["id_code"]) + ".png")
-        label = int(row["diagnosis"])
-        items.append((path, label))
-    return items
 
 
 # ── Sweep-aware trainer ────────────────────────────────────────────────────────
@@ -245,10 +232,10 @@ def run_sweep(args) -> dict:
     set_seed(cfg.seed)
 
     # ── Data ──
-    all_items = load_aptos_items(args.aptos_root)
+    all_items = load_all_aptos_items(args.aptos_root)
     log.info(f"APTOS: {len(all_items)} images")
 
-    cv = DRCrossValidator(
+    cv = APTOSCrossValidator(
         all_items, n_folds=cfg.n_folds,
         val_fraction=cfg.val_fraction, seed=cfg.seed,
     )
