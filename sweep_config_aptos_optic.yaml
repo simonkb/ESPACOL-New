@@ -1,0 +1,70 @@
+program: train_aptos_sweep.py
+method: bayes
+metric:
+  goal: maximize
+  name: best_val_acc
+
+# Hyperband: kill bottom 50% at epoch 10, bottom 75% at epoch 20.
+# A promising APTOS run should clear 78% by epoch 10 and 82% by epoch 20.
+early_terminate:
+  type: hyperband
+  min_iter: 10
+  eta: 2
+
+# ── Rationale ─────────────────────────────────────────────────────────────────
+# v9 on APTOS gives 85.36% avg, 86.77% peak (fold 1).  The CGPM ablation shows
+# that adding concept losses costs ~0.23% vs GPA-only, meaning the loss weights
+# (lambda_proto_ce, lambda_tile_concept) are not yet optimal.  The hypothesis:
+# a lighter concept constraint preserves more gradient signal for CORAL+GPA,
+# while the right freeze schedule and LR mult allows CTOT/GPA to converge faster.
+#
+# All runs use the fixed OPTIC-C architecture (CTOT + GPA + CGPM + CORAL-ODH),
+# alpha=beta=gamma=0 (no old SCOLw losses).
+# ──────────────────────────────────────────────────────────────────────────────
+
+parameters:
+  # CGPM concept losses — primary hypothesis: lighter supervision may help
+  lambda_proto_ce:
+    distribution: log_uniform_values
+    min: 0.2
+    max: 3.0
+
+  lambda_tile_concept:
+    distribution: log_uniform_values
+    min: 0.05
+    max: 1.2
+
+  # GPA spatial supervision — ablation showed +0.97% accuracy gain from GPA
+  lambda_gpa:
+    distribution: log_uniform_values
+    min: 0.03
+    max: 0.5
+
+  # Prototype temperature (sharpness of cosine similarities)
+  proto_temperature:
+    values: [0.08, 0.10, 0.12, 0.15, 0.20, 0.25]
+
+  # Label smoothing on proto-CE — regularises the dominant concept loss
+  proto_label_smoothing:
+    values: [0.0, 0.03, 0.05, 0.07, 0.10, 0.15]
+
+  # LR multiplier for randomly-initialised CTOT/GPA/CGPM vs backbone
+  new_component_lr_mult:
+    values: [1.5, 2.0, 2.5, 3.0, 4.0]
+
+  # Backbone freeze duration — gives CTOT/GPA/CGPM time to stabilise
+  backbone_freeze_epochs:
+    values: [15, 20, 25, 30]
+
+  # LR patience for ReduceLROnPlateau (used if use_cosine_lr=false)
+  lr_patience:
+    values: [8, 10, 12, 15]
+
+  # Regularisation
+  weight_decay:
+    values: [1.0e-6, 5.0e-6, 1.0e-5, 3.0e-5]
+
+  # CosineAnnealingLR at unfreeze instead of ReduceLROnPlateau
+  # Eliminates patience-based timing luck on some folds
+  use_cosine_lr:
+    values: [true, false]
