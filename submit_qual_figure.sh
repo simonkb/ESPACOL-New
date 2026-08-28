@@ -20,7 +20,10 @@ source activate G
 
 cd /dpc/kuin0170/ESPACOL-New
 
-python explainability/make_qual_figure.py \
-    --idrid_root    Datasets/IDRiD \
-    --inference_dir explainability/idrid_outputs \
-    --output_dir    explainability/figures
+python explainability/make_concept_figure.py \
+    --npz         explainability/idrid_outputs/official_outputs.npz \
+    --idrid_root  Datasets/IDRiD \
+    --out         paper/optic_c_concept_qual.png \
+    --tile_grid   3 \
+    --tile_size   300 \
+    --dpi         300
