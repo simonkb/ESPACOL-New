@@ -134,15 +134,13 @@ def select_best_image(
     idrid_root: str,
 ) -> Optional[str]:
     """
-    Among images with the target grade, pick the one where the max-tile
-    concept score is highest and the image file is accessible.
-
-    Preference order:
-      1. True labels == target_grade  (if any labels != -1)
-      2. Predicted grades == target_grade  (fallback when labels are all -1,
-         which happens when segmentation IDs don't match the grading CSV)
+    Pick the image that best shows the target concept, with grade preference:
+      1. True labels == target_grade
+      2. Predicted grades == target_grade
+      3. Any image — pick the one with highest concept activation
+         (for a qualitative figure this is fine; it just finds the clearest
+         example of the concept regardless of grade)
     """
-    # Try true labels first; fall back to predicted grades
     candidate_idxs = np.where(labels == target_grade)[0]
     if len(candidate_idxs) == 0:
         candidate_idxs = np.where(pred_grades == target_grade)[0]
@@ -281,7 +279,7 @@ def make_figure(args) -> None:
     pred_grades = data["pred_grades"]                            # (N,) — always valid
 
     n_spatial = args.tile_grid ** 2
-    grades_to_show = [1, 2, 3, 4]
+    grades_to_show = [2, 3, 4]
     n_grades = len(grades_to_show)
 
     fig, axes = plt.subplots(
