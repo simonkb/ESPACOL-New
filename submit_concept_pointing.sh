@@ -27,9 +27,9 @@ export HF_HUB_OFFLINE=1
 # If the outputs file already exists from a previous run, this step can be
 # skipped by passing --seg_split all (it will overwrite with the same data).
 #
-# MODEL_DIR should point to the directory containing fold1_best.pth.
-# Adjust the path below if the v10 checkpoint lives elsewhere.
-MODEL_DIR=runs/optic_concept_cv_v10
+# v9 fold 1 is the best single-fold checkpoint (85.35% test accuracy).
+# v10 is still incomplete (only folds 0-7 finished).
+MODEL_DIR=runs/optic_concept_cv_v9/fold1
 
 python explainability/inference_idrid.py \
     --idrid_root  Datasets/IDRiD \
