@@ -35,6 +35,6 @@ else
     python sanity_check_tscgp.py \
         --checkpoint "${CHECKPOINT}" \
         --dataset    dr \
-        --data_root  Datasets/DR \
+        --dr_root    Datasets/DR \
         --fold       0
 fi
