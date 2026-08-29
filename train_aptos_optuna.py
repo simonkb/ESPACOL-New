@@ -293,6 +293,15 @@ def make_objective(args, all_items: list, device: torch.device):
         )
 
         best_val_acc, _ = trainer.fit(test_loader)
+
+        # Explicitly free GPU memory before Optuna starts the next trial.
+        # Python GC does not immediately release CUDA tensors, so without this
+        # the second trial in a worker OOMs even though the first completed fine.
+        del trainer, model
+        del train_loader, val_loader, test_loader
+        del train_ds, val_ds, test_ds
+        torch.cuda.empty_cache()
+
         return best_val_acc
 
     return objective
