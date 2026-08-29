@@ -143,6 +143,7 @@ def eval_concept_decoder(checkpoint_path: str, args) -> None:
         model_name=cfg.text_encoder_name,
         class_descriptions=DR_CLASS_DESCRIPTIONS,
         proj_out_dim=cfg.proj_out_dim,
+        device=device,
         concept_descriptions=DR_CONCEPTS,
     ).to(device)
 
@@ -282,10 +283,12 @@ def main():
         from models.text import ClinicalTextEncoder
         from configs.clinical_text import DR_CLASS_DESCRIPTIONS, DR_CONCEPTS
         cfg = DRConfig()
+        device = torch.device("cpu")
         text_encoder = ClinicalTextEncoder(
             model_name=cfg.text_encoder_name,
             class_descriptions=DR_CLASS_DESCRIPTIONS,
             proj_out_dim=cfg.proj_out_dim,
+            device=device,
             concept_descriptions=DR_CONCEPTS,
         )
         R = compute_R_from_text(text_encoder)
