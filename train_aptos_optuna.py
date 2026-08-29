@@ -64,14 +64,40 @@ class OptunaTrainer(Trainer):
 
     def fit(self, test_loader: DataLoader) -> tuple[float, dict]:
         import optuna
+        from torch.optim.lr_scheduler import CosineAnnealingLR
 
         best_val_acc = -float("inf")
         best_val_mae = float("inf")
         best_score = -float("inf")
         best_ckpt_path = os.path.join(self.run_dir, "best.pth")
 
+        freeze_epochs = getattr(self.cfg, "backbone_freeze_epochs", 0)
+
         for epoch in range(1, self.cfg.epochs + 1):
             t0 = time.time()
+
+            # Backbone unfreeze — mirrors Trainer.fit() logic exactly
+            if freeze_epochs > 0 and epoch == freeze_epochs + 1 and self._backbone_params:
+                for p in self._backbone_params:
+                    p.requires_grad = True
+                log.info(f"Backbone unfrozen at epoch {epoch} — joint fine-tuning phase begins")
+                if self._use_cosine_lr:
+                    for group, base_lr in zip(self.optimizer.param_groups, self._base_lrs):
+                        group["lr"] = base_lr
+                    remaining = self.cfg.epochs - freeze_epochs
+                    self.scheduler = CosineAnnealingLR(
+                        self.optimizer, T_max=remaining, eta_min=self.cfg.lr_min
+                    )
+                    self._using_cosine = True
+                else:
+                    for group, base_lr in zip(self.optimizer.param_groups, self._base_lrs):
+                        group["lr"] = max(base_lr * self.cfg.lr_factor, self.cfg.lr_min)
+                    self.scheduler.best = float("inf")
+                    self.scheduler.num_bad_epochs = 0
+                self.early_stopping.best = -float("inf")
+                self.early_stopping.counter = 0
+                self.early_stopping.stop = False
+
             train_metrics = self._train_epoch(epoch)
             val_metrics = self._eval_epoch(self.val_loader, prefix="val")
             elapsed = time.time() - t0
@@ -130,7 +156,10 @@ class OptunaTrainer(Trainer):
                 if os.path.exists(prev) and prev != best_ckpt_path:
                     os.remove(prev)
 
-            self.scheduler.step(val_loss)
+            if self._using_cosine:
+                self.scheduler.step()
+            else:
+                self.scheduler.step(val_loss)
             if self.early_stopping.step(val_acc):
                 log.info(f"Early stopping at epoch {epoch}")
                 break
@@ -329,7 +358,7 @@ def main() -> None:
     storage = f"sqlite:///{db_path}"
 
     study = optuna.create_study(
-        study_name="aptos_optic_v9",
+        study_name="aptos_optic_v9b",
         storage=storage,
         load_if_exists=True,
         direction="maximize",
