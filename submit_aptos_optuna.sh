@@ -36,8 +36,8 @@ cd /dpc/kuin0170/ESPACOL-New
 export HF_HUB_OFFLINE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Install optuna if not present (silent no-op if already installed)
-pip install -q optuna
+# Install optuna into user site-packages (no write access to the shared conda env)
+pip install -q --user optuna
 
 echo "Worker ${SLURM_ARRAY_TASK_ID} starting on $(hostname)"
 
