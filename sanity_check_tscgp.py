@@ -217,20 +217,22 @@ def run_eval(args) -> None:
     train_csv = args.train_csv or os.path.join(args.dr_root, "trainLabels.csv")
     all_items = load_all_dr_items(args.dr_root, train_csv)
     cv = DRCrossValidator(all_items, n_folds=10, seed=42)
-    _, val_items, _ = cv.get_fold(args.fold)   # use val, NOT test
+    # train_dr.py trains on (train_raw + val_held), uses test_fold as its val signal.
+    # Evaluate on the held-out test fold — never seen during training.
+    _, _, eval_items = cv.get_fold(args.fold)
 
-    print(f"\nFold {args.fold} — evaluating on {len(val_items)} val images")
+    print(f"\nFold {args.fold} — evaluating on {len(eval_items)} held-out images")
 
     tile_tfm = build_tile_transform(
         tile_size=cfg.img_size, tile_grid=cfg.tile_grid, augment=False)
     loader = DataLoader(
-        ImageLabelDataset(val_items, transform=tile_tfm),
+        ImageLabelDataset(eval_items, transform=tile_tfm),
         batch_size=16, shuffle=False, num_workers=4, pin_memory=True,
     )
 
     # Majority-class baseline
     label_counts = [0] * cfg.n_classes
-    for _, lbl in val_items:
+    for _, lbl in eval_items:
         label_counts[lbl] += 1
     majority = label_counts.index(max(label_counts))
     print(f"Class distribution: {label_counts}  Majority class: {majority}")
