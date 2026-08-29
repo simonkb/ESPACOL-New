@@ -96,12 +96,12 @@ class OptunaTrainer(Trainer):
                 log.info(f"Pruned at epoch {epoch} (best_val_acc={best_val_acc:.1f}%)")
                 raise optuna.exceptions.TrialPruned()
 
-            # Hard early abandonment — kills clearly hopeless runs even before
-            # Hyperband fires (Hyperband min_resource=10, so first check at ep10)
+            # Hard cutoff only at epoch 10: kills truly broken configs (NaN loss,
+            # wildly wrong LR) that even frozen EfficientNetV2S features can't rescue.
+            # No epoch-20 cutoff — backbone_freeze_epochs goes up to 30, so at epoch 20
+            # the backbone may still be frozen and a legitimate run could be at 65-70%.
+            # Hyperband handles all later pruning decisions comparatively.
             if epoch == 10 and best_val_acc < 58.0:
-                log.info(f"Abandoned at epoch {epoch}: best_val_acc={best_val_acc:.1f}%")
-                break
-            if epoch >= 20 and best_val_acc < 72.0:
                 log.info(f"Abandoned at epoch {epoch}: best_val_acc={best_val_acc:.1f}%")
                 break
 
