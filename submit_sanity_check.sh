@@ -4,10 +4,11 @@
 #   sbatch submit_sanity_check.sh /path/to/fold0_best.pth
 #
 #SBATCH --job-name=tscgp_sanity
-#SBATCH --partition=cpu
+#SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
+#SBATCH --gres=gpu:1
 #SBATCH --mem=8G
 #SBATCH --time=0-00:30:00
 #SBATCH --output=/dpc/kuin0170/ESPACOL-New/slurm_logs/sanity_check_%j.out
