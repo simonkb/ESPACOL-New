@@ -92,14 +92,21 @@ Before submission:
 
 1. synchronize this branch and every untracked MOSAIC file to
    `/dpc/kuin0170/ESPACOL-New`;
-2. ensure environment `G` contains the project requirements and
-   `requirements-dev.txt`;
+2. use the established environment `G`, which is also used by the working
+   OPTIC launchers, and install its test-only dependency once with
+   `python -m pip install -r requirements-dev.txt`;
 3. ensure its PyTorch build supports CUDA 12.6 and `torch.amp`;
 4. ensure the EfficientNetV2-S ImageNet weights are cached or downloadable;
 5. verify APTOS has `train.csv` and all 3,662 `train_images`; and
 6. use a new run directory; set `MOSAIC_RESUME=1` only to continue a compatible
    `last.pth`. Checkpoints reject preprocessing or source-content signature
    drift.
+
+Do not reinstall `requirements.txt` into an already working cluster
+environment merely to obtain pytest: it pins a different PyTorch build and its
+current `packaging` entry is a machine-local Conda build path. The pilot checks
+the active PyTorch, torchvision, CUDA, pretrained weights, and pytest versions
+before doing any experiment work.
 
 Submit:
 

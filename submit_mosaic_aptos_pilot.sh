@@ -13,11 +13,22 @@
 #SBATCH --error=/dpc/kuin0170/ESPACOL-New/mosaic_aptos_pilot_%j.err
 #SBATCH --account=kuin0170
 
+# Match the bootstrap order used by the project's proven SLURM launchers.
+# Lmod and Conda are third-party shell code and are not safe under ``set -u``
+# (Lmod may inspect PBS_NODEFILE even in a Slurm job), so strict mode starts
+# only after both have initialized.
+source /etc/profile.d/lmod.sh || {
+  echo "Failed to initialize Lmod from /etc/profile.d/lmod.sh" >&2
+  exit 1
+}
+module load miniconda/3 || exit 1
+module load cuda/12.6 || exit 1
+source activate G || {
+  echo "Failed to activate conda environment G" >&2
+  exit 1
+}
+
 set -euo pipefail
-source /etc/profile.d/lmod.sh
-module load miniconda/3
-module load cuda/12.6
-source activate G
 cd /dpc/kuin0170/ESPACOL-New
 
 export HF_HUB_OFFLINE=1
@@ -39,6 +50,19 @@ date --iso-8601=seconds
 git rev-parse HEAD
 git status --short
 python --version
+
+# The established G environment already supplies the CUDA runtime packages.
+# Pytest is intentionally a development dependency because it is required by
+# Gate 0, not by inference/training itself.  Do not silently mutate the shared
+# Conda environment from a compute job; print the exact one-time repair.
+if ! python -c 'import pytest' >/dev/null 2>&1; then
+  echo "Missing pytest in conda environment G." >&2
+  echo "Install once from the repository root:" >&2
+  echo "  python -m pip install -r requirements-dev.txt" >&2
+  exit 3
+fi
+python -c 'import pytest; print("pytest", pytest.__version__)'
+
 python - <<'PY'
 import torch, torchvision
 from models.local_efficientnet import LocalEfficientNetV2S
