@@ -210,6 +210,37 @@ python export_mosaic_certificates.py \
 Every manifest row must have `replay_ok=True`. Twenty-five certificates are a
 replay smoke test, not evidence-quality evaluation.
 
+## Optional overnight exploratory runs
+
+Two validation-only launchers allow longer experiments to run without opening
+either dataset's outer test fold:
+
+```bash
+sbatch submit_mosaic_aptos_fold1_100.sh
+sbatch submit_mosaic_dr_fold0_75.sh
+```
+
+The first starts a fresh APTOS fold-1 run through epoch 100 in
+`runs/mosaic_aptos_fold1_e100`. The second starts patient-disjoint EyePACS fold
+0 through epoch 75 in `runs/mosaic_dr_fold0_e75`. The EyePACS exploration uses
+batch size 16 to turn the much larger corpus into a practical two-day job; the
+APTOS fold remains at batch size 4 so it is directly comparable to the first
+pilot. Both use nonblocking writer locks and refuse to overwrite existing
+artifacts. If a wall-time interruption occurs after at least one completed
+epoch, resume the identical run with:
+
+```bash
+MOSAIC_RESUME=1 sbatch submit_mosaic_aptos_fold1_100.sh
+MOSAIC_RESUME=1 sbatch submit_mosaic_dr_fold0_75.sh
+```
+
+These are exploratory robustness runs, not substitutes for the matched
+APTOS Gate-1 comparison or the preregistered two-fold EyePACS promotion rule.
+Their launchers set early-stopping patience equal to the epoch budget so that
+the requested learning curves are collected in full. Checkpoint selection
+still uses inner-validation QWK, and `--skip_test` keeps the outer folds
+untouched.
+
 ## Only after the pilot passes
 
 Implement/run formal Gate 1: a frozen cached-map, three-seed matched comparison
