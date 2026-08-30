@@ -189,3 +189,68 @@ class DRConfig(TrainConfig):
     text_finetune_start_epoch: int = 20
     use_multi_tile: bool = False
     tile_grid: int = 3
+
+
+@dataclass
+class MOSAICConfig(TrainConfig):
+    """Configuration for the proof-exclusive MOSAIC ordinal grader.
+
+    MOSAIC deliberately has its own configuration instead of reusing the
+    OPTIC feature flags.  In particular, it never instantiates CTOT, GPA,
+    CGPM, CORAL, or any global classification bypass.
+    """
+
+    dataset: str = "APTOS"
+    n_classes: int = 5
+    n_folds: int = 5
+    val_fraction: float = 0.1
+    run_dir: str = "runs/mosaic_aptos"
+    # This value is checked against the data pipeline at startup and is part
+    # of resume compatibility.  A checkpoint trained with acquisition-shaped
+    # masks must never be resumed after switching to canonical support.
+    preprocessing_version: str = "canonical-square-fixed-ellipse-v1"
+
+    # A single full-resolution retinal canvas replaces 10 independent tiles.
+    img_size: int = 896
+    batch_size: int = 4
+    epochs: int = 35
+    num_workers: int = 4
+    stratified: bool = False  # transition loss handles imbalance without double reweighting
+
+    # Local encoder.  Only pointwise mixing is permitted after the named tap.
+    local_stage: str = "rf_medium"  # rf_small / rf_medium / rf_large
+    evidence_dim: int = 128
+    grad_checkpoint: bool = False
+
+    # Exact truncated Poisson--binomial proof circuit.
+    max_count: int = 32
+    count_block_size: int = 64
+    count_implementation: str = "block_tree"
+    normal_expected_count: float = 0.5
+    proof_epsilon: float = 0.02
+    necessity_fraction: float = 0.5
+
+    # Dense warm-up, followed by a gradual hard-certificate transition.
+    dense_warmup_epochs: int = 4
+    proof_ramp_epochs: int = 4
+    dense_loss_weight: float = 0.1
+    stability_loss_weight: float = 0.0
+
+    # At-risk continuation balancing for the strongly imbalanced DR labels.
+    transition_weighting: str = "effective_num"
+    effective_num_beta: float = 0.999
+    transition_weight_cap: float = 10.0
+
+    # Optimisation.  The pointwise proof head learns faster than the local CNN.
+    lr: float = 1e-4
+    head_lr: float = 5e-4
+    weight_decay: float = 1e-5
+    lr_patience: int = 5
+    lr_min: float = 1e-6
+    early_stop_patience: int = 10
+    grad_clip_norm: float = 5.0
+
+    # Certificate output / validation controls.
+    save_val_certificates: bool = True
+    certificate_top_k: int = 64
+    certificate_tie_tolerance: float = 1e-6
