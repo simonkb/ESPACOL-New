@@ -14,6 +14,7 @@ from models.mosaic import (
     DualProofProjection,
     LocalOrdinalStateHead,
     MOSAICOrdinalCore,
+    MOSAICProofHead,
     OrdinalCardinalityCircuit,
     TruncatedPoissonBinomial,
     continuation_probabilities,
@@ -300,6 +301,54 @@ def test_extreme_alpha_logits_keep_log_stop_gradients_finite() -> None:
     assert float(witnesses.grad.abs().sum()) > 0.0
     assert circuit.alpha_logits.grad is not None
     assert torch.isfinite(circuit.alpha_logits.grad).all()
+
+
+def test_saturated_full_lattice_logits_keep_log_dp_backward_finite() -> None:
+    """Log-softmax witnesses must survive probability-space saturation."""
+
+    cells = 112 * 112
+    torch.manual_seed(123)
+    logits = (torch.randn(1, cells, 5) * 100.0).requires_grad_()
+    valid = torch.rand(1, cells) > 0.3
+    core = MOSAICOrdinalCore(
+        num_classes=5,
+        max_count=32,
+        implementation="block_tree",
+        block_size=64,
+    )
+    output = core(logits, valid_mask=valid, project=False)
+    loss, _ = MosaicLoss(5, dense_weight=0.1)(
+        output.transitions,
+        torch.tensor([0]),
+        projected_log_stop_probabilities=output.log_stop_probabilities,
+        dense_transitions=output.dense_transitions,
+        dense_log_stop_probabilities=output.dense_log_stop_probabilities,
+    )
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+    assert float(logits.grad.abs().sum()) > 0.0
+    assert core.circuit.alpha_logits.grad is not None
+    assert torch.isfinite(core.circuit.alpha_logits.grad).all()
+
+
+def test_proof_head_forces_local_linear_and_core_to_fp32_under_autocast() -> None:
+    head = MOSAICProofHead(
+        input_dim=8,
+        num_classes=5,
+        expected_num_cells=64,
+        max_count=8,
+        implementation="serial",
+    )
+    features = torch.randn(2, 64, 8)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        output = head(features, project=False)
+        loss = -output.log_stop_probabilities[:, 0].mean()
+    assert output.log_stop_probabilities.dtype == torch.float32
+    assert output.transitions.dtype == torch.float32
+    loss.backward()
+    assert head.local_state_head.linear.weight.grad is not None
+    assert torch.isfinite(head.local_state_head.linear.weight.grad).all()
 
 
 def test_cardinality_score_bounds_zero_and_monotonicity() -> None:

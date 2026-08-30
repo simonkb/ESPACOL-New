@@ -28,7 +28,9 @@ code actually does and the next executable experiment.
 - `training/mosaic_trainer.py` and `train_mosaic.py`: dense warm-up, proof
   tolerance ramp, validation-QWK checkpointing, complete resume state, atomic
   checkpoints, source-content implementation signatures, held-out test
-  evaluation, and proof diagnostics.
+  evaluation, proof diagnostics, and bounded AMP overflow recovery. The image
+  encoder uses autocast, while the lattice-wide local-state reduction and
+  exact proof circuit remain FP32.
 - `inference/mosaic_certificate.py` and
   `export_mosaic_certificates.py`: SHA-256-protected JSON certificates,
   hardware-tolerant numerical replay, minimum-prefix verification, fixed-proof
@@ -63,15 +65,15 @@ PYTHONPATH=. python -m pytest -q \
   tests/test_mosaic_integration.py
 ```
 
-The local result is **87 passed, 1 CUDA-only skipped**. The skipped
+The local result is **91 passed, 1 CUDA-only skipped**. The skipped
 full-lattice certificate test runs automatically in the cluster script; it
 checks a CUDA forward followed by canonical CPU replay.
 
 The latest local CPU Gate-0 run at `P=12,544`, batch 4, and `R=32` reported:
 
 - serial/tree agreement on an independent 127-event check: `3.55e-15` max error;
-- calibrated full-lattice forward: approximately `0.46 s`;
-- calibrated full-lattice backward: approximately `0.43 s`;
+- calibrated full-lattice forward: approximately `0.55 s`;
+- calibrated full-lattice backward: approximately `0.61 s`;
 - calibrated mean proof size: `1,187` cells;
 - minimum local-logit gradient norm: `0.03697`;
 - minimum cardinality-alpha gradient norm: `0.49433`; and
@@ -136,8 +138,8 @@ tail -f mosaic_aptos_pilot_<JOB_ID>.out
 The job records the git/worktree and software/GPU provenance, checks the
 pretrained weights and all 3,662 files, writes a validation-only shortcut
 audit, runs the structural and cross-device certificate tests, benchmarks Gate
-0 on CUDA, performs a configured-batch 896-by-896 projected-circuit backward
-memory smoke test, and then trains one seed of APTOS fold 0 with:
+0 on CUDA, performs configured-batch 896-by-896 dense and projected GradScaler
+backward/memory smoke tests, and then trains one seed of APTOS fold 0 with:
 
 - one 896-by-896 full fundus canvas;
 - RF-medium (stride 8, theoretical RF 95 pixels);
@@ -148,6 +150,11 @@ memory smoke test, and then trains one seed of APTOS fold 0 with:
 - complement-suppression fraction 0.5;
 - effective-number balanced at-risk continuation likelihood; and
 - no CTOT, GPA, CGPM, BiomedCLIP, CORAL, or global classifier bypass.
+
+The AMP scale starts at 8,192 rather than PyTorch's default 65,536 because the
+local-state bias aggregates roughly ten thousand evidence cells. A detected
+AMP overflow skips the optimizer update and reduces the scale, as GradScaler
+intends; repeated overflows or any non-AMP non-finite gradient remain fatal.
 
 The permitted EfficientNet trunk is fine-tuned from epoch 1 at the lower
 encoder learning rate. This is an intentional viability-pilot deviation from

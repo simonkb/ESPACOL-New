@@ -273,12 +273,15 @@ implemented recurrence therefore also carries
 \]
 
 and forms every stop mixture with `logsumexp` and the exact
-\(\log\operatorname{softmax}(\gamma_k)\). Training consumes these log-stop
-values directly. This scaled lower-tail representation preserves finite,
-nonzero gradients for diffuse 112-by-112 evidence fields where an ordinary
-probability-space stop would underflow. Thus \(T_r+U_r=1\) in exact arithmetic,
-while the implementation retains a stable log representation of the small
-side.
+\(\log\operatorname{softmax}(\gamma_k)\). Log witness and non-witness values
+are derived directly from the local categorical `log_softmax`, rather than by
+taking a logarithm after probability-space rounding. Impossible events use
+true log-zero with backward-safe masked reductions. Training consumes these
+log-stop values directly. This scaled lower-tail representation preserves
+finite, nonzero recovery gradients for diffuse or saturated 112-by-112
+evidence fields where an ordinary probability-space stop would underflow.
+Thus \(T_r+U_r=1\) in exact arithmetic, while the implementation retains a
+stable log representation of the small side.
 
 Every boundary learns a global distribution over focal versus distributed
 requirements:

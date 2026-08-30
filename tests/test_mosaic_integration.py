@@ -346,6 +346,48 @@ def test_epoch_diagnostics_aggregate_boundary_risk_sets_exactly(tmp_path: Path) 
         )
 
 
+def test_cpu_training_step_remains_finite_and_updates_parameters(tmp_path: Path) -> None:
+    trainer = _tiny_trainer(tmp_path)
+    labels = torch.tensor([0, 1, 3, 4])
+    loader = DataLoader(
+        TensorDataset(
+            torch.randn(4, 3, 64, 64),
+            torch.ones(4, 1, 64, 64, dtype=torch.bool),
+            labels,
+            torch.arange(4),
+        ),
+        batch_size=2,
+        shuffle=False,
+    )
+    before = trainer.model.proof_head.local_state_head.linear.bias.detach().clone()
+    metrics = trainer._run_epoch(loader, train=True, epoch=1)
+    after = trainer.model.proof_head.local_state_head.linear.bias.detach()
+    assert metrics["amp_skipped_steps"] == 0.0
+    assert metrics["amp_loss_scale"] == 1.0
+    assert torch.isfinite(after).all()
+    assert not torch.equal(before, after)
+
+
+def test_non_amp_nonfinite_gradient_is_immediately_fatal(tmp_path: Path) -> None:
+    trainer = _tiny_trainer(tmp_path)
+    parameter = trainer.model.proof_head.local_state_head.linear.bias
+    hook = parameter.register_hook(lambda gradient: torch.full_like(gradient, torch.inf))
+    loader = DataLoader(
+        TensorDataset(
+            torch.randn(2, 3, 64, 64),
+            torch.ones(2, 1, 64, 64, dtype=torch.bool),
+            torch.tensor([0, 4]),
+            torch.arange(2),
+        ),
+        batch_size=2,
+    )
+    try:
+        with pytest.raises(FloatingPointError, match="without AMP"):
+            trainer._run_epoch(loader, train=True, epoch=1)
+    finally:
+        hook.remove()
+
+
 def test_no_global_classifier_bypass_exists_statically_or_functionally() -> None:
     torch.manual_seed(22)
     model = _tiny_model()

@@ -133,6 +133,21 @@ def _json_safe(value: Any) -> Any:
     raise TypeError(f"value of type {type(value).__name__} is not JSON serializable")
 
 
+def _serialize_log_trace(value: torch.Tensor) -> torch.Tensor:
+    """Encode mathematical log-zero without permitting non-standard JSON."""
+
+    return torch.where(
+        torch.isneginf(value), torch.full_like(value, -1.0e30), value
+    )
+
+
+def _deserialize_log_trace(value: Any) -> torch.Tensor:
+    tensor = torch.tensor(value, dtype=torch.float32)
+    return torch.where(
+        tensor <= -5.0e29, torch.full_like(tensor, -torch.inf), tensor
+    )
+
+
 def _score_ledger(
     witness_ledger: torch.Tensor,
     alpha: torch.Tensor,
@@ -165,17 +180,53 @@ def _log_stop_ledger(
     alpha: torch.Tensor,
     log_alpha: torch.Tensor,
     selected_mask: torch.Tensor | None = None,
+    log_witness_ledger: torch.Tensor | None = None,
+    log_nonwitness_ledger: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Replay stable log stops and their scaled lower-tail state."""
 
     probabilities = witness_ledger.float()
+    log_probabilities = None
+    log_non_probabilities = None
+    if log_witness_ledger is not None or log_nonwitness_ledger is not None:
+        if (
+            log_witness_ledger is None
+            or log_nonwitness_ledger is None
+            or log_witness_ledger.shape != witness_ledger.shape
+            or log_nonwitness_ledger.shape != witness_ledger.shape
+        ):
+            raise ValueError("log witness ledgers must match the witness ledger")
+        log_probabilities = log_witness_ledger.float()
+        log_non_probabilities = log_nonwitness_ledger.float()
     if selected_mask is not None:
         probabilities = probabilities * selected_mask.to(probabilities.dtype)
+        if log_probabilities is not None:
+            selected = selected_mask.bool()
+            log_probabilities = torch.where(
+                selected,
+                log_probabilities,
+                torch.full_like(log_probabilities, -torch.inf),
+            )
+            log_non_probabilities = torch.where(
+                selected,
+                log_non_probabilities,
+                torch.zeros_like(log_non_probabilities),
+            )
     count = TruncatedPoissonBinomial(
         max_count=alpha.shape[1], implementation="block_tree", block_size=64
     )
     log_conditional, log_survival = count.scaled_log_lower_tail(
-        probabilities.transpose(0, 1).contiguous()
+        probabilities.transpose(0, 1).contiguous(),
+        log_probabilities=(
+            None
+            if log_probabilities is None
+            else log_probabilities.transpose(0, 1).contiguous()
+        ),
+        log_non_probabilities=(
+            None
+            if log_non_probabilities is None
+            else log_non_probabilities.transpose(0, 1).contiguous()
+        ),
     )
     log_stop = OrdinalCardinalityCircuit.score_log_stops(
         log_conditional, log_survival, alpha.float(), log_alpha.float()
@@ -297,6 +348,18 @@ def build_mosaic_certificate(
     witnesses = _sample(
         _field(output, "witness_probabilities"),
         "witness_probabilities",
+        sample_index=sample_index,
+        batched_ndim=3,
+    ).detach().float().cpu()
+    log_witnesses = _sample(
+        _field(output, "log_witness_probabilities"),
+        "log_witness_probabilities",
+        sample_index=sample_index,
+        batched_ndim=3,
+    ).detach().float().cpu()
+    log_nonwitnesses = _sample(
+        _field(output, "log_nonwitness_probabilities"),
+        "log_nonwitness_probabilities",
         sample_index=sample_index,
         batched_ndim=3,
     ).detach().float().cpu()
@@ -503,10 +566,17 @@ def build_mosaic_certificate(
         raise TypeError("lattice_metadata must serialize to an object")
     geometry = _lattice_geometry(metadata, p)
     _replay_dense_log_stop, dense_log_conditional, dense_log_survival = (
-        _log_stop_ledger(witnesses, alpha, log_alpha)
+        _log_stop_ledger(
+            witnesses, alpha, log_alpha,
+            log_witness_ledger=log_witnesses,
+            log_nonwitness_ledger=log_nonwitnesses,
+        )
     )
     _replay_retained_log_stop, retained_log_conditional, retained_log_survival = (
-        _log_stop_ledger(witnesses, alpha, log_alpha, selected_mask)
+        _log_stop_ledger(
+            witnesses, alpha, log_alpha, selected_mask,
+            log_witnesses, log_nonwitnesses,
+        )
     )
 
     selected_indices: list[list[int]] = []
@@ -568,9 +638,13 @@ def build_mosaic_certificate(
             "alpha": alpha,
             "log_alpha": log_alpha,
             "max_count": int(alpha.shape[1]),
-            "dense_log_conditional_low_distribution": dense_log_conditional,
+            "dense_log_conditional_low_distribution": _serialize_log_trace(
+                dense_log_conditional
+            ),
             "dense_log_low_survival": dense_log_survival,
-            "retained_log_conditional_low_distribution": retained_log_conditional,
+            "retained_log_conditional_low_distribution": _serialize_log_trace(
+                retained_log_conditional
+            ),
             "retained_log_low_survival": retained_log_survival,
         },
         "proof_rule": {
@@ -587,9 +661,16 @@ def build_mosaic_certificate(
             "replay_atol": float(replay_atol),
             "replay_rtol": float(replay_rtol),
             "arithmetic": "fp32_scaled_log_lower_tail_poisson_binomial",
+            "log_zero_encoding": -1.0e30,
         },
         "dense_ledger": {
             "witness_probabilities": witnesses,
+            "log_witness_probabilities": torch.where(
+                valid[:, None], log_witnesses, torch.zeros_like(log_witnesses)
+            ),
+            "log_nonwitness_probabilities": torch.where(
+                valid[:, None], log_nonwitnesses, torch.zeros_like(log_nonwitnesses)
+            ),
             "local_state_probabilities": local_states,
             "valid_mask": valid,
             "valid_mask_source": valid_source,
@@ -666,9 +747,26 @@ def _close_check(
         checks[name] = False
         errors[name] = math.inf
         return
-    difference = (actual.float() - expected.float()).abs()
-    errors[name] = float(difference.max()) if difference.numel() else 0.0
-    checks[name] = bool(torch.allclose(actual.float(), expected.float(), atol=atol, rtol=rtol))
+    actual = actual.float()
+    expected = expected.float()
+    matching_negative_infinity = torch.isneginf(actual) & torch.isneginf(expected)
+    finite_pair = torch.isfinite(actual) & torch.isfinite(expected)
+    compatible = matching_negative_infinity | finite_pair
+    finite_difference = torch.where(
+        finite_pair, (actual - expected).abs(), torch.zeros_like(actual)
+    )
+    errors[name] = (
+        float(finite_difference.max()) if finite_difference.numel() else 0.0
+    )
+    checks[name] = bool(
+        compatible.all()
+        and torch.allclose(
+            torch.where(finite_pair, actual, torch.zeros_like(actual)),
+            torch.where(finite_pair, expected, torch.zeros_like(expected)),
+            atol=atol,
+            rtol=rtol,
+        )
+    )
 
 
 def verify_mosaic_certificate(
@@ -718,6 +816,12 @@ def verify_mosaic_certificate(
     rule = certificate["proof_rule"]
 
     witnesses = torch.tensor(ledger["witness_probabilities"], dtype=torch.float32)
+    serialized_log_witnesses = torch.tensor(
+        ledger["log_witness_probabilities"], dtype=torch.float32
+    )
+    serialized_log_nonwitnesses = torch.tensor(
+        ledger["log_nonwitness_probabilities"], dtype=torch.float32
+    )
     local_states = torch.tensor(
         ledger["local_state_probabilities"], dtype=torch.float32
     )
@@ -731,10 +835,22 @@ def verify_mosaic_certificate(
         or alpha.shape[0] != boundaries
         or log_alpha.shape != alpha.shape
         or local_states.shape != (p, boundaries + 1)
+        or serialized_log_witnesses.shape != witnesses.shape
+        or serialized_log_nonwitnesses.shape != witnesses.shape
     ):
         raise ValueError("certificate ledger, valid mask, and alpha shapes disagree")
     raw_witnesses = witnesses
     witnesses = raw_witnesses * valid[:, None].float()
+    log_witnesses = torch.where(
+        valid[:, None],
+        serialized_log_witnesses,
+        torch.full_like(serialized_log_witnesses, -torch.inf),
+    )
+    log_nonwitnesses = torch.where(
+        valid[:, None],
+        serialized_log_nonwitnesses,
+        torch.zeros_like(serialized_log_nonwitnesses),
+    )
 
     geometry = None
     try:
@@ -763,10 +879,21 @@ def verify_mosaic_certificate(
         witnesses, alpha, (~selected_mask) & valid[:, None]
     )
     dense_log_stop, dense_log_conditional, dense_log_survival = _log_stop_ledger(
-        witnesses, alpha, log_alpha
+        witnesses,
+        alpha,
+        log_alpha,
+        log_witness_ledger=log_witnesses,
+        log_nonwitness_ledger=log_nonwitnesses,
     )
     retained_log_stop, retained_log_conditional, retained_log_survival = (
-        _log_stop_ledger(witnesses, alpha, log_alpha, selected_mask)
+        _log_stop_ledger(
+            witnesses,
+            alpha,
+            log_alpha,
+            selected_mask,
+            log_witnesses,
+            log_nonwitnesses,
+        )
     )
     _dense_continue, dense_stop, _dense_tails = (
         OrdinalCardinalityCircuit.score_distributions(dense_distribution, alpha)
@@ -811,6 +938,24 @@ def verify_mosaic_certificate(
             local_states.sum(dim=-1), torch.ones(p), atol=atol, rtol=rtol
         )
     )
+    checks["log_witness_ledger"] = bool(
+        torch.isfinite(serialized_log_witnesses[valid]).all()
+        and torch.isfinite(serialized_log_nonwitnesses[valid]).all()
+        and torch.allclose(
+            log_witnesses[valid].exp(), witnesses[valid], atol=atol, rtol=rtol
+        )
+        and torch.allclose(
+            torch.logsumexp(
+                torch.stack(
+                    (log_witnesses[valid], log_nonwitnesses[valid]), dim=-1
+                ),
+                dim=-1,
+            ),
+            torch.zeros_like(log_witnesses[valid]),
+            atol=atol,
+            rtol=rtol,
+        )
+    )
     replay_witnesses = torch.flip(
         torch.cumsum(
             torch.flip(local_states[:, 1:], dims=(-1,)), dim=-1
@@ -850,7 +995,9 @@ def verify_mosaic_certificate(
         errors,
         "dense_log_conditional_low_distribution",
         dense_log_conditional,
-        torch.tensor(cardinality["dense_log_conditional_low_distribution"]),
+        _deserialize_log_trace(
+            cardinality["dense_log_conditional_low_distribution"]
+        ),
         atol,
         rtol,
     )
@@ -868,7 +1015,9 @@ def verify_mosaic_certificate(
         errors,
         "retained_log_conditional_low_distribution",
         retained_log_conditional,
-        torch.tensor(cardinality["retained_log_conditional_low_distribution"]),
+        _deserialize_log_trace(
+            cardinality["retained_log_conditional_low_distribution"]
+        ),
         atol,
         rtol,
     )

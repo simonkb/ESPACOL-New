@@ -123,33 +123,67 @@ python - <<'PY'
 import torch
 from losses.mosaic import MosaicLoss
 from models.mosaic_model import build_mosaic_model
+from utils.spatial_mask import centered_ellipse_mask
 
-model = build_mosaic_model(
-    num_classes=5,
-    image_size=896,
-    local_stage="rf_medium",
-    local_dim=128,
-    pretrained=True,
-    max_count=32,
-    sufficiency_tolerance=0.0,
-    complement_suppression=0.5,
-).cuda().train()
-image = torch.zeros(4, 3, 896, 896, device="cuda")
-mask = torch.ones(4, 1, 896, 896, device="cuda", dtype=torch.bool)
-criterion = MosaicLoss(5, dense_weight=0.1).cuda()
-with torch.amp.autocast("cuda"):
-    output = model(image, mask, project=True)
-    loss, _ = criterion(
-        output.transitions,
-        torch.tensor([0, 1, 3, 4], device="cuda"),
-        projected_stop_probabilities=output.stop_probabilities,
-        projected_log_stop_probabilities=output.log_stop_probabilities,
-        dense_transitions=output.dense_transitions,
-        dense_stop_probabilities=output.dense_stop_probabilities,
-        dense_log_stop_probabilities=output.dense_log_stop_probabilities,
+labels = torch.tensor([0, 1, 3, 4], device="cuda")
+train_labels = [0] * 1300 + [1] * 266 + [2] * 719 + [3] * 139 + [4] * 212
+for project in (False, True):
+    model = build_mosaic_model(
+        num_classes=5,
+        image_size=896,
+        local_stage="rf_medium",
+        local_dim=128,
+        pretrained=True,
+        max_count=32,
+        sufficiency_tolerance=0.0,
+        complement_suppression=0.5,
+    ).cuda().train()
+    image = torch.zeros(4, 3, 896, 896, device="cuda")
+    mask = centered_ellipse_mask(
+        896, 896, batch_size=4, device=torch.device("cuda")
     )
-loss.backward()
-print("image_smoke_loss", float(loss.detach()))
+    criterion = MosaicLoss.from_training_labels(
+        train_labels,
+        5,
+        weight_method="effective_num",
+        weight_beta=0.999,
+        max_transition_weight=10.0,
+        dense_weight=0.1,
+    ).cuda()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    scaler = torch.amp.GradScaler(
+        "cuda", init_scale=8192.0, growth_interval=2000
+    )
+    optimizer.zero_grad(set_to_none=True)
+    with torch.amp.autocast("cuda"):
+        output = model(image, mask, project=project)
+        loss, _ = criterion(
+            output.transitions,
+            labels,
+            projected_stop_probabilities=output.stop_probabilities,
+            projected_log_stop_probabilities=output.log_stop_probabilities,
+            dense_transitions=output.dense_transitions,
+            dense_stop_probabilities=output.dense_stop_probabilities,
+            dense_log_stop_probabilities=output.dense_log_stop_probabilities,
+        )
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(), 5.0, error_if_nonfinite=True
+    )
+    offenders = [
+        name for name, parameter in model.named_parameters()
+        if parameter.grad is not None and not torch.isfinite(parameter.grad).all()
+    ]
+    if offenders:
+        raise RuntimeError(f"non-finite scaled smoke gradients: {offenders}")
+    scaler.step(optimizer)
+    scaler.update()
+    print(
+        "image_smoke",
+        {"project": project, "loss": float(loss.detach()),
+         "grad_norm": float(grad_norm), "scale": float(scaler.get_scale())},
+    )
 print("peak_cuda_memory_gib", torch.cuda.max_memory_allocated() / 2**30)
 PY
 

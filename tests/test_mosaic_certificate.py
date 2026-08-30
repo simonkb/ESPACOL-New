@@ -154,6 +154,8 @@ class MosaicCertificateTests(unittest.TestCase):
         output_mapping = {
             "local_state_probabilities": output.local_state_probabilities,
             "witness_probabilities": output.witness_probabilities,
+            "log_witness_probabilities": output.log_witness_probabilities,
+            "log_nonwitness_probabilities": output.log_nonwitness_probabilities,
             "alpha": output.alpha,
             "log_alpha": output.log_alpha,
             "dense_transitions": output.dense_transitions,

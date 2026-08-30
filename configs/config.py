@@ -250,6 +250,14 @@ class MOSAICConfig(TrainConfig):
     early_stop_patience: int = 10
     grad_clip_norm: float = 5.0
 
+    # The local-state head reduces gradients over roughly ten thousand cells.
+    # CUDA AMP's default 65,536 scale can overflow that otherwise finite FP16
+    # reduction on the first batch.  A conservative initial scale plus bounded
+    # dynamic backoff preserves mixed precision without hiding persistent NaNs.
+    amp_init_scale: float = 8192.0
+    amp_growth_interval: int = 2000
+    amp_max_consecutive_skips: int = 8
+
     # Certificate output / validation controls.
     save_val_certificates: bool = True
     certificate_top_k: int = 64

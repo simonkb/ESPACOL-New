@@ -33,6 +33,8 @@ class LocalOrdinalEvidence:
 
     state_probabilities: torch.Tensor
     witness_probabilities: torch.Tensor
+    log_witness_probabilities: torch.Tensor
+    log_nonwitness_probabilities: torch.Tensor
 
 
 @dataclass
@@ -74,6 +76,8 @@ class MOSAICOutput:
 
     local_state_probabilities: torch.Tensor
     witness_probabilities: torch.Tensor
+    log_witness_probabilities: torch.Tensor
+    log_nonwitness_probabilities: torch.Tensor
     alpha: torch.Tensor
     log_alpha: torch.Tensor
     dense_transitions: torch.Tensor
@@ -111,8 +115,11 @@ def nested_witness_probabilities(
     if local_logits.shape[-1] < 2:
         raise ValueError("at least two ordinal states are required")
 
-    # Softmax and all downstream probability operations are deliberately FP32.
-    state = torch.softmax(local_logits.float(), dim=-1)
+    # Preserve both sides of every ordinal Bernoulli event in log space.
+    # Converting a saturated softmax probability back through log(p) loses
+    # the recovery gradient that log_softmax retains for finite logits.
+    log_state = torch.log_softmax(local_logits.float(), dim=-1)
+    state = log_state.exp()
 
     if valid_mask is not None:
         if valid_mask.shape != local_logits.shape[:2]:
@@ -124,13 +131,26 @@ def nested_witness_probabilities(
         normal = torch.zeros_like(state)
         normal[..., 0] = 1.0
         state = torch.where(valid.unsqueeze(-1), state, normal)
+        log_normal = torch.full_like(log_state, -torch.inf)
+        log_normal[..., 0] = 0.0
+        log_state = torch.where(valid.unsqueeze(-1), log_state, log_normal)
 
     # For states 0,...,K-1 this produces [P(L>0), ..., P(L>K-2)].
-    abnormal = state[..., 1:]
-    witnesses = torch.flip(
-        torch.cumsum(torch.flip(abnormal, dims=(-1,)), dim=-1), dims=(-1,)
-    ).clamp(0.0, 1.0)
-    return LocalOrdinalEvidence(state, witnesses)
+    log_witnesses = []
+    log_nonwitnesses = []
+    for boundary in range(local_logits.shape[-1] - 1):
+        log_witnesses.append(
+            torch.logsumexp(log_state[..., boundary + 1 :], dim=-1)
+        )
+        log_nonwitnesses.append(
+            torch.logsumexp(log_state[..., : boundary + 1], dim=-1)
+        )
+    log_witness = torch.stack(log_witnesses, dim=-1)
+    log_nonwitness = torch.stack(log_nonwitnesses, dim=-1)
+    witnesses = log_witness.exp().clamp(0.0, 1.0)
+    return LocalOrdinalEvidence(
+        state, witnesses, log_witness, log_nonwitness
+    )
 
 
 class LocalOrdinalStateHead(nn.Module):
@@ -391,10 +411,9 @@ class TruncatedPoissonBinomial(nn.Module):
     def _empty_log_low(
         leading_shape: Tuple[int, ...], max_count: int, device: torch.device
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        log_zero = -1.0e30
         log_conditional = torch.full(
             (*leading_shape, max_count),
-            log_zero,
+            -torch.inf,
             device=device,
             dtype=torch.float32,
         )
@@ -405,22 +424,71 @@ class TruncatedPoissonBinomial(nn.Module):
         return log_conditional, log_survival
 
     @staticmethod
+    def _safe_logsumexp(log_values: torch.Tensor, dim: int) -> torch.Tensor:
+        """LogSumExp with a constant ``-inf`` result for empty support.
+
+        PyTorch's backward for an all-``-inf`` reduction is undefined.  The
+        finite dummy branch is evaluated only for unsupported rows and is
+        replaced by a constant, giving the mathematically correct zero
+        gradient there.
+        """
+
+        supported = (~torch.isneginf(log_values)).any(dim=dim)
+        safe_values = torch.where(
+            supported.unsqueeze(dim), log_values, torch.zeros_like(log_values)
+        )
+        reduced = torch.logsumexp(safe_values, dim=dim)
+        return torch.where(
+            supported, reduced, torch.full_like(reduced, -torch.inf)
+        )
+
+    @staticmethod
+    def _safe_logaddexp(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        supported = (~torch.isneginf(left)) | (~torch.isneginf(right))
+        safe_left = torch.where(supported, left, torch.zeros_like(left))
+        safe_right = torch.where(supported, right, torch.zeros_like(right))
+        combined = torch.logaddexp(safe_left, safe_right)
+        return torch.where(
+            supported, combined, torch.full_like(combined, -torch.inf)
+        )
+
+    @staticmethod
     def _normalise_log_low(
         log_low: torch.Tensor, log_survival: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Normalize low-count log masses and accumulate their total mass."""
 
-        log_scale = torch.logsumexp(log_low, dim=-1)
+        log_scale = TruncatedPoissonBinomial._safe_logsumexp(log_low, dim=-1)
         finite = torch.isfinite(log_scale)
         safe_scale = torch.where(finite, log_scale, torch.zeros_like(log_scale))
         normalized = log_low - safe_scale.unsqueeze(-1)
         # Conditional probabilities are undefined after exact zero survival.
         # A deterministic delta fallback avoids NaNs; log_survival=-inf keeps
         # every resulting absolute low-count probability exactly zero.
-        fallback = torch.full_like(normalized, -1.0e30)
+        fallback = torch.full_like(normalized, -torch.inf)
         fallback[..., 0] = 0.0
         normalized = torch.where(finite.unsqueeze(-1), normalized, fallback)
         return normalized, log_survival + log_scale
+
+    def _update_log_low_from_logs(
+        self,
+        log_conditional: torch.Tensor,
+        log_survival: torch.Tensor,
+        log_probability: torch.Tensor,
+        log_non_probability: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        stay = log_conditional + log_non_probability.float().unsqueeze(-1)
+        shifted = torch.cat(
+            (
+                torch.full_like(log_conditional[..., :1], -torch.inf),
+                log_conditional[..., :-1]
+                + log_probability.float().unsqueeze(-1),
+            ),
+            dim=-1,
+        )
+        return self._normalise_log_low(
+            self._safe_logaddexp(stay, shifted), log_survival
+        )
 
     def _update_log_low(
         self,
@@ -429,41 +497,33 @@ class TruncatedPoissonBinomial(nn.Module):
         probability: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         probability = probability.float().clamp(0.0, 1.0)
-        # Evaluate logarithms away from exact endpoints, then restore endpoint
-        # semantics with a finite log-zero sentinel.  This avoids 0*inf NaNs
-        # in autograd for masked/padded p=0 and deterministic p=1 cells.
         endpoint = (probability == 0.0) | (probability == 1.0)
         safe_probability = torch.where(
             endpoint, torch.full_like(probability, 0.5), probability
         )
-        log_p = torch.where(
+        log_probability = torch.where(
             probability == 0.0,
-            torch.full_like(probability, -1.0e30),
+            torch.full_like(probability, -torch.inf),
             torch.where(
                 probability == 1.0,
                 torch.zeros_like(probability),
                 torch.log(safe_probability),
             ),
         )
-        log_one_minus_p = torch.where(
+        log_non_probability = torch.where(
             probability == 1.0,
-            torch.full_like(probability, -1.0e30),
+            torch.full_like(probability, -torch.inf),
             torch.where(
                 probability == 0.0,
                 torch.zeros_like(probability),
                 torch.log1p(-safe_probability),
             ),
         )
-        stay = log_conditional + log_one_minus_p.unsqueeze(-1)
-        shifted = torch.cat(
-            (
-                torch.full_like(log_conditional[..., :1], -1.0e30),
-                log_conditional[..., :-1] + log_p.unsqueeze(-1),
-            ),
-            dim=-1,
-        )
-        return self._normalise_log_low(
-            torch.logaddexp(stay, shifted), log_survival
+        return self._update_log_low_from_logs(
+            log_conditional,
+            log_survival,
+            log_probability,
+            log_non_probability,
         )
 
     def _merge_log_low(
@@ -483,7 +543,7 @@ class TruncatedPoissonBinomial(nn.Module):
                     right_log_conditional[..., : count + 1], dims=(-1,)
                 )
             )
-            coefficients.append(torch.logsumexp(terms, dim=-1))
+            coefficients.append(self._safe_logsumexp(terms, dim=-1))
         log_low = torch.stack(coefficients, dim=-1)
         return self._normalise_log_low(
             log_low, left_log_survival + right_log_survival
@@ -494,18 +554,48 @@ class TruncatedPoissonBinomial(nn.Module):
         probabilities: torch.Tensor,
         valid_mask: Optional[torch.Tensor] = None,
         implementation: Optional[str] = None,
+        *,
+        log_probabilities: Optional[torch.Tensor] = None,
+        log_non_probabilities: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return ``log P(C=j | C<R)`` and ``log P(C<R)`` stably."""
 
         if probabilities.ndim < 1:
             raise ValueError("probabilities must have at least one dimension")
         probabilities = probabilities.float().clamp(0.0, 1.0)
+        if (log_probabilities is None) != (log_non_probabilities is None):
+            raise ValueError(
+                "log_probabilities and log_non_probabilities must be provided together"
+            )
+        if log_probabilities is not None:
+            if (
+                log_probabilities.shape != probabilities.shape
+                or log_non_probabilities is None
+                or log_non_probabilities.shape != probabilities.shape
+            ):
+                raise ValueError("log Bernoulli inputs must match probabilities")
+            log_probabilities = log_probabilities.float()
+            log_non_probabilities = log_non_probabilities.float()
+            pair_normalizer = torch.logsumexp(
+                torch.stack((log_probabilities, log_non_probabilities), dim=-1),
+                dim=-1,
+            )
+            log_probabilities = log_probabilities - pair_normalizer
+            log_non_probabilities = log_non_probabilities - pair_normalizer
         if valid_mask is not None:
             if valid_mask.shape != probabilities.shape:
                 raise ValueError("valid_mask must have the same shape as probabilities")
             probabilities = probabilities * valid_mask.to(
                 device=probabilities.device, dtype=torch.float32
             )
+            if log_probabilities is not None:
+                valid = valid_mask.to(device=probabilities.device, dtype=torch.bool)
+                log_probabilities = torch.where(
+                    valid, log_probabilities, torch.full_like(log_probabilities, -torch.inf)
+                )
+                log_non_probabilities = torch.where(
+                    valid, log_non_probabilities, torch.zeros_like(log_non_probabilities)
+                )
         mode = self.implementation if implementation is None else implementation
         if mode not in {"serial", "block_tree"}:
             raise ValueError("implementation must be 'serial' or 'block_tree'")
@@ -515,9 +605,17 @@ class TruncatedPoissonBinomial(nn.Module):
                 tuple(probabilities.shape[:-1]), self.max_count, probabilities.device
             )
             for index in range(probabilities.shape[-1]):
-                log_conditional, log_survival = self._update_log_low(
-                    log_conditional, log_survival, probabilities[..., index]
-                )
+                if log_probabilities is None:
+                    log_conditional, log_survival = self._update_log_low(
+                        log_conditional, log_survival, probabilities[..., index]
+                    )
+                else:
+                    log_conditional, log_survival = self._update_log_low_from_logs(
+                        log_conditional,
+                        log_survival,
+                        log_probabilities[..., index],
+                        log_non_probabilities[..., index],
+                    )
             return log_conditional, log_survival
 
         num_events = probabilities.shape[-1]
@@ -530,17 +628,41 @@ class TruncatedPoissonBinomial(nn.Module):
         padding = (-num_events) % block_size
         if padding:
             probabilities = F.pad(probabilities, (0, padding), value=0.0)
+            if log_probabilities is not None:
+                log_probabilities = F.pad(
+                    log_probabilities, (0, padding), value=-torch.inf
+                )
+                log_non_probabilities = F.pad(
+                    log_non_probabilities, (0, padding), value=0.0
+                )
         num_blocks = probabilities.shape[-1] // block_size
         blocks = probabilities.reshape(
             *probabilities.shape[:-1], num_blocks, block_size
         )
+        log_probability_blocks = None
+        log_non_probability_blocks = None
+        if log_probabilities is not None:
+            log_probability_blocks = log_probabilities.reshape(
+                *log_probabilities.shape[:-1], num_blocks, block_size
+            )
+            log_non_probability_blocks = log_non_probabilities.reshape(
+                *log_non_probabilities.shape[:-1], num_blocks, block_size
+            )
         log_conditional, log_survival = self._empty_log_low(
             tuple(blocks.shape[:-1]), self.max_count, probabilities.device
         )
         for offset in range(block_size):
-            log_conditional, log_survival = self._update_log_low(
-                log_conditional, log_survival, blocks[..., offset]
-            )
+            if log_probability_blocks is None:
+                log_conditional, log_survival = self._update_log_low(
+                    log_conditional, log_survival, blocks[..., offset]
+                )
+            else:
+                log_conditional, log_survival = self._update_log_low_from_logs(
+                    log_conditional,
+                    log_survival,
+                    log_probability_blocks[..., offset],
+                    log_non_probability_blocks[..., offset],
+                )
         while log_conditional.shape[-2] > 1:
             count = log_conditional.shape[-2]
             pair_count = count // 2
@@ -703,6 +825,9 @@ class OrdinalCardinalityCircuit(nn.Module):
         self,
         witnesses: torch.Tensor,
         valid_mask: Optional[torch.Tensor] = None,
+        *,
+        log_witnesses: Optional[torch.Tensor] = None,
+        log_nonwitnesses: Optional[torch.Tensor] = None,
     ) -> CardinalityResult:
         if witnesses.ndim != 3:
             raise ValueError("witnesses must have shape (N, P, K-1)")
@@ -713,14 +838,30 @@ class OrdinalCardinalityCircuit(nn.Module):
             )
         if valid_mask is not None and valid_mask.shape != witnesses.shape[:2]:
             raise ValueError("valid_mask must have shape (N, P)")
+        if (log_witnesses is None) != (log_nonwitnesses is None):
+            raise ValueError("both log witness tensors must be provided together")
+        if log_witnesses is not None and (
+            log_witnesses.shape != witnesses.shape
+            or log_nonwitnesses is None
+            or log_nonwitnesses.shape != witnesses.shape
+        ):
+            raise ValueError("log witness tensors must match witnesses")
 
         probabilities = witnesses.permute(0, 2, 1).float()
         count_mask = None
         if valid_mask is not None:
             count_mask = valid_mask[:, None, :].expand_as(probabilities)
         distributions = self.count(probabilities, count_mask)
+        log_probabilities = None
+        log_non_probabilities = None
+        if log_witnesses is not None:
+            log_probabilities = log_witnesses.permute(0, 2, 1).float()
+            log_non_probabilities = log_nonwitnesses.permute(0, 2, 1).float()
         log_conditional_low, log_low_survival = self.count.scaled_log_lower_tail(
-            probabilities, count_mask
+            probabilities,
+            count_mask,
+            log_probabilities=log_probabilities,
+            log_non_probabilities=log_non_probabilities,
         )
         alpha = self.alpha
         log_alpha = self.log_alpha
@@ -1191,7 +1332,12 @@ class MOSAICOrdinalCore(nn.Module):
                 f"{local_logits.shape[-1]}"
             )
         evidence = nested_witness_probabilities(local_logits, valid_mask)
-        dense = self.circuit(evidence.witness_probabilities, valid_mask)
+        dense = self.circuit(
+            evidence.witness_probabilities,
+            valid_mask,
+            log_witnesses=evidence.log_witness_probabilities,
+            log_nonwitnesses=evidence.log_nonwitness_probabilities,
+        )
 
         if project:
             proof = self.projector(
@@ -1250,8 +1396,23 @@ class MOSAICOrdinalCore(nn.Module):
             projected_probabilities = (
                 evidence.witness_probabilities * proof.selected_mask.float()
             ).permute(0, 2, 1)
+            selected = proof.selected_mask.permute(0, 2, 1)
+            projected_log_probabilities = torch.where(
+                selected,
+                evidence.log_witness_probabilities.permute(0, 2, 1),
+                torch.full_like(projected_probabilities, -torch.inf),
+            )
+            projected_log_non_probabilities = torch.where(
+                selected,
+                evidence.log_nonwitness_probabilities.permute(0, 2, 1),
+                torch.zeros_like(projected_probabilities),
+            )
             projected_log_conditional_low, projected_log_survival = (
-                self.circuit.count.scaled_log_lower_tail(projected_probabilities)
+                self.circuit.count.scaled_log_lower_tail(
+                    projected_probabilities,
+                    log_probabilities=projected_log_probabilities,
+                    log_non_probabilities=projected_log_non_probabilities,
+                )
             )
             projected_log_stops = self.circuit.score_log_stops(
                 projected_log_conditional_low,
@@ -1281,6 +1442,8 @@ class MOSAICOrdinalCore(nn.Module):
         return MOSAICOutput(
             local_state_probabilities=evidence.state_probabilities,
             witness_probabilities=evidence.witness_probabilities,
+            log_witness_probabilities=evidence.log_witness_probabilities,
+            log_nonwitness_probabilities=evidence.log_nonwitness_probabilities,
             alpha=dense.alpha,
             log_alpha=dense.log_alpha,
             dense_transitions=dense.transitions,
@@ -1340,14 +1503,18 @@ class MOSAICProofHead(nn.Module):
         return_pivotality: bool = False,
     ) -> MOSAICOutput:
         # The core computes probabilities once; avoid an otherwise redundant
-        # softmax in LocalOrdinalStateHead.forward.
-        local_logits = self.local_state_head.logits(local_features)
-        return self.ordinal_core(
-            local_logits,
-            valid_mask=valid_mask,
-            project=project,
-            return_pivotality=return_pivotality,
-        )
+        # softmax in LocalOrdinalStateHead.forward.  The local-state reduction
+        # spans the complete evidence lattice, so both its Linear backward and
+        # the exact count circuit must remain FP32 even when the image encoder
+        # runs under autocast.
+        with torch.autocast(device_type=local_features.device.type, enabled=False):
+            local_logits = self.local_state_head.logits(local_features.float())
+            return self.ordinal_core(
+                local_logits,
+                valid_mask=valid_mask,
+                project=project,
+                return_pivotality=return_pivotality,
+            )
 
 
 # A concise alias for downstream experiment code.

@@ -167,6 +167,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head_lr", type=float, default=5e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
     parser.add_argument("--early_stop_patience", type=int, default=10)
+    parser.add_argument(
+        "--no_amp",
+        action="store_true",
+        help="Disable CUDA mixed precision for numerical A/B diagnosis.",
+    )
+    parser.add_argument("--amp_init_scale", type=float, default=8192.0)
+    parser.add_argument("--amp_growth_interval", type=int, default=2000)
+    parser.add_argument("--amp_max_consecutive_skips", type=int, default=8)
     parser.add_argument("--transition_weighting", choices=("effective_num", "inverse_frequency", "none"), default="effective_num")
     parser.add_argument("--effective_num_beta", type=float, default=0.999)
     parser.add_argument("--transition_weight_cap", type=float, default=10.0)
@@ -211,6 +219,10 @@ def main() -> None:
         head_lr=args.head_lr,
         weight_decay=args.weight_decay,
         early_stop_patience=args.early_stop_patience,
+        amp=not args.no_amp,
+        amp_init_scale=args.amp_init_scale,
+        amp_growth_interval=args.amp_growth_interval,
+        amp_max_consecutive_skips=args.amp_max_consecutive_skips,
         transition_weighting=args.transition_weighting,
         effective_num_beta=args.effective_num_beta,
         transition_weight_cap=args.transition_weight_cap,

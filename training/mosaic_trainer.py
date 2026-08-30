@@ -135,6 +135,9 @@ class MosaicTrainer:
         "lr_min",
         "grad_clip_norm",
         "amp",
+        "amp_init_scale",
+        "amp_growth_interval",
+        "amp_max_consecutive_skips",
     )
 
     def __init__(
@@ -166,7 +169,20 @@ class MosaicTrainer:
         )
         self.model.to(self.device)
         self.use_amp = bool(cfg.amp and self.device.type == "cuda")
-        self.scaler = GradScaler("cuda", enabled=self.use_amp)
+        if cfg.amp_init_scale <= 0:
+            raise ValueError("amp_init_scale must be positive")
+        if cfg.amp_growth_interval < 1:
+            raise ValueError("amp_growth_interval must be positive")
+        if cfg.amp_max_consecutive_skips < 1:
+            raise ValueError("amp_max_consecutive_skips must be positive")
+        self.scaler = GradScaler(
+            "cuda",
+            enabled=self.use_amp,
+            init_scale=float(cfg.amp_init_scale),
+            growth_interval=int(cfg.amp_growth_interval),
+        )
+        self.amp_total_skipped_steps = 0
+        self.amp_consecutive_skipped_steps = 0
 
         # Only the ImageNet-initialised convolutional trunk uses the lower
         # backbone LR.  ``encoder.pointwise`` is a new, randomly initialised
@@ -232,6 +248,27 @@ class MosaicTrainer:
             indices,
         )
 
+    def _nonfinite_gradient_summary(self, limit: int = 8) -> str:
+        """Name the parameters containing non-finite gradients.
+
+        This runs only on an overflow path, so the per-parameter CUDA
+        synchronizations do not affect ordinary training throughput.
+        """
+
+        offenders: list[str] = []
+        for name, parameter in self.model.named_parameters():
+            gradient = parameter.grad
+            if gradient is None:
+                continue
+            finite = torch.isfinite(gradient)
+            if bool(finite.all()):
+                continue
+            nonfinite = int((~finite).sum().detach().cpu())
+            offenders.append(f"{name}[nonfinite={nonfinite}]")
+            if len(offenders) >= limit:
+                break
+        return ", ".join(offenders) if offenders else "unknown parameter"
+
     def _run_epoch(self, loader: DataLoader, *, train: bool, epoch: int) -> dict:
         self.model.train(train)
         project, tolerance = self._proof_phase(epoch) if train else (True, self.cfg.proof_epsilon)
@@ -249,6 +286,7 @@ class MosaicTrainer:
         sufficiency_violations: list[torch.Tensor] = []
         complement_violations: list[torch.Tensor] = []
         diagnostic_sums: dict[str, torch.Tensor] = {}
+        amp_skipped_steps = 0
         boundary_risk_sums = torch.zeros(
             self.cfg.n_classes - 1, device=self.device
         )
@@ -256,7 +294,7 @@ class MosaicTrainer:
 
         context = torch.enable_grad if train else torch.no_grad
         with context():
-            for batch in loader:
+            for batch_index, batch in enumerate(loader):
                 images, pixel_masks, labels, _ = self._move_batch(batch)
                 if train:
                     self.optimizer.zero_grad(set_to_none=True)
@@ -280,15 +318,70 @@ class MosaicTrainer:
                 if train:
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(self.optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.cfg.grad_clip_norm
-                    )
-                    if not torch.isfinite(grad_norm):
-                        raise FloatingPointError(
-                            f"non-finite MOSAIC gradient norm at epoch {epoch}"
+                    # ``error_if_nonfinite`` raises before applying a clip
+                    # coefficient.  Clipping an Inf norm first would multiply
+                    # Inf gradients by zero and turn a recoverable AMP
+                    # overflow into NaNs.
+                    try:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.cfg.grad_clip_norm,
+                            error_if_nonfinite=True,
                         )
+                    except RuntimeError as exc:
+                        if not self.use_amp:
+                            raise FloatingPointError(
+                                "non-finite MOSAIC gradient without AMP at "
+                                f"epoch {epoch}"
+                            ) from exc
+                        scale_before = float(self.scaler.get_scale())
+                        offenders = self._nonfinite_gradient_summary()
+                        if offenders == "unknown parameter":
+                            # The aggregate norm can itself overflow even when
+                            # every gradient element is finite.  GradScaler then
+                            # has no ``found_inf`` flag and would apply the bad
+                            # step, so fail loudly instead of treating this as a
+                            # recoverable mixed-precision overflow.
+                            raise FloatingPointError(
+                                "non-finite MOSAIC gradient norm with no "
+                                "non-finite gradient elements at "
+                                f"epoch {epoch}, batch {batch_index}"
+                            ) from exc
+                        # GradScaler recorded ``found_inf`` during unscale_.
+                        # step() therefore leaves all parameters unchanged;
+                        # update() lowers the scale for the next batch.
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        scale_after = float(self.scaler.get_scale())
+                        self.optimizer.zero_grad(set_to_none=True)
+                        amp_skipped_steps += 1
+                        self.amp_total_skipped_steps += 1
+                        self.amp_consecutive_skipped_steps += 1
+                        logger.warning(
+                            "AMP overflow: skipped fold=%d epoch=%d batch=%d "
+                            "scale=%.1f->%.1f offenders=%s",
+                            self.fold,
+                            epoch,
+                            batch_index,
+                            scale_before,
+                            scale_after,
+                            offenders,
+                        )
+                        if (
+                            scale_after >= scale_before
+                            or scale_after < 1.0
+                            or self.amp_consecutive_skipped_steps
+                            >= self.cfg.amp_max_consecutive_skips
+                        ):
+                            raise FloatingPointError(
+                                "persistent non-finite MOSAIC AMP gradients at "
+                                f"epoch {epoch}; scale {scale_before}->{scale_after}; "
+                                f"offenders: {offenders}"
+                            ) from exc
+                        continue
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+                    self.amp_consecutive_skipped_steps = 0
 
                 batch_size = int(labels.numel())
                 loss_sum = loss_sum + loss.detach() * batch_size
@@ -328,6 +421,10 @@ class MosaicTrainer:
                     ).clamp_min(0.0).detach()
                 )
 
+        if sample_count == 0:
+            raise FloatingPointError(
+                f"MOSAIC epoch {epoch} produced no finite optimization batches"
+            )
         predictions = torch.cat(all_predictions).cpu()
         labels_cpu = torch.cat(all_labels).cpu()
         cumulative = torch.cat(all_cumulative).cpu()
@@ -359,6 +456,8 @@ class MosaicTrainer:
                 "sufficiency_violation_max": float(sufficiency_violation_max),
                 "complement_score_mean": float(complement_score_mean),
                 "complement_violation_max": float(complement_violation_max),
+                "amp_skipped_steps": float(amp_skipped_steps),
+                "amp_loss_scale": float(self.scaler.get_scale()),
             }
         )
         for key, value in diagnostic_sums.items():
@@ -441,6 +540,7 @@ class MosaicTrainer:
             "optimizer_state": self.optimizer.state_dict(),
             "scheduler_state": self.scheduler.state_dict(),
             "scaler_state": self.scaler.state_dict(),
+            "amp_total_skipped_steps": int(self.amp_total_skipped_steps),
             "metrics": metrics,
             "best_qwk": float(best_qwk),
             "early_stopping_best": float(self.early_stopping.best),
@@ -605,6 +705,10 @@ class MosaicTrainer:
             self.scheduler.load_state_dict(state["scheduler_state"])
             if "scaler_state" in state:
                 self.scaler.load_state_dict(state["scaler_state"])
+            self.amp_total_skipped_steps = int(
+                state.get("amp_total_skipped_steps", 0)
+            )
+            self.amp_consecutive_skipped_steps = 0
             best_qwk = float(state.get("best_qwk", -math.inf))
             self.early_stopping.best = float(
                 state.get("early_stopping_best", best_qwk)
