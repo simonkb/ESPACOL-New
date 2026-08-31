@@ -762,8 +762,10 @@ APTOS split. Screen head-only models using identical folds and three seeds:
 11. MOSAIC dense Poisson--binomial cardinality without proof projection; and
 12. full proof-projected MOSAIC.
 
-Primary selection metric is mean validation QWK; accuracy and MAE are fixed
-tie-breakers. Also report certificate size and complement residual.
+Primary selection metric is mean validation accuracy, matching the established
+OPTIC protocol; QWK and MAE are reported secondary metrics. ReduceLROnPlateau
+is driven by validation loss rather than a discrete evaluation metric. Also
+report certificate size and complement residual.
 
 Use a corrected baseline on the identical split. Promote only if MOSAIC mean
 validation QWK is no more than 0.01 below that baseline, with accuracy and then

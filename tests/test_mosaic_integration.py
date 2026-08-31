@@ -212,7 +212,7 @@ def test_resume_validation_allows_epoch_extension_but_rejects_split_changes(
     tmp_path: Path,
 ) -> None:
     original = _tiny_trainer(tmp_path / "original", cfg_overrides={"epochs": 1})
-    state = original._checkpoint_payload(epoch=1, metrics={}, best_qwk=0.2)
+    state = original._checkpoint_payload(epoch=1, metrics={}, best_accuracy=80.0)
 
     extended = _tiny_trainer(
         tmp_path / "extended", cfg_overrides={"epochs": 5}, signature="split-a"
@@ -255,7 +255,7 @@ def test_checkpoint_rng_state_restores_python_numpy_and_torch(tmp_path: Path) ->
     random.seed(71)
     np.random.seed(71)
     torch.manual_seed(71)
-    state = trainer._checkpoint_payload(epoch=1, metrics={}, best_qwk=0.0)
+    state = trainer._checkpoint_payload(epoch=1, metrics={}, best_accuracy=0.0)
     expected = (random.random(), float(np.random.rand()), float(torch.rand(())))
 
     random.seed(999)
@@ -279,7 +279,12 @@ def test_checkpoint_write_is_atomic_and_history_reconciles_to_resume_epoch(
     assert [int(row["epoch"]) for row in rows] == [1, 2]
     assert float(rows[-1]["val_qwk"]) == pytest.approx(0.3)
 
-    trainer._save(epoch=2, metrics={"qwk": 0.3}, best_qwk=0.3, best=False)
+    trainer._save(
+        epoch=2,
+        metrics={"qwk": 0.3},
+        best_accuracy=80.0,
+        best=False,
+    )
     state = torch.load(
         trainer.last_checkpoint_path,
         map_location="cpu",
@@ -297,8 +302,10 @@ def test_checkpoint_write_is_atomic_and_history_reconciles_to_resume_epoch(
     assert [int(row["epoch"]) for row in rows] == [1, 2]
 
 
-def test_validation_only_fit_never_iterates_outer_test_loader(tmp_path: Path) -> None:
-    trainer = _tiny_trainer(tmp_path, cfg_overrides={"epochs": 1})
+def test_validation_only_fit_uses_accuracy_selection_and_loss_scheduler(
+    tmp_path: Path,
+) -> None:
+    trainer = _tiny_trainer(tmp_path, cfg_overrides={"epochs": 2})
     trainer.train_loader = "train-loader"
     trainer.val_loader = "validation-loader"
     trainer.test_loader = "outer-test-loader"
@@ -306,11 +313,20 @@ def test_validation_only_fit_never_iterates_outer_test_loader(tmp_path: Path) ->
 
     def fake_epoch(loader, *, train: bool, epoch: int):
         calls.append(loader)
+        # Accuracy improves while QWK declines. The second epoch must still be
+        # selected, and the plateau scheduler must consume the continuous loss.
+        validation = {
+            1: {"loss": 1.0, "acc": 42.0, "qwk": 0.50, "mae": 0.8},
+            2: {"loss": 0.8, "acc": 43.0, "qwk": 0.31, "mae": 0.7},
+        }
+        metrics = validation[epoch] if not train else {
+            "loss": 1.2,
+            "acc": 40.0,
+            "qwk": 0.2,
+            "mae": 0.9,
+        }
         return {
-            "loss": 1.0,
-            "acc": 42.0,
-            "qwk": 0.31,
-            "mae": 0.8,
+            **metrics,
             "proof_size_median": 3.0,
             "proof_fraction_mean": 0.2,
             "proof_tolerance": 0.0,
@@ -318,9 +334,18 @@ def test_validation_only_fit_never_iterates_outer_test_loader(tmp_path: Path) ->
 
     trainer._run_epoch = fake_epoch
     result = trainer.fit(evaluate_test=False)
-    assert calls == ["train-loader", "validation-loader"]
+    assert calls == [
+        "train-loader",
+        "validation-loader",
+        "train-loader",
+        "validation-loader",
+    ]
     assert result["test_evaluated"] is False
+    assert result["best_epoch"] == 2
+    assert result["best_validation_metrics"]["acc"] == pytest.approx(43.0)
     assert result["best_validation_metrics"]["qwk"] == pytest.approx(0.31)
+    assert trainer.scheduler.mode == "min"
+    assert trainer.scheduler.best == pytest.approx(0.8)
 
 
 def test_epoch_diagnostics_aggregate_boundary_risk_sets_exactly(tmp_path: Path) -> None:
@@ -584,7 +609,7 @@ def test_stratified_sampler_sequence_continues_exactly_after_resume(
     original = build_trainer(tmp_path / "original-stratified")
     first_epoch = list(iter(original.train_loader.batch_sampler))
     assert first_epoch
-    state = original._checkpoint_payload(epoch=1, metrics={}, best_qwk=0.0)
+    state = original._checkpoint_payload(epoch=1, metrics={}, best_accuracy=0.0)
     expected_second_epoch = list(iter(original.train_loader.batch_sampler))
 
     resumed = build_trainer(tmp_path / "resumed-stratified")

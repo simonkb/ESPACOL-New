@@ -95,8 +95,9 @@ class _EarlyStopping:
 class MosaicTrainer:
     """Train, select, and evaluate one MOSAIC fold.
 
-    Model selection uses validation QWK.  The held-out test split is evaluated
-    only after the best validation checkpoint is restored.
+    Model selection and early stopping use validation accuracy, while the
+    plateau scheduler follows validation loss.  The held-out test split is
+    evaluated only after the best validation checkpoint is restored.
     """
 
     _RESUME_CRITICAL_CONFIG_FIELDS = (
@@ -204,7 +205,7 @@ class MosaicTrainer:
         )
         self.scheduler = ReduceLROnPlateau(
             self.optimizer,
-            mode="max",
+            mode="min",
             factor=cfg.lr_factor,
             patience=cfg.lr_patience,
             min_lr=cfg.lr_min,
@@ -528,7 +529,12 @@ class MosaicTrainer:
             if temporary.exists():
                 temporary.unlink()
 
-    def _checkpoint_payload(self, epoch: int, metrics: dict, best_qwk: float) -> dict:
+    def _checkpoint_payload(
+        self,
+        epoch: int,
+        metrics: dict,
+        best_accuracy: float,
+    ) -> dict:
         train_batch_sampler = getattr(self.train_loader, "batch_sampler", None)
         return {
             "epoch": epoch,
@@ -542,7 +548,7 @@ class MosaicTrainer:
             "scaler_state": self.scaler.state_dict(),
             "amp_total_skipped_steps": int(self.amp_total_skipped_steps),
             "metrics": metrics,
-            "best_qwk": float(best_qwk),
+            "best_accuracy": float(best_accuracy),
             "early_stopping_best": float(self.early_stopping.best),
             "early_stopping_bad_epochs": int(self.early_stopping.bad_epochs),
             "rng_state": {
@@ -662,11 +668,21 @@ class MosaicTrainer:
             )
         sampler._epoch = int(saved_epoch)
 
-    def _save(self, epoch: int, metrics: dict, best_qwk: float, *, best: bool) -> None:
+    def _save(
+        self,
+        epoch: int,
+        metrics: dict,
+        best_accuracy: float,
+        *,
+        best: bool,
+    ) -> None:
         path = self.checkpoint_path if best else self.last_checkpoint_path
         temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         try:
-            torch.save(self._checkpoint_payload(epoch, metrics, best_qwk), temporary)
+            torch.save(
+                self._checkpoint_payload(epoch, metrics, best_accuracy),
+                temporary,
+            )
             # Same-directory replacement is atomic on the filesystems used by
             # the local workstation and cluster.  A preemption can leave only
             # the disposable temporary file, never a half-written last.pth.
@@ -690,7 +706,7 @@ class MosaicTrainer:
             self.model.receptive_field,
             self.criterion.transition_weights.detach().cpu().tolist(),
         )
-        best_qwk = -math.inf
+        best_accuracy = -math.inf
         start_epoch = 1
         if self.cfg.resume and self.last_checkpoint_path.exists():
             state = torch.load(
@@ -709,9 +725,9 @@ class MosaicTrainer:
                 state.get("amp_total_skipped_steps", 0)
             )
             self.amp_consecutive_skipped_steps = 0
-            best_qwk = float(state.get("best_qwk", -math.inf))
+            best_accuracy = float(state.get("best_accuracy", -math.inf))
             self.early_stopping.best = float(
-                state.get("early_stopping_best", best_qwk)
+                state.get("early_stopping_best", best_accuracy)
             )
             self.early_stopping.bad_epochs = int(
                 state.get("early_stopping_bad_epochs", 0)
@@ -722,17 +738,17 @@ class MosaicTrainer:
             self._reconcile_history(completed_epoch)
             start_epoch = completed_epoch + 1
             logger.info(
-                "resumed fold=%d from epoch=%d best_qwk=%.4f",
+                "resumed fold=%d from epoch=%d best_accuracy=%.2f",
                 self.fold,
                 start_epoch - 1,
-                best_qwk,
+                best_accuracy,
             )
 
         for epoch in range(start_epoch, self.cfg.epochs + 1):
             started = time.time()
             train_metrics = self._run_epoch(self.train_loader, train=True, epoch=epoch)
             val_metrics = self._run_epoch(self.val_loader, train=False, epoch=epoch)
-            self.scheduler.step(val_metrics["qwk"])
+            self.scheduler.step(val_metrics["loss"])
             lrs = [group["lr"] for group in self.optimizer.param_groups]
             row = self._flat_history_row(epoch, train_metrics, val_metrics, lrs)
             self._append_history(row)
@@ -749,13 +765,13 @@ class MosaicTrainer:
                 train_metrics["proof_tolerance"],
                 time.time() - started,
             )
-            is_best = val_metrics["qwk"] > best_qwk
+            is_best = val_metrics["acc"] > best_accuracy
             if is_best:
-                best_qwk = val_metrics["qwk"]
-            should_stop = self.early_stopping.update(val_metrics["qwk"])
+                best_accuracy = val_metrics["acc"]
+            should_stop = self.early_stopping.update(val_metrics["acc"])
             if is_best:
-                self._save(epoch, val_metrics, best_qwk, best=True)
-            self._save(epoch, val_metrics, best_qwk, best=False)
+                self._save(epoch, val_metrics, best_accuracy, best=True)
+            self._save(epoch, val_metrics, best_accuracy, best=False)
             if should_stop:
                 logger.info("early stopping after epoch %d", epoch)
                 break
