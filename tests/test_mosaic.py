@@ -7,9 +7,10 @@ enumeration can serve as an independent oracle for the optimized code.
 import itertools
 import math
 
+import pytest
 import torch
 
-from losses.mosaic import MosaicLoss
+from losses.mosaic import MosaicLoss, balanced_continuation_nll
 from models.mosaic import (
     DualProofProjection,
     LocalOrdinalStateHead,
@@ -281,6 +282,35 @@ def test_public_log_stop_mixture_accepts_exact_zero_weights() -> None:
     assert torch.isfinite(probabilities.grad).all()
 
 
+def test_exact_zero_stop_has_zero_gradient_when_not_selected() -> None:
+    """An impossible stop outside the target path must not poison backward."""
+
+    log_conditional = torch.tensor(
+        [[[0.0, -torch.inf, -torch.inf]]], requires_grad=True
+    )
+    log_survival = torch.tensor([[-torch.inf]], requires_grad=True)
+    alpha = torch.tensor([[1.0, 0.0, 0.0]])
+    log_stop = OrdinalCardinalityCircuit.score_log_stops(
+        log_conditional, log_survival, alpha
+    )
+    assert torch.isneginf(log_stop).all()
+
+    transition = torch.ones(1, 1, requires_grad=True)
+    loss = balanced_continuation_nll(
+        transition,
+        torch.tensor([1]),
+        log_stop_probabilities=log_stop,
+    )
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert log_conditional.grad is not None
+    assert torch.isfinite(log_conditional.grad).all()
+    assert torch.equal(log_conditional.grad, torch.zeros_like(log_conditional.grad))
+    assert log_survival.grad is not None
+    assert torch.isfinite(log_survival.grad).all()
+    assert torch.equal(log_survival.grad, torch.zeros_like(log_survival.grad))
+
+
 def test_extreme_alpha_logits_keep_log_stop_gradients_finite() -> None:
     witnesses = torch.tensor(
         [[[0.1], [0.2], [0.3]]], dtype=torch.float32, requires_grad=True
@@ -349,6 +379,46 @@ def test_proof_head_forces_local_linear_and_core_to_fp32_under_autocast() -> Non
     loss.backward()
     assert head.local_state_head.linear.weight.grad is not None
     assert torch.isfinite(head.local_state_head.linear.weight.grad).all()
+
+
+def test_proof_head_reports_nonfinite_local_feature_source() -> None:
+    head = MOSAICProofHead(
+        input_dim=8,
+        num_classes=5,
+        expected_num_cells=4,
+        max_count=4,
+        implementation="serial",
+    )
+    features = torch.zeros(1, 4, 8)
+    features[0, 0, 0] = torch.inf
+    with pytest.raises(FloatingPointError, match="MOSAIC local features"):
+        head(features, project=False)
+
+
+def test_core_reports_nonfinite_local_logit_source() -> None:
+    core = MOSAICOrdinalCore(
+        num_classes=5,
+        max_count=4,
+        implementation="serial",
+    )
+    logits = torch.zeros(1, 4, 5)
+    logits[0, 0, 0] = torch.inf
+    with pytest.raises(FloatingPointError, match="MOSAIC local logits"):
+        core(logits, project=False)
+
+
+def test_circuit_reports_nonfinite_alpha_parameter_source() -> None:
+    circuit = OrdinalCardinalityCircuit(
+        num_boundaries=1,
+        max_count=3,
+        implementation="serial",
+    )
+    with torch.no_grad():
+        circuit.alpha_logits[0, 0] = torch.inf
+    with pytest.raises(
+        FloatingPointError, match="MOSAIC cardinality alpha logits"
+    ):
+        circuit(torch.full((1, 3, 1), 0.1))
 
 
 def test_cardinality_score_bounds_zero_and_monotonicity() -> None:

@@ -3,6 +3,7 @@
 from pathlib import Path
 import csv
 import random
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -31,6 +32,28 @@ from train_mosaic import (
     summary_filename,
 )
 from training.mosaic_trainer import MosaicTrainer
+
+
+def test_mosaic_output_validation_allows_only_negative_infinite_log_stops() -> None:
+    valid = SimpleNamespace(
+        transitions=torch.tensor([[0.1, 0.2]]),
+        dense_transitions=torch.tensor([[0.3, 0.4]]),
+        log_stop_probabilities=torch.tensor([[-torch.inf, -2.0]]),
+        dense_log_stop_probabilities=torch.tensor([[-3.0, -torch.inf]]),
+    )
+    assert MosaicTrainer._nonfinite_output_summary(valid) == ""
+
+    invalid = SimpleNamespace(
+        transitions=torch.tensor([[torch.nan, 0.2]]),
+        dense_transitions=torch.tensor([[0.3, torch.inf]]),
+        log_stop_probabilities=torch.tensor([[torch.inf, -2.0]]),
+        dense_log_stop_probabilities=torch.tensor([[torch.nan, -torch.inf]]),
+    )
+    summary = MosaicTrainer._nonfinite_output_summary(invalid)
+    assert "transitions[nonfinite=1]" in summary
+    assert "dense_transitions[nonfinite=1]" in summary
+    assert "log_stop_probabilities[nonfinite=1]" in summary
+    assert "dense_log_stop_probabilities[nonfinite=1]" in summary
 
 
 def _tiny_model(**overrides) -> MOSAICModel:

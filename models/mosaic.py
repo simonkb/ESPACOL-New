@@ -27,6 +27,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _require_finite(tensor: torch.Tensor, name: str) -> None:
+    """Fail at the first corrupted proof-path tensor with useful provenance."""
+
+    finite = torch.isfinite(tensor)
+    if bool(finite.all()):
+        return
+    invalid = ~finite
+    nan_count = int(torch.isnan(tensor).sum().detach().cpu())
+    posinf_count = int(torch.isposinf(tensor).sum().detach().cpu())
+    neginf_count = int(torch.isneginf(tensor).sum().detach().cpu())
+    raise FloatingPointError(
+        f"{name} contains non-finite values "
+        f"(total={int(invalid.sum().detach().cpu())}, nan={nan_count}, "
+        f"+inf={posinf_count}, -inf={neginf_count})"
+    )
+
+
 @dataclass
 class LocalOrdinalEvidence:
     """Categorical local states and their nested boundary witnesses."""
@@ -114,6 +131,7 @@ def nested_witness_probabilities(
         )
     if local_logits.shape[-1] < 2:
         raise ValueError("at least two ordinal states are required")
+    _require_finite(local_logits, "MOSAIC local logits")
 
     # Preserve both sides of every ordinal Bernoulli event in log space.
     # Converting a saturated softmax probability back through log(p) loses
@@ -819,7 +837,14 @@ class OrdinalCardinalityCircuit(nn.Module):
             )
         while log_alpha.ndim < log_stops.ndim:
             log_alpha = log_alpha.unsqueeze(0)
-        return torch.logsumexp(log_alpha + log_stops, dim=-1)
+        # An exact zero stop is represented by an all-``-inf`` mixture row.
+        # Its forward value is correctly ``-inf``, but torch.logsumexp has an
+        # undefined backward (0/0) on that row.  The guarded reduction keeps
+        # the exact value and supplies the mathematically correct zero
+        # derivative for unsupported rows.
+        return TruncatedPoissonBinomial._safe_logsumexp(
+            log_alpha + log_stops, dim=-1
+        )
 
     def forward(
         self,
@@ -846,6 +871,7 @@ class OrdinalCardinalityCircuit(nn.Module):
             or log_nonwitnesses.shape != witnesses.shape
         ):
             raise ValueError("log witness tensors must match witnesses")
+        _require_finite(self.alpha_logits, "MOSAIC cardinality alpha logits")
 
         probabilities = witnesses.permute(0, 2, 1).float()
         count_mask = None
@@ -1507,6 +1533,7 @@ class MOSAICProofHead(nn.Module):
         # spans the complete evidence lattice, so both its Linear backward and
         # the exact count circuit must remain FP32 even when the image encoder
         # runs under autocast.
+        _require_finite(local_features, "MOSAIC local features")
         with torch.autocast(device_type=local_features.device.type, enabled=False):
             local_logits = self.local_state_head.logits(local_features.float())
             return self.ordinal_core(

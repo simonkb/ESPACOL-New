@@ -183,6 +183,7 @@ class MosaicTrainer:
             growth_interval=int(cfg.amp_growth_interval),
         )
         self.amp_total_skipped_steps = 0
+        self.amp_total_forward_retries = 0
         self.amp_consecutive_skipped_steps = 0
 
         # Only the ImageNet-initialised convolutional trunk uses the lower
@@ -270,6 +271,47 @@ class MosaicTrainer:
                 break
         return ", ".join(offenders) if offenders else "unknown parameter"
 
+    @staticmethod
+    def _nonfinite_output_summary(output) -> str:
+        """Name invalid tensors in a completed MOSAIC forward pass.
+
+        A log stop of ``-inf`` is the mathematically valid representation of
+        an exact zero lower-tail probability.  NaN and ``+inf`` are never
+        valid.  Transition probabilities, by contrast, must all be finite.
+        Keeping this distinction here prevents a recovery path from silently
+        clipping or otherwise changing the ordinal likelihood.
+        """
+
+        checks = (
+            ("transitions", output.transitions, False),
+            ("dense_transitions", output.dense_transitions, False),
+            ("log_stop_probabilities", output.log_stop_probabilities, True),
+            (
+                "dense_log_stop_probabilities",
+                output.dense_log_stop_probabilities,
+                True,
+            ),
+        )
+        invalid_masks: list[tuple[str, torch.Tensor]] = []
+        for name, tensor, allow_negative_infinity in checks:
+            invalid = torch.isnan(tensor) | torch.isposinf(tensor)
+            if not allow_negative_infinity:
+                invalid = invalid | torch.isneginf(tensor)
+            invalid_masks.append((name, invalid))
+        # One synchronization on the ordinary valid path.  Detailed counts
+        # are transferred only for the exceptional retry/error message.
+        any_invalid = torch.stack(
+            [invalid.any() for _, invalid in invalid_masks]
+        ).any()
+        if not bool(any_invalid):
+            return ""
+        offenders: list[str] = []
+        for name, invalid in invalid_masks:
+            count = int(invalid.sum().detach().cpu())
+            if count:
+                offenders.append(f"{name}[nonfinite={count}]")
+        return ", ".join(offenders)
+
     def _run_epoch(self, loader: DataLoader, *, train: bool, epoch: int) -> dict:
         self.model.train(train)
         project, tolerance = self._proof_phase(epoch) if train else (True, self.cfg.proof_epsilon)
@@ -288,6 +330,7 @@ class MosaicTrainer:
         complement_violations: list[torch.Tensor] = []
         diagnostic_sums: dict[str, torch.Tensor] = {}
         amp_skipped_steps = 0
+        amp_forward_retries = 0
         boundary_risk_sums = torch.zeros(
             self.cfg.n_classes - 1, device=self.device
         )
@@ -299,12 +342,77 @@ class MosaicTrainer:
                 images, pixel_masks, labels, _ = self._move_batch(batch)
                 if train:
                     self.optimizer.zero_grad(set_to_none=True)
-                with autocast(device_type="cuda", enabled=self.use_amp):
-                    output = self.model(
-                        images,
-                        pixel_valid_mask=pixel_masks,
-                        project=project,
+                amp_forward_error: Optional[FloatingPointError] = None
+                output = None
+                try:
+                    with autocast(device_type="cuda", enabled=self.use_amp):
+                        output = self.model(
+                            images,
+                            pixel_valid_mask=pixel_masks,
+                            project=project,
+                        )
+                except FloatingPointError as exc:
+                    amp_forward_error = exc
+                output_issues = (
+                    self._nonfinite_output_summary(output)
+                    if output is not None
+                    else ""
+                )
+                forward_retried = False
+                if self.use_amp and (amp_forward_error is not None or output_issues):
+                    # GradScaler cannot repair a non-finite *forward* because
+                    # its scale affects only backward.  Replay the same batch
+                    # once in FP32, preserving the model and loss exactly while
+                    # avoiding a global FP32 throughput penalty.
+                    source = (
+                        str(amp_forward_error)
+                        if amp_forward_error is not None
+                        else output_issues
                     )
+                    logger.warning(
+                        "AMP forward retry: fold=%d epoch=%d batch=%d "
+                        "offenders=%s",
+                        self.fold,
+                        epoch,
+                        batch_index,
+                        source,
+                    )
+                    if output is not None:
+                        del output
+                    try:
+                        with autocast(device_type="cuda", enabled=False):
+                            output = self.model(
+                                images,
+                                pixel_valid_mask=pixel_masks,
+                                project=project,
+                            )
+                    except FloatingPointError as fp32_exc:
+                        raise FloatingPointError(
+                            "non-finite MOSAIC forward after FP32 retry at "
+                            f"epoch {epoch}, batch {batch_index}; "
+                            f"AMP source: {source}; FP32 source: {fp32_exc}"
+                        ) from fp32_exc
+                    forward_retried = True
+                    amp_forward_retries += 1
+                    self.amp_total_forward_retries += 1
+                    output_issues = self._nonfinite_output_summary(output)
+                elif amp_forward_error is not None:
+                    raise FloatingPointError(
+                        "non-finite MOSAIC FP32 forward at "
+                        f"epoch {epoch}, batch {batch_index}: {amp_forward_error}"
+                    ) from amp_forward_error
+                assert output is not None
+                if output_issues:
+                    precision = "FP32 retry" if forward_retried else "FP32 forward"
+                    raise FloatingPointError(
+                        "non-finite MOSAIC output after "
+                        f"{precision} at epoch {epoch}, batch {batch_index}: "
+                        f"{output_issues}"
+                    )
+                with autocast(
+                    device_type="cuda",
+                    enabled=self.use_amp and not forward_retried,
+                ):
                     loss, diagnostics = self.criterion(
                         output.transitions,
                         labels,
@@ -458,6 +566,7 @@ class MosaicTrainer:
                 "complement_score_mean": float(complement_score_mean),
                 "complement_violation_max": float(complement_violation_max),
                 "amp_skipped_steps": float(amp_skipped_steps),
+                "amp_forward_retries": float(amp_forward_retries),
                 "amp_loss_scale": float(self.scaler.get_scale()),
             }
         )
@@ -547,6 +656,7 @@ class MosaicTrainer:
             "scheduler_state": self.scheduler.state_dict(),
             "scaler_state": self.scaler.state_dict(),
             "amp_total_skipped_steps": int(self.amp_total_skipped_steps),
+            "amp_total_forward_retries": int(self.amp_total_forward_retries),
             "metrics": metrics,
             "best_accuracy": float(best_accuracy),
             "early_stopping_best": float(self.early_stopping.best),
@@ -723,6 +833,9 @@ class MosaicTrainer:
                 self.scaler.load_state_dict(state["scaler_state"])
             self.amp_total_skipped_steps = int(
                 state.get("amp_total_skipped_steps", 0)
+            )
+            self.amp_total_forward_retries = int(
+                state.get("amp_total_forward_retries", 0)
             )
             self.amp_consecutive_skipped_steps = 0
             best_accuracy = float(state.get("best_accuracy", -math.inf))

@@ -506,8 +506,16 @@ class LocalEfficientNetV2S(nn.Module):
                 f"features must have shape (N,{self.tap_channels},H,W); got "
                 f"{tuple(features.shape)}"
             )
-        features = features.permute(0, 2, 3, 1)
-        return self.pointwise(features).permute(0, 3, 1, 2).contiguous()
+        # Keep the pretrained convolutional trunk under AMP, but do not run
+        # the newly trained pointwise adapter in FP16.  A finite trunk value
+        # can overflow in the adapter's Linear layers before the proof head's
+        # later ``.float()`` conversion, permanently poisoning its local
+        # logits and log-stop probabilities.  The adapter is small relative
+        # to the trunk and is part of the numerically sensitive proof path.
+        with torch.autocast(device_type=features.device.type, enabled=False):
+            features = features.float().permute(0, 2, 3, 1)
+            projected = self.pointwise(features)
+        return projected.permute(0, 3, 1, 2).contiguous()
 
     def forward_map(self, image: torch.Tensor) -> torch.Tensor:
         """Return the pointwise-projected ``(N,D_local,H_l,W_l)`` map."""

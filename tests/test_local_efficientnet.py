@@ -63,6 +63,23 @@ def test_pointwise_head_cannot_spread_a_spatial_perturbation():
     assert torch.count_nonzero(outside) == 0
 
 
+def test_pointwise_projection_is_fp32_under_encoder_autocast():
+    """AMP may cover the trunk, but never the proof-path adapter."""
+
+    model = LocalEfficientNetV2S(
+        tap="rf_small", local_dim=8, pretrained=False, dropout=0.0
+    ).eval()
+    trunk_features = torch.full((1, model.tap_channels, 2, 2), 4.0e4)
+
+    with torch.no_grad(), torch.autocast(
+        device_type="cpu", dtype=torch.bfloat16
+    ):
+        projected = model.project_trunk_map(trunk_features)
+
+    assert projected.dtype == torch.float32
+    assert torch.isfinite(projected).all()
+
+
 def test_mask_downsampling_uses_coverage_and_preserves_empty_field():
     mask = torch.zeros(2, 8, 8)
     mask[0, :4, :4] = 1
