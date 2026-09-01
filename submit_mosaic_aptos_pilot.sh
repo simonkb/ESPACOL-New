@@ -35,6 +35,8 @@ export HF_HUB_OFFLINE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 RUN_DIR="${MOSAIC_RUN_DIR:-runs/mosaic_aptos_pilot}"
+TOTAL_EPOCHS="${MOSAIC_EPOCHS:-50}"
+EARLY_STOP_PATIENCE="${MOSAIC_EARLY_STOP_PATIENCE:-30}"
 RESUME_ARGS=()
 if [[ "${MOSAIC_RESUME:-0}" == "1" ]]; then
   RESUME_ARGS+=(--resume)
@@ -200,7 +202,8 @@ python train_mosaic.py \
   --local_stage rf_medium \
   --image_size 896 \
   --batch_size 4 \
-  --epochs 35 \
+  --epochs "${TOTAL_EPOCHS}" \
+  --early_stop_patience "${EARLY_STOP_PATIENCE}" \
   --max_count 32 \
   --dense_warmup_epochs 4 \
   --proof_ramp_epochs 4 \
