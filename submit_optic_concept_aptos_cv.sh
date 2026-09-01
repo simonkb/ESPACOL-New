@@ -37,7 +37,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python train_dr.py \
     --dataset aptos \
     --dr_root Datasets/aptos2019-blindness-detection \
-    --run_dir runs/optic_concept_aptos_cv \
+    --run_dir runs/optic_concept_aptos_cv_3loss \
     --folds ${SLURM_ARRAY_TASK_ID} \
     --use_multi_tile \
     --tile_grid 3 \
@@ -56,7 +56,7 @@ python train_dr.py \
     --lambda_osd 0 \
     --lambda_tcl 0 \
     --lambda_gpa 0.1 \
-    --lambda_proto_ce 1.0 \
+    --lambda_proto_ce 0 \
     --lambda_tile_concept 0.5 \
     --proto_temperature 0.15 \
     --proto_label_smoothing 0.07 \
