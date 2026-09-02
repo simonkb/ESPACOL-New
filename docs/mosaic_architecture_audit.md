@@ -19,10 +19,13 @@ There is no pooled feature, CTOT token, CORAL logit, text branch, or residual
 classifier capable of bypassing the reported proof. The main architectural
 novelty therefore remains intact.
 
-The audit found two definite decoder mismatches and one measurable training
-risk.
+The audit found one theoretical decoder caveat, one metric-selection tension,
+and one measurable training risk. The completed APTOS fold-0 audit rejects
+analytic deweighting as the operating decoder. The safe default remains the
+historical `rounded_expected` rule while the independent EyePACS audit is
+pending.
 
-## Confirmed mismatch 1: weighted scores were treated as posteriors
+## Theoretical caveat: weighted scores are not calibrated posteriors
 
 For boundary `k`, the implemented loss applies weights `w[k,0]` to a stop and
 `w[k,1]` to an advance. If the natural continuation posterior is
@@ -45,11 +48,17 @@ Equivalently, `logit(c) = logit(c*) + log(w_stop/w_advance)`. The correction
 is evaluated in log space so a directly computed, extremely small stop
 probability is not destroyed by `1-c` cancellation.
 
-For a finite neural model this remains a loss-consistent, pre-specified
-correction rather than a guarantee of perfect calibration; the fixed-checkpoint
-audit below measures its actual effect. It is a correctness repair, not the
-claimed architectural novelty. MOSAIC's contribution remains that the selected
-minimum proof is the exclusive grade path and can be replayed interventionally.
+For a finite neural model this is only a loss-consistent, pre-specified
+candidate correction, not a guarantee of better calibration. In particular,
+the derivation assumes that the learned score is at the weighted population
+optimum; representation error, regularization, the projected/dense compound
+loss, and finite-sample fitting can violate that assumption. The candidate
+therefore had to pass the fixed-checkpoint audit before it could become the
+default. It did not pass on APTOS.
+
+This decoder question is not the claimed architectural novelty. MOSAIC's
+contribution remains that the selected minimum proof is the exclusive grade
+path and can be replayed interventionally.
 
 This is material, not cosmetic. The observed boundary logit offsets are:
 
@@ -58,15 +67,16 @@ This is material, not cosmetic. The observed boundary logit offsets are:
 | APTOS fold 0 | +0.0132 | +1.0341 | -0.5493 | +0.3867 |
 | EyePACS fold 0 | -0.0005 | +0.1447 | -0.3123 | -0.1415 |
 
-## Confirmed mismatch 2: the point rule did not match model selection
+## Metric tension: the point rule and checkpoint metric
 
-The previous grade was `round(E[Y])`. A posterior mean is the Bayes action for
-squared ordinal error, whereas checkpoints and early stopping use exact
-accuracy. Class MAP is the Bayes action for exact accuracy when applied to the
-natural class posterior. MOSAIC now defaults to the analytically deweighted
-class MAP decision.
+The historical grade is `round(E[Y])`. A posterior mean is aligned with
+ordinal distance, whereas checkpoints and early stopping currently use exact
+accuracy. Class MAP would be the Bayes action for exact accuracy only if its
+inputs formed a trustworthy class posterior. That condition is not established
+for these cost-sensitive finite-model scores, so metric matching alone does not
+justify changing the decoder.
 
-This correction has:
+Every audited rule has:
 
 - zero learned parameters;
 - zero validation-fitted parameters;
@@ -74,8 +84,34 @@ This correction has:
 - no change to proof membership or the cardinality circuit; and
 - a complete replay trace from proof scores and training-fold weights.
 
-It is not presented as MOSAIC's central novelty. It removes an evaluation
-confound so that the proposed proof architecture is tested fairly.
+The alternatives are retained as diagnostics, not architectural branches or
+post-hoc choices.
+
+## APTOS fold-0 result: decoder promotion rejected
+
+The audit exactly reproduced the epoch-13 checkpoint on all 293 inner-
+validation images. Results were:
+
+| Proof-only rule | Acc. | Bal. Acc. | Macro-F1 | QWK | MAE |
+|---|---:|---:|---:|---:|---:|
+| `rounded_expected` | 82.25 | **61.33** | **0.6322** | **0.9030** | 0.2150 |
+| `class_map` | **83.96** | 59.67 | 0.6112 | 0.8719 | 0.2253 |
+| `posterior_median` | 83.62 | 61.00 | 0.6321 | 0.8929 | **0.2116** |
+| `deweighted_mean_round` | 79.86 | 53.36 | 0.5500 | 0.8783 | 0.2526 |
+| `deweighted_class_map` | 81.23 | 52.31 | 0.5286 | 0.8671 | 0.2526 |
+| `deweighted_posterior_median` | 81.23 | 52.92 | 0.5462 | 0.8694 | 0.2491 |
+
+Analytic deweighting reduced every reported metric relative to
+`rounded_expected`, so it is rejected as the default. Raw `class_map` improved
+accuracy by 1.71 points, but simultaneously worsened balanced accuracy,
+macro-F1, QWK, and MAE. Promoting it from the same validation fold on which it
+was discovered would be post-hoc rule selection. Moreover, neither apparent
+accuracy gain is statistically compelling on this single fold: relative to
+`rounded_expected`, `posterior_median` has 6 corrected versus 2 newly wrong
+predictions (exact paired test, `p=0.289`), and `class_map` has 10 versus 5
+(`p=0.302`). `rounded_expected` therefore remains the safe operating rule
+pending the independently specified EyePACS audit. All six rules remain logged
+for diagnosis only.
 
 ## Measurable risk: empty-proof advance gradients
 
@@ -106,13 +142,10 @@ or silently changing the declared number of grades.
 
 ## Validation-only audit
 
-Run the completed checkpoints before another long training job:
+APTOS fold 0 has been completed. Run the EyePACS audit before making any
+cross-dataset decoder claim:
 
 ```bash
-sbatch submit_mosaic_decoder_audit.sh aptos \
-  runs/mosaic_aptos_f0_ampfix_policy_v2/fold0/best.pth
-
-# Run this after the active EyePACS job has finished.
 sbatch submit_mosaic_decoder_audit.sh dr \
   runs/mosaic_dr_f0_ampfix_policy_v2/fold0/best.pth
 ```
@@ -123,10 +156,10 @@ confusions, help-versus-harm counts, probability invariants, and the hard-proof
 diagnostics. It writes `decoder_audit/summary.json` and `predictions.csv` next
 to each checkpoint.
 
-The accuracy-targeted rule was fixed in advance as
-`deweighted_class_map`. Do not select whichever of the six rows happens to win
-on one fold. The remaining rows diagnose whether the previous plateau came
-from calibration/decision mismatch or from the learned representation.
+No alternative rule is promoted from the APTOS table. Do not select whichever
+of the six rows happens to win on one fold. The EyePACS audit is an independent
+diagnostic of whether the APTOS ordering generalizes; it is not permission to
+choose a dataset-specific decoder after inspecting both tables.
 
 ## Changes intentionally not made
 
@@ -138,6 +171,11 @@ from calibration/decision mismatch or from the learned representation.
 - no change to receptive field, count truncation, or proof tolerance; and
 - no stronger imbalance weights.
 
-Those would confound the single question this audit answers. New corrected
-runs must use a fresh run directory because the decision rule is part of the
-checkpoint and implementation identity.
+The operating decoder also remains unchanged: selected-proof continuation
+scores are converted to a normalized ordinal distribution and the prediction
+is `round(E[Y])`. Analytic deweighting, MAP, and posterior-median rules remain
+available only in the audit report.
+
+Those would confound the single question this audit answers. New runs under
+the audited source must use a fresh run directory because the decision rule is
+part of the checkpoint and implementation identity.

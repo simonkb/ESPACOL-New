@@ -188,10 +188,11 @@ def build_parser() -> argparse.ArgumentParser:
             "deweighted_class_map",
             "deweighted_posterior_median",
         ),
-        default="deweighted_class_map",
+        default="rounded_expected",
         help=(
             "Parameter-free point decision derived from the selected proof; "
-            "deweighted_class_map matches accuracy after a weighted likelihood."
+            "rounded_expected is the validated default and alternatives are "
+            "reserved for pre-specified decoder audits."
         ),
     )
     parser.add_argument(

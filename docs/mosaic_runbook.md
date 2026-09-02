@@ -1,6 +1,6 @@
 # MOSAIC implementation and experiment runbook
 
-Date: 2026-08-30
+Date: 2026-09-02
 
 Branch: `mosaic-ordinal-proof`
 
@@ -25,10 +25,11 @@ code actually does and the next executable experiment.
 - `Datasets/mosaic_data.py`: full-canvas APTOS/EyePACS loading, disjoint folds,
   tight-field cropping, direct canonical-square resizing, and the same
   image-independent centered ellipse for every sample.
-- `models/mosaic_decoder.py`: a proof-only decision layer that analytically
-  removes boundary outcome-weight distortion and applies a metric-matched
-  class MAP rule. It has zero learned or validation-fitted parameters and
-  accepts no image or feature input.
+- `models/mosaic_decoder.py`: a proof-only decision layer whose safe operating
+  rule remains `rounded_expected`. It also exposes five fixed alternative rules
+  for validation diagnostics, including analytic outcome-weight corrections;
+  none has learned or validation-fitted parameters, and none accepts image or
+  feature input.
 - `training/mosaic_trainer.py` and `train_mosaic.py`: dense warm-up, proof
   tolerance ramp, validation-accuracy checkpointing, complete resume state, atomic
   checkpoints, source-content implementation signatures, held-out test
@@ -183,24 +184,35 @@ The script passes `--skip_test`, so no outer-test predictions or
 `test_metrics.json` are produced during architecture development. Architecture
 decisions use only `best_validation_metrics.json`; the outer fold remains
 untouched until the architecture and hyperparameters are frozen.
-The original implementation used `round(E[Y])`. That is a posterior-mean
-decision for squared ordinal error, despite selecting checkpoints by exact
-accuracy. More importantly, the at-risk loss uses different stop/advance
-weights, so its direct continuation outputs are cost-sensitive scores rather
-than natural posterior probabilities. The corrected default is
-`deweighted_class_map`: for boundary weights ordered as
-`[w_stop, w_advance]`, it computes
+The operating rule is `rounded_expected`: the selected-proof continuation
+scores define the ordinal cascade and the final grade is
+`round(sum_k P(Y>k))`. The at-risk loss uses different stop/advance weights,
+so the audit also tests an analytic inverse candidate. For boundary weights
+ordered as `[w_stop, w_advance]`, that diagnostic computes
 
 ```text
 p_continue = w_stop*c / (w_stop*c + w_advance*s)
 ```
 
-in stable log space, rebuilds the ordinal class distribution, and returns its
-MAP grade. This is an analytic consequence of the training loss, not a tuned
-threshold. The decoder receives only selected-proof transitions, their direct
-log-stop partners, and training-fold weights; the proof remains the exclusive
-grade path. All six fixed decisions are logged every epoch so the effect is
-auditable.
+in stable log space before rebuilding the ordinal class distribution. The
+candidate is an analytic consequence of the weighted population loss, but a
+finite trained network need not satisfy that population optimum.
+
+The APTOS fold-0 audit reproduced the historical checkpoint exactly and found:
+
+- `rounded_expected`: 82.25% accuracy, 0.9030 QWK, 0.2150 MAE;
+- raw `class_map`: 83.96% accuracy, but 0.8719 QWK and 0.2253 MAE; and
+- `deweighted_class_map`: 81.23% accuracy, 0.8671 QWK, 0.2526 MAE.
+
+All three deweighted variants were worse than `rounded_expected` on every
+reported metric. Deweighting is therefore rejected as the default. Raw class
+MAP is not promoted either: it traded away ordinal and imbalance-sensitive
+quality, and choosing it after seeing this fold would be post-hoc. The one-fold
+accuracy differences are not statistically compelling: raw posterior median
+has help/harm 6/2 (exact paired `p=0.289`); raw MAP has 10/5
+(`p=0.302`). All six rules remain diagnostic outputs only. Every rule receives
+only selected-proof transitions, so the proof remains the exclusive grade
+path.
 
 All configured grades must occur in the training fold. Startup rejects any
 fold for which a boundary lacks either stop or advance examples; such a fold
@@ -224,12 +236,13 @@ sbatch submit_mosaic_decoder_audit.sh dr \
 
 The audit must exactly reproduce the checkpoint's historical rounded-mean
 accuracy/QWK/MAE before any decoder comparison is trusted. It writes
-`decoder_audit/summary.json` and per-image `predictions.csv`. The
-pre-specified accuracy candidate is `deweighted_class_map`; do not choose a
-different row merely because it happens to be best on this validation fold.
-The same audit reports empty selected proofs among positive/advance targets.
-Those cases expose the hard-projection dead-gradient region and determine
-whether a later training-objective change is justified.
+`decoder_audit/summary.json` and per-image `predictions.csv`. APTOS has now
+rejected deweighting as the default; no row should be chosen merely because it
+wins one metric on one validation fold. The EyePACS run is an independent
+diagnostic, while `rounded_expected` remains the safe operating rule. The same
+audit reports empty selected proofs among positive/advance targets. Those
+cases expose the hard-projection dead-gradient region and determine whether a
+later training-objective change is justified.
 
 The pilot passes only if:
 
@@ -251,17 +264,17 @@ Export five deterministic examples per grade (up to 25 total) and independently
 replay them. Certificate export requires the checkpoint's implementation
 signature to match the active source exactly; pre-audit checkpoints are valid
 for the decoder audit above, but must not be relabelled as certificates produced
-by the corrected implementation.
+by the audited implementation.
 
 ```bash
 python export_mosaic_certificates.py \
-  --checkpoint runs/mosaic_aptos_f0_deweighted_v1/fold0/best.pth \
+  --checkpoint runs/mosaic_aptos_f0_rounded_v1/fold0/best.pth \
   --dataset aptos \
   --data_root Datasets/aptos2019-blindness-detection \
   --fold 0 \
   --split validation \
   --per_grade_limit 5 \
-  --output_dir runs/mosaic_aptos_f0_deweighted_v1/fold0/validation_certificates
+  --output_dir runs/mosaic_aptos_f0_rounded_v1/fold0/validation_certificates
 ```
 
 Every manifest row must have `replay_ok=True` and `replay_status=passed`.
@@ -299,12 +312,12 @@ the requested learning curves are collected in full. Checkpoint selection
 uses inner-validation accuracy, and `--skip_test` keeps the outer folds
 untouched.
 
-The decoder change is resume-critical and changes the implementation
-signature. Do not resume a pre-audit run under the corrected source. Use the
-validation-only decoder audit on its `best.pth`, then start any corrected
-training comparison in a new run directory. To reproduce the historical rule
-explicitly, set `MOSAIC_DECISION_RULE=rounded_expected`; the default launcher
-uses `deweighted_class_map`.
+The audited decoder implementation is resume-critical and changes the
+implementation signature. Do not resume a pre-audit run under the audited
+source. Use the validation-only decoder audit on its `best.pth`, then start any
+new training comparison in a fresh run directory. The launchers use the safe
+`MOSAIC_DECISION_RULE=rounded_expected` default. The other five rules are
+diagnostic comparisons, not dataset-specific training configurations.
 
 ## Only after the pilot passes
 

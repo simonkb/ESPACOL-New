@@ -1,9 +1,10 @@
 # MOSAIC: minimum ordinal proofs on a retinal micro-region lattice
 
-Status: **Core implementation complete on `mosaic-ordinal-proof`; local Gate 0
-passed; CUDA Gate 0 and the APTOS fold-0 end-to-end viability pilot are next**
+Status: **Core implementation complete on `mosaic-ordinal-proof`; APTOS
+fold-0 viability run and proof-decoder audit complete; EyePACS decoder audit
+pending**
 
-Date: 2026-08-30 (implementation verified the same day)
+Date: 2026-09-02
 
 Data constraint: **EyePACS/Kaggle DR and APTOS image-level grades only**. No
 lesion masks, text encoder, concept labels, manual annotation, or clinician
@@ -445,17 +446,24 @@ p_{n,K-1}=\prod_{j=0}^{K-2}c_{n,j}.
 \]
 
 This guarantees ordered cumulative probabilities and a normalized class
-distribution without four independent CORAL logits. There is one necessary
-qualification when the continuation likelihood uses boundary outcome weights.
-Its population optimum is the cost-sensitive score
+distribution without four independent CORAL logits. The current safe point
+prediction remains
+
+\[
+\hat y_n=\operatorname{round}\!\left(\mathbb E[Y_n]\right)
+=\operatorname{round}\!\left(\sum_{k=0}^{K-2}q_{n,k}\right).
+\]
+
+There is one necessary qualification when the continuation likelihood uses
+boundary outcome weights. Its population optimum is the cost-sensitive score
 
 \[
 c^*_{n,k}=\frac{w_{k,1}\pi_{n,k}}
 {w_{k,1}\pi_{n,k}+w_{k,0}(1-\pi_{n,k})},
 \]
 
-not the natural continuation posterior \(\pi_{n,k}\). MOSAIC therefore applies
-the exact, parameter-free inverse
+not the natural continuation posterior \(\pi_{n,k}\). The decoder audit
+therefore evaluates the exact, parameter-free inverse
 
 \[
 \bar c_{n,k}=\frac{w_{k,0}c_{n,k}}
@@ -464,15 +472,23 @@ the exact, parameter-free inverse
 {w_{k,0}c_{n,k}+w_{k,1}s_{n,k}}.
 \]
 
-The reported accuracy decision is the MAP class under the class distribution
-rebuilt from \((\bar c,\bar s)\). This applies the analytic inverse link implied
-by the weighted population loss; in a finite model its empirical calibration
-must still be checked. It does not fit a calibration parameter. The historical
-rounded posterior mean, raw MAP, and ordinal medians remain fixed diagnostics.
-Every rule still receives only selected-proof scores, so no image or feature
-bypass is added. The proof's sufficiency and necessity statements remain in
-the raw cardinality-score domain, while the final decoder is a deterministic
-monotone transformation recorded in the certificate.
+This analytic inverse is retained as a fixed diagnostic, not used by the
+operating model. On the completed APTOS fold-0 checkpoint audit, all three
+deweighted rules reduced accuracy, balanced accuracy, macro-F1, QWK, and
+increased MAE relative to `rounded_expected`. Raw class MAP increased exact
+accuracy but reduced QWK, balanced accuracy, macro-F1, and worsened MAE;
+selecting it from that same validation fold would be post-hoc. The apparent
+accuracy changes were also not compelling in exact paired tests
+(`posterior_median`: help/harm 6/2, `p=0.289`; `class_map`: 10/5,
+`p=0.302`). Accordingly, `rounded_expected` remains the safe default pending
+the independent EyePACS audit. Raw/deweighted MAP, posterior medians, and
+deweighted mean-round remain six-rule audit diagnostics only.
+
+Every rule receives only selected-proof scores, so the diagnostic audit adds
+no image or feature bypass. The proof's sufficiency and necessity statements
+remain in the raw cardinality-score domain. MOSAIC's novelty is the exclusive,
+replayable proof computation, not a choice among conventional point-decision
+rules.
 
 ## 5. Hiding evidence without creating fake images
 

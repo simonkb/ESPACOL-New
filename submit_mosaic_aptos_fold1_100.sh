@@ -29,7 +29,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 RUN_DIR="${MOSAIC_RUN_DIR:-runs/mosaic_aptos_fold1_e100}"
 FOLD=1
 TOTAL_EPOCHS=100
-DECISION_RULE="${MOSAIC_DECISION_RULE:-deweighted_class_map}"
+DECISION_RULE="${MOSAIC_DECISION_RULE:-rounded_expected}"
 FOLD_DIR="${RUN_DIR}/fold${FOLD}"
 mkdir -p "${FOLD_DIR}"
 
