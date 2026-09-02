@@ -28,6 +28,7 @@ from inference.mosaic_certificate import (
     verify_mosaic_certificate,
 )
 from models.mosaic_model import build_mosaic_model
+from training.mosaic_trainer import mosaic_implementation_signature
 
 
 def _file_sha256(path: str | Path) -> str:
@@ -45,6 +46,39 @@ def _split_signature(*named_splits) -> str:
         for path, label in sorted((Path(path).name, int(label)) for path, label in items):
             digest.update(f"{path}\t{label}\n".encode())
     return digest.hexdigest()
+
+
+def _require_matching_implementation_signature(
+    checkpoint: dict,
+    *,
+    active_signature: str | None = None,
+) -> str:
+    """Reject checkpoints produced by a different executable MOSAIC stack."""
+
+    stored_signature = checkpoint.get("implementation_signature")
+    if not isinstance(stored_signature, str) or not stored_signature:
+        raise ValueError(
+            "checkpoint has no MOSAIC implementation signature; certificate "
+            "provenance would be incomplete"
+        )
+    if active_signature is None:
+        active_signature = mosaic_implementation_signature()
+    if stored_signature != active_signature:
+        raise ValueError(
+            "checkpoint MOSAIC implementation signature does not match the "
+            "active source tree; refusing to export a certificate computed "
+            "under different code"
+        )
+    return active_signature
+
+
+def _verification_fields(report: dict | None) -> tuple[bool | None, str]:
+    """Represent skipped replay distinctly from successful verification."""
+
+    if report is None:
+        return None, "not_run"
+    replay_ok = bool(report["ok"])
+    return replay_ok, "passed" if replay_ok else "failed"
 
 
 def main() -> None:
@@ -86,11 +120,9 @@ def main() -> None:
             "checkpoint predates MOSAIC's canonical preprocessing identity; "
             "it cannot produce a faithful certificate"
         )
-    if not checkpoint.get("implementation_signature"):
-        raise ValueError(
-            "checkpoint has no MOSAIC implementation signature; certificate "
-            "provenance would be incomplete"
-        )
+    active_implementation_signature = _require_matching_implementation_signature(
+        checkpoint
+    )
     cfg = MOSAICConfig(
         **{
             key: value
@@ -98,6 +130,33 @@ def main() -> None:
             if key in MOSAICConfig.__dataclass_fields__
         }
     )
+    # Checkpoints created before the explicit proof-decoder audit used rounded
+    # expected grade.  Preserve that provenance instead of inheriting the new
+    # configuration default when the stored field is absent.
+    cfg.decision_rule = stored.get("decision_rule", "rounded_expected")
+    criterion_state = checkpoint.get("criterion_state")
+    if (
+        not isinstance(criterion_state, dict)
+        or "transition_weights" not in criterion_state
+    ):
+        raise ValueError(
+            "checkpoint has no training-fold transition weights; a v3 "
+            "decision certificate cannot replay its decoder"
+        )
+    transition_weights = torch.as_tensor(
+        criterion_state["transition_weights"], dtype=torch.float32
+    ).cpu()
+    if tuple(transition_weights.shape) != (cfg.n_classes - 1, 2):
+        raise ValueError(
+            "checkpoint transition weights do not match the configured "
+            "ordinal boundaries"
+        )
+    if not bool(torch.isfinite(transition_weights).all()) or bool(
+        (transition_weights <= 0.0).any()
+    ):
+        raise ValueError(
+            "checkpoint transition weights must be finite and strictly positive"
+        )
     if cfg.preprocessing_version != MOSAIC_PREPROCESSING_VERSION:
         raise ValueError(
             "checkpoint preprocessing version does not match the active "
@@ -181,6 +240,7 @@ def main() -> None:
         count_block_size=cfg.count_block_size,
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
+    model.configure_proof_decoder(cfg.decision_rule, transition_weights)
     model.eval()
 
     output_dir = Path(args.output_dir)
@@ -208,6 +268,8 @@ def main() -> None:
                 sample_id=sample_id,
                 sufficiency_tolerance=cfg.proof_epsilon,
                 complement_suppression=cfg.necessity_fraction,
+                decision_rule=cfg.decision_rule,
+                transition_weights=transition_weights,
                 provenance={
                     "checkpoint_sha256": checkpoint_digest,
                     "source_image_sha256": _file_sha256(image_path),
@@ -217,9 +279,7 @@ def main() -> None:
                     "fold": int(args.fold),
                     "split": args.split,
                     "split_signature": current_signature,
-                    "implementation_signature": checkpoint.get(
-                        "implementation_signature"
-                    ),
+                    "implementation_signature": active_implementation_signature,
                     "preprocessing": {
                         "version": MOSAIC_PREPROCESSING_VERSION,
                         "image_size": int(cfg.img_size),
@@ -231,9 +291,18 @@ def main() -> None:
                     },
                 },
             )
-            report = {"ok": True}
+            direct_grade = int(result.predicted_grade[0].detach().cpu())
+            certified_grade = int(certificate["prediction"]["predicted_grade"])
+            if direct_grade != certified_grade:
+                raise RuntimeError(
+                    "configured model prediction and independently rebuilt "
+                    f"certificate decision disagree ({direct_grade} != "
+                    f"{certified_grade})"
+                )
+            report = None
             if not args.no_verify:
                 report = verify_mosaic_certificate(certificate, raise_on_error=True)
+            replay_ok, replay_status = _verification_fields(report)
             certificate_path = output_dir / f"{sample_id}.json"
             save_mosaic_certificate(certificate, certificate_path)
             manifest_rows.append(
@@ -244,7 +313,8 @@ def main() -> None:
                     "predicted_grade": certificate["prediction"]["predicted_grade"],
                     "expected_grade": certificate["prediction"]["expected_grade"],
                     "certificate": str(certificate_path),
-                    "replay_ok": report["ok"],
+                    "replay_ok": replay_ok,
+                    "replay_status": replay_status,
                 }
             )
 
@@ -259,10 +329,17 @@ def main() -> None:
         "dataset": args.dataset,
         "fold": args.fold,
         "split": args.split,
+        "decision_rule": cfg.decision_rule,
+        "implementation_signature": active_implementation_signature,
         "limit": args.limit,
         "per_grade_limit": args.per_grade_limit,
         "certificates": len(manifest_rows),
-        "all_replay_ok": all(row["replay_ok"] for row in manifest_rows),
+        "all_replay_ok": (
+            None
+            if args.no_verify
+            else all(bool(row["replay_ok"]) for row in manifest_rows)
+        ),
+        "replay_status": "not_run" if args.no_verify else "passed",
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))

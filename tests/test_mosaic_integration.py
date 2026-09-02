@@ -24,6 +24,7 @@ from Datasets.mosaic_data import (
     make_mosaic_loaders,
 )
 from models.local_efficientnet import downsample_retinal_field_mask
+from models.mosaic_decoder import proof_only_decisions
 from models.mosaic_model import MOSAICModel
 from train_mosaic import (
     default_run_dir,
@@ -73,7 +74,14 @@ def _tiny_model(**overrides) -> MOSAICModel:
     return MOSAICModel(**kwargs).eval()
 
 
-def _tiny_trainer(tmp_path, *, cfg_overrides=None, fold=0, signature="split-a"):
+def _tiny_trainer(
+    tmp_path,
+    *,
+    cfg_overrides=None,
+    fold=0,
+    signature="split-a",
+    train_labels=None,
+):
     cfg_values = {
         "img_size": 64,
         "batch_size": 2,
@@ -95,7 +103,7 @@ def _tiny_trainer(tmp_path, *, cfg_overrides=None, fold=0, signature="split-a"):
         [],
         cfg,
         str(tmp_path),
-        [0, 1, 2, 3, 4],
+        [0, 1, 2, 3, 4] if train_labels is None else train_labels,
         fold=fold,
         split_signature=signature,
         device=torch.device("cpu"),
@@ -139,6 +147,70 @@ def test_end_to_end_offline_forward_at_64_pixels() -> None:
         rtol=0,
     )
     assert not output.proof.selected_mask[1][~output.valid_mask[1]].any()
+
+
+def test_configured_direct_forward_exposes_selected_proof_only_decision() -> None:
+    torch.manual_seed(201)
+    model = _tiny_model()
+    weights = torch.tensor(
+        [[0.4, 2.0], [1.8, 0.7], [0.6, 3.0], [2.4, 0.5]]
+    )
+    model.configure_proof_decoder("deweighted_class_map", weights)
+    with torch.no_grad():
+        output = model(torch.randn(2, 3, 64, 64))
+    expected = proof_only_decisions(
+        output.transitions,
+        output.log_stop_probabilities,
+        weights,
+    )
+
+    assert output.decision_rule == "deweighted_class_map"
+    torch.testing.assert_close(
+        output.class_probabilities,
+        expected.deweighted_class_probabilities,
+    )
+    torch.testing.assert_close(
+        output.cumulative_probabilities,
+        expected.deweighted_cumulative_probabilities,
+    )
+    torch.testing.assert_close(
+        output.expected_grade,
+        expected.deweighted_expected_grade,
+    )
+    assert torch.equal(output.predicted_grade, expected.deweighted_argmax)
+    assert torch.equal(output.argmax_grade, expected.deweighted_argmax)
+    # The original core law remains explicit for audits and old consumers.
+    assert output.raw_class_probabilities is output.evidence.class_probabilities
+    assert output.raw_predicted_grade is output.evidence.predicted_grade
+
+
+def test_runtime_decoder_configuration_does_not_change_checkpoint_state() -> None:
+    model = _tiny_model()
+    original_keys = tuple(model.state_dict().keys())
+    state = {name: value.clone() for name, value in model.state_dict().items()}
+    model.configure_proof_decoder(
+        "deweighted_posterior_median",
+        torch.tensor(
+            [[0.5, 2.0], [1.5, 0.8], [0.7, 1.9], [2.1, 0.6]]
+        ),
+    )
+    assert tuple(model.state_dict().keys()) == original_keys
+    assert "_decision_transition_weights" not in model.state_dict()
+
+    legacy_default = _tiny_model()
+    legacy_default.load_state_dict(state, strict=True)
+    assert legacy_default.decision_rule == "rounded_expected"
+
+
+@pytest.mark.parametrize("decision_rule", ["rounded_expected", "deweighted_class_map"])
+def test_model_configuration_rejects_incomplete_boundary_support(
+    decision_rule: str,
+) -> None:
+    model = _tiny_model()
+    weights = torch.ones(4, 2)
+    weights[-1, 1] = 0.0
+    with pytest.raises(ValueError, match="fold incomplete"):
+        model.configure_proof_decoder(decision_rule, weights)
 
 
 def test_model_initial_count_prior_matches_canonical_fallback_support() -> None:
@@ -385,6 +457,20 @@ def test_epoch_diagnostics_aggregate_boundary_risk_sets_exactly(tmp_path: Path) 
         shuffle=False,
     )
     metrics = trainer._run_epoch(loader, train=False, epoch=1)
+    assert metrics["decision_rule"] == "deweighted_class_map"
+    assert metrics["acc"] == pytest.approx(
+        metrics["decoder_deweighted_class_map_acc"]
+    )
+    for rule in (
+        "rounded_expected",
+        "class_map",
+        "posterior_median",
+        "deweighted_mean_round",
+        "deweighted_class_map",
+        "deweighted_posterior_median",
+    ):
+        for metric in ("acc", "mae", "qwk", "ece"):
+            assert f"decoder_{rule}_{metric}" in metrics
     expected_risk = (4.0, 3.0, 2.0, 1.0)
     expected_advance = (3 / 4, 2 / 3, 1 / 2, 1.0)
     for boundary in range(4):
@@ -392,6 +478,64 @@ def test_epoch_diagnostics_aggregate_boundary_risk_sets_exactly(tmp_path: Path) 
         assert metrics[f"advance_rate_boundary_{boundary}"] == pytest.approx(
             expected_advance[boundary]
         )
+        assert 0.0 <= metrics[f"zero_proof_rate_boundary_{boundary}"] <= 1.0
+        assert (
+            0.0
+            <= metrics[f"zero_proof_advance_rate_boundary_{boundary}"]
+            <= 1.0
+        )
+        assert (
+            0.0
+            <= metrics[f"zero_transition_advance_rate_boundary_{boundary}"]
+            <= 1.0
+        )
+
+
+def test_invalid_proof_decision_rule_fails_before_training(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unknown MOSAIC decision rule"):
+        _tiny_trainer(
+            tmp_path,
+            cfg_overrides={"decision_rule": "validation_tuned_threshold"},
+        )
+
+
+@pytest.mark.parametrize("decision_rule", ["rounded_expected", "deweighted_class_map"])
+def test_incomplete_boundary_support_fails_at_trainer_initialization(
+    tmp_path: Path,
+    decision_rule: str,
+) -> None:
+    # With no grade-4 example, advance at the final boundary is unobserved and
+    # receives zero criterion weight.  That split cannot identify the complete
+    # declared five-grade model, regardless of the selected point rule.
+    labels_without_grade_four = [0, 0, 1, 1, 2, 2, 3, 3]
+    with pytest.raises(ValueError, match="invalid MOSAIC training fold"):
+        _tiny_trainer(
+            tmp_path / decision_rule,
+            cfg_overrides={"decision_rule": decision_rule},
+            train_labels=labels_without_grade_four,
+        )
+
+
+def test_decision_rule_is_resume_critical_and_serialized(tmp_path: Path) -> None:
+    original = _tiny_trainer(
+        tmp_path / "original",
+        cfg_overrides={"decision_rule": "deweighted_class_map"},
+    )
+    state = original._checkpoint_payload(epoch=1, metrics={}, best_accuracy=0.0)
+    assert state["architecture"]["decision_rule"] == "deweighted_class_map"
+    assert state["architecture"]["no_global_bypass"] is True
+    assert state["architecture"]["decision_inputs"] == (
+        "selected_proof_transitions",
+        "selected_proof_log_stop_probabilities",
+        "training_fold_boundary_outcome_weights",
+    )
+
+    changed = _tiny_trainer(
+        tmp_path / "changed",
+        cfg_overrides={"decision_rule": "rounded_expected"},
+    )
+    with pytest.raises(ValueError, match="decision_rule"):
+        changed._validate_resume_checkpoint(state)
 
 
 def test_cpu_training_step_remains_finite_and_updates_parameters(tmp_path: Path) -> None:

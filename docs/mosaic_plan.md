@@ -445,9 +445,34 @@ p_{n,K-1}=\prod_{j=0}^{K-2}c_{n,j}.
 \]
 
 This guarantees ordered cumulative probabilities and a normalized class
-distribution without four independent CORAL logits. The primary reported
-decision is \(\hat y=\operatorname{round}(\sum_y y p_{n,y})\), matching the
-existing project protocol; class argmax is retained only as a diagnostic.
+distribution without four independent CORAL logits. There is one necessary
+qualification when the continuation likelihood uses boundary outcome weights.
+Its population optimum is the cost-sensitive score
+
+\[
+c^*_{n,k}=\frac{w_{k,1}\pi_{n,k}}
+{w_{k,1}\pi_{n,k}+w_{k,0}(1-\pi_{n,k})},
+\]
+
+not the natural continuation posterior \(\pi_{n,k}\). MOSAIC therefore applies
+the exact, parameter-free inverse
+
+\[
+\bar c_{n,k}=\frac{w_{k,0}c_{n,k}}
+{w_{k,0}c_{n,k}+w_{k,1}s_{n,k}},\qquad
+\bar s_{n,k}=\frac{w_{k,1}s_{n,k}}
+{w_{k,0}c_{n,k}+w_{k,1}s_{n,k}}.
+\]
+
+The reported accuracy decision is the MAP class under the class distribution
+rebuilt from \((\bar c,\bar s)\). This applies the analytic inverse link implied
+by the weighted population loss; in a finite model its empirical calibration
+must still be checked. It does not fit a calibration parameter. The historical
+rounded posterior mean, raw MAP, and ordinal medians remain fixed diagnostics.
+Every rule still receives only selected-proof scores, so no image or feature
+bypass is added. The proof's sufficiency and necessity statements remain in
+the raw cardinality-score domain, while the final decoder is a deterministic
+monotone transformation recorded in the certificate.
 
 ## 5. Hiding evidence without creating fake images
 

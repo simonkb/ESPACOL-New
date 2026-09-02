@@ -28,18 +28,53 @@ from models.mosaic import (
     OrdinalCardinalityCircuit,
     ProofProjectionResult,
     TruncatedPoissonBinomial,
-    continuation_probabilities,
     fixed_proof_pivotality,
+)
+from models.mosaic_decoder import (
+    PROOF_DECISION_RULES,
+    ProofOnlyDecisionBundle,
+    decision_rule_outputs,
+    proof_only_decisions,
 )
 
 
-SCHEMA_VERSION = "mosaic-certificate-v2"
+SCHEMA_VERSION = "mosaic-certificate-v3"
 DEFAULT_REPLAY_ATOL = 2e-5
 DEFAULT_REPLAY_RTOL = 2e-5
+# Replay tolerances are part of the verifier's trust policy, not values that a
+# certificate may relax for itself. The serialized values document the
+# arithmetic contract, but neither a builder caller nor a loaded certificate is
+# allowed to make that contract weaker than the audited cross-device envelope.
+MAX_REPLAY_ATOL = DEFAULT_REPLAY_ATOL
+MAX_REPLAY_RTOL = DEFAULT_REPLAY_RTOL
 
 
 class CertificateReplayError(ValueError):
     """Raised when a serialized certificate cannot reproduce its prediction."""
+
+
+def _decision_view(
+    decisions: ProofOnlyDecisionBundle,
+    decision_rule: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str]:
+    """Return prediction, cumulative/class laws, mean, and law identity."""
+
+    if decision_rule not in PROOF_DECISION_RULES:
+        raise ValueError(
+            f"unknown proof-only decision rule {decision_rule!r}; expected one of "
+            f"{PROOF_DECISION_RULES}"
+        )
+    prediction, cumulative = decision_rule_outputs(decisions)[decision_rule]
+    deweighted = decision_rule.startswith("deweighted_")
+    if deweighted:
+        classes = decisions.deweighted_class_probabilities
+        expected = decisions.deweighted_expected_grade
+        probability_space = "analytically_deweighted"
+    else:
+        classes = decisions.raw_class_probabilities
+        expected = decisions.raw_expected_grade
+        probability_space = "raw_cost_sensitive"
+    return prediction, cumulative, classes, expected, probability_space
 
 
 def _payload_sha256(certificate: Mapping[str, Any]) -> str:
@@ -313,6 +348,8 @@ def build_mosaic_certificate(
     comparison_atol: float = 1e-7,
     replay_atol: float = DEFAULT_REPLAY_ATOL,
     replay_rtol: float = DEFAULT_REPLAY_RTOL,
+    decision_rule: str | None = None,
+    transition_weights: torch.Tensor | Sequence[Sequence[float]] | None = None,
     provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one strict JSON-safe certificate from a MOSAIC output.
@@ -321,16 +358,75 @@ def build_mosaic_certificate(
     ``MOSAICModelOutput`` wrapper, or a mapping with the same fields.  The
     wrapper supplies its lattice and valid mask automatically.  Receptive-field
     metadata remains mandatory so a consumer cannot mistake lattice spacing
-    for the true image support of a witness.
+    for the true image support of a witness.  A wrapper's decision rule and
+    training weights are inferred unless matching values are supplied
+    explicitly; a bare core output retains the historical rounded-mean/unit-
+    weight defaults.  ``transition_weights`` are the training-fold boundary
+    outcome weights in ``[stop, advance]`` order.  They affect only the
+    deterministic final decision decoder: proof selection, sufficiency, and
+    necessity remain certificates of the raw cardinality scores.
     """
 
     wrapped_evidence = _optional_field(output, "evidence")
     if wrapped_evidence is not None:
+        # A MOSAICModelOutput already carries the decoder that produced its
+        # public ``predicted_grade``.  Infer that metadata by default so a
+        # certificate built directly from the wrapper cannot silently certify
+        # the legacy raw decoder instead.  Explicit overrides are accepted
+        # only when they agree with the wrapper, preserving a single truthful
+        # prediction trace.
+        wrapped_decision_rule = _optional_field(output, "decision_rule")
+        wrapped_transition_weights = _optional_field(
+            output, "decision_transition_weights"
+        )
+        if decision_rule is None:
+            decision_rule = (
+                "rounded_expected"
+                if wrapped_decision_rule is None
+                else str(wrapped_decision_rule)
+            )
+        elif (
+            wrapped_decision_rule is not None
+            and decision_rule != str(wrapped_decision_rule)
+        ):
+            raise ValueError(
+                "explicit decision_rule conflicts with MOSAICModelOutput metadata"
+            )
+        if transition_weights is None:
+            transition_weights = wrapped_transition_weights
+        elif wrapped_transition_weights is not None:
+            explicit_weights = (
+                _tensor(transition_weights, "transition_weights")
+                .detach()
+                .float()
+                .cpu()
+            )
+            output_weights = (
+                _tensor(
+                    wrapped_transition_weights,
+                    "output.decision_transition_weights",
+                )
+                .detach()
+                .float()
+                .cpu()
+            )
+            if (
+                explicit_weights.shape != output_weights.shape
+                or not torch.equal(explicit_weights, output_weights)
+            ):
+                raise ValueError(
+                    "explicit transition_weights conflict with "
+                    "MOSAICModelOutput metadata"
+                )
         if lattice_metadata is None:
             lattice_metadata = _optional_field(output, "lattice")
         if valid_mask is None:
             valid_mask = _optional_field(output, "valid_mask")
         output = wrapped_evidence
+    elif decision_rule is None:
+        # Core outputs and legacy tensor mappings have no decoder metadata;
+        # retain their historical raw rounded-mean behavior.
+        decision_rule = "rounded_expected"
     if lattice_metadata is None:
         raise ValueError("lattice_metadata is required for a faithful certificate")
     if sufficiency_tolerance < 0.0:
@@ -339,8 +435,23 @@ def build_mosaic_certificate(
         raise ValueError("complement_suppression must lie in [0, 1]")
     if comparison_atol < 0.0:
         raise ValueError("comparison_atol must be non-negative")
-    if replay_atol < 0.0 or replay_rtol < 0.0:
-        raise ValueError("replay tolerances must be non-negative")
+    if (
+        replay_atol < 0.0
+        or replay_rtol < 0.0
+        or not math.isfinite(replay_atol)
+        or not math.isfinite(replay_rtol)
+        or replay_atol > MAX_REPLAY_ATOL
+        or replay_rtol > MAX_REPLAY_RTOL
+    ):
+        raise ValueError(
+            "replay tolerances must be finite and no greater than the "
+            f"audited maxima ({MAX_REPLAY_ATOL}, {MAX_REPLAY_RTOL})"
+        )
+    if decision_rule not in PROOF_DECISION_RULES:
+        raise ValueError(
+            f"unknown proof-only decision rule {decision_rule!r}; expected one of "
+            f"{PROOF_DECISION_RULES}"
+        )
     if provenance is not None and not isinstance(provenance, Mapping):
         raise TypeError("provenance must be a mapping")
 
@@ -423,41 +534,6 @@ def build_mosaic_certificate(
         sample_index=sample_index,
         batched_ndim=2,
     ).detach().float().cpu()
-    cumulative = _sample(
-        _field(output, "cumulative_probabilities"),
-        "cumulative_probabilities",
-        sample_index=sample_index,
-        batched_ndim=2,
-    ).detach().float().cpu()
-    classes = _sample(
-        _field(output, "class_probabilities"),
-        "class_probabilities",
-        sample_index=sample_index,
-        batched_ndim=2,
-    ).detach().float().cpu()
-    expected = _sample(
-        _field(output, "expected_grade"),
-        "expected_grade",
-        sample_index=sample_index,
-        batched_ndim=1,
-    ).detach().float().cpu()
-    predicted = _sample(
-        _field(output, "predicted_grade"),
-        "predicted_grade",
-        sample_index=sample_index,
-        batched_ndim=1,
-    ).detach().long().cpu()
-    argmax_value = _optional_field(output, "argmax_grade")
-    if argmax_value is None:
-        argmax_grade = classes.argmax().long()
-    else:
-        argmax_grade = _sample(
-            argmax_value,
-            "argmax_grade",
-            sample_index=sample_index,
-            batched_ndim=1,
-        ).detach().long().cpu()
-
     alpha_value = _tensor(_field(output, "alpha"), "alpha").detach().float().cpu()
     log_alpha_value = _tensor(
         _field(output, "log_alpha"), "log_alpha"
@@ -513,6 +589,35 @@ def build_mosaic_certificate(
         raise ValueError("selected mask and witness ledger disagree")
     if alpha.shape[0] != boundaries:
         raise ValueError("alpha and witness ledger boundary counts disagree")
+
+    if transition_weights is None and decision_rule.startswith("deweighted_"):
+        raise ValueError(
+            "transition_weights must be provided explicitly for a deweighted "
+            "decision rule"
+        )
+    if transition_weights is None:
+        weights = torch.ones(boundaries, 2, dtype=torch.float32)
+    else:
+        weights = _tensor(transition_weights, "transition_weights").detach().float().cpu()
+    if tuple(weights.shape) != (boundaries, 2):
+        raise ValueError(
+            "transition_weights must have shape "
+            f"({boundaries}, 2) ordered as [stop, advance]"
+        )
+    if not bool(torch.isfinite(weights).all()) or bool((weights <= 0.0).any()):
+        raise ValueError("transition_weights must be finite and strictly positive")
+
+    # Do not trust convenience predictions on ``output``.  The certificate's
+    # grade is recomputed from the selected proof transitions and their stable
+    # log-stop trace, which are the only numerical prediction inputs.
+    decisions = proof_only_decisions(transitions, log_stop, weights)
+    (
+        selected_prediction,
+        selected_cumulative,
+        selected_classes,
+        selected_expected,
+        selected_probability_space,
+    ) = _decision_view(decisions, decision_rule)
 
     if valid_mask is None:
         valid = torch.ones(p, dtype=torch.bool)
@@ -621,18 +726,53 @@ def build_mosaic_certificate(
         "sample_index": int(sample_index),
         "provenance": {} if provenance is None else _json_safe(provenance),
         "prediction": {
-            "predicted_grade": int(predicted),
-            "decision_rule": "rounded_expected_grade",
-            "class_argmax_grade": int(argmax_grade),
-            "expected_grade": float(expected),
-            "class_probabilities": classes,
-            "cumulative_probabilities": cumulative,
+            "predicted_grade": int(selected_prediction),
+            "decision_rule": decision_rule,
+            "probability_space": selected_probability_space,
+            "transition_weight_order": ["stop", "advance"],
+            "transition_weights": weights,
+            # These unprefixed values are the probability law selected by the
+            # configured rule and therefore support the final prediction.
+            "class_argmax_grade": int(selected_classes.argmax()),
+            "expected_grade": float(selected_expected),
+            "class_probabilities": selected_classes,
+            "cumulative_probabilities": selected_cumulative,
+            # Preserve both deterministic proof-only laws so an independent
+            # consumer can audit the effect of inverse outcome weighting.
+            "raw_expected_grade": float(decisions.raw_expected_grade),
+            "raw_rounded_expected_grade": int(decisions.raw_mean_round),
+            "raw_class_argmax_grade": int(decisions.raw_argmax),
+            "raw_posterior_median_grade": int(
+                decisions.raw_posterior_median
+            ),
+            "raw_class_probabilities": decisions.raw_class_probabilities,
+            "raw_cumulative_probabilities": (
+                decisions.raw_cumulative_probabilities
+            ),
+            "deweighted_expected_grade": float(
+                decisions.deweighted_expected_grade
+            ),
+            "deweighted_rounded_expected_grade": int(
+                decisions.deweighted_mean_round
+            ),
+            "deweighted_class_argmax_grade": int(
+                decisions.deweighted_argmax
+            ),
+            "deweighted_posterior_median_grade": int(
+                decisions.deweighted_posterior_median
+            ),
+            "deweighted_class_probabilities": (
+                decisions.deweighted_class_probabilities
+            ),
+            "deweighted_cumulative_probabilities": (
+                decisions.deweighted_cumulative_probabilities
+            ),
             "projected_transitions": transitions,
             "projected_stop_probabilities": stop,
             "dense_transitions": dense,
             "dense_stop_probabilities": dense_stop,
-            "projected_log_stop_probabilities": log_stop,
-            "dense_log_stop_probabilities": dense_log_stop,
+            "projected_log_stop_probabilities": _serialize_log_trace(log_stop),
+            "dense_log_stop_probabilities": _serialize_log_trace(dense_log_stop),
         },
         "cardinality": {
             "alpha": alpha,
@@ -652,6 +792,11 @@ def build_mosaic_certificate(
             "complement_suppression": float(complement_suppression),
             "comparison_atol": float(comparison_atol),
             "selection": "stable_descending_top_prefix",
+            "score_space": "raw_cardinality_transition_scores",
+            "scope": (
+                "Sufficiency and complement necessity certify raw proof scores; "
+                "outcome deweighting is a deterministic decision-only transform."
+            ),
         },
         "numerical_contract": {
             # CPU/GPU FP32 reduction orders are not bit-identical at a
@@ -661,6 +806,9 @@ def build_mosaic_certificate(
             "replay_atol": float(replay_atol),
             "replay_rtol": float(replay_rtol),
             "arithmetic": "fp32_scaled_log_lower_tail_poisson_binomial",
+            "decision_arithmetic": (
+                "proof_only_log_space_inverse_outcome_weighting"
+            ),
             "log_zero_encoding": -1.0e30,
         },
         "dense_ledger": {
@@ -691,7 +839,9 @@ def build_mosaic_certificate(
         "receptive_field_metadata": metadata,
         "interpretation_scope": (
             "Fine-grid computational evidence with the serialized receptive-field "
-            "support; not pixel segmentation or a named-lesion annotation."
+            "support; not pixel segmentation or a named-lesion annotation. Proof "
+            "sufficiency and necessity refer to raw cardinality scores, while the "
+            "final grade may apply the serialized deterministic deweighting rule."
         ),
     }
     # A round-trip with allow_nan=False is the final strict JSON-safety check.
@@ -787,7 +937,13 @@ def verify_mosaic_certificate(
         if certificate.get("schema_version") == "mosaic-certificate-v1":
             raise ValueError(
                 "mosaic-certificate-v1 has no stable log-stop trace; "
-                "regenerate it with the v2 exporter"
+                "regenerate it with the v3 exporter"
+            )
+        if certificate.get("schema_version") == "mosaic-certificate-v2":
+            raise ValueError(
+                "mosaic-certificate-v2 does not serialize the proof-only "
+                "decision rule and outcome weights; regenerate it with the "
+                "v3 exporter"
             )
         raise ValueError(
             f"unsupported certificate schema {certificate.get('schema_version')!r}"
@@ -795,12 +951,36 @@ def verify_mosaic_certificate(
     numerical = certificate.get("numerical_contract", {})
     if not isinstance(numerical, Mapping):
         raise ValueError("certificate numerical_contract must be an object")
+    serialized_atol = float(numerical.get("replay_atol", DEFAULT_REPLAY_ATOL))
+    serialized_rtol = float(numerical.get("replay_rtol", DEFAULT_REPLAY_RTOL))
+    if (
+        serialized_atol < 0.0
+        or serialized_rtol < 0.0
+        or not math.isfinite(serialized_atol)
+        or not math.isfinite(serialized_rtol)
+        or serialized_atol > MAX_REPLAY_ATOL
+        or serialized_rtol > MAX_REPLAY_RTOL
+    ):
+        raise ValueError(
+            "serialized replay tolerances exceed the verifier's audited maxima "
+            f"({MAX_REPLAY_ATOL}, {MAX_REPLAY_RTOL})"
+        )
     if atol is None:
-        atol = float(numerical.get("replay_atol", DEFAULT_REPLAY_ATOL))
+        atol = serialized_atol
     if rtol is None:
-        rtol = float(numerical.get("replay_rtol", DEFAULT_REPLAY_RTOL))
-    if atol < 0.0 or rtol < 0.0 or not math.isfinite(atol) or not math.isfinite(rtol):
-        raise ValueError("replay tolerances must be non-negative")
+        rtol = serialized_rtol
+    if (
+        atol < 0.0
+        or rtol < 0.0
+        or not math.isfinite(atol)
+        or not math.isfinite(rtol)
+        or atol > MAX_REPLAY_ATOL
+        or rtol > MAX_REPLAY_RTOL
+    ):
+        raise ValueError(
+            "replay tolerances must be finite and no greater than the "
+            f"audited maxima ({MAX_REPLAY_ATOL}, {MAX_REPLAY_RTOL})"
+        )
 
     integrity = certificate.get("integrity", {})
     integrity_valid = bool(
@@ -828,7 +1008,6 @@ def verify_mosaic_certificate(
     valid = torch.tensor(ledger["valid_mask"], dtype=torch.bool)
     alpha = torch.tensor(cardinality["alpha"], dtype=torch.float32)
     log_alpha = torch.tensor(cardinality["log_alpha"], dtype=torch.float32)
-    selected_indices = proof["selected_indices"]
     p, boundaries = witnesses.shape
     if (
         valid.shape != (p,)
@@ -863,9 +1042,31 @@ def verify_mosaic_certificate(
         geometry_valid = False
 
     selected_mask = torch.zeros_like(witnesses, dtype=torch.bool)
-    duplicate_or_invalid = False
-    for boundary, ids_value in enumerate(selected_indices):
-        ids = [int(index) for index in ids_value]
+    raw_selected_indices = proof.get("selected_indices")
+    selected_indices_structure_valid = bool(
+        isinstance(raw_selected_indices, list)
+        and len(raw_selected_indices) == boundaries
+    )
+    # Normalize a malformed boundary list to exactly B entries so the verifier
+    # can finish its audit and report a failed structural check instead of
+    # raising an incidental IndexError.
+    selected_indices: list[list[int]] = []
+    duplicate_or_invalid = not selected_indices_structure_valid
+    for boundary in range(boundaries):
+        ids_value = (
+            raw_selected_indices[boundary]
+            if isinstance(raw_selected_indices, list)
+            and boundary < len(raw_selected_indices)
+            else []
+        )
+        try:
+            if not isinstance(ids_value, list):
+                raise TypeError
+            ids = [int(index) for index in ids_value]
+        except (TypeError, ValueError, OverflowError):
+            duplicate_or_invalid = True
+            ids = []
+        selected_indices.append(ids)
         if len(ids) != len(set(ids)):
             duplicate_or_invalid = True
         if any(index < 0 or index >= p or not bool(valid[index]) for index in ids):
@@ -901,20 +1102,67 @@ def verify_mosaic_certificate(
     _retained_continue, retained_stop, _retained_tails = (
         OrdinalCardinalityCircuit.score_distributions(retained_distribution, alpha)
     )
-    cumulative, classes = continuation_probabilities(retained_score, retained_stop)
-    class_axis = torch.arange(classes.numel(), dtype=classes.dtype)
-    expected_grade = (classes * class_axis).sum()
+
+    weights_valid = True
+    try:
+        transition_weights = torch.tensor(
+            prediction["transition_weights"], dtype=torch.float32
+        )
+        if tuple(transition_weights.shape) != (boundaries, 2):
+            raise ValueError("invalid transition weight shape")
+        if not bool(torch.isfinite(transition_weights).all()) or bool(
+            (transition_weights <= 0.0).any()
+        ):
+            raise ValueError("transition weights are not strictly positive")
+        if prediction.get("transition_weight_order") != ["stop", "advance"]:
+            raise ValueError("invalid transition weight ordering")
+    except (KeyError, TypeError, ValueError):
+        # Continue the structural audit with an identity decoder while making
+        # the malformed decoder metadata an explicit failed check.
+        weights_valid = False
+        transition_weights = torch.ones(boundaries, 2, dtype=torch.float32)
+
+    decision_rule = prediction.get("decision_rule")
+    decision_rule_valid = bool(decision_rule in PROOF_DECISION_RULES)
+    replay_rule = decision_rule if decision_rule_valid else "rounded_expected"
+    serialized_transitions = torch.tensor(
+        prediction["projected_transitions"], dtype=torch.float32
+    )
+    serialized_log_stops = _deserialize_log_trace(
+        prediction["projected_log_stop_probabilities"]
+    )
+    decisions = proof_only_decisions(
+        serialized_transitions,
+        serialized_log_stops,
+        transition_weights,
+    )
+    (
+        replayed_prediction,
+        cumulative,
+        classes,
+        expected_grade,
+        probability_space,
+    ) = _decision_view(decisions, replay_rule)
 
     checks: dict[str, bool] = {
         "integrity_sha256": integrity_valid,
         "numerical_contract": bool(
             numerical.get("arithmetic")
             == "fp32_scaled_log_lower_tail_poisson_binomial"
+            and numerical.get("decision_arithmetic")
+            == "proof_only_log_space_inverse_outcome_weighting"
             and "replay_atol" in numerical
             and "replay_rtol" in numerical
         ),
         "receptive_field_metadata": geometry_valid,
         "selected_indices_valid": not duplicate_or_invalid,
+        "transition_weights": weights_valid,
+        "decision_rule": decision_rule_valid,
+        "proof_score_space": bool(
+            rule.get("score_space") == "raw_cardinality_transition_scores"
+            and isinstance(rule.get("scope"), str)
+            and "raw proof scores" in rule.get("scope", "")
+        ),
     }
     errors: dict[str, float] = {}
     checks["invalid_cells_are_normal"] = bool(
@@ -977,7 +1225,7 @@ def verify_mosaic_certificate(
         errors,
         "dense_log_stop_probabilities",
         dense_log_stop,
-        torch.tensor(prediction["dense_log_stop_probabilities"]),
+        _deserialize_log_trace(prediction["dense_log_stop_probabilities"]),
         atol,
         rtol,
     )
@@ -986,7 +1234,7 @@ def verify_mosaic_certificate(
         errors,
         "projected_log_stop_probabilities",
         retained_log_stop,
-        torch.tensor(prediction["projected_log_stop_probabilities"]),
+        _deserialize_log_trace(prediction["projected_log_stop_probabilities"]),
         atol,
         rtol,
     )
@@ -1123,20 +1371,99 @@ def verify_mosaic_certificate(
     _close_check(
         checks,
         errors,
+        "raw_cumulative_probabilities",
+        decisions.raw_cumulative_probabilities,
+        torch.tensor(prediction["raw_cumulative_probabilities"]),
+        atol,
+        rtol,
+    )
+    _close_check(
+        checks,
+        errors,
+        "raw_class_probabilities",
+        decisions.raw_class_probabilities,
+        torch.tensor(prediction["raw_class_probabilities"]),
+        atol,
+        rtol,
+    )
+    _close_check(
+        checks,
+        errors,
+        "deweighted_cumulative_probabilities",
+        decisions.deweighted_cumulative_probabilities,
+        torch.tensor(prediction["deweighted_cumulative_probabilities"]),
+        atol,
+        rtol,
+    )
+    _close_check(
+        checks,
+        errors,
+        "deweighted_class_probabilities",
+        decisions.deweighted_class_probabilities,
+        torch.tensor(prediction["deweighted_class_probabilities"]),
+        atol,
+        rtol,
+    )
+    _close_check(
+        checks,
+        errors,
         "expected_grade",
         expected_grade.reshape(1),
         torch.tensor([prediction["expected_grade"]]),
         atol,
         rtol,
     )
-    replayed_grade = int(expected_grade.round().clamp(0, classes.numel() - 1))
-    checks["decision_rule"] = prediction.get("decision_rule") == "rounded_expected_grade"
+    _close_check(
+        checks,
+        errors,
+        "raw_expected_grade",
+        decisions.raw_expected_grade.reshape(1),
+        torch.tensor([prediction["raw_expected_grade"]]),
+        atol,
+        rtol,
+    )
+    _close_check(
+        checks,
+        errors,
+        "deweighted_expected_grade",
+        decisions.deweighted_expected_grade.reshape(1),
+        torch.tensor([prediction["deweighted_expected_grade"]]),
+        atol,
+        rtol,
+    )
+    replayed_grade = int(replayed_prediction)
+    checks["probability_space"] = (
+        prediction.get("probability_space") == probability_space
+    )
     checks["predicted_grade"] = replayed_grade == int(prediction["predicted_grade"])
     checks["class_argmax_grade"] = int(classes.argmax()) == int(
         prediction["class_argmax_grade"]
     )
+    checks["raw_decisions"] = bool(
+        int(decisions.raw_mean_round)
+        == int(prediction["raw_rounded_expected_grade"])
+        and int(decisions.raw_argmax)
+        == int(prediction["raw_class_argmax_grade"])
+        and int(decisions.raw_posterior_median)
+        == int(prediction["raw_posterior_median_grade"])
+    )
+    checks["deweighted_decisions"] = bool(
+        int(decisions.deweighted_mean_round)
+        == int(prediction["deweighted_rounded_expected_grade"])
+        and int(decisions.deweighted_argmax)
+        == int(prediction["deweighted_class_argmax_grade"])
+        and int(decisions.deweighted_posterior_median)
+        == int(prediction["deweighted_posterior_median_grade"])
+    )
     checks["class_probabilities_normalized"] = bool(
-        (classes >= -atol).all() and abs(float(classes.sum()) - 1.0) <= atol + rtol
+        (classes >= -atol).all()
+        and abs(float(classes.sum()) - 1.0) <= atol + rtol
+        and (decisions.raw_class_probabilities >= -atol).all()
+        and abs(float(decisions.raw_class_probabilities.sum()) - 1.0)
+        <= atol + rtol
+        and (decisions.deweighted_class_probabilities >= -atol).all()
+        and abs(float(decisions.deweighted_class_probabilities.sum()) - 1.0)
+        <= atol + rtol
     )
 
     proof_sizes = torch.tensor(proof["proof_sizes"], dtype=torch.long)
@@ -1365,6 +1692,8 @@ def verify_mosaic_certificate(
         "checks": checks,
         "max_abs_errors": errors,
         "replayed_predicted_grade": replayed_grade,
+        "replayed_decision_rule": replay_rule,
+        "replayed_probability_space": probability_space,
         "replayed_class_argmax_grade": int(classes.argmax()),
         "replayed_expected_grade": float(expected_grade),
         "replay_atol": float(atol),
@@ -1383,6 +1712,8 @@ __all__ = [
     "SCHEMA_VERSION",
     "DEFAULT_REPLAY_ATOL",
     "DEFAULT_REPLAY_RTOL",
+    "MAX_REPLAY_ATOL",
+    "MAX_REPLAY_RTOL",
     "build_mosaic_certificate",
     "certificate_to_json",
     "load_mosaic_certificate",

@@ -4,7 +4,7 @@ This wrapper is intentionally separate from ``models.framework``.  The final
 grade has exactly one computational path:
 
 ``full canvas -> bounded local features -> local ordinal states -> exact
-cardinality proof -> continuation probabilities``.
+cardinality proof -> loss-aware proof decoder -> ordinal grade``.
 
 There is no globally pooled feature, residual logit, text branch, or CORAL
 head that can bypass the reported proof.
@@ -13,7 +13,7 @@ head that can bypass the reported proof.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -24,6 +24,11 @@ from .local_efficientnet import (
     downsample_retinal_field_mask,
 )
 from .mosaic import MOSAICOutput, MOSAICProofHead
+from .mosaic_decoder import (
+    PROOF_DECISION_RULES,
+    ProofOnlyDecisionBundle,
+    proof_only_decisions,
+)
 from utils.spatial_mask import centered_ellipse_mask
 
 
@@ -35,6 +40,9 @@ class MOSAICModelOutput:
     valid_mask: torch.Tensor
     lattice: LatticeMetadata
     local_features: Optional[torch.Tensor] = None
+    decision_rule: str = "rounded_expected"
+    decision_transition_weights: Optional[torch.Tensor] = None
+    decisions: Optional[ProofOnlyDecisionBundle] = None
 
     # Short properties keep trainer code readable while retaining a clearly
     # separated encoder-independent mathematical core.
@@ -63,20 +71,87 @@ class MOSAICModelOutput:
         return self.evidence.log_stop_probabilities
 
     @property
-    def class_probabilities(self) -> torch.Tensor:
+    def raw_cumulative_probabilities(self) -> torch.Tensor:
+        """Unmodified cumulative law emitted by the cardinality core."""
+
+        return self.evidence.cumulative_probabilities
+
+    @property
+    def raw_class_probabilities(self) -> torch.Tensor:
+        """Unmodified class law emitted by the cardinality core."""
+
         return self.evidence.class_probabilities
 
     @property
-    def predicted_grade(self) -> torch.Tensor:
+    def raw_predicted_grade(self) -> torch.Tensor:
+        """Legacy rounded-expected decision before outcome deweighting."""
+
         return self.evidence.predicted_grade
 
     @property
-    def argmax_grade(self) -> torch.Tensor:
+    def raw_argmax_grade(self) -> torch.Tensor:
         return self.evidence.argmax_grade
 
     @property
-    def expected_grade(self) -> torch.Tensor:
+    def raw_expected_grade(self) -> torch.Tensor:
         return self.evidence.expected_grade
+
+    def _require_deweighted_decisions(self) -> ProofOnlyDecisionBundle:
+        if self.decisions is None:
+            raise RuntimeError(
+                "deweighted decisions are unavailable because at least one "
+                "training outcome weight is zero"
+            )
+        return self.decisions
+
+    @property
+    def cumulative_probabilities(self) -> torch.Tensor:
+        """Cumulative law selected by the configured proof-only decoder."""
+
+        if self.decision_rule.startswith("deweighted_"):
+            return self._require_deweighted_decisions().deweighted_cumulative_probabilities
+        return self.raw_cumulative_probabilities
+
+    @property
+    def class_probabilities(self) -> torch.Tensor:
+        """Class law selected by the configured proof-only decoder."""
+
+        if self.decision_rule.startswith("deweighted_"):
+            return self._require_deweighted_decisions().deweighted_class_probabilities
+        return self.raw_class_probabilities
+
+    @property
+    def expected_grade(self) -> torch.Tensor:
+        """Posterior mean under the selected raw or deweighted law."""
+
+        if self.decision_rule.startswith("deweighted_"):
+            return self._require_deweighted_decisions().deweighted_expected_grade
+        return self.raw_expected_grade
+
+    @property
+    def predicted_grade(self) -> torch.Tensor:
+        """Final grade selected by ``decision_rule`` from the reported proof."""
+
+        if self.decision_rule == "rounded_expected":
+            return self.raw_predicted_grade
+        if self.decision_rule == "class_map":
+            return self.raw_argmax_grade
+        if self.decision_rule == "posterior_median":
+            return (self.raw_cumulative_probabilities >= 0.5).sum(dim=-1)
+        decisions = self._require_deweighted_decisions()
+        if self.decision_rule == "deweighted_mean_round":
+            return decisions.deweighted_mean_round
+        if self.decision_rule == "deweighted_class_map":
+            return decisions.deweighted_argmax
+        if self.decision_rule == "deweighted_posterior_median":
+            return decisions.deweighted_posterior_median
+        raise RuntimeError(f"unconfigured decision rule {self.decision_rule!r}")
+
+    @property
+    def argmax_grade(self) -> torch.Tensor:
+        """MAP grade under the selected raw or deweighted probability law."""
+
+        return self.class_probabilities.argmax(dim=-1)
 
     @property
     def proof(self):
@@ -101,6 +176,8 @@ class MOSAICModel(nn.Module):
         complement_suppression: float = 0.5,
         count_implementation: str = "block_tree",
         count_block_size: int = 64,
+        decision_rule: str = "rounded_expected",
+        transition_weights: torch.Tensor | Sequence[Sequence[float]] | None = None,
     ) -> None:
         super().__init__()
         self.num_classes = int(num_classes)
@@ -133,6 +210,70 @@ class MOSAICModel(nn.Module):
             implementation=count_implementation,
             block_size=count_block_size,
         )
+        # Runtime decoder metadata is deliberately non-persistent.  It is
+        # reconstructed from the training criterion/checkpoint, so legacy
+        # model state dictionaries continue to load strictly and no learned
+        # parameter can bypass the proof.
+        self.register_buffer(
+            "_decision_transition_weights",
+            torch.ones(self.num_classes - 1, 2),
+            persistent=False,
+        )
+        self._decision_rule = "rounded_expected"
+        self.configure_proof_decoder(decision_rule, transition_weights)
+
+    @property
+    def decision_rule(self) -> str:
+        return self._decision_rule
+
+    @property
+    def decision_transition_weights(self) -> torch.Tensor:
+        return self._decision_transition_weights
+
+    def configure_proof_decoder(
+        self,
+        decision_rule: str,
+        transition_weights: torch.Tensor | Sequence[Sequence[float]] | None = None,
+    ) -> None:
+        """Configure the parameter-free final decision from criterion metadata.
+
+        Outcome weights are ordered ``[stop, advance]``.  They are not saved in
+        the model state because the criterion checkpoint is their authoritative
+        source.  Every outcome must have positive training support: a fold that
+        omits one side of a configured ordinal boundary is not a valid fold for
+        the declared ``K``-grade model or its complete decoder audit.
+        """
+
+        if decision_rule not in PROOF_DECISION_RULES:
+            raise ValueError(
+                f"unknown MOSAIC decision rule {decision_rule!r}; expected one of "
+                f"{PROOF_DECISION_RULES}"
+            )
+        if transition_weights is None:
+            weights = torch.ones(
+                self.num_classes - 1,
+                2,
+                device=self._decision_transition_weights.device,
+            )
+        else:
+            weights = torch.as_tensor(
+                transition_weights,
+                dtype=torch.float32,
+                device=self._decision_transition_weights.device,
+            )
+        if tuple(weights.shape) != (self.num_classes - 1, 2):
+            raise ValueError(
+                "transition_weights must have shape "
+                f"({self.num_classes - 1}, 2) ordered as [stop, advance]"
+            )
+        if not bool(torch.isfinite(weights).all()) or bool((weights <= 0.0).any()):
+            raise ValueError(
+                "every ordinal boundary needs strictly positive stop and advance "
+                "training weights; a zero-weight outcome makes the declared "
+                "K-grade fold incomplete"
+            )
+        self._decision_transition_weights.copy_(weights)
+        self._decision_rule = decision_rule
 
     @property
     def proof_tolerance(self) -> float:
@@ -196,11 +337,19 @@ class MOSAICModel(nn.Module):
             project=project,
             return_pivotality=return_pivotality,
         )
+        decisions = proof_only_decisions(
+            evidence.transitions,
+            evidence.log_stop_probabilities,
+            self._decision_transition_weights,
+        )
         return MOSAICModelOutput(
             evidence=evidence,
             valid_mask=local.valid_mask,
             lattice=local.lattice,
             local_features=local.tokens if return_local_features else None,
+            decision_rule=self._decision_rule,
+            decision_transition_weights=self._decision_transition_weights,
+            decisions=decisions,
         )
 
 

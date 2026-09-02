@@ -399,13 +399,15 @@ def _svg_figure(raw_uri: str, canonical_uri: str) -> str:
         1075,
         640,
         [
-            "Ordinal Continuation Cascade",
-            "u[k] = P(Y>k) = product_(j=0..k) c[j]",
+            "Proof-Only Outcome-Weight Decoder",
+            "cbar[k] = w[k,0]c[k] / (w[k,0]c[k]+w[k,1]s[k])",
+            "w: fixed training-fold [stop, advance] weights",
+            "P(Y>k) = product_(j=0..k) cbar[j]",
             "P(Y=0), …, P(Y=4)",
-            "ŷ = round(Σ_(g=0..4) g P(Y=g))",
+            "ŷ = argmax_g P(Y=g)",
         ],
-        size=11.5,
-        leading=25,
+        size=9.5,
+        leading=19,
         bold_first=True,
     )
     s.arrow([(1060, 590), (1060, 607), (757, 607), (757, 618)], color=ORANGE, width=2.6)
@@ -428,7 +430,7 @@ def _svg_figure(raw_uri: str, canonical_uri: str) -> str:
         bold_first=True,
         family="Arial,Helvetica,sans-serif",
     )
-    s.arrow([(1220, 676), (1265, 676), (1265, 125), (1278, 125)], color=CORAL_STROKE, width=1.7, dashed=True)
+    s.arrow([(885, 660), (910, 660), (910, 600), (1265, 600), (1265, 125), (1278, 125)], color=CORAL_STROKE, width=1.7, dashed=True)
     s.arrow([(972, 275), (972, 230), (1265, 230), (1265, 170), (1278, 170)], color=GRAY, width=1.5, dashed=True)
     s.text(1185, 224, ["dense auxiliary • training only"], size=9.5, anchor="middle", color=GRAY, italic=True)
 
@@ -477,9 +479,9 @@ def _svg_figure(raw_uri: str, canonical_uri: str) -> str:
     s.rect(1285, 650, 300, 165, fill="#FFFFFF", stroke="#111111", radius=12, width=1.2)
     s.text(1435, 678, ["Ordinal Outputs (inference)"], size=13, bold_first=True)
     s.rect(1310, 700, 250, 43, fill=LIGHT_BLUE, stroke="#6CA6E8", radius=7)
-    s.text(1435, 718, ["c[0..3]  •  P(Y>k)  •  P(Y=0..4)"], size=10.5)
+    s.text(1435, 718, ["cbar[0..3]  •  P(Y>k)  •  P(Y=0..4)"], size=10.5)
     s.rect(1310, 755, 250, 43, fill=ORANGE, stroke=ORANGE, radius=7)
-    s.text(1435, 774, ["Expected grade E[Y]  →  predicted grade ŷ"], size=11, bold_first=True)
+    s.text(1435, 774, ["Proof class MAP  →  predicted grade ŷ"], size=11, bold_first=True)
     s.arrow([(1220, 680), (1278, 680)], color=ORANGE, width=2.6)
 
     # Footer claim boundary.
@@ -649,12 +651,12 @@ def _drawio_figure(raw_uri: str, canonical_uri: str) -> str:
     d.edge(alpha, proof)
 
     retained = d.vertex(_html("Retained-Proof Circuit Replay", "same PB counter on M* ⊙ λ", "cₖ=cᴿₖ and stable log sₖ"), 630, 625, 255, 100, box.replace("strokeColor=#111111", f"strokeColor={ORANGE};strokeWidth=2"), ident="retained")
-    cascade = d.vertex(_html("Ordinal Continuation Cascade", "P(Y&gt;k) = product(j=0..k) c[j]", "P(Y=0), …, P(Y=4)", "ŷ = round(sum(g=0..4) g P(Y=g))"), 930, 615, 290, 130, yellow, ident="cascade")
+    cascade = d.vertex(_html("Proof-Only Outcome-Weight Decoder", "c̄[k] = w[k,0]c[k] / (w[k,0]c[k] + w[k,1]s[k])", "w: fixed training-fold [stop, advance] weights", "P(Y&gt;k) = product(j=0..k) c̄[j]", "P(Y=0), …, P(Y=4)", "ŷ = argmax(g) P(Y=g)"), 930, 615, 290, 130, yellow, ident="cascade")
     d.edge(proof, retained, color=ORANGE, width=2.6)
     d.edge(retained, cascade, color=ORANGE, width=2.6)
 
     loss_box = d.vertex(_html("Balanced At-Risk Continuation NLL", "Lproj = −Σₖ<ᵧ wₖ,₁ log cₖ", "− 1[y<4] wᵧ,₀ log sᵧ", "L = Lproj + 0.1 Ldense", "effective-number transition weights"), 1285, 25, 300, 180, loss, ident="loss")
-    d.edge(cascade, loss_box, color=CORAL_STROKE, width=1.7, dashed=True)
+    d.edge(retained, loss_box, color=CORAL_STROKE, width=1.7, dashed=True)
     d.edge(dense, loss_box, color=GRAY, width=1.5, dashed=True)
 
     certificate = d.vertex("", 1285, 225, 300, 405, output, ident="certificate")
@@ -675,8 +677,8 @@ def _drawio_figure(raw_uri: str, canonical_uri: str) -> str:
 
     ordinal_output = d.vertex("", 1285, 650, 300, 165, output, ident="ordinal_output")
     d.vertex("<b>Ordinal Outputs (inference)</b>", 1315, 665, 240, 28, "text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=13;")
-    d.vertex("c[0..3] • P(Y&gt;k) • P(Y=0..4)", 1310, 700, 250, 43, box)
-    d.vertex("<b>Expected grade E[Y] → predicted grade ŷ</b>", 1310, 755, 250, 43, box.replace("#CCE5FF", ORANGE).replace("#111111", ORANGE))
+    d.vertex("c̄[0..3] • P(Y&gt;k) • P(Y=0..4)", 1310, 700, 250, 43, box)
+    d.vertex("<b>Proof class MAP → predicted grade ŷ</b>", 1310, 755, 250, 43, box.replace("#CCE5FF", ORANGE).replace("#111111", ORANGE))
     d.edge(cascade, ordinal_output, color=ORANGE, width=2.6)
 
     d.vertex("Fine-grid local witnesses: stride-8 centers with 95×95 receptive-field support — not pixel segmentation&nbsp;&nbsp; • &nbsp;&nbsp;Prediction has no global classifier bypass", 260, 838, 1080, 38, "rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#F4F6F8;strokeColor=#C5CCD3;fontSize=10;align=center;verticalAlign=middle;")

@@ -179,6 +179,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--effective_num_beta", type=float, default=0.999)
     parser.add_argument("--transition_weight_cap", type=float, default=10.0)
     parser.add_argument(
+        "--decision_rule",
+        choices=(
+            "rounded_expected",
+            "class_map",
+            "posterior_median",
+            "deweighted_mean_round",
+            "deweighted_class_map",
+            "deweighted_posterior_median",
+        ),
+        default="deweighted_class_map",
+        help=(
+            "Parameter-free point decision derived from the selected proof; "
+            "deweighted_class_map matches accuracy after a weighted likelihood."
+        ),
+    )
+    parser.add_argument(
         "--stratified_batches",
         action="store_true",
         help="Usually leave off: the at-risk likelihood already corrects imbalance.",
@@ -226,6 +242,7 @@ def main() -> None:
         transition_weighting=args.transition_weighting,
         effective_num_beta=args.effective_num_beta,
         transition_weight_cap=args.transition_weight_cap,
+        decision_rule=args.decision_rule,
         stratified=args.stratified_batches,
     )
     if cfg.preprocessing_version != MOSAIC_PREPROCESSING_VERSION:

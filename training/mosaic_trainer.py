@@ -22,6 +22,11 @@ from torch.utils.data import DataLoader
 
 from configs.config import MOSAICConfig
 from losses.mosaic import MosaicLoss
+from models.mosaic_decoder import (
+    PROOF_DECISION_RULES,
+    decision_rule_outputs,
+    proof_only_decisions,
+)
 from utils.metrics import evaluate_predictions
 
 
@@ -33,6 +38,7 @@ _IMPLEMENTATION_FILES = (
     "Datasets/mosaic_data.py",
     "models/local_efficientnet.py",
     "models/mosaic.py",
+    "models/mosaic_decoder.py",
     "models/mosaic_model.py",
     "losses/mosaic.py",
     "utils/spatial_mask.py",
@@ -127,6 +133,7 @@ class MosaicTrainer:
         "transition_weighting",
         "effective_num_beta",
         "transition_weight_cap",
+        "decision_rule",
         "stratified",
         "lr",
         "head_lr",
@@ -168,6 +175,11 @@ class MosaicTrainer:
             "cuda" if torch.cuda.is_available() else
             "mps" if torch.backends.mps.is_available() else "cpu"
         )
+        if cfg.decision_rule not in PROOF_DECISION_RULES:
+            raise ValueError(
+                f"unknown MOSAIC decision rule {cfg.decision_rule!r}; "
+                f"expected one of {PROOF_DECISION_RULES}"
+            )
         self.model.to(self.device)
         self.use_amp = bool(cfg.amp and self.device.type == "cuda")
         if cfg.amp_init_scale <= 0:
@@ -220,6 +232,7 @@ class MosaicTrainer:
             dense_weight=cfg.dense_loss_weight,
             stability_weight=cfg.stability_loss_weight,
         ).to(self.device)
+        self._configure_model_decision()
         if cfg.stability_loss_weight > 0:
             raise ValueError(
                 "stability_loss_weight requires geometry-matched dual photometric "
@@ -230,6 +243,21 @@ class MosaicTrainer:
         self.last_checkpoint_path = self.run_dir / "last.pth"
         self.history_path = self.run_dir / "history.csv"
         self.implementation_signature = mosaic_implementation_signature()
+
+    def _configure_model_decision(self) -> None:
+        """Bind the direct model API to the criterion's fold-level weights."""
+
+        weights = self.criterion.transition_weights.detach()
+        if bool((weights <= 0.0).any()):
+            raise ValueError(
+                "invalid MOSAIC training fold: every ordinal boundary must have "
+                "both stop and advance examples; at least one outcome has zero "
+                "weight for the declared number of grades"
+            )
+        configure = getattr(self.model, "configure_proof_decoder", None)
+        if configure is None:
+            raise TypeError("MOSAIC model does not expose configure_proof_decoder")
+        configure(self.cfg.decision_rule, weights)
 
     def _proof_phase(self, epoch: int) -> tuple[bool, float]:
         if epoch <= self.cfg.dense_warmup_epochs:
@@ -319,9 +347,9 @@ class MosaicTrainer:
 
         loss_sum = torch.zeros((), device=self.device)
         sample_count = 0
-        all_predictions: list[torch.Tensor] = []
         all_labels: list[torch.Tensor] = []
-        all_cumulative: list[torch.Tensor] = []
+        all_transitions: list[torch.Tensor] = []
+        all_log_stops: list[torch.Tensor] = []
         proof_sizes: list[torch.Tensor] = []
         proof_fractions: list[torch.Tensor] = []
         sufficiency_gaps: list[torch.Tensor] = []
@@ -495,9 +523,9 @@ class MosaicTrainer:
                 batch_size = int(labels.numel())
                 loss_sum = loss_sum + loss.detach() * batch_size
                 sample_count += batch_size
-                all_predictions.append(output.predicted_grade.detach().float())
                 all_labels.append(labels.detach())
-                all_cumulative.append(output.evidence.cumulative_probabilities.detach())
+                all_transitions.append(output.transitions.detach())
+                all_log_stops.append(output.log_stop_probabilities.detach())
                 for boundary in range(self.cfg.n_classes - 1):
                     risk = diagnostics[f"at_risk_boundary_{boundary}"]
                     advance_rate = diagnostics[f"advance_rate_boundary_{boundary}"]
@@ -534,17 +562,38 @@ class MosaicTrainer:
             raise FloatingPointError(
                 f"MOSAIC epoch {epoch} produced no finite optimization batches"
             )
-        predictions = torch.cat(all_predictions).cpu()
         labels_cpu = torch.cat(all_labels).cpu()
-        cumulative = torch.cat(all_cumulative).cpu()
+        transitions_cpu = torch.cat(all_transitions).float().cpu()
+        log_stops_cpu = torch.cat(all_log_stops).float().cpu()
+        decisions = proof_only_decisions(
+            transitions_cpu,
+            log_stops_cpu,
+            self.criterion.transition_weights.detach().float().cpu(),
+        )
+        decision_rules = decision_rule_outputs(decisions)
+        predictions, cumulative = decision_rules[self.cfg.decision_rule]
         metrics = evaluate_predictions(
-            predictions,
+            predictions.float(),
             labels_cpu,
             self.cfg.n_classes,
             ordinal_probs=cumulative,
         )
         metrics.update(_macro_metrics(predictions.long(), labels_cpu, self.cfg.n_classes))
-        sizes = torch.cat(proof_sizes).flatten().cpu()
+        metrics["decision_rule"] = self.cfg.decision_rule
+        # All alternatives are fixed before seeing validation labels.  Logging
+        # them on the identical proof outputs distinguishes a decoder mismatch
+        # from a representation bottleneck without fitting a calibration rule.
+        for rule_name, (rule_prediction, rule_cumulative) in decision_rules.items():
+            rule_metrics = evaluate_predictions(
+                rule_prediction.float(),
+                labels_cpu,
+                self.cfg.n_classes,
+                ordinal_probs=rule_cumulative,
+            )
+            for metric_name, value in rule_metrics.items():
+                metrics[f"decoder_{rule_name}_{metric_name}"] = value
+        proof_size_matrix = torch.cat(proof_sizes).cpu()
+        sizes = proof_size_matrix.flatten()
         fractions = torch.cat(proof_fractions).flatten().cpu()
         sufficiency_gap_mean = torch.cat(sufficiency_gaps).mean().cpu()
         complement_score_mean = torch.cat(complement_scores).mean().cpu()
@@ -579,6 +628,30 @@ class MosaicTrainer:
             metrics[f"at_risk_boundary_{boundary}"] = risk
             metrics[f"advance_rate_boundary_{boundary}"] = (
                 float(boundary_advance_cpu[boundary]) / risk if risk > 0 else 0.0
+            )
+            advance = labels_cpu > boundary
+            stop = labels_cpu == boundary
+            zero_proof = proof_size_matrix[:, boundary] == 0
+            zero_transition = transitions_cpu[:, boundary] == 0
+            advance_count = int(advance.sum())
+            stop_count = int(stop.sum())
+            metrics[f"zero_proof_rate_boundary_{boundary}"] = float(
+                zero_proof.float().mean()
+            )
+            metrics[f"zero_proof_advance_rate_boundary_{boundary}"] = (
+                float((zero_proof & advance).sum()) / advance_count
+                if advance_count > 0
+                else 0.0
+            )
+            metrics[f"zero_proof_stop_rate_boundary_{boundary}"] = (
+                float((zero_proof & stop).sum()) / stop_count
+                if stop_count > 0
+                else 0.0
+            )
+            metrics[f"zero_transition_advance_rate_boundary_{boundary}"] = (
+                float((zero_transition & advance).sum()) / advance_count
+                if advance_count > 0
+                else 0.0
             )
         return metrics
 
@@ -683,6 +756,12 @@ class MosaicTrainer:
                 "expected_valid_cells": self.model.expected_valid_cells,
                 "preprocessing_version": self.cfg.preprocessing_version,
                 "no_global_bypass": True,
+                "decision_rule": self.cfg.decision_rule,
+                "decision_inputs": (
+                    "selected_proof_transitions",
+                    "selected_proof_log_stop_probabilities",
+                    "training_fold_boundary_outcome_weights",
+                ),
             },
         }
 
@@ -805,15 +884,18 @@ class MosaicTrainer:
         checkpoint = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint["model_state"])
         self.criterion.load_state_dict(checkpoint["criterion_state"])
+        self._configure_model_decision()
         return checkpoint
 
     def fit(self, *, evaluate_test: bool = True) -> dict:
         logger.info(
-            "MOSAIC fold=%d device=%s stride=%d RF=%d transition_weights=%s",
+            "MOSAIC fold=%d device=%s stride=%d RF=%d decision=%s "
+            "transition_weights=%s",
             self.fold,
             self.device,
             self.model.output_stride,
             self.model.receptive_field,
+            self.cfg.decision_rule,
             self.criterion.transition_weights.detach().cpu().tolist(),
         )
         best_accuracy = -math.inf
@@ -827,6 +909,7 @@ class MosaicTrainer:
             self._validate_resume_checkpoint(state)
             self.model.load_state_dict(state["model_state"])
             self.criterion.load_state_dict(state["criterion_state"])
+            self._configure_model_decision()
             self.optimizer.load_state_dict(state["optimizer_state"])
             self.scheduler.load_state_dict(state["scheduler_state"])
             if "scaler_state" in state:

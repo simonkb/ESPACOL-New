@@ -37,6 +37,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 RUN_DIR="${MOSAIC_RUN_DIR:-runs/mosaic_aptos_pilot}"
 TOTAL_EPOCHS="${MOSAIC_EPOCHS:-50}"
 EARLY_STOP_PATIENCE="${MOSAIC_EARLY_STOP_PATIENCE:-30}"
+DECISION_RULE="${MOSAIC_DECISION_RULE:-deweighted_class_map}"
 RESUME_ARGS=()
 if [[ "${MOSAIC_RESUME:-0}" == "1" ]]; then
   RESUME_ARGS+=(--resume)
@@ -108,8 +109,11 @@ PY
 python -m pytest -q \
   tests/test_mosaic.py \
   tests/test_mosaic_loss.py \
+  tests/test_mosaic_decoder.py \
+  tests/test_mosaic_decoder_audit.py \
   tests/test_local_efficientnet.py \
   tests/test_mosaic_certificate.py \
+  tests/test_mosaic_certificate_export.py \
   tests/test_mosaic_integration.py
 
 # The calibrated case must produce nonzero local and cardinality gradients.
@@ -204,6 +208,7 @@ python train_mosaic.py \
   --batch_size 4 \
   --epochs "${TOTAL_EPOCHS}" \
   --early_stop_patience "${EARLY_STOP_PATIENCE}" \
+  --decision_rule "${DECISION_RULE}" \
   --max_count 32 \
   --dense_warmup_epochs 4 \
   --proof_ramp_epochs 4 \

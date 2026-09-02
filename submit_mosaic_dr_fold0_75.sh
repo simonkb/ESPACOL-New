@@ -27,6 +27,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 RUN_DIR="${MOSAIC_RUN_DIR:-runs/mosaic_dr_fold0_e75}"
 FOLD=0
 TOTAL_EPOCHS=75
+DECISION_RULE="${MOSAIC_DECISION_RULE:-deweighted_class_map}"
 FOLD_DIR="${RUN_DIR}/fold${FOLD}"
 mkdir -p "${FOLD_DIR}"
 
@@ -99,6 +100,7 @@ python train_mosaic.py \
   --num_workers 8 \
   --epochs "${TOTAL_EPOCHS}" \
   --early_stop_patience "${TOTAL_EPOCHS}" \
+  --decision_rule "${DECISION_RULE}" \
   --max_count 32 \
   --dense_warmup_epochs 4 \
   --proof_ramp_epochs 4 \

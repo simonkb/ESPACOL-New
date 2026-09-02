@@ -25,8 +25,12 @@ code actually does and the next executable experiment.
 - `Datasets/mosaic_data.py`: full-canvas APTOS/EyePACS loading, disjoint folds,
   tight-field cropping, direct canonical-square resizing, and the same
   image-independent centered ellipse for every sample.
+- `models/mosaic_decoder.py`: a proof-only decision layer that analytically
+  removes boundary outcome-weight distortion and applies a metric-matched
+  class MAP rule. It has zero learned or validation-fitted parameters and
+  accepts no image or feature input.
 - `training/mosaic_trainer.py` and `train_mosaic.py`: dense warm-up, proof
-  tolerance ramp, validation-QWK checkpointing, complete resume state, atomic
+  tolerance ramp, validation-accuracy checkpointing, complete resume state, atomic
   checkpoints, source-content implementation signatures, held-out test
   evaluation, proof diagnostics, and bounded AMP overflow recovery. The image
   encoder uses autocast, while the lattice-wide local-state reduction and
@@ -44,6 +48,11 @@ code actually does and the next executable experiment.
 - `tools/audit_mosaic_shortcuts.py`: a validation-only source-dimension and
   canonical-mask shortcut audit; outer-test image headers are not read unless
   explicitly requested.
+- `tools/audit_mosaic_decoders.py`: a fixed-checkpoint, inner-validation-only
+  audit of six pre-specified proof decisions, plus boundary-wise empty-proof
+  diagnostics. It never constructs an outer-test data loader.
+- `submit_mosaic_decoder_audit.sh`: two-argument GPU launcher for that audit;
+  it accepts `aptos|dr` and a checkpoint path.
 - `submit_mosaic_aptos_pilot.sh`: the first end-to-end viability job.
 
 The stability loss cannot yet be enabled because the first data path returns a
@@ -174,8 +183,53 @@ The script passes `--skip_test`, so no outer-test predictions or
 `test_metrics.json` are produced during architecture development. Architecture
 decisions use only `best_validation_metrics.json`; the outer fold remains
 untouched until the architecture and hyperparameters are frozen.
-Predicted grades use `round(E[Y])`, matching the existing project evaluation;
-class argmax is stored only as a diagnostic.
+The original implementation used `round(E[Y])`. That is a posterior-mean
+decision for squared ordinal error, despite selecting checkpoints by exact
+accuracy. More importantly, the at-risk loss uses different stop/advance
+weights, so its direct continuation outputs are cost-sensitive scores rather
+than natural posterior probabilities. The corrected default is
+`deweighted_class_map`: for boundary weights ordered as
+`[w_stop, w_advance]`, it computes
+
+```text
+p_continue = w_stop*c / (w_stop*c + w_advance*s)
+```
+
+in stable log space, rebuilds the ordinal class distribution, and returns its
+MAP grade. This is an analytic consequence of the training loss, not a tuned
+threshold. The decoder receives only selected-proof transitions, their direct
+log-stop partners, and training-fold weights; the proof remains the exclusive
+grade path. All six fixed decisions are logged every epoch so the effect is
+auditable.
+
+All configured grades must occur in the training fold. Startup rejects any
+fold for which a boundary lacks either stop or advance examples; such a fold
+cannot identify the complete declared ordinal model or support the full
+raw/deweighted decoder audit.
+
+Before retraining, audit an existing best checkpoint without touching the
+outer test split:
+
+```bash
+sbatch submit_mosaic_decoder_audit.sh aptos \
+  runs/mosaic_aptos_f0_ampfix_policy_v2/fold0/best.pth
+```
+
+For EyePACS:
+
+```bash
+sbatch submit_mosaic_decoder_audit.sh dr \
+  runs/mosaic_dr_f0_ampfix_policy_v2/fold0/best.pth
+```
+
+The audit must exactly reproduce the checkpoint's historical rounded-mean
+accuracy/QWK/MAE before any decoder comparison is trusted. It writes
+`decoder_audit/summary.json` and per-image `predictions.csv`. The
+pre-specified accuracy candidate is `deweighted_class_map`; do not choose a
+different row merely because it happens to be best on this validation fold.
+The same audit reports empty selected proofs among positive/advance targets.
+Those cases expose the hard-projection dead-gradient region and determine
+whether a later training-objective change is justified.
 
 The pilot passes only if:
 
@@ -194,21 +248,25 @@ The formal comparison must rerun the corrected baseline on this exact fold.
 ## Certificate smoke test after a passing pilot
 
 Export five deterministic examples per grade (up to 25 total) and independently
-replay them:
+replay them. Certificate export requires the checkpoint's implementation
+signature to match the active source exactly; pre-audit checkpoints are valid
+for the decoder audit above, but must not be relabelled as certificates produced
+by the corrected implementation.
 
 ```bash
 python export_mosaic_certificates.py \
-  --checkpoint runs/mosaic_aptos_pilot/fold0/best.pth \
+  --checkpoint runs/mosaic_aptos_f0_deweighted_v1/fold0/best.pth \
   --dataset aptos \
   --data_root Datasets/aptos2019-blindness-detection \
   --fold 0 \
   --split validation \
   --per_grade_limit 5 \
-  --output_dir runs/mosaic_aptos_pilot/fold0/validation_certificates
+  --output_dir runs/mosaic_aptos_f0_deweighted_v1/fold0/validation_certificates
 ```
 
-Every manifest row must have `replay_ok=True`. Twenty-five certificates are a
-replay smoke test, not evidence-quality evaluation.
+Every manifest row must have `replay_ok=True` and `replay_status=passed`.
+Using `--no_verify` records `null/not_run`, never a false success. Twenty-five
+certificates are a replay smoke test, not evidence-quality evaluation.
 
 ## Optional overnight exploratory runs
 
@@ -238,8 +296,15 @@ These are exploratory robustness runs, not substitutes for the matched
 APTOS Gate-1 comparison or the preregistered two-fold EyePACS promotion rule.
 Their launchers set early-stopping patience equal to the epoch budget so that
 the requested learning curves are collected in full. Checkpoint selection
-still uses inner-validation QWK, and `--skip_test` keeps the outer folds
+uses inner-validation accuracy, and `--skip_test` keeps the outer folds
 untouched.
+
+The decoder change is resume-critical and changes the implementation
+signature. Do not resume a pre-audit run under the corrected source. Use the
+validation-only decoder audit on its `best.pth`, then start any corrected
+training comparison in a new run directory. To reproduce the historical rule
+explicitly, set `MOSAIC_DECISION_RULE=rounded_expected`; the default launcher
+uses `deweighted_class_map`.
 
 ## Only after the pilot passes
 

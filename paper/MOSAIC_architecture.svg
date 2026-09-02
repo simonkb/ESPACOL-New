@@ -240,11 +240,13 @@
 <tspan x="757" dy="24">c[k] = cR[k]   and stable log s[k]</tspan>
 </text>
 <rect x="930" y="615" width="290" height="130" rx="12" fill="#FFF2CC" fill-opacity="1.0" stroke="#111111" stroke-width="1.2"/>
-<text x="1075" y="640" text-anchor="middle" fill="#111111" font-family="Arial,Helvetica,sans-serif" font-size="11.5" style="">
-<tspan x="1075" dy="0" font-weight="700">Ordinal Continuation Cascade</tspan>
-<tspan x="1075" dy="25">u[k] = P(Y&gt;k) = product_(j=0..k) c[j]</tspan>
-<tspan x="1075" dy="25">P(Y=0), …, P(Y=4)</tspan>
-<tspan x="1075" dy="25">ŷ = round(Σ_(g=0..4) g P(Y=g))</tspan>
+<text x="1075" y="640" text-anchor="middle" fill="#111111" font-family="Arial,Helvetica,sans-serif" font-size="9.5" style="">
+<tspan x="1075" dy="0" font-weight="700">Proof-Only Outcome-Weight Decoder</tspan>
+<tspan x="1075" dy="19">cbar[k] = w[k,0]c[k] / (w[k,0]c[k]+w[k,1]s[k])</tspan>
+<tspan x="1075" dy="19">w: fixed training-fold [stop, advance] weights</tspan>
+<tspan x="1075" dy="19">P(Y&gt;k) = product_(j=0..k) cbar[j]</tspan>
+<tspan x="1075" dy="19">P(Y=0), …, P(Y=4)</tspan>
+<tspan x="1075" dy="19">ŷ = argmax_g P(Y=g)</tspan>
 </text>
 <path d="M 1060 590 L 1060 607 L 757 607 L 757 618" fill="none" stroke="#FF8000" stroke-width="2.6" stroke-linejoin="miter" marker-end="url(#arrow-orange)"/>
 <path d="M 885 675 L 923 675" fill="none" stroke="#FF8000" stroke-width="2.6" stroke-linejoin="miter" marker-end="url(#arrow-orange)"/>
@@ -256,7 +258,7 @@
 <tspan x="1435" dy="27">L = Lproj + 0.1 Ldense</tspan>
 <tspan x="1435" dy="27">effective-number transition weights</tspan>
 </text>
-<path d="M 1220 676 L 1265 676 L 1265 125 L 1278 125" fill="none" stroke="#9C4241" stroke-width="1.7" stroke-linejoin="miter" stroke-dasharray="7 5" marker-end="url(#arrow-black)"/>
+<path d="M 885 660 L 910 660 L 910 600 L 1265 600 L 1265 125 L 1278 125" fill="none" stroke="#9C4241" stroke-width="1.7" stroke-linejoin="miter" stroke-dasharray="7 5" marker-end="url(#arrow-black)"/>
 <path d="M 972 275 L 972 230 L 1265 230 L 1265 170 L 1278 170" fill="none" stroke="#777777" stroke-width="1.5" stroke-linejoin="miter" stroke-dasharray="7 5" marker-end="url(#arrow-gray)"/>
 <text x="1185" y="224" text-anchor="middle" fill="#777777" font-family="Arial,Helvetica,sans-serif" font-size="9.5" style="font-style:italic;">
 <tspan x="1185" dy="0">dense auxiliary • training only</tspan>
@@ -311,11 +313,11 @@
 </text>
 <rect x="1310" y="700" width="250" height="43" rx="7" fill="#CCE5FF" fill-opacity="1.0" stroke="#6CA6E8" stroke-width="1.2"/>
 <text x="1435" y="718" text-anchor="middle" fill="#111111" font-family="Arial,Helvetica,sans-serif" font-size="10.5" style="">
-<tspan x="1435" dy="0">c[0..3]  •  P(Y&gt;k)  •  P(Y=0..4)</tspan>
+<tspan x="1435" dy="0">cbar[0..3]  •  P(Y&gt;k)  •  P(Y=0..4)</tspan>
 </text>
 <rect x="1310" y="755" width="250" height="43" rx="7" fill="#FF8000" fill-opacity="1.0" stroke="#FF8000" stroke-width="1.2"/>
 <text x="1435" y="774" text-anchor="middle" fill="#111111" font-family="Arial,Helvetica,sans-serif" font-size="11" style="">
-<tspan x="1435" dy="0" font-weight="700">Expected grade E[Y]  →  predicted grade ŷ</tspan>
+<tspan x="1435" dy="0" font-weight="700">Proof class MAP  →  predicted grade ŷ</tspan>
 </text>
 <path d="M 1220 680 L 1278 680" fill="none" stroke="#FF8000" stroke-width="2.6" stroke-linejoin="miter" marker-end="url(#arrow-orange)"/>
 <rect x="260" y="838" width="1080" height="38" rx="8" fill="#F4F6F8" fill-opacity="1.0" stroke="#C5CCD3" stroke-width="1.2"/>

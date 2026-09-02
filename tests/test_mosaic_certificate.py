@@ -7,12 +7,16 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import torch
 
 from inference.mosaic_certificate import (
     CertificateReplayError,
+    MAX_REPLAY_ATOL,
+    MAX_REPLAY_RTOL,
     SCHEMA_VERSION,
+    _payload_sha256,
     build_mosaic_certificate,
     certificate_to_json,
     load_mosaic_certificate,
@@ -20,6 +24,7 @@ from inference.mosaic_certificate import (
     verify_mosaic_certificate,
 )
 from models.mosaic import MOSAICOrdinalCore
+from models.mosaic_decoder import proof_only_decisions
 
 
 def _example_output():
@@ -70,6 +75,7 @@ class MosaicCertificateTests(unittest.TestCase):
             complement_suppression=0.5,
         )
         self.assertEqual(certificate["schema_version"], SCHEMA_VERSION)
+        self.assertEqual(SCHEMA_VERSION, "mosaic-certificate-v3")
         self.assertEqual(certificate["sample_id"], "aptos-example")
         self.assertIn("witness_probabilities", certificate["dense_ledger"])
         self.assertIn("selected_indices", certificate["proof"])
@@ -77,6 +83,17 @@ class MosaicCertificateTests(unittest.TestCase):
         self.assertIn("receptive_field", certificate["receptive_field_metadata"])
         self.assertIn(
             "projected_log_stop_probabilities", certificate["prediction"]
+        )
+        self.assertEqual(
+            certificate["prediction"]["decision_rule"], "rounded_expected"
+        )
+        self.assertEqual(
+            certificate["prediction"]["transition_weight_order"],
+            ["stop", "advance"],
+        )
+        self.assertEqual(
+            certificate["proof_rule"]["score_space"],
+            "raw_cardinality_transition_scores",
         )
         self.assertIn(
             "dense_log_conditional_low_distribution", certificate["cardinality"]
@@ -97,6 +114,15 @@ class MosaicCertificateTests(unittest.TestCase):
         )
         certificate["schema_version"] = "mosaic-certificate-v1"
         with self.assertRaisesRegex(ValueError, "no stable log-stop trace"):
+            verify_mosaic_certificate(certificate)
+
+    def test_v2_certificate_is_explicitly_rejected(self) -> None:
+        output, valid, metadata = _example_output()
+        certificate = build_mosaic_certificate(
+            output, lattice_metadata=metadata, valid_mask=valid
+        )
+        certificate["schema_version"] = "mosaic-certificate-v2"
+        with self.assertRaisesRegex(ValueError, "decision rule and outcome weights"):
             verify_mosaic_certificate(certificate)
 
     def test_each_selected_cell_has_support_and_effect(self) -> None:
@@ -221,6 +247,186 @@ class MosaicCertificateTests(unittest.TestCase):
             build_mosaic_certificate(output, lattice_metadata=None, valid_mask=valid)
         with self.assertRaisesRegex(ValueError, "receptive-field"):
             build_mosaic_certificate(output, lattice_metadata={}, valid_mask=valid)
+
+    def test_deweighted_rule_replays_from_proof_and_training_weights(self) -> None:
+        output, valid, metadata = _example_output()
+        weights = torch.tensor([[0.35, 2.4], [3.1, 0.55]])
+        certificate = build_mosaic_certificate(
+            output,
+            lattice_metadata=metadata,
+            valid_mask=valid,
+            sample_index=0,
+            sufficiency_tolerance=0.05,
+            complement_suppression=0.5,
+            decision_rule="deweighted_class_map",
+            transition_weights=weights,
+        )
+        expected = proof_only_decisions(
+            output.transitions[0],
+            output.log_stop_probabilities[0],
+            weights,
+        )
+        prediction = certificate["prediction"]
+        self.assertEqual(prediction["decision_rule"], "deweighted_class_map")
+        self.assertEqual(
+            prediction["probability_space"], "analytically_deweighted"
+        )
+        self.assertEqual(
+            prediction["predicted_grade"], int(expected.deweighted_argmax)
+        )
+        torch.testing.assert_close(
+            torch.tensor(prediction["class_probabilities"]),
+            expected.deweighted_class_probabilities,
+        )
+        report = verify_mosaic_certificate(certificate)
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(
+            report["replayed_decision_rule"], "deweighted_class_map"
+        )
+
+    def test_wrapper_decoder_metadata_is_inferred_and_conflicts_are_rejected(
+        self,
+    ) -> None:
+        output, valid, metadata = _example_output()
+        weights = torch.tensor([[0.35, 2.4], [3.1, 0.55]])
+        wrapped = SimpleNamespace(
+            evidence=output,
+            valid_mask=valid,
+            lattice=metadata,
+            decision_rule="deweighted_class_map",
+            decision_transition_weights=weights,
+        )
+
+        certificate = build_mosaic_certificate(
+            wrapped,
+            sample_index=0,
+            sufficiency_tolerance=0.05,
+            complement_suppression=0.5,
+        )
+        expected = proof_only_decisions(
+            output.transitions[0],
+            output.log_stop_probabilities[0],
+            weights,
+        )
+        prediction = certificate["prediction"]
+        self.assertEqual(prediction["decision_rule"], "deweighted_class_map")
+        self.assertEqual(
+            prediction["predicted_grade"], int(expected.deweighted_argmax)
+        )
+        torch.testing.assert_close(
+            torch.tensor(prediction["transition_weights"]), weights
+        )
+        self.assertTrue(verify_mosaic_certificate(certificate)["ok"])
+
+        with self.assertRaisesRegex(ValueError, "decision_rule conflicts"):
+            build_mosaic_certificate(
+                wrapped,
+                decision_rule="class_map",
+                sufficiency_tolerance=0.05,
+                complement_suppression=0.5,
+            )
+        with self.assertRaisesRegex(ValueError, "transition_weights conflict"):
+            build_mosaic_certificate(
+                wrapped,
+                transition_weights=weights * 2.0,
+                sufficiency_tolerance=0.05,
+                complement_suppression=0.5,
+            )
+
+    def test_builder_rejects_nonpositive_transition_weights(self) -> None:
+        output, valid, metadata = _example_output()
+        with self.assertRaisesRegex(ValueError, "strictly positive"):
+            build_mosaic_certificate(
+                output,
+                lattice_metadata=metadata,
+                valid_mask=valid,
+                transition_weights=torch.tensor([[1.0, 0.0], [1.0, 1.0]]),
+            )
+
+    def test_deweighted_rule_requires_explicit_transition_weights(self) -> None:
+        output, valid, metadata = _example_output()
+        with self.assertRaisesRegex(ValueError, "provided explicitly"):
+            build_mosaic_certificate(
+                output,
+                lattice_metadata=metadata,
+                valid_mask=valid,
+                decision_rule="deweighted_class_map",
+            )
+
+    def test_replay_tolerances_cannot_exceed_audited_maxima(self) -> None:
+        output, valid, metadata = _example_output()
+        with self.assertRaisesRegex(ValueError, "audited maxima"):
+            build_mosaic_certificate(
+                output,
+                lattice_metadata=metadata,
+                valid_mask=valid,
+                replay_atol=MAX_REPLAY_ATOL * 2.0,
+            )
+
+        certificate = build_mosaic_certificate(
+            output,
+            lattice_metadata=metadata,
+            valid_mask=valid,
+            sufficiency_tolerance=0.05,
+        )
+        tampered = copy.deepcopy(certificate)
+        tampered["numerical_contract"]["replay_rtol"] = MAX_REPLAY_RTOL * 2.0
+        tampered["integrity"]["payload_sha256"] = _payload_sha256(tampered)
+        with self.assertRaisesRegex(ValueError, "audited maxima"):
+            verify_mosaic_certificate(tampered)
+
+    def test_malformed_selected_boundary_count_fails_without_crashing(self) -> None:
+        output, valid, metadata = _example_output()
+        certificate = build_mosaic_certificate(
+            output,
+            lattice_metadata=metadata,
+            valid_mask=valid,
+            sufficiency_tolerance=0.05,
+        )
+        for malformed in ([], certificate["proof"]["selected_indices"] + [[]]):
+            tampered = copy.deepcopy(certificate)
+            tampered["proof"]["selected_indices"] = copy.deepcopy(malformed)
+            tampered["integrity"]["payload_sha256"] = _payload_sha256(tampered)
+            report = verify_mosaic_certificate(tampered)
+            self.assertFalse(report["ok"])
+            self.assertFalse(report["checks"]["selected_indices_valid"])
+
+    def test_weight_and_rule_tampering_fail_independent_decision_replay(self) -> None:
+        output, valid, metadata = _example_output()
+        certificate = build_mosaic_certificate(
+            output,
+            lattice_metadata=metadata,
+            valid_mask=valid,
+            sample_index=0,
+            sufficiency_tolerance=0.05,
+            complement_suppression=0.5,
+            decision_rule="deweighted_class_map",
+            transition_weights=torch.tensor([[0.35, 2.4], [3.1, 0.55]]),
+        )
+
+        tampered_weights = copy.deepcopy(certificate)
+        tampered_weights["prediction"]["transition_weights"][0][0] *= 4.0
+        # Repair the generic payload hash so this test specifically exercises
+        # independent mathematical replay of the decoder.
+        tampered_weights["integrity"]["payload_sha256"] = _payload_sha256(
+            tampered_weights
+        )
+        weight_report = verify_mosaic_certificate(tampered_weights)
+        self.assertFalse(weight_report["ok"])
+        self.assertTrue(weight_report["checks"]["integrity_sha256"])
+        self.assertFalse(
+            weight_report["checks"]["deweighted_class_probabilities"]
+        )
+
+        tampered_rule = copy.deepcopy(certificate)
+        tampered_rule["prediction"]["decision_rule"] = "class_map"
+        tampered_rule["integrity"]["payload_sha256"] = _payload_sha256(
+            tampered_rule
+        )
+        rule_report = verify_mosaic_certificate(tampered_rule)
+        self.assertFalse(rule_report["ok"])
+        self.assertTrue(rule_report["checks"]["integrity_sha256"])
+        self.assertFalse(rule_report["checks"]["probability_space"])
 
     def test_human_facing_cell_and_geometry_tampering_is_detected(self) -> None:
         output, valid, metadata = _example_output()

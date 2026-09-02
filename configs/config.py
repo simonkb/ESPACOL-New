@@ -241,6 +241,13 @@ class MOSAICConfig(TrainConfig):
     effective_num_beta: float = 0.999
     transition_weight_cap: float = 10.0
 
+    # Final point decision from the selected proof.  The balanced boundary
+    # likelihood learns cost-sensitive continuation posteriors, so the
+    # default analytically removes that known distortion and then uses MAP,
+    # the Bayes decision for the accuracy used in checkpoint selection.
+    # No validation-fitted calibration or feature bypass is introduced.
+    decision_rule: str = "deweighted_class_map"
+
     # Optimisation.  The pointwise proof head learns faster than the local CNN.
     lr: float = 1e-4
     head_lr: float = 5e-4
