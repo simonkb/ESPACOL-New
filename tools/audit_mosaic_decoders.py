@@ -12,7 +12,9 @@ pre-specified, parameter-free decisions derived from the selected MOSAIC proof:
 
 No threshold, temperature, or calibration parameter is fitted to validation
 data.  The audit also exposes empty-proof advance cases, the only known region
-where the hard projected likelihood has no primary recovery gradient.
+where the hard projected likelihood has no primary recovery gradient, and
+streams conditional proof/witness concentration summaries that distinguish
+localized evidence from diffuse probability dust.
 """
 
 from __future__ import annotations
@@ -55,7 +57,8 @@ from training.mosaic_trainer import mosaic_implementation_signature
 from utils.metrics import evaluate_predictions
 
 
-SCHEMA = "mosaic-validation-decoder-audit-v1"
+SCHEMA = "mosaic-validation-decoder-audit-v2"
+WITNESS_TOP_K = (1, 4, 16, 32, 64)
 
 
 def _file_sha256(path: Path) -> str:
@@ -183,25 +186,257 @@ def _rate(numerator: int, denominator: int) -> float | None:
     return None if denominator == 0 else numerator / denominator
 
 
+def _batch_witness_concentration(
+    witness_probabilities: torch.Tensor,
+) -> dict[str, Any]:
+    """Reduce dense witnesses to per-image concentration scalars.
+
+    Only the largest 64 witnesses and ``(N, K-1)`` reductions are materialized.
+    The caller can therefore retain exact per-image values for conditional
+    quantiles without copying the much larger ``(N, P, K-1)`` ledger to CPU.
+    A zero-mass witness vector has effective support and top-k fractions zero.
+    """
+
+    if witness_probabilities.ndim != 3:
+        raise ValueError(
+            "witness_probabilities must have shape (N, P, K-1); got "
+            f"{tuple(witness_probabilities.shape)}"
+        )
+    spatial_cells = int(witness_probabilities.shape[1])
+    if spatial_cells < 1:
+        raise ValueError("witness_probabilities must contain at least one cell")
+
+    probabilities = witness_probabilities.detach().float()
+    if not bool(torch.isfinite(probabilities).all()):
+        raise ValueError("witness_probabilities contain non-finite values")
+    if bool((probabilities < 0.0).any()) or bool((probabilities > 1.0).any()):
+        raise ValueError("witness_probabilities must lie in [0, 1]")
+
+    witness_count = probabilities.sum(dim=1)
+    # einsum performs the reduction without retaining a full-sized squared
+    # witness tensor alongside the already-live model output.
+    squared_sum = torch.einsum("npb,npb->nb", probabilities, probabilities)
+    effective_support = torch.where(
+        squared_sum > 0.0,
+        witness_count.square() / squared_sum.clamp_min(
+            torch.finfo(probabilities.dtype).tiny
+        ),
+        torch.zeros_like(witness_count),
+    ).clamp(0.0, float(spatial_cells))
+
+    largest_k = min(max(WITNESS_TOP_K), spatial_cells)
+    largest = torch.topk(
+        probabilities,
+        k=largest_k,
+        dim=1,
+        largest=True,
+        sorted=True,
+    ).values
+    cumulative_largest = largest.cumsum(dim=1)
+    positive_mass = witness_count > 0.0
+    top_k_mass_fractions: dict[int, torch.Tensor] = {}
+    clamped_top_k: dict[int, int] = {}
+    for requested_k in WITNESS_TOP_K:
+        used_k = min(requested_k, spatial_cells)
+        clamped_top_k[requested_k] = used_k
+        top_mass = cumulative_largest[:, used_k - 1, :]
+        fraction = torch.where(
+            positive_mass,
+            top_mass / witness_count.clamp_min(
+                torch.finfo(probabilities.dtype).tiny
+            ),
+            torch.zeros_like(witness_count),
+        )
+        top_k_mass_fractions[requested_k] = fraction.clamp(0.0, 1.0).cpu()
+
+    return {
+        "spatial_cell_count": spatial_cells,
+        "clamped_top_k": clamped_top_k,
+        "witness_count": witness_count.cpu(),
+        "effective_support": effective_support.cpu(),
+        "max_witness_probability": largest[:, 0, :].cpu(),
+        "top_k_witness_mass_fraction": top_k_mass_fractions,
+    }
+
+
+def _merge_witness_concentration_batches(
+    batches: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Concatenate only reduced per-image concentration statistics."""
+
+    if not batches:
+        raise ValueError("cannot merge an empty witness-concentration audit")
+    spatial_cell_count = int(batches[0]["spatial_cell_count"])
+    clamped_top_k = batches[0]["clamped_top_k"]
+    for batch in batches[1:]:
+        if int(batch["spatial_cell_count"]) != spatial_cell_count:
+            raise ValueError("witness spatial cell count changed across batches")
+        if batch["clamped_top_k"] != clamped_top_k:
+            raise ValueError("clamped witness top-k values changed across batches")
+
+    return {
+        "spatial_cell_count": spatial_cell_count,
+        "clamped_top_k": dict(clamped_top_k),
+        "witness_count": torch.cat(
+            [batch["witness_count"] for batch in batches], dim=0
+        ),
+        "effective_support": torch.cat(
+            [batch["effective_support"] for batch in batches], dim=0
+        ),
+        "max_witness_probability": torch.cat(
+            [batch["max_witness_probability"] for batch in batches], dim=0
+        ),
+        "top_k_witness_mass_fraction": {
+            requested_k: torch.cat(
+                [
+                    batch["top_k_witness_mass_fraction"][requested_k]
+                    for batch in batches
+                ],
+                dim=0,
+            )
+            for requested_k in WITNESS_TOP_K
+        },
+    }
+
+
+def _distribution_summary(values: torch.Tensor) -> dict[str, float | None]:
+    """Return exact validation-set summaries with explicit empty semantics."""
+
+    values = values.detach().float().flatten()
+    if values.numel() == 0:
+        return {"mean": None, "median": None, "p90": None}
+    if not bool(torch.isfinite(values).all()):
+        raise ValueError("cannot summarize non-finite diagnostic values")
+    return {
+        "mean": float(values.mean()),
+        "median": float(torch.quantile(values, 0.5)),
+        "p90": float(torch.quantile(values, 0.9)),
+    }
+
+
+def _alpha_diagnostics(alpha: torch.Tensor) -> dict[str, Any]:
+    """Describe a boundary's learned distribution over count thresholds."""
+
+    weights = alpha.detach().float().flatten()
+    if weights.numel() == 0:
+        raise ValueError("alpha must contain at least one count threshold")
+    if not bool(torch.isfinite(weights).all()) or bool((weights < 0.0).any()):
+        raise ValueError("alpha must contain finite non-negative weights")
+    total = weights.sum()
+    if not bool(total > 0.0):
+        raise ValueError("alpha weights must have positive total mass")
+    weights = weights / total
+    thresholds = torch.arange(
+        1,
+        weights.numel() + 1,
+        device=weights.device,
+        dtype=weights.dtype,
+    )
+    positive = weights > 0.0
+    entropy = -(weights[positive] * weights[positive].log()).sum()
+    return {
+        "expected_threshold": float((weights * thresholds).sum()),
+        "mode_threshold": int(weights.argmax()) + 1,
+        "entropy_nats": float(entropy),
+        "weights": weights.cpu().tolist(),
+    }
+
+
+def _conditional_concentration_summary(
+    *,
+    mask: torch.Tensor,
+    boundary: int,
+    proof_sizes: torch.Tensor,
+    retained_overflow: torch.Tensor,
+    witness_concentration: dict[str, Any],
+) -> dict[str, Any]:
+    """Summarize proof and dense-witness concentration for one label group."""
+
+    mask = mask.bool().cpu()
+    witness_count = witness_concentration["witness_count"][:, boundary]
+    selected_proof_sizes = proof_sizes[mask, boundary]
+    proof_size_summary = _distribution_summary(selected_proof_sizes)
+    proof_size_summary["zero_rate"] = (
+        None
+        if selected_proof_sizes.numel() == 0
+        else float((selected_proof_sizes == 0).float().mean())
+    )
+    sample_count = int(mask.sum())
+    zero_witness_mass_count = int(((witness_count == 0.0) & mask).sum())
+    group = {
+        "sample_count": sample_count,
+        "zero_witness_mass_count": zero_witness_mass_count,
+        "zero_witness_mass_rate": _rate(zero_witness_mass_count, sample_count),
+        "proof_size": proof_size_summary,
+        "witness_count": _distribution_summary(witness_count[mask]),
+        "effective_support": _distribution_summary(
+            witness_concentration["effective_support"][mask, boundary]
+        ),
+        "max_witness_probability": _distribution_summary(
+            witness_concentration["max_witness_probability"][mask, boundary]
+        ),
+        "retained_overflow_mass": _distribution_summary(
+            retained_overflow[mask, boundary]
+        ),
+        "top_k_witness_mass_fraction": {},
+    }
+    for requested_k in WITNESS_TOP_K:
+        group["top_k_witness_mass_fraction"][str(requested_k)] = {
+            "clamped_k": int(witness_concentration["clamped_top_k"][requested_k]),
+            **_distribution_summary(
+                witness_concentration["top_k_witness_mass_fraction"][requested_k][
+                    mask, boundary
+                ]
+            ),
+        }
+    return group
+
+
 def _proof_diagnostics(
     proof_sizes: torch.Tensor,
     transitions: torch.Tensor,
     labels: torch.Tensor,
-    witness_counts: torch.Tensor,
+    witness_concentration: dict[str, Any],
     retained_overflow: torch.Tensor,
     alpha: torch.Tensor,
 ) -> dict[str, Any]:
-    """Expose boundary-wise hard-proof optimization failure modes."""
+    """Expose boundary-wise hard-proof and probability-dust diagnostics."""
 
-    proof_sizes = proof_sizes.long()
-    transitions = transitions.float()
-    labels = labels.long()
+    proof_sizes = proof_sizes.long().cpu()
+    transitions = transitions.float().cpu()
+    labels = labels.long().cpu()
+    retained_overflow = retained_overflow.float().cpu()
+    alpha = alpha.float().cpu()
     boundaries = transitions.shape[1]
+    expected_shape = (labels.numel(), boundaries)
+    for name, tensor in (
+        ("proof_sizes", proof_sizes),
+        ("transitions", transitions),
+        ("retained_overflow", retained_overflow),
+        ("witness_count", witness_concentration["witness_count"]),
+        ("effective_support", witness_concentration["effective_support"]),
+        (
+            "max_witness_probability",
+            witness_concentration["max_witness_probability"],
+        ),
+    ):
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(
+                f"{name} must have shape {expected_shape}; got {tuple(tensor.shape)}"
+            )
+    if tuple(alpha.shape[:1]) != (boundaries,) or alpha.ndim != 2:
+        raise ValueError(
+            "alpha must have shape (K-1, max_count); got "
+            f"{tuple(alpha.shape)}"
+        )
+
     rows: list[dict[str, Any]] = []
     for boundary in range(boundaries):
+        overall = torch.ones_like(labels, dtype=torch.bool)
         at_risk = labels >= boundary
         advance = labels > boundary
         stop = labels == boundary
+        below_risk = labels < boundary
         empty = proof_sizes[:, boundary] == 0
         exact_zero = transitions[:, boundary] == 0
         advance_count = int(advance.sum())
@@ -211,9 +446,11 @@ def _proof_diagnostics(
         rows.append(
             {
                 "boundary": boundary,
+                "overall_count": int(labels.numel()),
                 "at_risk_count": int(at_risk.sum()),
                 "advance_count": advance_count,
                 "stop_count": stop_count,
+                "below_risk_count": int(below_risk.sum()),
                 "empty_proof_count": int(empty.sum()),
                 "empty_proof_rate": float(empty.float().mean()),
                 "empty_proof_advance_count": empty_advance,
@@ -224,11 +461,30 @@ def _proof_diagnostics(
                     exact_zero_advance, advance_count
                 ),
                 "proof_size_mean": float(proof_sizes[:, boundary].float().mean()),
-                "witness_count_mean": float(witness_counts[:, boundary].mean()),
+                "witness_count_mean": float(
+                    witness_concentration["witness_count"][:, boundary].mean()
+                ),
                 "retained_overflow_mass_mean": float(
                     retained_overflow[:, boundary].mean()
                 ),
                 "alpha_at_max_count": float(alpha[boundary, -1]),
+                "alpha": _alpha_diagnostics(alpha[boundary]),
+                "conditional_concentration": {
+                    name: _conditional_concentration_summary(
+                        mask=mask,
+                        boundary=boundary,
+                        proof_sizes=proof_sizes,
+                        retained_overflow=retained_overflow,
+                        witness_concentration=witness_concentration,
+                    )
+                    for name, mask in (
+                        ("overall", overall),
+                        ("at_risk", at_risk),
+                        ("advance", advance),
+                        ("stop", stop),
+                        ("below_risk", below_risk),
+                    )
+                },
             }
         )
     return {
@@ -236,6 +492,21 @@ def _proof_diagnostics(
             "An empty proof with an advance target yields an exact-zero projected "
             "transition; the primary clamped projected NLL has zero recovery "
             "gradient there, leaving only the dense auxiliary path."
+        ),
+        "concentration_note": (
+            "Witness concentration is computed from the dense regional witness "
+            "ledger before proof selection. Witness count is sum(p), effective "
+            "support is "
+            "sum(p)^2/sum(p^2); top-k mass is divided by sum(p), with zero "
+            "reported for a zero-mass ledger. Requested k is clamped to the "
+            "spatial cell count."
+        ),
+        "condition_note": (
+            "At boundary k: at_risk means Y>=k, advance means Y>k, stop means "
+            "Y=k, and below_risk means Y<k."
+        ),
+        "witness_spatial_cell_count": int(
+            witness_concentration["spatial_cell_count"]
         ),
         "boundaries": rows,
     }
@@ -399,7 +670,7 @@ def main() -> None:
     log_stops_batches: list[torch.Tensor] = []
     model_classes_batches: list[torch.Tensor] = []
     proof_sizes_batches: list[torch.Tensor] = []
-    witness_counts_batches: list[torch.Tensor] = []
+    witness_concentration_batches: list[dict[str, Any]] = []
     overflow_batches: list[torch.Tensor] = []
     alpha_reference: torch.Tensor | None = None
 
@@ -424,8 +695,10 @@ def main() -> None:
             log_stops_batches.append(output.log_stop_probabilities.float().cpu())
             model_classes_batches.append(output.class_probabilities.float().cpu())
             proof_sizes_batches.append(output.proof.proof_size.long().cpu())
-            witness_counts_batches.append(
-                output.evidence.witness_probabilities.float().sum(dim=1).cpu()
+            witness_concentration_batches.append(
+                _batch_witness_concentration(
+                    output.evidence.witness_probabilities
+                )
             )
             overflow_batches.append(
                 output.proof.retained_distribution[..., -1].float().cpu()
@@ -445,7 +718,9 @@ def main() -> None:
     log_stops = torch.cat(log_stops_batches)
     model_classes = torch.cat(model_classes_batches)
     proof_sizes = torch.cat(proof_sizes_batches)
-    witness_counts = torch.cat(witness_counts_batches)
+    witness_concentration = _merge_witness_concentration_batches(
+        witness_concentration_batches
+    )
     retained_overflow = torch.cat(overflow_batches)
     assert alpha_reference is not None
 
@@ -562,7 +837,7 @@ def main() -> None:
             proof_sizes,
             transitions,
             labels,
-            witness_counts,
+            witness_concentration,
             retained_overflow,
             alpha_reference,
         ),
