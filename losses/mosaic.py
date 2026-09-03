@@ -26,7 +26,8 @@ import torch.nn as nn
 
 
 WeightMethod = Literal["effective_num", "inverse_frequency", "none"]
-Reduction = Literal["none", "mean", "sum"]
+Reduction = Literal["none", "mean", "sum", "boundary_mean"]
+TransitionReduction = Literal["sample_mean", "boundary_mean"]
 
 
 def _labels_tensor(labels: Sequence[int] | torch.Tensor) -> torch.Tensor:
@@ -230,6 +231,7 @@ def balanced_continuation_nll(
     labels: torch.Tensor,
     transition_weights: torch.Tensor | None = None,
     *,
+    at_risk_counts: torch.Tensor | None = None,
     stop_probabilities: torch.Tensor | None = None,
     log_stop_probabilities: torch.Tensor | None = None,
     eps: float = 1e-7,
@@ -243,14 +245,18 @@ def balanced_continuation_nll(
     ``-sum_{k < y_n} w[k,1] log(c[n,k])``
     ``-1[y_n < K-1] w[y_n,0] log(1-c[n,y_n])``.
 
-    The ``mean`` reduction averages these per-image sums, matching the plan's
-    sample-level objective.  All logarithms run in float32 (or float64 when the
-    input is float64) even under AMP.
+    ``mean`` is the historical sample-mean reduction. ``boundary_mean`` uses
+    complete training-fold risk-set counts to give every boundary equal
+    expected loss mass under uniformly sampled minibatches. It applies the
+    fixed coefficient ``N_0 / ((K-1) N_k)`` to boundary ``k`` before taking
+    the minibatch mean; it never estimates a denominator from the current
+    minibatch. All logarithms run in float32 (or float64 when the input is
+    float64) even under AMP.
     """
 
     if eps <= 0.0 or eps >= 0.5:
         raise ValueError(f"eps must lie in (0, 0.5), got {eps}")
-    if reduction not in ("none", "mean", "sum"):
+    if reduction not in ("none", "mean", "sum", "boundary_mean"):
         raise ValueError(f"unknown reduction {reduction!r}")
 
     _, labels = _validate_transition_inputs(transitions, labels, transition_weights)
@@ -301,16 +307,42 @@ def balanced_continuation_nll(
         assert stop is not None
         log_stop = torch.log(stop.clamp_min(tiny))
     log_likelihood = torch.where(advance, torch.log(c.clamp_min(tiny)), log_stop)
-    per_sample = -torch.where(
+    boundary_losses = -torch.where(
         at_risk,
         outcome_weights * log_likelihood,
         torch.zeros_like(log_likelihood),
-    ).sum(dim=1)
+    )
+    per_sample = boundary_losses.sum(dim=1)
 
     if reduction == "none":
         return per_sample
     if reduction == "sum":
         return per_sample.sum()
+    if reduction == "boundary_mean":
+        if at_risk_counts is None:
+            raise ValueError(
+                "at_risk_counts are required for boundary_mean reduction"
+            )
+        counts = torch.as_tensor(
+            at_risk_counts, device=c.device, dtype=work_dtype
+        )
+        if counts.ndim != 1 or counts.numel() != num_boundaries:
+            raise ValueError(
+                "at_risk_counts must have shape "
+                f"({num_boundaries},), got {tuple(counts.shape)}"
+            )
+        if not torch.isfinite(counts).all() or bool((counts <= 0).any()):
+            raise ValueError("at_risk_counts must be finite and strictly positive")
+        if bool((counts != counts.round()).any()):
+            raise ValueError("at_risk_counts must contain integer counts")
+        if counts.numel() > 1 and bool((counts[1:] > counts[:-1]).any()):
+            raise ValueError("at_risk_counts must be non-increasing by boundary")
+        # Boundary zero contains every valid training label, so counts[0] is
+        # the complete training-fold size. For a uniformly sampled minibatch,
+        # this fixed multiplier is an unbiased estimator of the average of
+        # the four complete-fold boundary means.
+        boundary_scale = counts[0] / (float(num_boundaries) * counts)
+        return (boundary_losses * boundary_scale.unsqueeze(0)).sum(dim=1).mean()
     return per_sample.mean()
 
 
@@ -398,12 +430,18 @@ class MosaicLoss(nn.Module):
         dense_weight: float = 0.1,
         stability_weight: float = 0.0,
         eps: float = 1e-7,
+        transition_reduction: TransitionReduction = "sample_mean",
+        at_risk_counts: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         if num_classes < 2:
             raise ValueError("num_classes must be at least 2")
         if dense_weight < 0.0 or stability_weight < 0.0:
             raise ValueError("loss weights must be non-negative")
+        if transition_reduction not in ("sample_mean", "boundary_mean"):
+            raise ValueError(
+                "transition_reduction must be 'sample_mean' or 'boundary_mean'"
+            )
         if transition_weights is None:
             transition_weights = torch.ones(num_classes - 1, 2)
         if tuple(transition_weights.shape) != (num_classes - 1, 2):
@@ -414,7 +452,40 @@ class MosaicLoss(nn.Module):
         self.dense_weight = float(dense_weight)
         self.stability_weight = float(stability_weight)
         self.eps = float(eps)
+        self.transition_reduction = transition_reduction
         self.register_buffer("transition_weights", transition_weights.detach().float().clone())
+        if transition_reduction == "boundary_mean":
+            if at_risk_counts is None:
+                raise ValueError(
+                    "at_risk_counts are required for boundary_mean reduction"
+                )
+            counts = torch.as_tensor(at_risk_counts).detach()
+            if counts.ndim != 1 or counts.numel() != num_classes - 1:
+                raise ValueError(
+                    "at_risk_counts must have shape "
+                    f"({num_classes - 1},), got {tuple(counts.shape)}"
+                )
+            counts_float = counts.to(dtype=torch.float32)
+            if not torch.isfinite(counts_float).all() or bool(
+                (counts_float <= 0).any()
+            ):
+                raise ValueError(
+                    "at_risk_counts must be finite and strictly positive"
+                )
+            if bool((counts_float != counts_float.round()).any()):
+                raise ValueError("at_risk_counts must contain integer counts")
+            if counts_float.numel() > 1 and bool(
+                (counts_float[1:] > counts_float[:-1]).any()
+            ):
+                raise ValueError(
+                    "at_risk_counts must be non-increasing by boundary"
+                )
+            self.register_buffer("at_risk_counts", counts_float.long())
+        else:
+            # None-valued buffers are absent from state_dict. This keeps
+            # strict loading compatible with historical sample-mean criterion
+            # states, which contain only transition_weights.
+            self.register_buffer("at_risk_counts", None)
 
     @classmethod
     def from_training_labels(
@@ -428,15 +499,17 @@ class MosaicLoss(nn.Module):
         dense_weight: float = 0.1,
         stability_weight: float = 0.0,
         eps: float = 1e-7,
+        transition_reduction: TransitionReduction = "boundary_mean",
     ) -> "MosaicLoss":
         """Build the criterion and its persistent weights from one train fold."""
 
-        weights = build_at_risk_transition_weights(
+        weights, outcome_counts = build_at_risk_transition_weights(
             labels,
             num_classes,
             method=weight_method,
             beta=weight_beta,
             max_weight=max_transition_weight,
+            return_counts=True,
         )
         return cls(
             num_classes,
@@ -444,6 +517,8 @@ class MosaicLoss(nn.Module):
             dense_weight=dense_weight,
             stability_weight=stability_weight,
             eps=eps,
+            transition_reduction=transition_reduction,
+            at_risk_counts=outcome_counts.sum(dim=1),
         )
 
     def forward(
@@ -466,13 +541,20 @@ class MosaicLoss(nn.Module):
                 f"{projected_transitions.shape[-1]}"
             )
 
+        reduction = (
+            "boundary_mean"
+            if self.transition_reduction == "boundary_mean"
+            else "mean"
+        )
         projected = balanced_continuation_nll(
             projected_transitions,
             labels,
             self.transition_weights,
+            at_risk_counts=self.at_risk_counts,
             stop_probabilities=projected_stop_probabilities,
             log_stop_probabilities=projected_log_stop_probabilities,
             eps=self.eps,
+            reduction=reduction,
         )
 
         zero = projected_transitions.float().sum() * 0.0
@@ -484,9 +566,11 @@ class MosaicLoss(nn.Module):
                 dense_transitions,
                 labels,
                 self.transition_weights,
+                at_risk_counts=self.at_risk_counts,
                 stop_probabilities=dense_stop_probabilities,
                 log_stop_probabilities=dense_log_stop_probabilities,
                 eps=self.eps,
+                reduction=reduction,
             )
 
         stability = zero
@@ -535,6 +619,7 @@ class MosaicLoss(nn.Module):
 
 __all__ = [
     "MosaicLoss",
+    "TransitionReduction",
     "balanced_continuation_nll",
     "build_at_risk_transition_weights",
     "transition_outcome_counts",

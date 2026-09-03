@@ -274,6 +274,18 @@ proofs among positive/advance targets. Those cases expose the hard-projection
 dead-gradient region and determine whether a later training-objective change
 is justified.
 
+The APTOS audit found no empty proof on an advance target at any boundary; the
+EyePACS audit found only 5/844 (0.59%) at boundary 0 and none at boundaries
+1--3. Empty-proof dead gradients therefore do not explain the weak late-grade
+recall. The historical sample-mean loss instead gave each boundary total mass
+proportional to its risk-set size: the final boundary had only 351/2,636
+(13.3%) of boundary 0's training support on APTOS and 1,278/28,446 (4.5%) on
+EyePACS. New runs default to `--transition_reduction boundary_mean`, which uses
+fixed complete-training-fold counts to average the four boundary losses
+equally in expectation. Both projected and dense likelihoods use the same
+reduction. `--transition_reduction sample_mean` is retained only to reproduce
+the historical objective; never resume an older run under the new default.
+
 The pilot passes only if:
 
 1. validation QWK clearly exceeds a collapsed/majority solution and validation

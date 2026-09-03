@@ -87,6 +87,104 @@ class ContinuationLikelihoodTests(unittest.TestCase):
         ]
         self.assertAlmostEqual(float(got), sum(expected_per_sample) / 3.0, places=12)
 
+    def test_boundary_mean_matches_manual_complete_fold_means(self) -> None:
+        transitions = torch.tensor(
+            [
+                [0.2, 0.3, 0.4, 0.5],
+                [0.7, 0.6, 0.5, 0.4],
+                [0.9, 0.8, 0.7, 0.6],
+                [0.6, 0.5, 0.4, 0.3],
+            ],
+            dtype=torch.float64,
+        )
+        labels = torch.tensor([0, 1, 2, 4])
+        counts = torch.tensor([4, 3, 2, 1])
+        got = balanced_continuation_nll(
+            transitions,
+            labels,
+            at_risk_counts=counts,
+            reduction="boundary_mean",
+        )
+        boundary_means = [
+            sum(-math.log(value) for value in (0.8, 0.7, 0.9, 0.6)) / 4,
+            sum(-math.log(value) for value in (0.4, 0.8, 0.5)) / 3,
+            sum(-math.log(value) for value in (0.3, 0.4)) / 2,
+            -math.log(0.3),
+        ]
+        self.assertAlmostEqual(float(got), sum(boundary_means) / 4, places=12)
+
+    def test_boundary_mean_uses_fixed_counts_not_batch_denominators(self) -> None:
+        transitions = torch.tensor(
+            [
+                [0.2, 0.3, 0.4, 0.5],
+                [0.7, 0.6, 0.5, 0.4],
+                [0.9, 0.8, 0.7, 0.6],
+                [0.6, 0.5, 0.4, 0.3],
+            ],
+            dtype=torch.float64,
+        )
+        labels = torch.tensor([0, 1, 2, 4])
+        counts = torch.tensor([4, 3, 2, 1])
+        full = balanced_continuation_nll(
+            transitions,
+            labels,
+            at_risk_counts=counts,
+            reduction="boundary_mean",
+        )
+        first = balanced_continuation_nll(
+            transitions[:1],
+            labels[:1],
+            at_risk_counts=counts,
+            reduction="boundary_mean",
+        )
+        rest = balanced_continuation_nll(
+            transitions[1:],
+            labels[1:],
+            at_risk_counts=counts,
+            reduction="boundary_mean",
+        )
+        partitioned = (first + 3.0 * rest) / 4.0
+        self.assertAlmostEqual(float(partitioned), float(full), places=12)
+
+    def test_boundary_mean_has_expected_fixed_scale_gradients(self) -> None:
+        transitions = torch.tensor(
+            [[0.25, 0.9], [0.25, 0.5]],
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        loss = balanced_continuation_nll(
+            transitions,
+            torch.tensor([0, 2]),
+            at_risk_counts=torch.tensor([10, 2]),
+            reduction="boundary_mean",
+        )
+        loss.backward()
+        expected = torch.tensor(
+            [[1.0 / 3.0, 0.0], [-1.0, -2.5]], dtype=torch.float64
+        )
+        self.assertTrue(torch.allclose(transitions.grad, expected, atol=1e-12))
+
+    def test_boundary_mean_rejects_missing_or_invalid_fold_counts(self) -> None:
+        transitions = torch.full((2, 2), 0.5)
+        labels = torch.tensor([0, 2])
+        with self.assertRaisesRegex(ValueError, "at_risk_counts are required"):
+            balanced_continuation_nll(
+                transitions, labels, reduction="boundary_mean"
+            )
+        for invalid in (
+            torch.tensor([2.0]),
+            torch.tensor([2.0, 0.0]),
+            torch.tensor([1.0, 2.0]),
+            torch.tensor([2.0, 1.5]),
+        ):
+            with self.assertRaisesRegex(ValueError, "at_risk_counts"):
+                balanced_continuation_nll(
+                    transitions,
+                    labels,
+                    at_risk_counts=invalid,
+                    reduction="boundary_mean",
+                )
+
     def test_direct_log_stop_is_used_without_probability_round_trip(self) -> None:
         transitions = torch.ones(1, 4, requires_grad=True)
         log_stops = torch.tensor([[-180.0, -90.0, -30.0, -4.0]], requires_grad=True)
@@ -221,9 +319,74 @@ class CombinedMosaicLossTests(unittest.TestCase):
             [0, 0, 1, 2, 3, 4], 5, dense_weight=0.0
         )
         self.assertIn("transition_weights", criterion.state_dict())
-        clone = MosaicLoss(5, dense_weight=0.0)
+        self.assertIn("at_risk_counts", criterion.state_dict())
+        self.assertTrue(
+            torch.equal(
+                criterion.at_risk_counts,
+                torch.tensor([6, 4, 3, 2]),
+            )
+        )
+        clone = MosaicLoss(
+            5,
+            dense_weight=0.0,
+            transition_reduction="boundary_mean",
+            at_risk_counts=criterion.at_risk_counts,
+        )
         clone.load_state_dict(criterion.state_dict())
         self.assertTrue(torch.equal(clone.transition_weights, criterion.transition_weights))
+        self.assertTrue(torch.equal(clone.at_risk_counts, criterion.at_risk_counts))
+
+    def test_historical_sample_mean_state_loads_strictly(self) -> None:
+        historical = MosaicLoss(5, dense_weight=0.0)
+        state = historical.state_dict()
+        self.assertEqual(set(state), {"transition_weights"})
+        clone = MosaicLoss(
+            5, dense_weight=0.0, transition_reduction="sample_mean"
+        )
+        clone.load_state_dict(state, strict=True)
+
+    def test_boundary_mean_is_applied_to_projected_and_dense_paths(self) -> None:
+        training_labels = [0, 1, 2, 4]
+        criterion = MosaicLoss.from_training_labels(
+            training_labels,
+            5,
+            weight_method="none",
+            dense_weight=0.2,
+        )
+        projected = torch.tensor(
+            [[0.2, 0.3, 0.4, 0.5], [0.8, 0.7, 0.6, 0.5]],
+            requires_grad=True,
+        )
+        dense = torch.tensor(
+            [[0.25, 0.35, 0.45, 0.55], [0.85, 0.75, 0.65, 0.55]],
+            requires_grad=True,
+        )
+        labels = torch.tensor([0, 4])
+        total, diagnostics = criterion(
+            projected, labels, dense_transitions=dense
+        )
+        expected_projected = balanced_continuation_nll(
+            projected,
+            labels,
+            criterion.transition_weights,
+            at_risk_counts=criterion.at_risk_counts,
+            reduction="boundary_mean",
+        )
+        expected_dense = balanced_continuation_nll(
+            dense,
+            labels,
+            criterion.transition_weights,
+            at_risk_counts=criterion.at_risk_counts,
+            reduction="boundary_mean",
+        )
+        self.assertTrue(
+            torch.allclose(total, expected_projected + 0.2 * expected_dense)
+        )
+        self.assertTrue(torch.allclose(diagnostics["loss_ccl"], expected_projected))
+        self.assertTrue(torch.allclose(diagnostics["loss_dense"], expected_dense))
+        total.backward()
+        self.assertTrue(torch.isfinite(projected.grad).all())
+        self.assertTrue(torch.isfinite(dense.grad).all())
 
 
 if __name__ == "__main__":

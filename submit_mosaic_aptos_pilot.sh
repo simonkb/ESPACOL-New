@@ -209,6 +209,7 @@ python train_mosaic.py \
   --epochs "${TOTAL_EPOCHS}" \
   --early_stop_patience "${EARLY_STOP_PATIENCE}" \
   --decision_rule "${DECISION_RULE}" \
+  --transition_reduction boundary_mean \
   --max_count 32 \
   --dense_warmup_epochs 4 \
   --proof_ramp_epochs 4 \

@@ -179,6 +179,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--effective_num_beta", type=float, default=0.999)
     parser.add_argument("--transition_weight_cap", type=float, default=10.0)
     parser.add_argument(
+        "--transition_reduction",
+        choices=("boundary_mean", "sample_mean"),
+        default="boundary_mean",
+        help=(
+            "Boundary mean uses fixed training-fold risk counts so every ordinal "
+            "boundary contributes equally in expectation; sample mean reproduces "
+            "the historical objective."
+        ),
+    )
+    parser.add_argument(
         "--decision_rule",
         choices=(
             "rounded_expected",
@@ -243,6 +253,7 @@ def main() -> None:
         transition_weighting=args.transition_weighting,
         effective_num_beta=args.effective_num_beta,
         transition_weight_cap=args.transition_weight_cap,
+        transition_reduction=args.transition_reduction,
         decision_rule=args.decision_rule,
         stratified=args.stratified_batches,
     )

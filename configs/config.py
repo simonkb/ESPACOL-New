@@ -240,6 +240,9 @@ class MOSAICConfig(TrainConfig):
     transition_weighting: str = "effective_num"
     effective_num_beta: float = 0.999
     transition_weight_cap: float = 10.0
+    # Equalise the four boundary objectives with fixed complete-training-fold
+    # risk counts. ``sample_mean`` reproduces historical checkpoints.
+    transition_reduction: str = "boundary_mean"
 
     # Final point decision from the selected proof.  The raw posterior median
     # was fixed after development-fold audits showed consistent accuracy/MAE

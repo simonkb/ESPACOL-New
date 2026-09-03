@@ -578,6 +578,24 @@ The primary loss is the balanced continuation likelihood:
 -\mathbf1[y_n<K-1]w_{y_n,0}\log(s_{n,y_n}+\epsilon).
 \]
 
+For prospective runs, let
+\(N_k=|\{n:y_n\geq k\}|\) be the complete training-fold risk-set size. The
+four boundaries contribute equally:
+
+\[
+\mathcal L_{\mathrm{CCL}}
+=\frac{1}{K-1}\sum_{k=0}^{K-2}\frac{1}{N_k}
+  \sum_{n:y_n\geq k}\ell_{n,k}.
+\]
+
+Uniform minibatches use the fixed multiplier
+\(N_0/((K-1)N_k)\) before their ordinary sample mean. No minibatch risk-set
+denominator is estimated, so an absent late-boundary example contributes zero
+rather than producing a noisy or undefined normalization. Historical
+checkpoints used the sample mean of \(\mathcal L_{\mathrm{CCL}}(n)\); that
+objective remains available as `transition_reduction=sample_mean` for exact
+provenance and controlled ablation.
+
 Using the directly evaluated stop probability \(s\), rather than a floating-
 point subtraction \(1-c\), preserves the recovery gradient of a confidently
 wrong grade-0 example when a dense continuation rounds to one.
@@ -587,7 +605,7 @@ for each boundary. Use effective-number smoothing and cap the rare late-boundary
 weights. Do not balance only the five nominal classes: the useful imbalance
 structure lives in the four at-risk transitions.
 
-Use the same continuation likelihood on the dense transitions
+Use the same boundary-normalized continuation likelihood on the dense transitions
 \(\widetilde c_{n,k}\), denoted \(\mathcal L_{\mathrm{dense}}\). It supplies
 label gradients to witnesses currently outside the hard certificate and
 prevents an early random prefix from becoming self-reinforcing. This is the

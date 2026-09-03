@@ -133,6 +133,7 @@ class MosaicTrainer:
         "transition_weighting",
         "effective_num_beta",
         "transition_weight_cap",
+        "transition_reduction",
         "decision_rule",
         "stratified",
         "lr",
@@ -179,6 +180,12 @@ class MosaicTrainer:
             raise ValueError(
                 f"unknown MOSAIC decision rule {cfg.decision_rule!r}; "
                 f"expected one of {PROOF_DECISION_RULES}"
+            )
+        if cfg.transition_reduction == "boundary_mean" and cfg.stratified:
+            raise ValueError(
+                "boundary_mean transition reduction requires uniformly sampled "
+                "training batches; disable stratified_batches or use the "
+                "historical sample_mean reduction"
             )
         self.model.to(self.device)
         self.use_amp = bool(cfg.amp and self.device.type == "cuda")
@@ -231,6 +238,7 @@ class MosaicTrainer:
             max_transition_weight=cfg.transition_weight_cap,
             dense_weight=cfg.dense_loss_weight,
             stability_weight=cfg.stability_loss_weight,
+            transition_reduction=cfg.transition_reduction,
         ).to(self.device)
         self._configure_model_decision()
         if cfg.stability_loss_weight > 0:
@@ -762,6 +770,12 @@ class MosaicTrainer:
                     "selected_proof_log_stop_probabilities",
                     "training_fold_boundary_outcome_weights",
                 ),
+                "transition_reduction": self.cfg.transition_reduction,
+                "training_fold_at_risk_counts": (
+                    self.criterion.at_risk_counts.detach().cpu().tolist()
+                    if self.criterion.at_risk_counts is not None
+                    else None
+                ),
             },
         }
 
@@ -806,10 +820,15 @@ class MosaicTrainer:
         if not isinstance(saved_config, dict):
             raise ValueError("resume checkpoint has no usable configuration")
         current_config = asdict(self.cfg)
+        # A checkpoint without this post-audit field used the historical
+        # sample-mean objective. Preserve that identity rather than allowing a
+        # missing value to inherit the prospective boundary-mean default.
+        saved_config_values = dict(saved_config)
+        saved_config_values.setdefault("transition_reduction", "sample_mean")
         mismatches = {
-            field: (saved_config.get(field), current_config.get(field))
+            field: (saved_config_values.get(field), current_config.get(field))
             for field in self._RESUME_CRITICAL_CONFIG_FIELDS
-            if saved_config.get(field) != current_config.get(field)
+            if saved_config_values.get(field) != current_config.get(field)
         }
         if mismatches:
             details = ", ".join(
@@ -890,12 +909,18 @@ class MosaicTrainer:
     def fit(self, *, evaluate_test: bool = True) -> dict:
         logger.info(
             "MOSAIC fold=%d device=%s stride=%d RF=%d decision=%s "
-            "transition_weights=%s",
+            "transition_reduction=%s at_risk_counts=%s transition_weights=%s",
             self.fold,
             self.device,
             self.model.output_stride,
             self.model.receptive_field,
             self.cfg.decision_rule,
+            self.cfg.transition_reduction,
+            (
+                self.criterion.at_risk_counts.detach().cpu().tolist()
+                if self.criterion.at_risk_counts is not None
+                else None
+            ),
             self.criterion.transition_weights.detach().cpu().tolist(),
         )
         best_accuracy = -math.inf

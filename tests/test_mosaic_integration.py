@@ -529,6 +529,18 @@ def test_decision_rule_is_resume_critical_and_serialized(tmp_path: Path) -> None
         "selected_proof_log_stop_probabilities",
         "training_fold_boundary_outcome_weights",
     )
+    assert state["config"]["transition_reduction"] == "boundary_mean"
+    assert state["architecture"]["transition_reduction"] == "boundary_mean"
+    assert state["architecture"]["training_fold_at_risk_counts"] == [
+        5,
+        4,
+        3,
+        2,
+    ]
+    assert torch.equal(
+        state["criterion_state"]["at_risk_counts"],
+        torch.tensor([5, 4, 3, 2]),
+    )
 
     changed = _tiny_trainer(
         tmp_path / "changed",
@@ -536,6 +548,38 @@ def test_decision_rule_is_resume_critical_and_serialized(tmp_path: Path) -> None
     )
     with pytest.raises(ValueError, match="decision_rule"):
         changed._validate_resume_checkpoint(state)
+
+
+def test_transition_reduction_is_resume_critical_with_legacy_identity(
+    tmp_path: Path,
+) -> None:
+    boundary_mean = _tiny_trainer(tmp_path / "boundary-mean")
+    state = boundary_mean._checkpoint_payload(
+        epoch=1, metrics={}, best_accuracy=0.0
+    )
+    sample_mean = _tiny_trainer(
+        tmp_path / "sample-mean",
+        cfg_overrides={"transition_reduction": "sample_mean"},
+    )
+    with pytest.raises(ValueError, match="transition_reduction"):
+        sample_mean._validate_resume_checkpoint(state)
+
+    # Missing metadata denotes the historical sample-mean objective; it must
+    # never silently inherit the prospective boundary-mean default.
+    legacy_state = dict(state)
+    legacy_state["config"] = dict(state["config"])
+    legacy_state["config"].pop("transition_reduction")
+    sample_mean._validate_resume_checkpoint(legacy_state)
+    with pytest.raises(ValueError, match="transition_reduction"):
+        boundary_mean._validate_resume_checkpoint(legacy_state)
+
+
+def test_boundary_mean_rejects_nonuniform_training_sampler(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="uniformly sampled"):
+        _tiny_trainer(
+            tmp_path,
+            cfg_overrides={"stratified": True},
+        )
 
 
 def test_cpu_training_step_remains_finite_and_updates_parameters(tmp_path: Path) -> None:
@@ -760,6 +804,7 @@ def test_stratified_sampler_sequence_continues_exactly_after_resume(
             count_block_size=8,
             amp=False,
             stratified=True,
+            transition_reduction="sample_mean",
             seed=91,
         )
         return MosaicTrainer(
