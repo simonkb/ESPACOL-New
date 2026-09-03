@@ -241,11 +241,12 @@ class MOSAICConfig(TrainConfig):
     effective_num_beta: float = 0.999
     transition_weight_cap: float = 10.0
 
-    # Final point decision from the selected proof.  Keep the historically
-    # validated rounded expectation as the safe default.  Alternative raw and
-    # analytically deweighted rules remain available for fixed decoder audits,
-    # but are not enabled from a single development-fold comparison.
-    decision_rule: str = "rounded_expected"
+    # Final point decision from the selected proof.  The raw posterior median
+    # was fixed after development-fold audits showed consistent accuracy/MAE
+    # gains on APTOS and EyePACS without validation-fitted parameters.  It is
+    # now locked prospectively for all new folds; alternatives remain audit
+    # diagnostics only.
+    decision_rule: str = "posterior_median"
 
     # Optimisation.  The pointwise proof head learns faster than the local CNN.
     lr: float = 1e-4

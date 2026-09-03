@@ -1,10 +1,10 @@
 # MOSAIC: minimum ordinal proofs on a retinal micro-region lattice
 
-Status: **Core implementation complete on `mosaic-ordinal-proof`; APTOS
-fold-0 viability run and proof-decoder audit complete; EyePACS decoder audit
-pending**
+Status: **Core implementation complete on `mosaic-ordinal-proof`; independent
+APTOS and EyePACS fold-0 decoder audits complete; raw posterior median locked
+prospectively for new folds**
 
-Date: 2026-09-02
+Date: 2026-09-03
 
 Data constraint: **EyePACS/Kaggle DR and APTOS image-level grades only**. No
 lesion masks, text encoder, concept labels, manual annotation, or clinician
@@ -446,13 +446,20 @@ p_{n,K-1}=\prod_{j=0}^{K-2}c_{n,j}.
 \]
 
 This guarantees ordered cumulative probabilities and a normalized class
-distribution without four independent CORAL logits. The current safe point
-prediction remains
+distribution without four independent CORAL logits. The prospectively locked
+point prediction is the raw posterior median
 
 \[
-\hat y_n=\operatorname{round}\!\left(\mathbb E[Y_n]\right)
-=\operatorname{round}\!\left(\sum_{k=0}^{K-2}q_{n,k}\right).
+\hat y_n=\sum_{k=0}^{K-2}
+\mathbf 1\!\left[q_{n,k}\ge 0.5\right].
 \]
+
+Because the cumulative probabilities are ordered, this is a valid ordinal
+upper median (the `>=` convention selects the upper grade on an exact 0.5 tie)
+and minimizes expected absolute grade error under the model-implied raw
+cascade law. This statement does not claim that the cost-sensitive scores are
+calibrated natural posteriors. The rule adds no parameter and receives no
+input outside the selected proof.
 
 There is one necessary qualification when the continuation likelihood uses
 boundary outcome weights. Its population optimum is the cost-sensitive score
@@ -473,22 +480,27 @@ therefore evaluates the exact, parameter-free inverse
 \]
 
 This analytic inverse is retained as a fixed diagnostic, not used by the
-operating model. On the completed APTOS fold-0 checkpoint audit, all three
-deweighted rules reduced accuracy, balanced accuracy, macro-F1, QWK, and
-increased MAE relative to `rounded_expected`. Raw class MAP increased exact
-accuracy but reduced QWK, balanced accuracy, macro-F1, and worsened MAE;
-selecting it from that same validation fold would be post-hoc. The apparent
-accuracy changes were also not compelling in exact paired tests
-(`posterior_median`: help/harm 6/2, `p=0.289`; `class_map`: 10/5,
-`p=0.302`). Accordingly, `rounded_expected` remains the safe default pending
-the independent EyePACS audit. Raw/deweighted MAP, posterior medians, and
-deweighted mean-round remain six-rule audit diagnostics only.
+operating model. On APTOS, raw posterior median changed accuracy/MAE/QWK from
+82.25/0.2150/0.9030 to 83.62/0.2116/0.8929; the small one-fold help/harm count
+of 6/2 was not significant (`p=0.289`). On the independently audited EyePACS
+fold, the same rule changed 81.63/0.2283/0.8093 to
+83.93/0.2170/0.7999, with help/harm 95/22 (`p=5.3144e-12`). Thus accuracy and
+MAE improve consistently, while QWK falls by approximately 0.01 on both
+datasets. This trade-off is explicit and must be reported.
+
+Raw posterior median is now locked prospectively for all new folds. Raw class
+MAP is rejected: versus posterior median, it adds only 0.34 accuracy points on
+APTOS and 0.45 on EyePACS, while worsening balanced accuracy, QWK, and MAE on
+both. Analytic deweighting is rejected because it gives no consistent
+cross-dataset advantage and substantially harms APTOS. The other five rules
+remain audit diagnostics and may not be selected per dataset or fold.
+Historical checkpoints retain their serialized rule.
 
 Every rule receives only selected-proof scores, so the diagnostic audit adds
 no image or feature bypass. The proof's sufficiency and necessity statements
 remain in the raw cardinality-score domain. MOSAIC's novelty is the exclusive,
 replayable proof computation, not a choice among conventional point-decision
-rules.
+rules. Posterior median itself is not claimed as a contribution.
 
 ## 5. Hiding evidence without creating fake images
 

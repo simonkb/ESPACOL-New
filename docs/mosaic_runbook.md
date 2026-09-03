@@ -1,6 +1,6 @@
 # MOSAIC implementation and experiment runbook
 
-Date: 2026-09-02
+Date: 2026-09-03
 
 Branch: `mosaic-ordinal-proof`
 
@@ -25,11 +25,11 @@ code actually does and the next executable experiment.
 - `Datasets/mosaic_data.py`: full-canvas APTOS/EyePACS loading, disjoint folds,
   tight-field cropping, direct canonical-square resizing, and the same
   image-independent centered ellipse for every sample.
-- `models/mosaic_decoder.py`: a proof-only decision layer whose safe operating
-  rule remains `rounded_expected`. It also exposes five fixed alternative rules
-  for validation diagnostics, including analytic outcome-weight corrections;
-  none has learned or validation-fitted parameters, and none accepts image or
-  feature input.
+- `models/mosaic_decoder.py`: a proof-only decision layer whose prospectively
+  locked operating rule is raw `posterior_median`. It also exposes five fixed
+  alternatives for validation diagnostics, including analytic outcome-weight
+  corrections; none has learned or validation-fitted parameters, and none
+  accepts image or feature input.
 - `training/mosaic_trainer.py` and `train_mosaic.py`: dense warm-up, proof
   tolerance ramp, validation-accuracy checkpointing, complete resume state, atomic
   checkpoints, source-content implementation signatures, held-out test
@@ -184,11 +184,17 @@ The script passes `--skip_test`, so no outer-test predictions or
 `test_metrics.json` are produced during architecture development. Architecture
 decisions use only `best_validation_metrics.json`; the outer fold remains
 untouched until the architecture and hyperparameters are frozen.
-The operating rule is `rounded_expected`: the selected-proof continuation
-scores define the ordinal cascade and the final grade is
-`round(sum_k P(Y>k))`. The at-risk loss uses different stop/advance weights,
-so the audit also tests an analytic inverse candidate. For boundary weights
-ordered as `[w_stop, w_advance]`, that diagnostic computes
+The operating rule for all new folds is raw `posterior_median`: selected-proof
+continuation scores define the cumulative ordinal cascade and the final grade
+is
+
+```text
+sum_k 1[P(Y>k) >= 0.5].
+```
+
+The at-risk loss uses different stop/advance weights, so the audit also tests
+an analytic inverse candidate. For boundary weights ordered as
+`[w_stop, w_advance]`, that diagnostic computes
 
 ```text
 p_continue = w_stop*c / (w_stop*c + w_advance*s)
@@ -201,26 +207,51 @@ finite trained network need not satisfy that population optimum.
 The APTOS fold-0 audit reproduced the historical checkpoint exactly and found:
 
 - `rounded_expected`: 82.25% accuracy, 0.9030 QWK, 0.2150 MAE;
+- raw `posterior_median`: 83.62% accuracy, 0.8929 QWK, 0.2116 MAE;
 - raw `class_map`: 83.96% accuracy, but 0.8719 QWK and 0.2253 MAE; and
 - `deweighted_class_map`: 81.23% accuracy, 0.8671 QWK, 0.2526 MAE.
 
 All three deweighted variants were worse than `rounded_expected` on every
-reported metric. Deweighting is therefore rejected as the default. Raw class
-MAP is not promoted either: it traded away ordinal and imbalance-sensitive
-quality, and choosing it after seeing this fold would be post-hoc. The one-fold
-accuracy differences are not statistically compelling: raw posterior median
-has help/harm 6/2 (exact paired `p=0.289`); raw MAP has 10/5
-(`p=0.302`). All six rules remain diagnostic outputs only. Every rule receives
-only selected-proof transitions, so the proof remains the exclusive grade
-path.
+reported APTOS metric. Deweighting was therefore rejected. Raw class MAP was
+not promoted: it traded away ordinal and imbalance-sensitive quality, and
+choosing it after seeing this fold would have been post-hoc. Raw posterior
+median had help/harm 6/2 (exact paired `p=0.289`), so APTOS alone did not
+justify changing the operating rule.
+
+The independent EyePACS fold-0 audit then found:
+
+| Rule | Acc. | Bal. Acc. | Macro-F1 | QWK | MAE |
+|---|---:|---:|---:|---:|---:|
+| `rounded_expected` | 81.63 | 52.08 | 0.5225 | **0.8093** | 0.2283 |
+| `class_map` | **84.38** | 51.44 | **0.5635** | 0.7865 | 0.2201 |
+| `posterior_median` | 83.93 | **52.92** | 0.5593 | 0.7999 | **0.2170** |
+| `deweighted_mean_round` | 81.91 | 50.74 | 0.5076 | 0.8070 | 0.2255 |
+| `deweighted_class_map` | 84.31 | 49.39 | 0.5450 | 0.7848 | 0.2207 |
+| `deweighted_posterior_median` | 83.97 | 50.82 | 0.5466 | 0.7931 | 0.2185 |
+
+Raw posterior median corrected 95 predictions while making 22 newly wrong
+(exact paired `p=5.3144e-12`). Across APTOS and EyePACS it consistently raises
+accuracy and lowers MAE, while lowering QWK by about 0.01. It is therefore
+locked prospectively for untouched folds, with the QWK cost reported. Raw MAP
+is rejected: it adds only 0.34 APTOS and 0.45 EyePACS accuracy points over the
+median while worsening balanced accuracy, QWK, and MAE on both. Deweighting is
+rejected for its lack of consistent cross-dataset benefit and large APTOS
+degradation. The remaining five rules stay diagnostic only. Historical
+checkpoints retain their serialized rule. Every rule receives only
+selected-proof transitions, so the proof remains the exclusive grade path.
+
+The median rule is conventional and is not a novelty claim. It minimizes
+absolute error under the model-implied raw cascade law; the `>= 0.5`
+convention selects the upper grade on an exact tie. It has zero learned or
+validation-fitted parameters.
 
 All configured grades must occur in the training fold. Startup rejects any
 fold for which a boundary lacks either stop or advance examples; such a fold
 cannot identify the complete declared ordinal model or support the full
 raw/deweighted decoder audit.
 
-Before retraining, audit an existing best checkpoint without touching the
-outer test split:
+The completed audits can be reproduced without touching either outer test
+split:
 
 ```bash
 sbatch submit_mosaic_decoder_audit.sh aptos \
@@ -235,14 +266,13 @@ sbatch submit_mosaic_decoder_audit.sh dr \
 ```
 
 The audit must exactly reproduce the checkpoint's historical rounded-mean
-accuracy/QWK/MAE before any decoder comparison is trusted. It writes
-`decoder_audit/summary.json` and per-image `predictions.csv`. APTOS has now
-rejected deweighting as the default; no row should be chosen merely because it
-wins one metric on one validation fold. The EyePACS run is an independent
-diagnostic, while `rounded_expected` remains the safe operating rule. The same
-audit reports empty selected proofs among positive/advance targets. Those
-cases expose the hard-projection dead-gradient region and determine whether a
-later training-objective change is justified.
+accuracy/QWK/MAE before any comparison is trusted. It writes
+`decoder_audit/summary.json` and per-image `predictions.csv`. The cross-dataset
+decision is now frozen: future folds use `posterior_median`, and no row may be
+selected retrospectively per fold. The audit also reports empty selected
+proofs among positive/advance targets. Those cases expose the hard-projection
+dead-gradient region and determine whether a later training-objective change
+is justified.
 
 The pilot passes only if:
 
@@ -268,13 +298,13 @@ by the audited implementation.
 
 ```bash
 python export_mosaic_certificates.py \
-  --checkpoint runs/mosaic_aptos_f0_rounded_v1/fold0/best.pth \
+  --checkpoint runs/mosaic_aptos_f0_median_v1/fold0/best.pth \
   --dataset aptos \
   --data_root Datasets/aptos2019-blindness-detection \
   --fold 0 \
   --split validation \
   --per_grade_limit 5 \
-  --output_dir runs/mosaic_aptos_f0_rounded_v1/fold0/validation_certificates
+  --output_dir runs/mosaic_aptos_f0_median_v1/fold0/validation_certificates
 ```
 
 Every manifest row must have `replay_ok=True` and `replay_status=passed`.
@@ -315,9 +345,10 @@ untouched.
 The audited decoder implementation is resume-critical and changes the
 implementation signature. Do not resume a pre-audit run under the audited
 source. Use the validation-only decoder audit on its `best.pth`, then start any
-new training comparison in a fresh run directory. The launchers use the safe
-`MOSAIC_DECISION_RULE=rounded_expected` default. The other five rules are
-diagnostic comparisons, not dataset-specific training configurations.
+new training comparison in a fresh run directory. The launchers use the
+prospectively locked `MOSAIC_DECISION_RULE=posterior_median`. The other five
+rules are diagnostic comparisons, not dataset-specific training
+configurations.
 
 ## Only after the pilot passes
 

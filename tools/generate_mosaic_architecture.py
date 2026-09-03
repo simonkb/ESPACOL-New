@@ -402,9 +402,9 @@ def _svg_figure(raw_uri: str, canonical_uri: str) -> str:
             "Proof-Only Ordinal Cascade",
             "P(Y>k) = product_(j=0..k) c[j]",
             "P(Y=0), …, P(Y=4)",
-            "E[Y] = sum_(k=0..3) P(Y>k)",
-            "ŷ = round(E[Y])   (safe default)",
-            "6-rule comparison: diagnostic audit only",
+            "ŷ = sum_(k=0..3) 1[P(Y>k) >= 0.5]",
+            "raw upper cascade median   •   parameter-free",
+            "5 alternatives: diagnostic audit only",
         ],
         size=9.5,
         leading=19,
@@ -481,7 +481,7 @@ def _svg_figure(raw_uri: str, canonical_uri: str) -> str:
     s.rect(1310, 700, 250, 43, fill=LIGHT_BLUE, stroke="#6CA6E8", radius=7)
     s.text(1435, 718, ["c[0..3]  •  P(Y>k)  •  P(Y=0..4)"], size=10.5)
     s.rect(1310, 755, 250, 43, fill=ORANGE, stroke=ORANGE, radius=7)
-    s.text(1435, 774, ["round(E[Y])  →  predicted grade ŷ"], size=11, bold_first=True)
+    s.text(1435, 774, ["upper median(q)  →  predicted grade ŷ"], size=11, bold_first=True)
     s.arrow([(1220, 680), (1278, 680)], color=ORANGE, width=2.6)
 
     # Footer claim boundary.
@@ -651,7 +651,7 @@ def _drawio_figure(raw_uri: str, canonical_uri: str) -> str:
     d.edge(alpha, proof)
 
     retained = d.vertex(_html("Retained-Proof Circuit Replay", "same PB counter on M* ⊙ λ", "cₖ=cᴿₖ and stable log sₖ"), 630, 625, 255, 100, box.replace("strokeColor=#111111", f"strokeColor={ORANGE};strokeWidth=2"), ident="retained")
-    cascade = d.vertex(_html("Proof-Only Ordinal Cascade", "P(Y&gt;k) = product(j=0..k) c[j]", "P(Y=0), …, P(Y=4)", "E[Y] = sum(k=0..3) P(Y&gt;k)", "ŷ = round(E[Y]) (safe default)", "6-rule comparison: diagnostic audit only"), 930, 615, 290, 130, yellow, ident="cascade")
+    cascade = d.vertex(_html("Proof-Only Ordinal Cascade", "P(Y&gt;k) = product(j=0..k) c[j]", "P(Y=0), …, P(Y=4)", "ŷ = sum(k=0..3) 1[P(Y&gt;k) ≥ 0.5]", "raw upper cascade median • parameter-free", "5 alternatives: diagnostic audit only"), 930, 615, 290, 130, yellow, ident="cascade")
     d.edge(proof, retained, color=ORANGE, width=2.6)
     d.edge(retained, cascade, color=ORANGE, width=2.6)
 
@@ -678,7 +678,7 @@ def _drawio_figure(raw_uri: str, canonical_uri: str) -> str:
     ordinal_output = d.vertex("", 1285, 650, 300, 165, output, ident="ordinal_output")
     d.vertex("<b>Ordinal Outputs (inference)</b>", 1315, 665, 240, 28, "text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=13;")
     d.vertex("c[0..3] • P(Y&gt;k) • P(Y=0..4)", 1310, 700, 250, 43, box)
-    d.vertex("<b>round(E[Y]) → predicted grade ŷ</b>", 1310, 755, 250, 43, box.replace("#CCE5FF", ORANGE).replace("#111111", ORANGE))
+    d.vertex("<b>upper median(q) → predicted grade ŷ</b>", 1310, 755, 250, 43, box.replace("#CCE5FF", ORANGE).replace("#111111", ORANGE))
     d.edge(cascade, ordinal_output, color=ORANGE, width=2.6)
 
     d.vertex("Fine-grid local witnesses: stride-8 centers with 95×95 receptive-field support — not pixel segmentation&nbsp;&nbsp; • &nbsp;&nbsp;Prediction has no global classifier bypass", 260, 838, 1080, 38, "rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#F4F6F8;strokeColor=#C5CCD3;fontSize=10;align=center;verticalAlign=middle;")

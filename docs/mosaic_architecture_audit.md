@@ -1,6 +1,6 @@
 # MOSAIC architecture audit: proof-to-grade path
 
-Date: 2026-09-02
+Date: 2026-09-03
 
 Scope: code-level audit of the implemented prediction path and the completed
 APTOS/EyePACS pilot behavior. This audit does not use either outer test split
@@ -20,10 +20,11 @@ classifier capable of bypassing the reported proof. The main architectural
 novelty therefore remains intact.
 
 The audit found one theoretical decoder caveat, one metric-selection tension,
-and one measurable training risk. The completed APTOS fold-0 audit rejects
-analytic deweighting as the operating decoder. The safe default remains the
-historical `rounded_expected` rule while the independent EyePACS audit is
-pending.
+and one measurable training risk. Independent fold-0 audits on APTOS and
+EyePACS reject analytic deweighting and raw class MAP as operating rules. Raw
+`posterior_median` is now locked prospectively for new folds: it improved both
+accuracy and MAE on both datasets, while incurring an approximately 0.01 QWK
+reduction that must be reported rather than hidden.
 
 ## Theoretical caveat: weighted scores are not calibrated posteriors
 
@@ -54,7 +55,8 @@ the derivation assumes that the learned score is at the weighted population
 optimum; representation error, regularization, the projected/dense compound
 loss, and finite-sample fitting can violate that assumption. The candidate
 therefore had to pass the fixed-checkpoint audit before it could become the
-default. It did not pass on APTOS.
+default. It did not pass on APTOS, and the EyePACS audit supplied no reason to
+reverse that conclusion.
 
 This decoder question is not the claimed architectural novelty. MOSAIC's
 contribution remains that the selected minimum proof is the exclusive grade
@@ -87,7 +89,7 @@ Every audited rule has:
 The alternatives are retained as diagnostics, not architectural branches or
 post-hoc choices.
 
-## APTOS fold-0 result: decoder promotion rejected
+## APTOS fold-0 result: initial audit
 
 The audit exactly reproduced the epoch-13 checkpoint on all 293 inner-
 validation images. Results were:
@@ -109,9 +111,41 @@ was discovered would be post-hoc rule selection. Moreover, neither apparent
 accuracy gain is statistically compelling on this single fold: relative to
 `rounded_expected`, `posterior_median` has 6 corrected versus 2 newly wrong
 predictions (exact paired test, `p=0.289`), and `class_map` has 10 versus 5
-(`p=0.302`). `rounded_expected` therefore remains the safe operating rule
-pending the independently specified EyePACS audit. All six rules remain logged
-for diagnosis only.
+(`p=0.302`). APTOS alone therefore did not justify a decoder change;
+`posterior_median` was carried into the independently specified EyePACS audit
+as the only alternative that improved both accuracy and MAE without the much
+larger ordinal degradation of class MAP.
+
+## EyePACS fold-0 result: independent replication
+
+The EyePACS audit also reproduced the historical checkpoint before comparing
+the same six fixed proof-only rules:
+
+| Proof-only rule | Acc. | Bal. Acc. | Macro-F1 | QWK | MAE |
+|---|---:|---:|---:|---:|---:|
+| `rounded_expected` | 81.63 | 52.08 | 0.5225 | **0.8093** | 0.2283 |
+| `class_map` | **84.38** | 51.44 | **0.5635** | 0.7865 | 0.2201 |
+| `posterior_median` | 83.93 | **52.92** | 0.5593 | 0.7999 | **0.2170** |
+| `deweighted_mean_round` | 81.91 | 50.74 | 0.5076 | 0.8070 | 0.2255 |
+| `deweighted_class_map` | 84.31 | 49.39 | 0.5450 | 0.7848 | 0.2207 |
+| `deweighted_posterior_median` | 83.97 | 50.82 | 0.5466 | 0.7931 | 0.2185 |
+
+Raw `posterior_median` improved accuracy by 2.30 points and reduced MAE by
+0.0113 relative to `rounded_expected`; it also improved balanced accuracy and
+macro-F1. Its 95 corrected versus 22 newly wrong predictions give an exact
+paired `p=5.3144e-12`. The trade-off is a QWK decrease from 0.8093 to 0.7999
+(-0.0094). This mirrors APTOS, where accuracy rose by 1.37 points and MAE fell
+by 0.0034 while QWK decreased from 0.9030 to 0.8929 (-0.0101).
+
+This cross-dataset consistency is sufficient to lock raw `posterior_median`
+prospectively for untouched folds. It is not evidence that the QWK cost is
+zero; future reporting must include accuracy, MAE, and QWK. Raw class MAP is
+rejected: relative to posterior median, it adds only 0.34 accuracy points on
+APTOS and 0.45 on EyePACS, while worsening balanced accuracy, QWK, and MAE on
+both (and macro-F1 on APTOS). Analytic deweighting is rejected because it
+offers no consistent cross-dataset benefit and causes large APTOS degradation.
+The choice is global and prospective, never selected separately per dataset
+or fold. Historical checkpoints retain their serialized decision rule.
 
 ## Measurable risk: empty-proof advance gradients
 
@@ -142,13 +176,7 @@ or silently changing the declared number of grades.
 
 ## Validation-only audit
 
-APTOS fold 0 has been completed. Run the EyePACS audit before making any
-cross-dataset decoder claim:
-
-```bash
-sbatch submit_mosaic_decoder_audit.sh dr \
-  runs/mosaic_dr_f0_ampfix_policy_v2/fold0/best.pth
-```
+Both fold-0 audits are complete. Neither accessed an outer test split.
 
 The utility is locked to inner validation. It first reproduces the historical
 checkpoint metrics, then reports six pre-specified proof-only rules, full
@@ -156,10 +184,10 @@ confusions, help-versus-harm counts, probability invariants, and the hard-proof
 diagnostics. It writes `decoder_audit/summary.json` and `predictions.csv` next
 to each checkpoint.
 
-No alternative rule is promoted from the APTOS table. Do not select whichever
-of the six rows happens to win on one fold. The EyePACS audit is an independent
-diagnostic of whether the APTOS ordering generalizes; it is not permission to
-choose a dataset-specific decoder after inspecting both tables.
+The same six-rule table remains an audit output, but the decision is now frozen:
+new untouched folds use raw `posterior_median`. Do not select whichever row
+happens to win on a later fold, and do not introduce dataset-specific decision
+rules.
 
 ## Changes intentionally not made
 
@@ -171,10 +199,16 @@ choose a dataset-specific decoder after inspecting both tables.
 - no change to receptive field, count truncation, or proof tolerance; and
 - no stronger imbalance weights.
 
-The operating decoder also remains unchanged: selected-proof continuation
-scores are converted to a normalized ordinal distribution and the prediction
-is `round(E[Y])`. Analytic deweighting, MAP, and posterior-median rules remain
-available only in the audit report.
+Only the zero-parameter point decision changes: selected-proof cumulative
+probabilities now produce the raw posterior-median grade
+`sum_k 1[P(Y>k) >= 0.5]`. Analytic deweighting, raw/deweighted MAP,
+deweighted median, and rounded expectation remain audit diagnostics.
+
+Posterior median is a conventional decision rule, not a new contribution. It
+preserves proof exclusivity because it consumes only cumulative probabilities
+replayed from the retained proof and has no learned or validation-fitted
+parameters. The novelty remains the exact cardinality circuit, deterministic
+minimum dual proof, and replayable internal intervention.
 
 Those would confound the single question this audit answers. New runs under
 the audited source must use a fresh run directory because the decision rule is

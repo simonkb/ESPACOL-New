@@ -188,11 +188,11 @@ def build_parser() -> argparse.ArgumentParser:
             "deweighted_class_map",
             "deweighted_posterior_median",
         ),
-        default="rounded_expected",
+        default="posterior_median",
         help=(
             "Parameter-free point decision derived from the selected proof; "
-            "rounded_expected is the validated default and alternatives are "
-            "reserved for pre-specified decoder audits."
+            "posterior_median is prospectively locked after the APTOS and "
+            "EyePACS development-fold audits."
         ),
     )
     parser.add_argument(

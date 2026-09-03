@@ -457,9 +457,9 @@ def test_epoch_diagnostics_aggregate_boundary_risk_sets_exactly(tmp_path: Path) 
         shuffle=False,
     )
     metrics = trainer._run_epoch(loader, train=False, epoch=1)
-    assert metrics["decision_rule"] == "rounded_expected"
+    assert metrics["decision_rule"] == "posterior_median"
     assert metrics["acc"] == pytest.approx(
-        metrics["decoder_rounded_expected_acc"]
+        metrics["decoder_posterior_median_acc"]
     )
     for rule in (
         "rounded_expected",

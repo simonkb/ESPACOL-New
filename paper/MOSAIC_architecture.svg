@@ -244,9 +244,9 @@
 <tspan x="1075" dy="0" font-weight="700">Proof-Only Ordinal Cascade</tspan>
 <tspan x="1075" dy="19">P(Y&gt;k) = product_(j=0..k) c[j]</tspan>
 <tspan x="1075" dy="19">P(Y=0), …, P(Y=4)</tspan>
-<tspan x="1075" dy="19">E[Y] = sum_(k=0..3) P(Y&gt;k)</tspan>
-<tspan x="1075" dy="19">ŷ = round(E[Y])   (safe default)</tspan>
-<tspan x="1075" dy="19">6-rule comparison: diagnostic audit only</tspan>
+<tspan x="1075" dy="19">ŷ = sum_(k=0..3) 1[P(Y&gt;k) &gt;= 0.5]</tspan>
+<tspan x="1075" dy="19">raw upper cascade median   •   parameter-free</tspan>
+<tspan x="1075" dy="19">5 alternatives: diagnostic audit only</tspan>
 </text>
 <path d="M 1060 590 L 1060 607 L 757 607 L 757 618" fill="none" stroke="#FF8000" stroke-width="2.6" stroke-linejoin="miter" marker-end="url(#arrow-orange)"/>
 <path d="M 885 675 L 923 675" fill="none" stroke="#FF8000" stroke-width="2.6" stroke-linejoin="miter" marker-end="url(#arrow-orange)"/>
@@ -317,7 +317,7 @@
 </text>
 <rect x="1310" y="755" width="250" height="43" rx="7" fill="#FF8000" fill-opacity="1.0" stroke="#FF8000" stroke-width="1.2"/>
 <text x="1435" y="774" text-anchor="middle" fill="#111111" font-family="Arial,Helvetica,sans-serif" font-size="11" style="">
-<tspan x="1435" dy="0" font-weight="700">round(E[Y])  →  predicted grade ŷ</tspan>
+<tspan x="1435" dy="0" font-weight="700">upper median(q)  →  predicted grade ŷ</tspan>
 </text>
 <path d="M 1220 680 L 1278 680" fill="none" stroke="#FF8000" stroke-width="2.6" stroke-linejoin="miter" marker-end="url(#arrow-orange)"/>
 <rect x="260" y="838" width="1080" height="38" rx="8" fill="#F4F6F8" fill-opacity="1.0" stroke="#C5CCD3" stroke-width="1.2"/>

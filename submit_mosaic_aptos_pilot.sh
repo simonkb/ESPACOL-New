@@ -37,7 +37,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 RUN_DIR="${MOSAIC_RUN_DIR:-runs/mosaic_aptos_pilot}"
 TOTAL_EPOCHS="${MOSAIC_EPOCHS:-50}"
 EARLY_STOP_PATIENCE="${MOSAIC_EARLY_STOP_PATIENCE:-30}"
-DECISION_RULE="${MOSAIC_DECISION_RULE:-rounded_expected}"
+DECISION_RULE="${MOSAIC_DECISION_RULE:-posterior_median}"
 RESUME_ARGS=()
 if [[ "${MOSAIC_RESUME:-0}" == "1" ]]; then
   RESUME_ARGS+=(--resume)
