@@ -3,10 +3,13 @@
 import pytest
 import torch
 import torch.nn as nn
+from torchvision.ops.misc import SqueezeExcitation
 
 from models.local_efficientnet import (
     LocalEfficientNetV2S,
     PointwiseResidualMLP,
+    PointwiseSqueezeExcitation,
+    _collapse_spatial_convolutions_to_pointwise,
     available_local_taps,
     centered_ellipse_mask,
     downsample_retinal_field_mask,
@@ -21,6 +24,7 @@ from models.local_efficientnet import (
         ("rf_small", 2, 48, 4, 39),
         ("rf_medium", 3, 64, 8, 95),
         ("rf_large", 5, 160, 16, 559),
+        ("deep_local_95", 7, 1280, 32, 95),
     ],
 )
 def test_exact_receptive_field_metadata(
@@ -39,14 +43,22 @@ def test_tap_aliases_and_public_channels():
     assert efficientnet_v2_s_receptive_field(4).tap == "rf_small"
     assert efficientnet_v2_s_receptive_field("s8").tap == "rf_medium"
     assert efficientnet_v2_s_receptive_field("stride16").tap == "rf_large"
+    assert efficientnet_v2_s_receptive_field("dl95").tap == "deep_local_95"
+    assert efficientnet_v2_s_receptive_field("stride32").tap == "deep_local_95"
     assert LocalEfficientNetV2S.TAP_CHANNELS == {
         "rf_small": 48,
         "rf_medium": 64,
         "rf_large": 160,
+        "deep_local_95": 1280,
     }
-    assert set(available_local_taps()) == {"rf_small", "rf_medium", "rf_large"}
+    assert set(available_local_taps()) == {
+        "rf_small",
+        "rf_medium",
+        "rf_large",
+        "deep_local_95",
+    }
     with pytest.raises(ValueError, match="Unknown local tap"):
-        efficientnet_v2_s_receptive_field("stride32")
+        efficientnet_v2_s_receptive_field("stride64")
 
 
 def test_pointwise_head_cannot_spread_a_spatial_perturbation():
@@ -61,6 +73,65 @@ def test_pointwise_head_cannot_spread_a_spatial_perturbation():
     outside = delta.clone()
     outside[:, 2, 3] = 0
     assert torch.count_nonzero(outside) == 0
+
+
+def test_dl95_kernel_collapse_preserves_groups_stride_and_constant_response():
+    conv = nn.Conv2d(
+        4,
+        4,
+        kernel_size=3,
+        stride=2,
+        padding=1,
+        groups=4,
+        bias=True,
+    )
+    with torch.no_grad():
+        conv.weight.copy_(torch.arange(36, dtype=torch.float32).reshape(4, 1, 3, 3))
+        conv.bias.copy_(torch.arange(4, dtype=torch.float32))
+    expected_weight = conv.weight.detach().sum(dim=(-2, -1), keepdim=True)
+    module = nn.Sequential(conv)
+
+    _collapse_spatial_convolutions_to_pointwise(module)
+    collapsed = module[0]
+
+    assert collapsed.kernel_size == (1, 1)
+    assert collapsed.stride == (2, 2)
+    assert collapsed.groups == 4
+    assert torch.equal(collapsed.weight, expected_weight)
+    assert torch.equal(collapsed.bias, torch.arange(4, dtype=torch.float32))
+
+
+def test_dl95_retains_spatial_kernels_only_through_feature_three():
+    model = LocalEfficientNetV2S(
+        tap="dl95", local_dim=8, pretrained=False, dropout=0.0
+    )
+    early_spatial = [
+        module
+        for module in model.trunk[:4].modules()
+        if isinstance(module, nn.Conv2d) and module.kernel_size != (1, 1)
+    ]
+    late_spatial = [
+        module
+        for module in model.trunk[4:].modules()
+        if isinstance(module, nn.Conv2d) and module.kernel_size != (1, 1)
+    ]
+    assert early_spatial
+    assert late_spatial == []
+
+
+def test_dl95_pointwise_squeeze_excitation_cannot_mix_sites():
+    torch.manual_seed(17)
+    gate = PointwiseSqueezeExcitation(SqueezeExcitation(4, 2)).eval()
+    base = torch.zeros(1, 4, 3, 3)
+    changed = base.clone()
+    changed[:, :, 1, 1] = 1.0
+
+    with torch.no_grad():
+        delta = (gate(changed) - gate(base)).abs().sum(dim=1)
+
+    assert delta[0, 1, 1] > 0
+    delta[0, 1, 1] = 0
+    assert torch.count_nonzero(delta) == 0
 
 
 def test_pointwise_projection_is_fp32_under_encoder_autocast():
@@ -115,7 +186,12 @@ def test_empty_image_produces_empty_retinal_mask():
 
 @pytest.mark.parametrize(
     "tap,expected_hw",
-    [("rf_small", 16), ("rf_medium", 8), ("rf_large", 4)],
+    [
+        ("rf_small", 16),
+        ("rf_medium", 8),
+        ("rf_large", 4),
+        ("dl95", 2),
+    ],
 )
 def test_encoder_output_shape_masking_and_lattice_metadata(tap, expected_hw):
     torch.manual_seed(3)
@@ -138,7 +214,7 @@ def test_encoder_output_shape_masking_and_lattice_metadata(tap, expected_hw):
     assert output.feature_map.shape == (1, 12, expected_hw, expected_hw)
     assert output.lattice.lattice_size == (expected_hw, expected_hw)
     assert output.lattice.num_cells == expected_hw * expected_hw
-    assert output.lattice.output_stride in (4, 8, 16)
+    assert output.lattice.output_stride in (4, 8, 16, 32)
     assert torch.count_nonzero(output.tokens[~output.valid_mask]) == 0
     assert torch.count_nonzero(output.feature_map[:, :, :, expected_hw // 2 :]) == 0
 
@@ -147,9 +223,10 @@ def test_encoder_output_shape_masking_and_lattice_metadata(tap, expected_hw):
     assert torch.equal(centers[0], torch.tensor([0.5, 0.5]))
 
 
-def test_encoder_contains_no_global_or_training_time_spatial_normalization():
+@pytest.mark.parametrize("tap", ["rf_large", "dl95"])
+def test_encoder_contains_no_global_or_training_time_spatial_normalization(tap):
     model = LocalEfficientNetV2S(
-        tap="rf_large", local_dim=8, pretrained=False
+        tap=tap, local_dim=8, pretrained=False
     )
     forbidden = (nn.AdaptiveAvgPool2d, nn.BatchNorm2d, nn.MultiheadAttention)
     offenders = [module for module in model.trunk.modules() if isinstance(module, forbidden)]
@@ -171,6 +248,25 @@ def test_real_small_encoder_does_not_leak_a_distant_pixel_to_center_cell():
 
     # The stride-4 center cell has RF 39 and therefore cannot depend on (0,0).
     assert torch.equal(base_map[:, :, 8, 8], perturbed_map[:, :, 8, 8])
+
+
+def test_real_dl95_encoder_keeps_the_stage_three_receptive_field():
+    torch.manual_seed(23)
+    model = LocalEfficientNetV2S(
+        tap="dl95", local_dim=8, pretrained=False, image_is_normalized=False
+    ).eval()
+    base = torch.zeros(1, 3, 128, 128)
+    perturbed = base.clone()
+    perturbed[:, :, 0, 0] = 1.0
+
+    with torch.no_grad():
+        base_map = model.forward_map(base)
+        perturbed_map = model.forward_map(perturbed)
+
+    # Output (2,2) is centred at 64.5 px.  Its exact RF-95 support starts at
+    # 17.5 px, so the corner perturbation cannot alter this evidence value.
+    assert base_map.shape[-2:] == (4, 4)
+    assert torch.equal(base_map[:, :, 2, 2], perturbed_map[:, :, 2, 2])
 
 
 def test_encoder_fallback_mask_is_fixed_across_canonical_image_textures():

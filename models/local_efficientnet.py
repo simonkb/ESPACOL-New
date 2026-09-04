@@ -6,11 +6,18 @@ remain attached to one image location.  This module therefore
 
 * consumes one full image canvas (not a bag of tiles),
 * stops at a named EfficientNetV2-S spatial stage,
-* removes squeeze--excitation at taps that would otherwise introduce global
-  image context,
+* removes or localizes squeeze--excitation gates that would otherwise
+  introduce global image context,
 * freezes BatchNorm statistics so training-time normalization cannot mix
   spatial locations, and
 * uses only channel-wise (pointwise) operations after the tap.
+
+The ``deep_local_95`` variant keeps the original stem and stages 1--3, then
+continues through the complete EfficientNetV2-S semantic hierarchy without
+enlarging the stage-3 receptive field.  Every spatial convolution in feature
+indices 4--7 is replaced by a grouped 1x1 convolution whose weights are the
+spatial sum of the pretrained kernel.  Strides and channel/group structure are
+preserved, yielding a deep 1280-channel, stride-32 lattice with exact RF 95.
 
 ``output_stride`` is the spacing between lattice sites.  It is *not* the
 receptive-field diameter.  Both values are reported explicitly in
@@ -166,13 +173,21 @@ def _canonical_tap(tap: Union[str, int]) -> str:
         "stride16": "rf_large",
         "rf_large": "rf_large",
         "large": "rf_large",
+        32: "deep_local_95",
+        "32": "deep_local_95",
+        "s32": "deep_local_95",
+        "stride32": "deep_local_95",
+        "dl95": "deep_local_95",
+        "deep95": "deep_local_95",
+        "rf95": "deep_local_95",
+        "deep_local_95": "deep_local_95",
     }
     try:
         return aliases[tap]
     except (KeyError, TypeError) as exc:
         raise ValueError(
             f"Unknown local tap {tap!r}; choose rf_small/4, rf_medium/8, "
-            "or rf_large/16."
+            "rf_large/16, or deep_local_95/dl95."
         ) from exc
 
 
@@ -180,6 +195,9 @@ _TAP_TO_FEATURE_INDEX = {
     "rf_small": 2,   # stage2: stride 4, 48 channels
     "rf_medium": 3,  # stage3: stride 8, 64 channels
     "rf_large": 5,   # stage5: stride 16, 160 channels (stage4+5 SE removed)
+    # Full semantic hierarchy.  Spatial kernels in features 4--7 are
+    # collapsed to 1x1, so downsampling continues while the RF remains 95.
+    "deep_local_95": 7,
 }
 
 
@@ -211,18 +229,27 @@ def efficientnet_v2_s_receptive_field(
         se_removed = se_removed or stage.contains_squeeze_excitation
         for block_index in range(stage.blocks):
             stride = stage.first_stride if block_index == 0 else 1
-            padding = (stage.kernel_size - 1) // 2
-            center += ((stage.kernel_size - 1) / 2 - padding) * jump
-            receptive_field += (stage.kernel_size - 1) * jump
+            # deep_local_95 preserves stages 0--3 exactly and replaces every
+            # later spatial kernel by 1x1.  The stage-4 and stage-6 first-block
+            # strides remain, but those blocks no longer enlarge the RF.
+            spatial_kernel = (
+                1
+                if canonical == "deep_local_95" and stage.feature_index >= 4
+                else stage.kernel_size
+            )
+            padding = (spatial_kernel - 1) // 2
+            center += ((spatial_kernel - 1) / 2 - padding) * jump
+            receptive_field += (spatial_kernel - 1) * jump
             jump *= stride
 
     if target_stage is None:  # pragma: no cover - protected by the tap table
         raise RuntimeError(f"No EfficientNet stage found for feature index {target_index}")
 
+    channels = 1280 if canonical == "deep_local_95" else target_stage.channels
     return ReceptiveFieldMetadata(
         tap=canonical,
         feature_index=target_index,
-        channels=target_stage.channels,
+        channels=channels,
         output_stride=jump,
         receptive_field=receptive_field,
         center_offset=center,
@@ -232,11 +259,11 @@ def efficientnet_v2_s_receptive_field(
 
 
 def available_local_taps() -> Dict[str, ReceptiveFieldMetadata]:
-    """Return the three supported locality/semantic trade-off points."""
+    """Return the supported locality/semantic trade-off points."""
 
     return {
         name: efficientnet_v2_s_receptive_field(name)
-        for name in ("rf_small", "rf_medium", "rf_large")
+        for name in ("rf_small", "rf_medium", "rf_large", "deep_local_95")
     }
 
 
@@ -356,14 +383,50 @@ def retinal_field_mask(
         return ellipse & found[:, None, None]
 
 
-def _replace_global_modules(module: nn.Module) -> None:
+class PointwiseSqueezeExcitation(nn.Module):
+    """Local replacement for EfficientNet's globally pooled SE gate.
+
+    The pretrained squeeze/excitation channel transforms are retained, but
+    they are evaluated independently at every lattice site instead of after
+    adaptive global pooling.  This preserves the bounded receptive-field
+    contract and, unlike replacing every SE block by identity, retains the
+    multiplicative gates that stabilize the deep residual hierarchy.
+    """
+
+    def __init__(self, source: SqueezeExcitation) -> None:
+        super().__init__()
+        self.fc1 = source.fc1
+        self.fc2 = source.fc2
+        self.activation = source.activation
+        self.scale_activation = source.scale_activation
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        scale = self.fc1(x)
+        scale = self.activation(scale)
+        scale = self.fc2(scale)
+        scale = self.scale_activation(scale)
+        return scale * x
+
+
+def _replace_global_modules(
+    module: nn.Module,
+    *,
+    pointwise_squeeze_excitation: bool = False,
+) -> None:
     """Make an EfficientNet prefix spatially bounded in train and eval modes."""
 
     for name, child in list(module.named_children()):
         if isinstance(child, SqueezeExcitation):
-            # SE pools the complete spatial map.  Identity retains the
-            # pretrained convolutional path without a hidden global bypass.
-            setattr(module, name, nn.Identity())
+            # Standard SE pools the complete spatial map.  Historical taps
+            # retain their identity replacement for checkpoint compatibility;
+            # DL95 keeps a pretrained, per-site channel gate so its much
+            # deeper residual stack remains numerically well conditioned.
+            replacement: nn.Module
+            if pointwise_squeeze_excitation:
+                replacement = PointwiseSqueezeExcitation(child)
+            else:
+                replacement = nn.Identity()
+            setattr(module, name, replacement)
         elif isinstance(child, nn.BatchNorm2d):
             # BatchNorm in training mode mixes sites through batch/spatial
             # statistics.  FrozenBatchNorm is an exactly pointwise affine map.
@@ -376,7 +439,54 @@ def _replace_global_modules(module: nn.Module) -> None:
                 frozen.running_var.copy_(child.running_var.detach())
             setattr(module, name, frozen)
         else:
-            _replace_global_modules(child)
+            _replace_global_modules(
+                child,
+                pointwise_squeeze_excitation=pointwise_squeeze_excitation,
+            )
+
+
+def _collapse_spatial_convolutions_to_pointwise(module: nn.Module) -> None:
+    """Replace spatial convolutions by pretrained grouped 1x1 operators.
+
+    For a convolutional kernel ``W``, the replacement is initialized as
+    ``W_point = sum_{u,v} W[..., u, v]``.  This is the exact response of the
+    original convolution when every value in its spatial support is equal,
+    and therefore provides a considerably less disruptive initialization
+    than a new random pointwise layer.  Stride, grouping, channels and bias
+    are retained; padding is zero because a 1x1 kernel needs none.
+
+    The function is intentionally applied only to EfficientNet feature
+    indices 4--7 by :class:`LocalEfficientNetV2S`.  Calling it on earlier
+    stages would invalidate the RF-95 contract.
+    """
+
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Conv2d) and child.kernel_size != (1, 1):
+            pointwise = nn.Conv2d(
+                in_channels=child.in_channels,
+                out_channels=child.out_channels,
+                kernel_size=1,
+                stride=child.stride,
+                padding=0,
+                dilation=1,
+                groups=child.groups,
+                bias=child.bias is not None,
+                padding_mode="zeros",
+                device=child.weight.device,
+                dtype=child.weight.dtype,
+            )
+            with torch.no_grad():
+                pointwise.weight.copy_(
+                    child.weight.detach().sum(dim=(-2, -1), keepdim=True)
+                )
+                if child.bias is not None:
+                    pointwise.bias.copy_(child.bias.detach())
+            pointwise.weight.requires_grad_(child.weight.requires_grad)
+            if pointwise.bias is not None and child.bias is not None:
+                pointwise.bias.requires_grad_(child.bias.requires_grad)
+            setattr(module, name, pointwise)
+        else:
+            _collapse_spatial_convolutions_to_pointwise(child)
 
 
 class PointwiseResidualMLP(nn.Module):
@@ -420,10 +530,15 @@ class LocalEfficientNetV2S(nn.Module):
     * ``rf_small`` / ``4``: stage 2, stride 4, RF 39, 48 channels;
     * ``rf_medium`` / ``8``: stage 3, stride 8, RF 95, 64 channels;
     * ``rf_large`` / ``16``: stage 5, stride 16, RF 559, 160 channels.
+    * ``deep_local_95`` / ``dl95``: final stage, stride 32, RF 95,
+      1280 channels.
 
     The large variant removes squeeze--excitation from stages 4--5.  Otherwise
     every nominally local output would depend on the complete image through
-    SE's adaptive global pooling and its RF claim would be false.
+    SE's adaptive global pooling and its RF claim would be false.  The deep
+    RF-95 variant additionally replaces spatial kernels in features 4--7 by
+    pretrained kernel-sum 1x1 operators, retaining the full channel hierarchy
+    without increasing the receptive field beyond stage 3.
     """
 
     TAP_CHANNELS = {name: meta.channels for name, meta in available_local_taps().items()}
@@ -461,9 +576,19 @@ class LocalEfficientNetV2S(nn.Module):
         # weights=None is fully offline and never attempts a download.
         weights = EfficientNet_V2_S_Weights.DEFAULT if pretrained else None
         base = efficientnet_v2_s(weights=weights, progress=progress)
-        prefix = list(base.features.children())[: self.rf_metadata.feature_index + 1]
+        all_features = list(base.features.children())
+        if self.tap == "deep_local_95":
+            # Do not touch features 0--3: they define the exact RF-95 support.
+            # Later feature stages retain their downsampling/channel hierarchy
+            # but cannot acquire additional spatial context.
+            for feature in all_features[4:8]:
+                _collapse_spatial_convolutions_to_pointwise(feature)
+        prefix = all_features[: self.rf_metadata.feature_index + 1]
         self.trunk = nn.Sequential(*prefix)
-        _replace_global_modules(self.trunk)
+        _replace_global_modules(
+            self.trunk,
+            pointwise_squeeze_excitation=self.tap == "deep_local_95",
+        )
 
         self.pointwise = PointwiseResidualMLP(
             self.rf_metadata.channels,
@@ -580,6 +705,7 @@ __all__ = [
     "LocalEfficientNetV2S",
     "LocalEncoderOutput",
     "PointwiseResidualMLP",
+    "PointwiseSqueezeExcitation",
     "ReceptiveFieldMetadata",
     "available_local_taps",
     "centered_ellipse_mask",

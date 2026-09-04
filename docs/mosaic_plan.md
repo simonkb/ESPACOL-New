@@ -2,9 +2,10 @@
 
 Status: **Core implementation complete on `mosaic-ordinal-proof`; independent
 APTOS and EyePACS fold-0 decoder audits complete; raw posterior median locked
-prospectively for new folds**
+prospectively for new folds; controlled DL95 encoder correction ready for
+APTOS fold-0 validation**
 
-Date: 2026-09-03
+Date: 2026-09-04
 
 Data constraint: **EyePACS/Kaggle DR and APTOS image-level grades only**. No
 lesion masks, text encoder, concept labels, manual annotation, or clinician
@@ -39,6 +40,28 @@ with a separate global path.
 MOSAIC is a research hypothesis, not a guarantee of 86% accuracy or venue
 acceptance. The plan is designed to reject it quickly on APTOS before any full
 EyePACS run.
+
+### 1.1 Controlled DL95 correction
+
+The first completed runs exposed a specific representation/counting mismatch,
+not merely an optimisation plateau.  The historical default stops
+EfficientNetV2-S at a 64-channel, stride-8, RF-95 map and counts roughly 9,864
+heavily overlapping valid sites with a count vocabulary truncated at 32.  The
+new `dl95` option preserves the exact RF-95 dependency support while carrying
+features through the complete EfficientNet channel hierarchy.  Spatial
+convolutions after feature index 3 are converted to grouped 1-by-1 operators
+initialized by spatial kernel sums; their original strides produce a
+1280-channel, 28-by-28 lattice.  Globally pooled squeeze-excitation is replaced
+by a pretrained pointwise channel gate.  At 896 pixels the fixed ellipse
+contains 616 evidence sites.
+
+The first causal experiment changes only `--local_stage rf_medium` to
+`--local_stage dl95`; the loss, decoder, learning rates, proof schedule, split,
+and seed remain fixed.  It is launched by
+`submit_mosaic_aptos_dl95_fold0_35.sh`.  Hierarchical counting and a unified
+decision-preserving proof are deliberately deferred until this encoder-only
+ablation establishes whether deeper bounded-local representations improve the
+severe-grade errors.
 
 ## 2. Why the granularity must change
 

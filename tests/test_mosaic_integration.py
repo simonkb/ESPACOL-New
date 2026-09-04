@@ -27,6 +27,7 @@ from models.local_efficientnet import downsample_retinal_field_mask
 from models.mosaic_decoder import proof_only_decisions
 from models.mosaic_model import MOSAICModel
 from train_mosaic import (
+    build_parser,
     default_run_dir,
     parse_folds,
     split_signature,
@@ -842,6 +843,11 @@ def test_dataset_default_run_dirs_and_fold_summaries_do_not_collide() -> None:
         parse_folds("", 5)
     with pytest.raises(ValueError, match="duplicate"):
         parse_folds("0,0", 5)
+
+
+def test_training_cli_accepts_deep_local_95_encoder() -> None:
+    args = build_parser().parse_args(["--local_stage", "dl95"])
+    assert args.local_stage == "dl95"
 
 
 def test_dataset_item_preserves_label_and_stable_sample_index(tmp_path: Path) -> None:

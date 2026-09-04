@@ -66,7 +66,11 @@ def main() -> None:
     parser.add_argument("--labels_csv", default=None)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--image_size", type=int, default=896)
-    parser.add_argument("--local_stage", choices=("rf_small", "rf_medium", "rf_large"), default="rf_medium")
+    parser.add_argument(
+        "--local_stage",
+        choices=("rf_small", "rf_medium", "rf_large", "dl95"),
+        default="rf_medium",
+    )
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--no_pretrained", action="store_true")

@@ -217,8 +217,10 @@ class MOSAICConfig(TrainConfig):
     num_workers: int = 4
     stratified: bool = False  # transition loss handles imbalance without double reweighting
 
-    # Local encoder.  Only pointwise mixing is permitted after the named tap.
-    local_stage: str = "rf_medium"  # rf_small / rf_medium / rf_large
+    # Local encoder. ``dl95`` keeps the RF-95 locality contract while carrying
+    # the representation through the deep EfficientNetV2-S stages at stride
+    # 32.  The historical taps remain the default for checkpoint compatibility.
+    local_stage: str = "rf_medium"  # rf_small / rf_medium / rf_large / dl95
     evidence_dim: int = 128
     grad_checkpoint: bool = False
 

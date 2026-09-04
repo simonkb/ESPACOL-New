@@ -149,7 +149,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=35)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--local_stage", choices=("rf_small", "rf_medium", "rf_large"), default="rf_medium")
+    parser.add_argument(
+        "--local_stage",
+        choices=("rf_small", "rf_medium", "rf_large", "dl95"),
+        default="rf_medium",
+        help=(
+            "Local evidence encoder. dl95 uses the deep stride-32 "
+            "EfficientNetV2-S representation while preserving a 95-pixel "
+            "theoretical receptive field."
+        ),
+    )
     parser.add_argument("--evidence_dim", type=int, default=128)
     parser.add_argument("--grad_checkpoint", action="store_true")
     parser.add_argument("--no_pretrained", action="store_true")
