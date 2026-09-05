@@ -204,6 +204,7 @@ class MosaicTrainer:
         self.amp_total_skipped_steps = 0
         self.amp_total_forward_retries = 0
         self.amp_consecutive_skipped_steps = 0
+        self.amp_consecutive_forward_retries = 0
 
         # Only the ImageNet-initialised convolutional trunk uses the lower
         # backbone LR.  ``encoder.pointwise`` is a new, randomly initialised
@@ -306,6 +307,38 @@ class MosaicTrainer:
             if len(offenders) >= limit:
                 break
         return ", ".join(offenders) if offenders else "unknown parameter"
+
+    def _nonfinite_parameter_summary(self, limit: int = 8) -> str:
+        """Name corrupt parameters or optimizer tensors on an error path."""
+
+        offenders: list[str] = []
+        for name, parameter in self.model.named_parameters():
+            finite = torch.isfinite(parameter)
+            if bool(finite.all()):
+                continue
+            offenders.append(
+                f"parameter:{name}[nonfinite={int((~finite).sum().detach().cpu())}]"
+            )
+            if len(offenders) >= limit:
+                return ", ".join(offenders)
+        parameter_names = {
+            id(parameter): name for name, parameter in self.model.named_parameters()
+        }
+        for parameter, state in self.optimizer.state.items():
+            name = parameter_names.get(id(parameter), "unknown")
+            for key, value in state.items():
+                if not torch.is_tensor(value):
+                    continue
+                finite = torch.isfinite(value)
+                if bool(finite.all()):
+                    continue
+                offenders.append(
+                    f"optimizer:{name}.{key}"
+                    f"[nonfinite={int((~finite).sum().detach().cpu())}]"
+                )
+                if len(offenders) >= limit:
+                    return ", ".join(offenders)
+        return ", ".join(offenders) if offenders else "all stored tensors finite"
 
     @staticmethod
     def _nonfinite_output_summary(output) -> str:
@@ -413,6 +446,18 @@ class MosaicTrainer:
                         batch_index,
                         source,
                     )
+                    self.amp_consecutive_forward_retries += 1
+                    if (
+                        self.amp_consecutive_forward_retries
+                        >= self.cfg.amp_max_consecutive_skips
+                    ):
+                        raise FloatingPointError(
+                            "persistent non-finite MOSAIC AMP forwards: "
+                            f"{self.amp_consecutive_forward_retries} consecutive "
+                            f"batches by epoch {epoch}, batch {batch_index}; "
+                            "GradScaler cannot repair forward overflow. "
+                            f"Latest offenders: {source}"
+                        )
                     if output is not None:
                         del output
                     try:
@@ -423,10 +468,12 @@ class MosaicTrainer:
                                 project=project,
                             )
                     except FloatingPointError as fp32_exc:
+                        stored_state = self._nonfinite_parameter_summary()
                         raise FloatingPointError(
                             "non-finite MOSAIC forward after FP32 retry at "
                             f"epoch {epoch}, batch {batch_index}; "
-                            f"AMP source: {source}; FP32 source: {fp32_exc}"
+                            f"AMP source: {source}; FP32 source: {fp32_exc}; "
+                            f"stored state: {stored_state}"
                         ) from fp32_exc
                     forward_retried = True
                     amp_forward_retries += 1
@@ -437,6 +484,8 @@ class MosaicTrainer:
                         "non-finite MOSAIC FP32 forward at "
                         f"epoch {epoch}, batch {batch_index}: {amp_forward_error}"
                     ) from amp_forward_error
+                else:
+                    self.amp_consecutive_forward_retries = 0
                 assert output is not None
                 if output_issues:
                     precision = "FP32 retry" if forward_retried else "FP32 forward"

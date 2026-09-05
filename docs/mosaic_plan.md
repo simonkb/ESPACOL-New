@@ -50,14 +50,29 @@ heavily overlapping valid sites with a count vocabulary truncated at 32.  The
 new `dl95` option preserves the exact RF-95 dependency support while carrying
 features through the complete EfficientNet channel hierarchy.  Spatial
 convolutions after feature index 3 are converted to grouped 1-by-1 operators
-initialized by spatial kernel sums; their original strides produce a
-1280-channel, 28-by-28 lattice.  Globally pooled squeeze-excitation is replaced
-by a pretrained pointwise channel gate.  At 896 pixels the fixed ellipse
-contains 616 evidence sites.
+using the pretrained spatial-sum direction with a source-norm upper cap; their
+original strides produce a 1280-channel, 28-by-28 lattice.  These compiled
+spatial kernels are fixed, while the surrounding pretrained pointwise layers
+and new evidence head remain trainable.  Globally pooled squeeze-excitation is
+replaced by a pretrained pointwise channel gate.  At 896 pixels the fixed
+ellipse contains 616 evidence sites.
 
-The first causal experiment changes only `--local_stage rf_medium` to
+The initial unconstrained kernel-sum implementation is rejected.  On its first
+APTOS run, real-data FP16 overflow began at epoch 1 batch 3 and became permanent
+from batch 49; 10,802 failed AMP forwards were replayed in FP32, validation QWK
+remained zero, and the run eventually failed during epoch 15.  This was a
+DL95-compilation defect rather than evidence about the MOSAIC proof head.  The
+corrected contract (i) never amplifies a collapsed kernel beyond its source
+norm, (ii) fixes the structurally compiled depthwise scalars, (iii) evaluates
+the DL95 trunk in FP32, and (iv) aborts repeated AMP-forward retries instead of
+silently replaying an invalid experiment.  A 16-step canary now uses real
+augmented APTOS images and executes optimizer steps before training starts.
+
+The corrected causal experiment changes the bounded-local encoder to
 `--local_stage dl95`; the loss, decoder, learning rates, proof schedule, split,
-and seed remain fixed.  It is launched by
+and seed remain fixed.  DL95 runs in FP32 because all downstream proof
+arithmetic was already explicitly FP32 and V100 FP16 cannot represent the
+converted tail's intermediate range.  It is launched by
 `submit_mosaic_aptos_dl95_fold0_35.sh`.  Hierarchical counting and a unified
 decision-preserving proof are deliberately deferred until this encoder-only
 ablation establishes whether deeper bounded-local representations improve the

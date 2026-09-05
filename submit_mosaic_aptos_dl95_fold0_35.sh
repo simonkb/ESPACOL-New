@@ -26,7 +26,7 @@ cd /dpc/kuin0170/ESPACOL-New
 export HF_HUB_OFFLINE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-RUN_DIR="${MOSAIC_RUN_DIR:-runs/mosaic_aptos_f0_dl95_v1}"
+RUN_DIR="${MOSAIC_RUN_DIR:-runs/mosaic_aptos_f0_dl95_v2}"
 FOLD=0
 TOTAL_EPOCHS=35
 FOLD_DIR="${RUN_DIR}/fold${FOLD}"
@@ -90,19 +90,39 @@ python -m pytest -q \
   tests/test_local_efficientnet.py \
   tests/test_mosaic_integration.py
 
-# Exercise the actual AMP + checkpointed DL95 training path once at the
-# configured image and batch sizes.  This fails early on non-finite activations,
-# gradients, or insufficient GPU memory instead of losing an experiment hours
-# into training.
+# Exercise the exact DL95 precision and optimizer policy on real augmented
+# fundus images.  The old one-step, all-zero smoke was the special case for
+# which spatial kernel summation is exact; it also never executed AdamW.step().
+# This multi-step canary would have caught the epoch-1 activation runaway before
+# launching the failed 15-epoch experiment.
 python - <<'PY'
-import torch
+import random
 
+import torch
+from PIL import Image
+
+from Datasets.mosaic_data import (
+    MosaicFundusTransform,
+    aptos_fold,
+    load_aptos_items,
+)
 from losses.mosaic import MosaicLoss
 from models.mosaic_model import build_mosaic_model
-from utils.spatial_mask import centered_ellipse_mask
 
-labels = torch.tensor([0, 1, 3, 4], device="cuda")
-train_labels = [0] * 1300 + [1] * 266 + [2] * 719 + [3] * 139 + [4] * 212
+torch.manual_seed(31)
+random.seed(31)
+root = "Datasets/aptos2019-blindness-detection"
+items = load_aptos_items(root)
+train_items, _, _ = aptos_fold(items, fold=0, n_folds=5, val_fraction=0.1, seed=42)
+by_grade = {
+    grade: [item for item in train_items if item[1] == grade][:4]
+    for grade in range(5)
+}
+canary_items = [item for grade in range(5) for item in by_grade[grade]]
+if any(len(by_grade[grade]) < 4 for grade in range(5)):
+    raise RuntimeError("APTOS canary requires at least four images per grade")
+transform = MosaicFundusTransform(896, augment=True)
+
 model = build_mosaic_model(
     num_classes=5,
     image_size=896,
@@ -115,7 +135,7 @@ model = build_mosaic_model(
     complement_suppression=0.5,
 ).cuda().train()
 criterion = MosaicLoss.from_training_labels(
-    train_labels,
+    [label for _, label in train_items],
     5,
     weight_method="effective_num",
     weight_beta=0.999,
@@ -123,36 +143,93 @@ criterion = MosaicLoss.from_training_labels(
     dense_weight=0.1,
     transition_reduction="boundary_mean",
 ).cuda()
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-image = torch.zeros(4, 3, 896, 896, device="cuda")
-mask = centered_ellipse_mask(
-    896, 896, batch_size=4, device=torch.device("cuda")
+encoder_parameters = list(model.encoder.trunk.parameters())
+encoder_ids = {id(parameter) for parameter in encoder_parameters}
+head_parameters = [
+    parameter for parameter in model.parameters()
+    if id(parameter) not in encoder_ids
+]
+optimizer = torch.optim.AdamW(
+    [
+        {"params": encoder_parameters, "lr": 1e-4},
+        {"params": head_parameters, "lr": 5e-4},
+    ],
+    weight_decay=1e-5,
 )
-scaler = torch.amp.GradScaler("cuda", init_scale=8192.0, growth_interval=2000)
-optimizer.zero_grad(set_to_none=True)
-with torch.amp.autocast("cuda"):
-    output = model(image, mask, project=True)
+
+stage_peaks = {str(index): 0.0 for index in range(len(model.encoder.trunk))}
+
+def stage_hook(name):
+    def check(_module, _inputs, output):
+        if not torch.isfinite(output).all():
+            raise RuntimeError(f"non-finite DL95 canary stage {name}")
+        stage_peaks[name] = max(stage_peaks[name], float(output.detach().abs().max()))
+    return check
+
+handles = [
+    stage.register_forward_hook(stage_hook(str(index)))
+    for index, stage in enumerate(model.encoder.trunk)
+]
+
+for step in range(16):
+    selected = [canary_items[(4 * step + offset) % len(canary_items)] for offset in range(4)]
+    images = []
+    masks = []
+    labels = []
+    for path, label in selected:
+        with Image.open(path) as source:
+            image, mask = transform(source.convert("RGB"))
+        images.append(image)
+        masks.append(mask)
+        labels.append(label)
+    image_batch = torch.stack(images).cuda(non_blocking=True)
+    mask_batch = torch.stack(masks).cuda(non_blocking=True)
+    label_batch = torch.tensor(labels, device="cuda")
+
+    optimizer.zero_grad(set_to_none=True)
+    output = model(image_batch, mask_batch, project=False)
     loss, _ = criterion(
         output.transitions,
-        labels,
+        label_batch,
         projected_stop_probabilities=output.stop_probabilities,
         projected_log_stop_probabilities=output.log_stop_probabilities,
         dense_transitions=output.dense_transitions,
         dense_stop_probabilities=output.dense_stop_probabilities,
         dense_log_stop_probabilities=output.dense_log_stop_probabilities,
     )
-if not torch.isfinite(loss):
-    raise RuntimeError(f"non-finite DL95 smoke loss: {float(loss.detach())}")
-scaler.scale(loss).backward()
-scaler.unscale_(optimizer)
-grad_norm = torch.nn.utils.clip_grad_norm_(
-    model.parameters(), 5.0, error_if_nonfinite=True
-)
+    if not torch.isfinite(loss):
+        raise RuntimeError(f"non-finite DL95 canary loss at step {step + 1}")
+    loss.backward()
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(), 5.0, error_if_nonfinite=True
+    )
+    optimizer.step()
+
+    for name, parameter in model.named_parameters():
+        if not torch.isfinite(parameter).all():
+            raise RuntimeError(f"non-finite DL95 parameter after step {step + 1}: {name}")
+    for _parameter, state in optimizer.state.items():
+        for name, value in state.items():
+            if torch.is_tensor(value) and not torch.isfinite(value).all():
+                raise RuntimeError(
+                    f"non-finite DL95 AdamW state after step {step + 1}: {name}"
+                )
+    print(
+        "dl95_canary_step",
+        step + 1,
+        "loss",
+        float(loss.detach()),
+        "grad_norm",
+        float(grad_norm),
+    )
+
+for handle in handles:
+    handle.remove()
 print(
-    "dl95_training_smoke",
+    "dl95_real_training_canary",
     {
-        "loss": float(loss.detach()),
-        "grad_norm": float(grad_norm),
+        "steps": 16,
+        "stage_peak_abs": stage_peaks,
         "valid_cells": model.expected_valid_cells,
         "peak_cuda_gib": torch.cuda.max_memory_allocated() / 2**30,
     },
@@ -192,6 +269,7 @@ python train_mosaic.py \
   --lr 1e-4 \
   --head_lr 5e-4 \
   --weight_decay 1e-5 \
+  --no_amp \
   --amp_init_scale 8192 \
   --amp_growth_interval 2000 \
   --amp_max_consecutive_skips 8

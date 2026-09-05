@@ -15,9 +15,12 @@ remain attached to one image location.  This module therefore
 The ``deep_local_95`` variant keeps the original stem and stages 1--3, then
 continues through the complete EfficientNetV2-S semantic hierarchy without
 enlarging the stage-3 receptive field.  Every spatial convolution in feature
-indices 4--7 is replaced by a grouped 1x1 convolution whose weights are the
-spatial sum of the pretrained kernel.  Strides and channel/group structure are
-preserved, yielding a deep 1280-channel, stride-32 lattice with exact RF 95.
+indices 4--7 is replaced by a fixed grouped 1x1 convolution whose weights use
+the spatial-sum direction of the pretrained kernel, capped at the source
+kernel norm.  Strides and channel/group structure are preserved, yielding a
+deep 1280-channel, stride-32 lattice with exact RF 95.  Keeping the compiled
+spatial kernels fixed prevents unconstrained fine-tuning from destroying their
+pretrained scale.
 
 ``output_stride`` is the spacing between lattice sites.  It is *not* the
 receptive-field diameter.  Both values are reported explicitly in
@@ -449,11 +452,18 @@ def _collapse_spatial_convolutions_to_pointwise(module: nn.Module) -> None:
     """Replace spatial convolutions by pretrained grouped 1x1 operators.
 
     For a convolutional kernel ``W``, the replacement is initialized as
-    ``W_point = sum_{u,v} W[..., u, v]``.  This is the exact response of the
-    original convolution when every value in its spatial support is equal,
-    and therefore provides a considerably less disruptive initialization
-    than a new random pointwise layer.  Stride, grouping, channels and bias
-    are retained; padding is zero because a 1x1 kernel needs none.
+    ``d = sum_{u,v} W[..., u, v]``.  This preserves the source kernel's DC
+    direction, but an unconstrained sum can have up to ``kernel_size`` times
+    its norm.  We therefore apply only an upper cap,
+    ``W_point = d * min(1, ||W||_F / ||d||_2)`` per output channel.  Unlike full
+    norm matching, the cap never amplifies a near-cancelling pretrained filter.
+
+    The compiled kernel is fixed: Adam's scale-invariant update otherwise
+    moves near-cancelling sums (some are below ``1e-4``) by a large relative
+    amount and destabilizes the deep frozen-normalization stack.  Surrounding
+    pretrained 1x1 transforms, local SE gates, and the new evidence adapter
+    remain trainable.  Stride, grouping, channels and bias are retained;
+    padding is zero because a 1x1 kernel needs none.
 
     The function is intentionally applied only to EfficientNet feature
     indices 4--7 by :class:`LocalEfficientNetV2S`.  Calling it on earlier
@@ -476,14 +486,26 @@ def _collapse_spatial_convolutions_to_pointwise(module: nn.Module) -> None:
                 dtype=child.weight.dtype,
             )
             with torch.no_grad():
+                source = child.weight.detach()
+                collapsed = source.sum(dim=(-2, -1), keepdim=True)
+                source_norm = source.flatten(1).norm(dim=1)
+                collapsed_norm = collapsed.flatten(1).norm(dim=1)
+                upper_cap = torch.minimum(
+                    torch.ones_like(source_norm),
+                    source_norm
+                    / collapsed_norm.clamp_min(torch.finfo(source.dtype).eps),
+                )
                 pointwise.weight.copy_(
-                    child.weight.detach().sum(dim=(-2, -1), keepdim=True)
+                    collapsed * upper_cap[:, None, None, None]
                 )
                 if child.bias is not None:
                     pointwise.bias.copy_(child.bias.detach())
-            pointwise.weight.requires_grad_(child.weight.requires_grad)
+            # The collapse is a fixed compilation of spatial pretrained
+            # filters, not a freely trainable replacement layer.  Gradients
+            # still pass through it to earlier feature stages.
+            pointwise.weight.requires_grad_(False)
             if pointwise.bias is not None and child.bias is not None:
-                pointwise.bias.requires_grad_(child.bias.requires_grad)
+                pointwise.bias.requires_grad_(False)
             setattr(module, name, pointwise)
         else:
             _collapse_spatial_convolutions_to_pointwise(child)
@@ -537,8 +559,8 @@ class LocalEfficientNetV2S(nn.Module):
     every nominally local output would depend on the complete image through
     SE's adaptive global pooling and its RF claim would be false.  The deep
     RF-95 variant additionally replaces spatial kernels in features 4--7 by
-    pretrained kernel-sum 1x1 operators, retaining the full channel hierarchy
-    without increasing the receptive field beyond stage 3.
+    fixed, norm-capped pretrained kernel-sum 1x1 operators, retaining the full
+    channel hierarchy without increasing the receptive field beyond stage 3.
     """
 
     TAP_CHANNELS = {name: meta.channels for name, meta in available_local_taps().items()}
@@ -613,15 +635,27 @@ class LocalEfficientNetV2S(nn.Module):
         """Return the pretrained tap map before the trainable pointwise head."""
         if image.ndim != 4 or image.shape[1] != 3:
             raise ValueError(f"image must have shape (N,3,H,W); got {tuple(image.shape)}")
-        if self.grad_checkpoint and self.training and torch.is_grad_enabled():
-            features = checkpoint_sequential(
-                self.trunk,
-                max(1, len(self.trunk)),
-                image,
-                use_reentrant=False,
-            )
+        # DL95 replaces a pretrained spatial tail by a deep pointwise residual
+        # circuit.  On V100, real fundus batches demonstrated that this circuit
+        # can exceed FP16's finite range even while the corresponding FP32
+        # computation remains valid.  GradScaler cannot repair a forward
+        # overflow, so DL95 owns an explicit FP32 precision boundary.  The
+        # shallower historical taps retain ordinary outer-autocast behavior.
+        def run_trunk(trunk_input: torch.Tensor) -> torch.Tensor:
+            if self.grad_checkpoint and self.training and torch.is_grad_enabled():
+                return checkpoint_sequential(
+                    self.trunk,
+                    max(1, len(self.trunk)),
+                    trunk_input,
+                    use_reentrant=False,
+                )
+            return self.trunk(trunk_input)
+
+        if self.tap == "deep_local_95":
+            with torch.autocast(device_type=image.device.type, enabled=False):
+                features = run_trunk(image.float())
         else:
-            features = self.trunk(image)
+            features = run_trunk(image)
         return features
 
     def project_trunk_map(self, features: torch.Tensor) -> torch.Tensor:

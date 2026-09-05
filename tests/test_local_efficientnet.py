@@ -75,7 +75,7 @@ def test_pointwise_head_cannot_spread_a_spatial_perturbation():
     assert torch.count_nonzero(outside) == 0
 
 
-def test_dl95_kernel_collapse_preserves_groups_stride_and_constant_response():
+def test_dl95_kernel_collapse_preserves_direction_caps_norm_and_is_fixed():
     conv = nn.Conv2d(
         4,
         4,
@@ -87,8 +87,14 @@ def test_dl95_kernel_collapse_preserves_groups_stride_and_constant_response():
     )
     with torch.no_grad():
         conv.weight.copy_(torch.arange(36, dtype=torch.float32).reshape(4, 1, 3, 3))
+        # A near-cancelling filter exercises the one-sided nature of the cap:
+        # safe small sums must not be amplified to the source norm.
+        conv.weight[3].zero_()
+        conv.weight[3, 0, 0, 0] = 1.0
+        conv.weight[3, 0, 0, 1] = -0.75
         conv.bias.copy_(torch.arange(4, dtype=torch.float32))
-    expected_weight = conv.weight.detach().sum(dim=(-2, -1), keepdim=True)
+    source = conv.weight.detach().clone()
+    spatial_sum = source.sum(dim=(-2, -1), keepdim=True)
     module = nn.Sequential(conv)
 
     _collapse_spatial_convolutions_to_pointwise(module)
@@ -97,8 +103,15 @@ def test_dl95_kernel_collapse_preserves_groups_stride_and_constant_response():
     assert collapsed.kernel_size == (1, 1)
     assert collapsed.stride == (2, 2)
     assert collapsed.groups == 4
-    assert torch.equal(collapsed.weight, expected_weight)
+    collapsed_norm = collapsed.weight.flatten(1).norm(dim=1)
+    source_norm = source.flatten(1).norm(dim=1)
+    assert torch.all(collapsed_norm <= source_norm + 1e-6)
+    assert torch.all(collapsed.weight > 0)
+    torch.testing.assert_close(collapsed_norm[:3], source_norm[:3])
+    torch.testing.assert_close(collapsed.weight[3], spatial_sum[3])
     assert torch.equal(collapsed.bias, torch.arange(4, dtype=torch.float32))
+    assert collapsed.weight.requires_grad is False
+    assert collapsed.bias.requires_grad is False
 
 
 def test_dl95_retains_spatial_kernels_only_through_feature_three():
@@ -149,6 +162,28 @@ def test_pointwise_projection_is_fp32_under_encoder_autocast():
 
     assert projected.dtype == torch.float32
     assert torch.isfinite(projected).all()
+
+
+def test_dl95_trunk_is_fp32_under_outer_autocast():
+    model = LocalEfficientNetV2S(
+        tap="dl95",
+        local_dim=8,
+        pretrained=False,
+        dropout=0.0,
+        grad_checkpoint=True,
+    ).train()
+    image = torch.randn(1, 3, 64, 64, requires_grad=True)
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        features = model.forward_trunk_map(image)
+        loss = features.square().mean()
+    loss.backward()
+
+    assert features.dtype == torch.float32
+    assert torch.isfinite(features).all()
+    assert image.grad is not None
+    assert image.grad.dtype == torch.float32
+    assert torch.isfinite(image.grad).all()
 
 
 def test_mask_downsampling_uses_coverage_and_preserves_empty_field():
