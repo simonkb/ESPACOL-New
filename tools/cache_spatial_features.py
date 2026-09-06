@@ -68,7 +68,7 @@ def main() -> None:
     parser.add_argument("--image_size", type=int, default=896)
     parser.add_argument(
         "--local_stage",
-        choices=("rf_small", "rf_medium", "rf_large", "dl95"),
+        choices=("rf_small", "rf_medium", "rf_large"),
         default="rf_medium",
     )
     parser.add_argument("--batch_size", type=int, default=8)

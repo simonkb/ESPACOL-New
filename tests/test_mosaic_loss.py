@@ -198,6 +198,23 @@ class ContinuationLikelihoodTests(unittest.TestCase):
         self.assertEqual(float(log_stops.grad[0, 0]), -1.0)
         self.assertTrue(torch.isfinite(log_stops.grad).all())
 
+    def test_direct_log_advance_is_used_without_probability_round_trip(self) -> None:
+        transitions = torch.zeros(1, 4, requires_grad=True)
+        log_transitions = torch.tensor(
+            [[-200.0, -100.0, -50.0, -25.0]], requires_grad=True
+        )
+        loss = balanced_continuation_nll(
+            transitions,
+            torch.tensor([4]),
+            log_transition_probabilities=log_transitions,
+        )
+        self.assertAlmostEqual(float(loss.detach()), 375.0, places=5)
+        loss.backward()
+        self.assertTrue(
+            torch.equal(log_transitions.grad, -torch.ones_like(log_transitions))
+        )
+        self.assertEqual(float(transitions.grad.abs().sum()), 0.0)
+
     def test_negative_infinite_stop_outside_risk_set_does_not_create_nan(self) -> None:
         transitions = torch.tensor([[0.8, 0.7, 0.6, 0.5]], requires_grad=True)
         log_stops = torch.tensor(
@@ -270,6 +287,142 @@ class WitnessStabilityTests(unittest.TestCase):
 
 
 class CombinedMosaicLossTests(unittest.TestCase):
+    def test_dead_positive_proof_uses_dense_loss_exactly_once(self) -> None:
+        projected = torch.tensor(
+            [[0.2, 0.5]], dtype=torch.float64, requires_grad=True
+        )
+        dense = torch.tensor(
+            [[0.25, 0.4]], dtype=torch.float64, requires_grad=True
+        )
+        criterion = MosaicLoss(3, dense_weight=0.2)
+        total, diagnostics = criterion(
+            projected,
+            torch.tensor([2]),
+            dense_transitions=dense,
+            proof_sizes=torch.tensor([[0, 1]]),
+        )
+
+        expected_primary = -math.log(0.25) - math.log(0.5)
+        expected_dense_aux = -math.log(0.4)
+        self.assertAlmostEqual(
+            float(total.detach()),
+            expected_primary + 0.2 * expected_dense_aux,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            float(diagnostics["loss_ccl"]), expected_primary, places=12
+        )
+        self.assertAlmostEqual(
+            float(diagnostics["loss_dense"]), expected_dense_aux, places=12
+        )
+        self.assertAlmostEqual(
+            float(diagnostics["loss_dead_positive_rescue"]),
+            -math.log(0.25),
+            places=12,
+        )
+        self.assertEqual(float(diagnostics["dead_positive_count"]), 1.0)
+        self.assertEqual(float(diagnostics["dead_positive_rate"]), 0.5)
+        self.assertEqual(float(diagnostics["dead_positive_boundary_0"]), 1.0)
+        self.assertEqual(float(diagnostics["dead_positive_boundary_1"]), 0.0)
+
+        total.backward()
+        torch.testing.assert_close(
+            projected.grad,
+            torch.tensor([[0.0, -2.0]], dtype=torch.float64),
+            atol=1e-12,
+            rtol=0,
+        )
+        # Boundary 0 is the unscaled primary dense term (-log(.25)), not the
+        # erroneous (1 + eta) multiple. Boundary 1 keeps eta * -log(.4).
+        torch.testing.assert_close(
+            dense.grad,
+            torch.tensor([[-4.0, -0.5]], dtype=torch.float64),
+            atol=1e-12,
+            rtol=0,
+        )
+
+    def test_zero_projected_transition_triggers_dense_rescue(self) -> None:
+        projected = torch.tensor([[0.0]], dtype=torch.float64, requires_grad=True)
+        dense = torch.tensor([[0.4]], dtype=torch.float64, requires_grad=True)
+        total, diagnostics = MosaicLoss(2, dense_weight=0.3)(
+            projected,
+            torch.tensor([1]),
+            dense_transitions=dense,
+            proof_sizes=torch.ones(1, 1, dtype=torch.long),
+        )
+
+        self.assertAlmostEqual(float(total.detach()), -math.log(0.4), places=12)
+        self.assertEqual(float(diagnostics["dead_positive_count"]), 1.0)
+        total.backward()
+        self.assertEqual(float(projected.grad), 0.0)
+        self.assertAlmostEqual(float(dense.grad), -2.5, places=12)
+
+    def test_empty_stop_proof_is_not_a_dead_positive(self) -> None:
+        projected = torch.tensor([[0.2]], dtype=torch.float64, requires_grad=True)
+        dense = torch.tensor([[0.8]], dtype=torch.float64, requires_grad=True)
+        total, diagnostics = MosaicLoss(2, dense_weight=0.2)(
+            projected,
+            torch.tensor([0]),
+            dense_transitions=dense,
+            proof_sizes=torch.zeros(1, 1, dtype=torch.long),
+        )
+
+        expected = -math.log(0.8) + 0.2 * -math.log(0.2)
+        self.assertAlmostEqual(float(total.detach()), expected, places=12)
+        self.assertEqual(float(diagnostics["dead_positive_count"]), 0.0)
+        total.backward()
+        self.assertAlmostEqual(float(projected.grad), 1.25, places=12)
+        self.assertAlmostEqual(float(dense.grad), 1.0, places=12)
+
+    def test_dead_positive_rescue_preserves_boundary_mean_coefficients(self) -> None:
+        projected = torch.tensor(
+            [[0.2, 0.5]], dtype=torch.float64, requires_grad=True
+        )
+        dense = torch.tensor(
+            [[0.25, 0.4]], dtype=torch.float64, requires_grad=True
+        )
+        criterion = MosaicLoss(
+            3,
+            dense_weight=0.2,
+            transition_reduction="boundary_mean",
+            at_risk_counts=torch.tensor([10, 2]),
+        )
+        total, _ = criterion(
+            projected,
+            torch.tensor([2]),
+            dense_transitions=dense,
+            proof_sizes=torch.tensor([[0, 1]]),
+        )
+
+        # Fixed boundary scales are 10/(2*10)=0.5 and 10/(2*2)=2.5.
+        expected = (
+            0.5 * -math.log(0.25)
+            + 2.5 * -math.log(0.5)
+            + 0.2 * 2.5 * -math.log(0.4)
+        )
+        self.assertAlmostEqual(float(total.detach()), expected, places=12)
+        total.backward()
+        torch.testing.assert_close(
+            projected.grad,
+            torch.tensor([[0.0, -5.0]], dtype=torch.float64),
+            atol=1e-12,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            dense.grad,
+            torch.tensor([[-2.0, -1.25]], dtype=torch.float64),
+            atol=1e-12,
+            rtol=0,
+        )
+
+    def test_proof_sizes_must_match_projected_transitions(self) -> None:
+        with self.assertRaisesRegex(ValueError, "proof_sizes"):
+            MosaicLoss(3, dense_weight=0.0)(
+                torch.full((2, 2), 0.5),
+                torch.tensor([0, 2]),
+                proof_sizes=torch.zeros(2, 1),
+            )
+
     def test_combined_objective_and_diagnostics(self) -> None:
         projected = torch.tensor(
             [[0.2, 0.3, 0.4, 0.5], [0.8, 0.7, 0.6, 0.5]], requires_grad=True

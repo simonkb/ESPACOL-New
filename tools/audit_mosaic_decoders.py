@@ -642,6 +642,8 @@ def main() -> None:
         complement_suppression=cfg.necessity_fraction,
         count_implementation=cfg.count_implementation,
         count_block_size=cfg.count_block_size,
+        region_grid_size=cfg.region_grid_size,
+        region_pool_temperature=cfg.region_pool_temperature,
     ).to(device)
     model.load_state_dict(checkpoint["model_state"], strict=True)
     model.eval()

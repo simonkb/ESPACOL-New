@@ -21,6 +21,7 @@ from models.mosaic import (
     continuation_probabilities,
     fixed_proof_pivotality,
     nested_witness_probabilities,
+    regional_logmeanexp_ordinal_evidence,
 )
 
 
@@ -68,6 +69,140 @@ def test_nested_local_witnesses_are_structural_and_masked() -> None:
         extreme.witness_probabilities[..., :-1]
         >= extreme.witness_probabilities[..., 1:]
     )
+
+
+def test_regional_logmeanexp_matches_definition_and_keeps_peak_provenance() -> None:
+    # Four 2x2 source blocks, with the bottom-right block deliberately invalid.
+    logits = torch.tensor(
+        [
+            [
+                [4.0, 0.0, 0.0, 0.0],
+                [0.0, 4.0, 0.0, 0.0],
+                [0.0, 0.0, 4.0, 0.0],
+                [0.0, 0.0, 0.0, 4.0],
+            ]
+            * 4
+        ],
+        requires_grad=True,
+    )
+    valid = torch.ones(1, 16, dtype=torch.bool)
+    valid[:, 10:] = False
+    source = nested_witness_probabilities(logits, valid)
+    temperature = 0.25
+    pooled = regional_logmeanexp_ordinal_evidence(
+        source, valid, (4, 4), (2, 2), temperature=temperature
+    )
+
+    assert pooled.evidence.witness_probabilities.shape == (1, 4, 3)
+    assert pooled.evidence.state_probabilities.shape == (1, 4, 4)
+    assert torch.equal(
+        pooled.valid_mask, torch.tensor([[True, True, True, False]])
+    )
+    assert torch.all(
+        pooled.evidence.witness_probabilities[..., :-1]
+        >= pooled.evidence.witness_probabilities[..., 1:]
+    )
+    torch.testing.assert_close(
+        pooled.evidence.state_probabilities.sum(dim=-1), torch.ones(1, 4)
+    )
+    assert torch.equal(
+        pooled.evidence.state_probabilities[0, 3],
+        torch.tensor([1.0, 0.0, 0.0, 0.0]),
+    )
+    assert torch.equal(pooled.source_indices[0, 3], torch.full((3,), -1))
+
+    source_blocks = (
+        torch.arange(16)
+        .reshape(2, 2, 2, 2)
+        .permute(0, 2, 1, 3)
+        .reshape(4, 4)
+    )
+    for region in range(3):
+        block_indices = source_blocks[region]
+        block_indices = block_indices[valid[0, block_indices]]
+        for boundary in range(3):
+            source_index = int(pooled.source_indices[0, region, boundary])
+            assert valid[0, source_index]
+            source_logits = (
+                source.log_witness_probabilities[0, block_indices, boundary]
+                - source.log_nonwitness_probabilities[0, block_indices, boundary]
+            )
+            expected_logit = temperature * (
+                torch.logsumexp(source_logits / temperature, dim=0)
+                - math.log(len(block_indices))
+            )
+            torch.testing.assert_close(
+                pooled.evidence.witness_probabilities[0, region, boundary],
+                expected_logit.sigmoid(),
+            )
+            assert source_index == int(
+                block_indices[source_logits.argmax()]
+            )
+
+    # The smooth event is not the provenance peak when a region is
+    # heterogeneous; the peak index is explanatory metadata only.
+    first_peak = pooled.source_indices[0, 0, 0]
+    assert not torch.isclose(
+        pooled.evidence.witness_probabilities[0, 0, 0],
+        source.witness_probabilities[0, first_peak, 0],
+    )
+
+    pooled.evidence.witness_probabilities.sum().backward()
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+    # All valid source cells receive gradient; winner-take-all pooling would not.
+    assert torch.all(logits.grad[valid].abs().sum(dim=-1) > 0)
+    assert pooled.temperature == temperature
+
+
+def test_regional_peak_provenance_uses_stable_logits_at_saturation() -> None:
+    # Both cumulative witnesses round to exactly one in FP32, but the second
+    # cell has the larger finite log-odds and must remain the representative.
+    logits = torch.tensor([[[-50.0, 50.0], [-100.0, 100.0]]])
+    valid = torch.ones(1, 2, dtype=torch.bool)
+    source = nested_witness_probabilities(logits, valid)
+    assert torch.equal(
+        source.witness_probabilities,
+        torch.ones_like(source.witness_probabilities),
+    )
+    pooled = regional_logmeanexp_ordinal_evidence(
+        source, valid, (1, 2), (1, 1), temperature=0.25
+    )
+    assert int(pooled.source_indices[0, 0, 0]) == 1
+
+
+def test_regional_logmeanexp_has_equal_input_identity() -> None:
+    logits = torch.tensor([[[2.0, 0.5, -1.0]]]).repeat(1, 16, 1)
+    valid = torch.ones(1, 16, dtype=torch.bool)
+    source = nested_witness_probabilities(logits, valid)
+    for temperature in (0.1, 0.25, 1.0, 4.0):
+        pooled = regional_logmeanexp_ordinal_evidence(
+            source, valid, (4, 4), (2, 2), temperature=temperature
+        )
+        torch.testing.assert_close(
+            pooled.evidence.witness_probabilities,
+            source.witness_probabilities[:, :1].expand(-1, 4, -1),
+            atol=2e-7,
+            rtol=2e-7,
+        )
+
+
+def test_regional_logmeanexp_requires_a_fixed_partition_and_positive_temperature() -> None:
+    evidence = nested_witness_probabilities(torch.zeros(1, 15, 3))
+    with pytest.raises(ValueError, match="divide exactly"):
+        regional_logmeanexp_ordinal_evidence(
+            evidence, torch.ones(1, 15, dtype=torch.bool), (3, 5), (2, 2)
+        )
+    valid_evidence = nested_witness_probabilities(torch.zeros(1, 16, 3))
+    for temperature in (0.0, -0.1, math.inf, math.nan):
+        with pytest.raises(ValueError, match="temperature"):
+            regional_logmeanexp_ordinal_evidence(
+                valid_evidence,
+                torch.ones(1, 16, dtype=torch.bool),
+                (4, 4),
+                (2, 2),
+                temperature=temperature,
+            )
 
 
 def test_local_head_bias_matches_requested_initial_abnormal_count() -> None:
@@ -196,6 +331,63 @@ def test_scaled_log_lower_tail_block_tree_matches_serial() -> None:
     torch.testing.assert_close(
         tree_conditional, serial_conditional, atol=3e-5, rtol=3e-5
     )
+
+
+def test_log_count_distribution_block_tree_matches_serial_and_probability() -> None:
+    torch.manual_seed(92)
+    probabilities = torch.rand(2, 3, 37) * 0.4
+    count = TruncatedPoissonBinomial(8, implementation="block_tree", block_size=7)
+    serial = count.log_distribution(probabilities, implementation="serial")
+    tree = count.log_distribution(probabilities, implementation="block_tree")
+    probability_distribution = count(probabilities)
+    torch.testing.assert_close(tree, serial, atol=3e-5, rtol=3e-5)
+    torch.testing.assert_close(
+        tree.exp(), probability_distribution, atol=3e-6, rtol=3e-5
+    )
+
+
+def test_dead_positive_dense_log_tail_recovers_from_probability_underflow() -> None:
+    """Finite local logits must train even when every FP32 tail rounds to zero."""
+
+    cells = 64
+    logits = torch.full((1, cells, 5), -200.0)
+    logits[..., 0] = 0.0
+    logits.requires_grad_()
+    core = MOSAICOrdinalCore(
+        num_classes=5,
+        max_count=32,
+        implementation="block_tree",
+        block_size=64,
+    )
+    output = core(logits, project=True)
+    assert torch.equal(
+        output.dense_transitions, torch.zeros_like(output.dense_transitions)
+    )
+    assert torch.isfinite(output.dense_log_transition_probabilities).all()
+    assert torch.equal(
+        output.proof.proof_size, torch.zeros_like(output.proof.proof_size)
+    )
+
+    loss, diagnostics = MosaicLoss(5, dense_weight=0.1)(
+        output.transitions,
+        torch.tensor([4]),
+        projected_log_transition_probabilities=output.log_transition_probabilities,
+        projected_log_stop_probabilities=output.log_stop_probabilities,
+        dense_transitions=output.dense_transitions,
+        dense_log_transition_probabilities=(
+            output.dense_log_transition_probabilities
+        ),
+        dense_log_stop_probabilities=output.dense_log_stop_probabilities,
+        proof_sizes=output.proof.proof_size,
+    )
+    assert torch.isfinite(loss)
+    assert float(diagnostics["dead_positive_count"]) == 4.0
+    loss.backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+    assert float(logits.grad.abs().sum()) > 0.0
+    assert core.circuit.alpha_logits.grad is not None
+    assert torch.isfinite(core.circuit.alpha_logits.grad).all()
+    assert float(core.circuit.alpha_logits.grad.abs().sum()) > 0.0
 
 
 def test_scaled_log_lower_tail_has_endpoint_safe_semantics_and_gradients() -> None:

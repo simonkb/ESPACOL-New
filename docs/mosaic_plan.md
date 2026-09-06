@@ -2,10 +2,10 @@
 
 Status: **Core implementation complete on `mosaic-ordinal-proof`; independent
 APTOS and EyePACS fold-0 decoder audits complete; raw posterior median locked
-prospectively for new folds; controlled DL95 encoder correction ready for
-APTOS fold-0 validation**
+prospectively for new folds; DL95 rejected; RF-medium regional-event v3 ready
+for one controlled APTOS fold-0 validation**
 
-Date: 2026-09-04
+Date: 2026-09-06
 
 Data constraint: **EyePACS/Kaggle DR and APTOS image-level grades only**. No
 lesion masks, text encoder, concept labels, manual annotation, or clinician
@@ -41,42 +41,56 @@ MOSAIC is a research hypothesis, not a guarantee of 86% accuracy or venue
 acceptance. The plan is designed to reject it quickly on APTOS before any full
 EyePACS run.
 
-### 1.1 Controlled DL95 correction
+### 1.1 Rejected ablation: compiled deep RF-95 encoder
 
-The first completed runs exposed a specific representation/counting mismatch,
-not merely an optimisation plateau.  The historical default stops
-EfficientNetV2-S at a 64-channel, stride-8, RF-95 map and counts roughly 9,864
-heavily overlapping valid sites with a count vocabulary truncated at 32.  The
-new `dl95` option preserves the exact RF-95 dependency support while carrying
-features through the complete EfficientNet channel hierarchy.  Spatial
-convolutions after feature index 3 are converted to grouped 1-by-1 operators
-using the pretrained spatial-sum direction with a source-norm upper cap; their
-original strides produce a 1280-channel, 28-by-28 lattice.  These compiled
-spatial kernels are fixed, while the surrounding pretrained pointwise layers
-and new evidence head remain trainable.  Globally pooled squeeze-excitation is
-replaced by a pretrained pointwise channel gate.  At 896 pixels the fixed
-ellipse contains 616 evidence sites.
+DL95 attempted to retain the complete EfficientNet channel hierarchy while
+compiling all post-stage-3 spatial kernels to pointwise operations. Its first
+run exposed FP16 overflow; the corrected v2 then completed all 35 epochs in
+FP32 with no numerical error. That clean run nevertheless remained exactly at
+QWK 0, alternating between all-grade-0 and all-grade-1 predictions, while its
+proof used roughly 90% of the 616 events. DL95 is therefore rejected as a
+representation failure, not scheduled for more LR tuning or an EyePACS run.
+The implementation remains in git history as a negative ablation; it is no
+longer exposed by the active training CLI. The general non-finite forward and
+optimizer-state protections introduced during that audit are retained.
 
-The initial unconstrained kernel-sum implementation is rejected.  On its first
-APTOS run, real-data FP16 overflow began at epoch 1 batch 3 and became permanent
-from batch 49; 10,802 failed AMP forwards were replayed in FP32, validation QWK
-remained zero, and the run eventually failed during epoch 15.  This was a
-DL95-compilation defect rather than evidence about the MOSAIC proof head.  The
-corrected contract (i) never amplifies a collapsed kernel beyond its source
-norm, (ii) fixes the structurally compiled depthwise scalars, (iii) evaluates
-the DL95 trunk in FP32, and (iv) aborts repeated AMP-forward retries instead of
-silently replaying an invalid experiment.  A 16-step canary now uses real
-augmented APTOS images and executes optimizer steps before training starts.
+### 1.2 Active correction: disjoint regional event envelope
 
-The corrected causal experiment changes the bounded-local encoder to
-`--local_stage dl95`; the loss, decoder, learning rates, proof schedule, split,
-and seed remain fixed.  DL95 runs in FP32 because all downstream proof
-arithmetic was already explicitly FP32 and V100 FP16 cannot represent the
-converted tail's intermediate range.  It is launched by
-`submit_mosaic_aptos_dl95_fold0_35.sh`.  Hierarchical counting and a unified
-decision-preserving proof are deliberately deferred until this encoder-only
-ablation establishes whether deeper bounded-local representations improve the
-severe-grade errors.
+The successful RF-medium checkpoint reveals a different, measured defect. It
+feeds 9,864 stride-8 cells with RF 95 into a circuit truncated at count 32.
+Neighbouring events therefore have about 92% receptive-field overlap on each
+axis. On APTOS advance cases, early-boundary count overflow is frequently near
+one and hundreds of overlapping cells can enter one proof. The count then
+models replicated views of one pattern as if they were distinct Bernoulli
+events.
+
+MOSAIC-v3 keeps the proven RF-medium encoder unchanged and partitions its
+112-by-112 source lattice into a fixed 8-by-8 grid of equal, disjoint
+14-by-14-cell regions. For region $G_b$, boundary $k$, and
+$a_{n,i,k}=\operatorname{logit}(\lambda_{n,i,k})$, the count event is
+
+\[
+r_{n,b,k}=\sigma\!\left(\tau_R\left[
+\log\sum_{i\in G_b:\,v_i=1}\exp(a_{n,i,k}/\tau_R)
+-\log|G_b^{\rm valid}|\right]\right),\qquad \tau_R=0.25.
+\]
+
+This normalized LogMeanExp preserves both a constant source probability and
+the cumulative order $r_{b,k}\ge r_{b,k+1}$, while distributing gradient to
+all valid sources. The existing exact
+Poisson--binomial circuit, proof projector, posterior-median decoder, imbalance
+weights, optimizer, and schedule then operate on at most 64 fixed regional
+events. The boundary-specific largest RF-95 source is serialized as
+representative provenance, but causal sufficiency belongs to the whole smooth
+regional event. A regional event's conservative
+receptive field is the union of its source RFs (199 pixels at 896 input), not
+the 112-pixel distance between regional centers.
+
+The event-head normal bias is calibrated against the number of valid regional
+events. This is necessary because the initial source-cell probabilities are
+equal and normalized LogMeanExp has exact equal-input identity; calibrating
+against 9,864 source cells would make the initial regional abnormal count
+almost zero.
 
 ## 2. Why the granularity must change
 
@@ -236,28 +250,56 @@ later boundary must support all earlier boundaries. It does not claim that the
 clinical lesion inventory of grade \(k+1\) literally contains every lesion of
 grade \(k\).
 
-Calibrate the local-state bias quantitatively toward state 0. With \(P\) valid
-cells, choose an initial expected abnormal count \(\mu_0\in[0.1,1]\) so
+Calibrate the local-state bias quantitatively toward state 0. With \(E\) valid
+events entering the active circuit, choose an initial expected abnormal count
+\(\mu_0\in[0.1,1]\) so
 
 \[
-P\,P(L_i>0)\approx\mu_0.
+E\,P(L_i>0)\approx\mu_0.
 \]
 
 For four equal abnormal-state logits, the normal-state logit advantage is
-approximately \(\log(4P/\mu_0)\), roughly 10--13 at this lattice size. A merely
-“strong” conventional bias would let thousands of tiny background
-probabilities saturate the count distribution. Grade-0 images then provide
-abundant negative-bag supervision that drives abnormal probabilities down
-without pixel labels.
+approximately \(\log(4E/\mu_0)\). Here \(E\) is the number of valid regional
+events for v3 and the number of valid source cells only when regional pooling
+is disabled. Grade-0 images then provide abundant negative-bag supervision
+that drives abnormal probabilities down without pixel labels.
 
-### 4.3 Exact truncated Poisson--binomial cardinality law
+### 4.3 Fixed disjoint regional event envelope
 
-For boundary \(k\), treat every valid cell as a Bernoulli regional witness:
+Let \(G_1,\ldots,G_B\) be the fixed 8-by-8 partition of the source lattice.
+For \(a_{n,i,k}=\operatorname{logit}(\lambda_{n,i,k})\), the event ledger
+consumed by the count circuit is the normalized LogMeanExp envelope
 
 \[
-Z_{n,i,k}\sim\operatorname{Bernoulli}(\lambda_{n,i,k}),
+r_{n,b,k}=\sigma\!\left(
+\tau_R\left[
+\log\sum_{i\in G_b:\,v_i=1}\exp(a_{n,i,k}/\tau_R)
+-\log |G_b^{\rm valid}|
+\right]\right),
+\qquad b=1,\ldots,B,\quad B\le64.
+\]
+
+We fix \(\tau_R=0.25\). Subtracting \(\log |G_b^{\rm valid}|\) gives exact
+equal-input identity: a constant source field \(\lambda_{n,i,k}=p\) maps to
+the regional event \(r_{n,b,k}=p\), independent of block size. An empty region
+is invalid and excluded. The partition is identical for every image and cannot
+communicate acquisition shape or label information. Because logit, LogMeanExp,
+and sigmoid are monotone, \(r_{n,b,k}\ge r_{n,b,k+1}\) follows directly from
+the nested source witnesses. All valid source cells receive gradient. The
+largest source witness is carried through only as boundary-specific spatial
+provenance; it does not define or individually certify the regional event.
+This is not a noisy-OR and must not be described as the probability that any
+independent lesion occurs inside a region; it is a deterministic smooth
+envelope over correlated local scores.
+
+### 4.4 Exact truncated Poisson--binomial cardinality law
+
+For boundary \(k\), treat every valid regional event as a Bernoulli witness:
+
+\[
+Z_{n,b,k}\sim\operatorname{Bernoulli}(r_{n,b,k}),
 \qquad
-C_{n,k}(S)=\sum_{i\in S}Z_{n,i,k}.
+C_{n,k}(S)=\sum_{b\in S}Z_{n,b,k}.
 \]
 
 The model counts regional evidence events, not manually annotated lesions. The
@@ -271,7 +313,7 @@ masses \(0,\ldots,R-1\) plus an overflow bucket \(R\equiv C\ge R\). Initialise
 D^{(0)}_0=1,\qquad D^{(0)}_r=0\quad(r=1,\ldots,R).
 \]
 
-After witness probability \(e=\lambda_{n,i,k}\), update
+After regional witness probability \(e=r_{n,b,k}\), update
 
 \[
 D'_0=(1-e)D_0,
@@ -384,7 +426,7 @@ arithmetic and stabilized in both simplex and log-tail representations;
 replay and intervention equalities are asserted to a serialized numerical
 tolerance rather than as bitwise identities across CPU and CUDA reductions.
 
-### 4.4 Deterministic dual proof projection
+### 4.5 Deterministic dual proof projection
 
 For boundary \(k\), sort valid witness probabilities
 
@@ -452,7 +494,7 @@ part of the computation because it determines \(\widetilde c_k\), the selected
 indices, and the proof size; it must be serialized so certificate replay
 reproduces selection as well as the final score.
 
-### 4.5 Exclusive continuation cascade
+### 4.6 Exclusive continuation cascade
 
 Interpret \(c_{n,k}\) as the conditional probability of advancing from rung
 \(k\) to \(k+1\), and compute its stop partner directly as
@@ -547,24 +589,29 @@ as causal evidence. Black, grey, blur, and inpainting baselines can introduce
 out-of-distribution content; mask colour and shape can themselves encode the
 label.
 
-MOSAIC can intervene at one explicit boundary-witness node:
+In MOSAIC-v3, the proof circuit can intervene at one explicit regional
+boundary-witness node:
 
 \[
-\operatorname{do}(\lambda_{n,i,k}=0).
+\operatorname{do}(r_{n,b,k}=0).
 \]
 
-The coherent whole-region intervention instead replaces the complete local
-state by normal, \(\rho_{n,i}=(1,0,\ldots,0)\), and therefore sets all four
-nested boundary witnesses for that cell to zero.
+The coherent whole-region intervention sets the complete regional cumulative
+state to normal, \(r_{n,b,0}=\cdots=r_{n,b,K-2}=0\). The fixed source-cell
+partition and the LogMeanExp denominator do not change under either
+intervention; removing cells from the validity mask would redefine the event
+rather than hide its evidence. A source-level intervention is possible only by
+recomputing the regional envelope and is not equivalent to removing its
+representative peak, because other source cells continue to contribute.
 
-For a fixed certificate, the exact direct effect of hiding selected cell \(i\)
+For a fixed certificate, the exact direct effect of hiding selected region \(b\)
 at boundary \(k\) is
 
 \[
-\delta_{n,i,k}
-=\mathbf1[i\in S_{n,k}^*]\left[
-F_k(\boldsymbol\lambda^+_{n,k,m_k^*})
--F_k(\boldsymbol\lambda^+_{n,k,m_k^*}\setminus\lambda_{n,i,k})
+\delta_{n,b,k}
+=\mathbf1[b\in S_{n,k}^*]\left[
+F_k(\mathbf r^+_{n,k,m_k^*})
+-F_k(\mathbf r^+_{n,k,m_k^*}\setminus r_{n,b,k})
 \right].
 \]
 
@@ -572,10 +619,10 @@ Using the count distribution of the other selected witnesses gives the
 equivalent closed form
 
 \[
-\delta_{n,i,k}
-=\mathbf1[i\in S_{n,k}^*]\lambda_{n,i,k}
+\delta_{n,b,k}
+=\mathbf1[b\in S_{n,k}^*]r_{n,b,k}
 \sum_{r=1}^{R}\alpha_{k,r}
-P(C_{S_{n,k}^*\setminus i}=r-1).
+P(C_{S_{n,k}^*\setminus b}=r-1).
 \]
 
 No backward pass, gradient approximation, surrogate mask network, new image,
@@ -585,16 +632,16 @@ the circuit's boundary probability.
 For the cumulative boundary \(j\ge k\), holding the other transitions fixed,
 
 \[
-q_{n,j}-q_{n,j}^{(-i,k)}
-=\delta_{n,i,k}
+q_{n,j}-q_{n,j}^{(-b,k)}
+=\delta_{n,b,k}
 \prod_{\substack{\ell=0\\\ell\ne k}}^{j}c_{n,\ell}.
 \]
 
-If the deterministic proof is recomputed after hiding \(i\), another region
+If the deterministic proof is recomputed after hiding \(b\), another region
 may replace it. Therefore report two quantities:
 
-1. **proof-conditional pivotality**: hide \(i\) while holding the proof fixed;
-2. **adaptive replacement effect**: hide \(i\), recompute the proof, and report
+1. **proof-conditional pivotality**: hide \(b\) while holding the proof fixed;
+2. **adaptive replacement effect**: hide \(b\), recompute the proof, and report
    the end-to-end grade change.
 
 Adaptive reprojection is not guaranteed monotone: after evidence is reduced,
@@ -602,7 +649,7 @@ the projection can expand and admit replacement regions, making its selected
 score larger even though the dense and fixed-proof scores decreased. Treat
 that behaviour as a redundancy diagnostic, not a contradiction.
 
-Do not call every selected cell universally causally necessary. What is proven
+Do not call every selected region universally causally necessary. What is proven
 is tolerance-conditioned minimum normal-baseline sufficiency and
 \(\rho_n\)-collective score necessity for the fixed witness ledger.
 
@@ -644,18 +691,41 @@ weights. Do not balance only the five nominal classes: the useful imbalance
 structure lives in the four at-risk transitions.
 
 Use the same boundary-normalized continuation likelihood on the dense transitions
-\(\widetilde c_{n,k}\), denoted \(\mathcal L_{\mathrm{dense}}\). It supplies
-label gradients to witnesses currently outside the hard certificate and
-prevents an early random prefix from becoming self-reinforcing. This is the
-same circuit before projection, not a second classifier.
+\(\widetilde c_{n,k}\), denoted \(\ell^d_{n,k}\). It supplies label gradients
+to witnesses currently outside the hard certificate and prevents an early
+random prefix from becoming self-reinforcing. This is the same circuit before
+projection, not a second classifier.
+
+The audit exposed one hard-projection dead state. A positive boundary may
+receive an empty proof when its dense score lies inside the sufficiency
+tolerance. Its projected score is then exactly zero, and clamping before
+\(-\log c\) gives no recovery gradient. Define the detached gate
+
+\[
+d_{n,k}=\mathbf 1[y_n>k]\,
+\mathbf 1[m^*_{n,k}=0\ \lor\ c^p_{n,k}=0].
+\]
+
+Only for this state, replace the unusable projected likelihood by the dense
+likelihood. With dense coefficient \(\eta_d\), the per-boundary objective is
+
+\[
+(1-d_{n,k})\ell^p_{n,k}
++[\eta_d+(1-\eta_d)d_{n,k}]\ell^d_{n,k}.
+\]
+
+Thus an ordinary entry remains exactly \(\ell^p+\eta_d\ell^d\), while a dead
+positive entry receives \(\ell^d\) exactly once. This is a training-time
+gradient repair inside the same cardinality circuit; inference remains
+strictly proof-exclusive.
 
 The complete initial objective is deliberately small:
 
 \[
 \mathcal L
-=\mathcal L_{\mathrm{CCL}}
-+\eta_d\mathcal L_{\mathrm{dense}}
-+\lambda_{\mathrm{stab}}\mathcal L_{\mathrm{stab}}.
+=\mathcal R\!\left((1-d)\ell^p
++[\eta_d+(1-\eta_d)d]\ell^d\right)
++\lambda_{\mathrm{stab}}\mathcal L_{\mathrm{stab}},
 \]
 
 Here \(\mathcal L_{\mathrm{stab}}\) is Jensen--Shannon consistency between the
@@ -699,12 +769,13 @@ For each predicted image, return a machine-readable certificate:
 - the predicted class distribution;
 - four transition probabilities \(c_k\);
 - the learned extent distributions \(\alpha_k\);
-- the selected cell coordinates and their known receptive-field boxes;
+- the selected regional coordinates and their conservative receptive-field
+  boxes, plus a boundary-specific peak source as representative provenance;
 - the local categorical states \(\rho_i\);
 - retained and complement count distributions and tail probabilities;
 - sufficiency gap \(\widetilde c_k-c_k\);
 - complement residual \(F_k(\boldsymbol\lambda_k^-)\);
-- proof-conditional pivotality for every selected cell.
+- proof-conditional pivotality for every selected regional event.
 
 The current certificate implements the items above, together with source and
 checkpoint hashes and a serialized CPU/CUDA replay tolerance. Adaptive

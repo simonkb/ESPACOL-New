@@ -118,6 +118,8 @@ class MosaicTrainer:
         "num_workers",
         "local_stage",
         "evidence_dim",
+        "region_grid_size",
+        "region_pool_temperature",
         "pretrained",
         "grad_checkpoint",
         "max_count",
@@ -351,7 +353,7 @@ class MosaicTrainer:
         clipping or otherwise changing the ordinal likelihood.
         """
 
-        checks = (
+        checks = [
             ("transitions", output.transitions, False),
             ("dense_transitions", output.dense_transitions, False),
             ("log_stop_probabilities", output.log_stop_probabilities, True),
@@ -360,7 +362,15 @@ class MosaicTrainer:
                 output.dense_log_stop_probabilities,
                 True,
             ),
-        )
+        ]
+        for name in (
+            "log_transition_probabilities",
+            "dense_log_transition_probabilities",
+        ):
+            tensor = getattr(output, name, None)
+            if tensor is not None:
+                # -inf is the exact log representation of a zero advance.
+                checks.append((name, tensor, True))
         invalid_masks: list[tuple[str, torch.Tensor]] = []
         for name, tensor, allow_negative_infinity in checks:
             invalid = torch.isnan(tensor) | torch.isposinf(tensor)
@@ -502,10 +512,17 @@ class MosaicTrainer:
                         output.transitions,
                         labels,
                         projected_stop_probabilities=output.stop_probabilities,
+                        projected_log_transition_probabilities=(
+                            output.log_transition_probabilities
+                        ),
                         projected_log_stop_probabilities=output.log_stop_probabilities,
                         dense_transitions=output.dense_transitions,
                         dense_stop_probabilities=output.dense_stop_probabilities,
+                        dense_log_transition_probabilities=(
+                            output.dense_log_transition_probabilities
+                        ),
                         dense_log_stop_probabilities=output.dense_log_stop_probabilities,
+                        proof_sizes=output.proof.proof_size,
                     )
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"non-finite MOSAIC loss at epoch {epoch}")
@@ -650,6 +667,11 @@ class MosaicTrainer:
             for metric_name, value in rule_metrics.items():
                 metrics[f"decoder_{rule_name}_{metric_name}"] = value
         proof_size_matrix = torch.cat(proof_sizes).cpu()
+        boundaries_cpu = torch.arange(self.cfg.n_classes - 1).unsqueeze(0)
+        positive_entries = labels_cpu.unsqueeze(1) > boundaries_cpu
+        dead_positive_entries = positive_entries & (
+            proof_size_matrix.eq(0) | transitions_cpu.eq(0)
+        )
         sizes = proof_size_matrix.flatten()
         fractions = torch.cat(proof_fractions).flatten().cpu()
         sufficiency_gap_mean = torch.cat(sufficiency_gaps).mean().cpu()
@@ -674,9 +696,18 @@ class MosaicTrainer:
                 "amp_skipped_steps": float(amp_skipped_steps),
                 "amp_forward_retries": float(amp_forward_retries),
                 "amp_loss_scale": float(self.scaler.get_scale()),
+                "dead_positive_count": float(dead_positive_entries.sum()),
+                "dead_positive_rate": float(
+                    dead_positive_entries.sum().float()
+                    / positive_entries.sum().float().clamp_min(1.0)
+                ),
             }
         )
         for key, value in diagnostic_sums.items():
+            if key in {"dead_positive_count", "dead_positive_rate"}:
+                # These are recomputed exactly from the complete epoch above;
+                # averaging per-batch ratios or counts would be misleading.
+                continue
             metrics[key] = float((value / max(sample_count, 1)).cpu())
         boundary_risk_cpu = boundary_risk_sums.cpu()
         boundary_advance_cpu = boundary_advance_sums.cpu()
@@ -690,6 +721,7 @@ class MosaicTrainer:
             stop = labels_cpu == boundary
             zero_proof = proof_size_matrix[:, boundary] == 0
             zero_transition = transitions_cpu[:, boundary] == 0
+            dead_positive = (zero_proof | zero_transition) & advance
             advance_count = int(advance.sum())
             stop_count = int(stop.sum())
             metrics[f"zero_proof_rate_boundary_{boundary}"] = float(
@@ -707,6 +739,14 @@ class MosaicTrainer:
             )
             metrics[f"zero_transition_advance_rate_boundary_{boundary}"] = (
                 float((zero_transition & advance).sum()) / advance_count
+                if advance_count > 0
+                else 0.0
+            )
+            metrics[f"dead_positive_boundary_{boundary}"] = float(
+                dead_positive.sum()
+            )
+            metrics[f"dead_positive_rate_boundary_{boundary}"] = (
+                float(dead_positive.sum()) / advance_count
                 if advance_count > 0
                 else 0.0
             )
@@ -808,9 +848,15 @@ class MosaicTrainer:
             ),
             "config": asdict(self.cfg),
             "architecture": {
-                "output_stride": self.model.output_stride,
-                "receptive_field": self.model.receptive_field,
-                "expected_valid_cells": self.model.expected_valid_cells,
+                "source_output_stride": self.model.output_stride,
+                "source_receptive_field": self.model.receptive_field,
+                "source_expected_valid_cells": self.model.expected_valid_cells,
+                "region_grid_size": self.model.region_grid_size,
+                "regional_pool": "normalized_logmeanexp_logit",
+                "region_pool_temperature": self.model.region_pool_temperature,
+                "proof_output_stride": self.model.proof_output_stride,
+                "proof_receptive_field": self.model.proof_receptive_field,
+                "expected_valid_proof_events": self.model.expected_valid_regions,
                 "preprocessing_version": self.cfg.preprocessing_version,
                 "no_global_bypass": True,
                 "decision_rule": self.cfg.decision_rule,
@@ -957,12 +1003,19 @@ class MosaicTrainer:
 
     def fit(self, *, evaluate_test: bool = True) -> dict:
         logger.info(
-            "MOSAIC fold=%d device=%s stride=%d RF=%d decision=%s "
+            "MOSAIC fold=%d device=%s source_stride=%d source_RF=%d "
+            "region_grid=%d region_tau=%.4g proof_stride=%d proof_RF=%d "
+            "proof_events=%d decision=%s "
             "transition_reduction=%s at_risk_counts=%s transition_weights=%s",
             self.fold,
             self.device,
             self.model.output_stride,
             self.model.receptive_field,
+            self.model.region_grid_size,
+            self.model.region_pool_temperature,
+            self.model.proof_output_stride,
+            self.model.proof_receptive_field,
+            self.model.expected_valid_regions,
             self.cfg.decision_rule,
             self.cfg.transition_reduction,
             (

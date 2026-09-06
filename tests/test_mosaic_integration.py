@@ -225,6 +225,57 @@ def test_model_initial_count_prior_matches_canonical_fallback_support() -> None:
     )
 
 
+def test_regional_model_counts_only_smooth_disjoint_events_and_reports_honest_geometry() -> None:
+    model = _tiny_model(region_grid_size=2, region_pool_temperature=0.25)
+    with torch.no_grad():
+        output = model(
+            torch.zeros(1, 3, 64, 64),
+            return_local_features=True,
+        )
+
+    assert output.source_lattice is not None
+    assert output.source_valid_mask is not None
+    assert output.source_lattice.lattice_size == (8, 8)
+    assert output.lattice.lattice_size == (2, 2)
+    assert output.lattice.output_stride == 32
+    # A regional LME event depends on the union of four-by-four RF-95 cells.
+    assert output.lattice.receptive_field.receptive_field == 119
+    assert output.lattice.receptive_field.tap.endswith("_regional_lme_2x2")
+    assert output.valid_mask.shape == (1, 4)
+    assert output.evidence.witness_probabilities.shape == (1, 4, 4)
+    assert output.proof.selected_mask.shape == (1, 4, 4)
+    assert output.evidence.regional_source_indices is not None
+    assert output.evidence.regional_source_indices.shape == (1, 4, 4)
+    assert output.evidence.regional_pool_temperature == 0.25
+    assert output.local_features is not None
+    assert output.local_features.shape == (1, 64, 8)
+    assert model.expected_valid_regions == int(output.valid_mask.sum())
+    # The normalized LME equal-input identity preserves the requested initial
+    # abnormal evidence mass independently of source cells per region.
+    expected_abnormal = output.evidence.witness_probabilities[..., 0].sum()
+    assert abs(float(expected_abnormal) - 0.5) < 0.03
+
+
+def test_cached_source_features_reproduce_regional_forward_exactly() -> None:
+    torch.manual_seed(210)
+    model = _tiny_model(region_grid_size=2)
+    image = torch.randn(1, 3, 64, 64)
+    with torch.no_grad():
+        image_output = model(image, return_local_features=True)
+        cached = model.forward_from_features(
+            image_output.local_features,
+            image_output.source_valid_mask,
+            lattice_size=image_output.source_lattice.lattice_size,
+            project=True,
+        )
+    torch.testing.assert_close(cached.transitions, image_output.transitions, atol=0, rtol=0)
+    assert torch.equal(cached.proof.selected_mask, image_output.proof.selected_mask)
+    assert torch.equal(
+        cached.regional_source_indices,
+        image_output.evidence.regional_source_indices,
+    )
+
+
 def test_cached_local_features_reproduce_image_forward_exactly() -> None:
     torch.manual_seed(21)
     model = _tiny_model()
@@ -845,9 +896,15 @@ def test_dataset_default_run_dirs_and_fold_summaries_do_not_collide() -> None:
         parse_folds("0,0", 5)
 
 
-def test_training_cli_accepts_deep_local_95_encoder() -> None:
-    args = build_parser().parse_args(["--local_stage", "dl95"])
-    assert args.local_stage == "dl95"
+def test_training_cli_retires_dl95_and_accepts_regional_envelope() -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--local_stage", "dl95"])
+    args = build_parser().parse_args(
+        ["--region_grid_size", "8", "--region_pool_temperature", "0.4"]
+    )
+    assert args.local_stage == "rf_medium"
+    assert args.region_grid_size == 8
+    assert args.region_pool_temperature == 0.4
 
 
 def test_dataset_item_preserves_label_and_stable_sample_index(tmp_path: Path) -> None:

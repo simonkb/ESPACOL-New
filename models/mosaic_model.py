@@ -13,6 +13,7 @@ head that can bypass the reported proof.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Optional, Sequence
 
 import torch
@@ -21,6 +22,7 @@ import torch.nn as nn
 from .local_efficientnet import (
     LatticeMetadata,
     LocalEfficientNetV2S,
+    ReceptiveFieldMetadata,
     downsample_retinal_field_mask,
 )
 from .mosaic import MOSAICOutput, MOSAICProofHead
@@ -40,6 +42,8 @@ class MOSAICModelOutput:
     valid_mask: torch.Tensor
     lattice: LatticeMetadata
     local_features: Optional[torch.Tensor] = None
+    source_lattice: Optional[LatticeMetadata] = None
+    source_valid_mask: Optional[torch.Tensor] = None
     decision_rule: str = "rounded_expected"
     decision_transition_weights: Optional[torch.Tensor] = None
     decisions: Optional[ProofOnlyDecisionBundle] = None
@@ -59,12 +63,20 @@ class MOSAICModelOutput:
         return self.evidence.dense_stop_probabilities
 
     @property
+    def dense_log_transition_probabilities(self) -> torch.Tensor:
+        return self.evidence.dense_log_transition_probabilities
+
+    @property
     def dense_log_stop_probabilities(self) -> torch.Tensor:
         return self.evidence.dense_log_stop_probabilities
 
     @property
     def stop_probabilities(self) -> torch.Tensor:
         return self.evidence.stop_probabilities
+
+    @property
+    def log_transition_probabilities(self) -> torch.Tensor:
+        return self.evidence.log_transition_probabilities
 
     @property
     def log_stop_probabilities(self) -> torch.Tensor:
@@ -178,10 +190,18 @@ class MOSAICModel(nn.Module):
         count_block_size: int = 64,
         decision_rule: str = "rounded_expected",
         transition_weights: torch.Tensor | Sequence[Sequence[float]] | None = None,
+        region_grid_size: int = 0,
+        region_pool_temperature: float = 0.25,
     ) -> None:
         super().__init__()
         self.num_classes = int(num_classes)
         self.image_size = int(image_size)
+        if region_grid_size < 0:
+            raise ValueError("region_grid_size must be non-negative")
+        self.region_grid_size = int(region_grid_size)
+        if not math.isfinite(region_pool_temperature) or region_pool_temperature <= 0.0:
+            raise ValueError("region_pool_temperature must be finite and positive")
+        self.region_pool_temperature = float(region_pool_temperature)
         self.encoder = LocalEfficientNetV2S(
             tap=local_stage,
             local_dim=local_dim,
@@ -199,16 +219,47 @@ class MOSAICModel(nn.Module):
         self.expected_valid_cells = int(canonical_lattice_mask.sum())
         if self.expected_valid_cells <= 0:
             raise RuntimeError("canonical MOSAIC support contains no valid lattice cells")
+        self.expected_valid_regions = self.expected_valid_cells
+        if self.region_grid_size:
+            if expected_side % self.region_grid_size:
+                raise ValueError(
+                    "the source lattice must divide exactly into the configured "
+                    f"regional grid ({expected_side} vs {self.region_grid_size})"
+                )
+            block = expected_side // self.region_grid_size
+            regional_mask = (
+                canonical_lattice_mask.reshape(
+                    1,
+                    self.region_grid_size,
+                    block,
+                    self.region_grid_size,
+                    block,
+                )
+                .permute(0, 1, 3, 2, 4)
+                .reshape(1, self.region_grid_size**2, block * block)
+                .any(dim=-1)
+            )
+            self.expected_valid_regions = int(regional_mask.sum())
+            if self.expected_valid_regions <= 0:
+                raise RuntimeError("canonical MOSAIC regional support is empty")
         self.proof_head = MOSAICProofHead(
             input_dim=local_dim,
             num_classes=self.num_classes,
-            expected_num_cells=self.expected_valid_cells,
+            # The head bias calibrates the events consumed by the count
+            # circuit. The normalised regional LogMeanExp has equal-input
+            # identity, so one fixed region is one
+            # Bernoulli event; using all 9,864 source sites here would reduce
+            # the intended initial evidence mass by roughly two orders of
+            # magnitude because LME_tau(logit(p),...,logit(p))=logit(p).
+            expected_num_cells=self.expected_valid_regions,
             initial_abnormal_count=initial_abnormal_count,
             max_count=max_count,
             sufficiency_tolerance=sufficiency_tolerance,
             complement_suppression=complement_suppression,
             implementation=count_implementation,
             block_size=count_block_size,
+            region_grid_size=self.region_grid_size,
+            region_pool_temperature=self.region_pool_temperature,
         )
         # Runtime decoder metadata is deliberately non-persistent.  It is
         # reconstructed from the training criterion/checkpoint, so legacy
@@ -292,6 +343,63 @@ class MOSAICModel(nn.Module):
     def output_stride(self) -> int:
         return self.encoder.output_stride
 
+    @property
+    def proof_output_stride(self) -> int:
+        if not self.region_grid_size:
+            return self.encoder.output_stride
+        source_side = (self.image_size + self.encoder.output_stride - 1) // self.encoder.output_stride
+        return self.encoder.output_stride * (source_side // self.region_grid_size)
+
+    @property
+    def proof_receptive_field(self) -> int:
+        if not self.region_grid_size:
+            return self.encoder.receptive_field
+        source_side = (self.image_size + self.encoder.output_stride - 1) // self.encoder.output_stride
+        block = source_side // self.region_grid_size
+        return self.encoder.receptive_field + (block - 1) * self.encoder.output_stride
+
+    def _proof_lattice(self, source: LatticeMetadata) -> LatticeMetadata:
+        """Return truthful geometry for the events consumed by the proof.
+
+        A regional LogMeanExp event depends on every valid source RF inside its
+        fixed block, so its theoretical support is the union of those RFs. The
+        finer source-lattice peak remains available separately as provenance.
+        """
+
+        if not self.region_grid_size:
+            return source
+        source_h, source_w = source.lattice_size
+        grid = self.region_grid_size
+        if source_h != source_w or source_h % grid or source_w % grid:
+            raise ValueError(
+                "regional MOSAIC requires a square source lattice divisible "
+                f"by {grid}; got {source.lattice_size}"
+            )
+        block = source_h // grid
+        source_rf = source.receptive_field
+        regional_rf = ReceptiveFieldMetadata(
+            tap=f"{source_rf.tap}_regional_lme_{grid}x{grid}",
+            feature_index=source_rf.feature_index,
+            channels=source_rf.channels,
+            output_stride=source_rf.output_stride * block,
+            receptive_field=(
+                source_rf.receptive_field
+                + (block - 1) * source_rf.output_stride
+            ),
+            center_offset=(
+                source_rf.center_offset
+                + 0.5 * (block - 1) * source_rf.output_stride
+            ),
+            squeeze_excitation_removed=source_rf.squeeze_excitation_removed,
+            globally_mixed=source_rf.globally_mixed,
+        )
+        return LatticeMetadata(
+            input_size=source.input_size,
+            lattice_size=(grid, grid),
+            local_dim=source.local_dim,
+            receptive_field=regional_rf,
+        )
+
     def forward_features(
         self,
         image: torch.Tensor,
@@ -311,12 +419,14 @@ class MOSAICModel(nn.Module):
         local_features: torch.Tensor,
         valid_mask: torch.Tensor,
         *,
+        lattice_size: Optional[tuple[int, int]] = None,
         project: bool = True,
         return_pivotality: bool = False,
     ) -> MOSAICOutput:
         return self.proof_head(
             local_features,
             valid_mask=valid_mask,
+            lattice_size=lattice_size,
             project=project,
             return_pivotality=return_pivotality,
         )
@@ -334,9 +444,16 @@ class MOSAICModel(nn.Module):
         evidence = self.forward_from_features(
             local.tokens,
             local.valid_mask,
+            lattice_size=local.lattice.lattice_size,
             project=project,
             return_pivotality=return_pivotality,
         )
+        proof_valid_mask = (
+            local.valid_mask
+            if evidence.evidence_valid_mask is None
+            else evidence.evidence_valid_mask
+        )
+        proof_lattice = self._proof_lattice(local.lattice)
         decisions = proof_only_decisions(
             evidence.transitions,
             evidence.log_stop_probabilities,
@@ -344,9 +461,11 @@ class MOSAICModel(nn.Module):
         )
         return MOSAICModelOutput(
             evidence=evidence,
-            valid_mask=local.valid_mask,
-            lattice=local.lattice,
+            valid_mask=proof_valid_mask,
+            lattice=proof_lattice,
             local_features=local.tokens if return_local_features else None,
+            source_lattice=(local.lattice if self.region_grid_size else None),
+            source_valid_mask=(local.valid_mask if self.region_grid_size else None),
             decision_rule=self._decision_rule,
             decision_transition_weights=self._decision_transition_weights,
             decisions=decisions,

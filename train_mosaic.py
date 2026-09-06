@@ -151,17 +151,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument(
         "--local_stage",
-        choices=("rf_small", "rf_medium", "rf_large", "dl95"),
+        choices=("rf_small", "rf_medium", "rf_large"),
         default="rf_medium",
-        help=(
-            "Local evidence encoder. dl95 uses the deep stride-32 "
-            "EfficientNetV2-S representation while preserving a 95-pixel "
-            "theoretical receptive field."
-        ),
+        help="Pretrained spatial tap used for bounded local evidence.",
     )
     parser.add_argument("--evidence_dim", type=int, default=128)
     parser.add_argument("--grad_checkpoint", action="store_true")
     parser.add_argument("--no_pretrained", action="store_true")
+    parser.add_argument(
+        "--region_grid_size",
+        type=int,
+        default=0,
+        help=(
+            "Compile the source lattice into a fixed square grid of disjoint "
+            "smooth regional events before counting; 0 disables the envelope."
+        ),
+    )
+    parser.add_argument(
+        "--region_pool_temperature",
+        type=float,
+        default=0.25,
+        help=(
+            "Temperature of the normalized LogMeanExp regional envelope in "
+            "witness-logit space."
+        ),
+    )
 
     parser.add_argument("--max_count", type=int, default=32)
     parser.add_argument("--count_block_size", type=int, default=64)
@@ -242,6 +256,8 @@ def main() -> None:
         local_stage=args.local_stage,
         evidence_dim=args.evidence_dim,
         grad_checkpoint=args.grad_checkpoint,
+        region_grid_size=args.region_grid_size,
+        region_pool_temperature=args.region_pool_temperature,
         pretrained=not args.no_pretrained,
         max_count=args.max_count,
         count_block_size=args.count_block_size,
@@ -331,6 +347,8 @@ def main() -> None:
             local_dim=cfg.evidence_dim,
             pretrained=cfg.pretrained,
             grad_checkpoint=cfg.grad_checkpoint,
+            region_grid_size=cfg.region_grid_size,
+            region_pool_temperature=cfg.region_pool_temperature,
             initial_abnormal_count=cfg.normal_expected_count,
             max_count=cfg.max_count,
             sufficiency_tolerance=cfg.proof_epsilon,

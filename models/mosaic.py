@@ -55,11 +55,31 @@ class LocalOrdinalEvidence:
 
 
 @dataclass
+class RegionalOrdinalEvidence:
+    """Ordinal evidence after a fixed disjoint smooth spatial envelope.
+
+    ``source_indices[n, r, k]`` identifies the original lattice cell whose
+    boundary-``k`` witness is largest inside regional event ``r``.  The index
+    is provenance only: the causal event consumed by the cardinality circuit
+    is the smooth regional envelope over *all* valid cells, not an assertion
+    that the peak cell realizes or remains sufficient for that event alone.
+    """
+
+    evidence: LocalOrdinalEvidence
+    valid_mask: torch.Tensor
+    source_indices: torch.Tensor
+    source_lattice_size: Tuple[int, int]
+    block_size: Tuple[int, int]
+    temperature: float
+
+
+@dataclass
 class CardinalityResult:
     """Output of a boundary-wise cardinality circuit."""
 
     transitions: torch.Tensor
     stop_probabilities: torch.Tensor
+    log_transition_probabilities: torch.Tensor
     log_stop_probabilities: torch.Tensor
     distributions: torch.Tensor
     log_conditional_low_distributions: torch.Tensor
@@ -99,9 +119,11 @@ class MOSAICOutput:
     log_alpha: torch.Tensor
     dense_transitions: torch.Tensor
     dense_stop_probabilities: torch.Tensor
+    dense_log_transition_probabilities: torch.Tensor
     dense_log_stop_probabilities: torch.Tensor
     transitions: torch.Tensor
     stop_probabilities: torch.Tensor
+    log_transition_probabilities: torch.Tensor
     log_stop_probabilities: torch.Tensor
     cumulative_probabilities: torch.Tensor
     class_probabilities: torch.Tensor
@@ -110,6 +132,11 @@ class MOSAICOutput:
     argmax_grade: torch.Tensor
     proof: ProofProjectionResult
     pivotality: Optional[torch.Tensor] = None
+    evidence_valid_mask: Optional[torch.Tensor] = None
+    regional_source_indices: Optional[torch.Tensor] = None
+    source_lattice_size: Optional[Tuple[int, int]] = None
+    regional_block_size: Optional[Tuple[int, int]] = None
+    regional_pool_temperature: Optional[float] = None
 
 
 def nested_witness_probabilities(
@@ -168,6 +195,209 @@ def nested_witness_probabilities(
     witnesses = log_witness.exp().clamp(0.0, 1.0)
     return LocalOrdinalEvidence(
         state, witnesses, log_witness, log_nonwitness
+    )
+
+
+def regional_logmeanexp_ordinal_evidence(
+    evidence: LocalOrdinalEvidence,
+    valid_mask: torch.Tensor,
+    lattice_size: Tuple[int, int],
+    region_grid_size: Tuple[int, int],
+    temperature: float = 0.25,
+) -> RegionalOrdinalEvidence:
+    r"""Compile correlated local witnesses into smooth disjoint region events.
+
+    The source lattice is partitioned into an equal ``Gh x Gw`` grid.  Each
+    region contributes one event per ordinal boundary.  For valid source-cell
+    witnesses :math:`\lambda_i`, its regional logit is
+
+    .. math::
+
+       u_R = \tau\left[\log\sum_{i\in R}\exp
+             \left(\operatorname{logit}(\lambda_i)/\tau\right)
+             - \log |R|\right],\qquad q_R=\sigma(u_R).
+
+    This is a *normalised* LogMeanExp in logit space.  The ``-log |R|`` term
+    gives the crucial equal-input identity: if every source witness is ``p``,
+    the regional witness is exactly ``p`` rather than growing with block size.
+    Unlike winner-take-all pooling, every valid source cell receives gradient. Because
+    LogMeanExp, logit and sigmoid are coordinate-wise monotone, cumulative
+    ordinal nesting is preserved structurally:
+
+    ``q_R(P(L_i>k)) >= q_R(P(L_i>k+1))``.
+
+    Requiring exact divisibility is deliberate.  It prevents hidden overlap,
+    unequal edge regions, or image-dependent grouping from entering the proof
+    path.  Invalid regions become the normal categorical state and are
+    excluded from counting.  ``source_indices`` records the strongest source
+    witness per boundary for provenance only; it does not define the pooled
+    value.
+    """
+
+    temperature = float(temperature)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("regional LogMeanExp temperature must be finite and positive")
+
+    states = evidence.state_probabilities
+    witnesses = evidence.witness_probabilities
+    log_witnesses = evidence.log_witness_probabilities
+    log_nonwitnesses = evidence.log_nonwitness_probabilities
+    if states.ndim != 3 or witnesses.ndim != 3:
+        raise ValueError("ordinal evidence must have shapes (N,P,K) and (N,P,K-1)")
+    if witnesses.shape[:2] != states.shape[:2] or witnesses.shape[-1] + 1 != states.shape[-1]:
+        raise ValueError("state and witness evidence shapes disagree")
+    if log_witnesses.shape != witnesses.shape or log_nonwitnesses.shape != witnesses.shape:
+        raise ValueError("log witness tensors must match witness probabilities")
+    n, p, boundaries = witnesses.shape
+    height, width = (int(lattice_size[0]), int(lattice_size[1]))
+    grid_h, grid_w = (int(region_grid_size[0]), int(region_grid_size[1]))
+    if height < 1 or width < 1 or height * width != p:
+        raise ValueError(
+            f"lattice_size must contain P={p} cells; got {lattice_size}"
+        )
+    if grid_h < 1 or grid_w < 1 or grid_h > height or grid_w > width:
+        raise ValueError("region grid must be positive and no larger than the source lattice")
+    if height % grid_h or width % grid_w:
+        raise ValueError(
+            "source lattice must divide exactly into fixed disjoint regions; "
+            f"got lattice {height}x{width} and grid {grid_h}x{grid_w}"
+        )
+    if valid_mask.shape != (n, p):
+        raise ValueError(f"valid_mask must have shape {(n, p)}")
+
+    block_h, block_w = height // grid_h, width // grid_w
+    region_cells = block_h * block_w
+    valid = valid_mask.to(device=witnesses.device, dtype=torch.bool)
+
+    def blocks(tensor: torch.Tensor) -> torch.Tensor:
+        channels = tensor.shape[-1]
+        return (
+            tensor.reshape(n, height, width, channels)
+            .reshape(n, grid_h, block_h, grid_w, block_w, channels)
+            .permute(0, 1, 3, 2, 4, 5)
+            .reshape(n, grid_h * grid_w, region_cells, channels)
+        )
+
+    valid_blocks = (
+        valid.reshape(n, height, width)
+        .reshape(n, grid_h, block_h, grid_w, block_w)
+        .permute(0, 1, 3, 2, 4)
+        .reshape(n, grid_h * grid_w, region_cells)
+    )
+    region_valid = valid_blocks.any(dim=2)
+
+    witness_blocks = blocks(witnesses.float())
+    log_witness_blocks = blocks(log_witnesses.float())
+    log_nonwitness_blocks = blocks(log_nonwitnesses.float())
+    valid_channels = valid_blocks[..., None].expand_as(log_witness_blocks)
+
+    # Compute source logits from the two stable log-probability sides rather
+    # than applying torch.logit to probabilities that may have rounded to 0/1.
+    source_logits = log_witness_blocks - log_nonwitness_blocks
+    valid_source_logits = source_logits.masked_select(valid_channels)
+    _require_finite(valid_source_logits, "valid regional source witness logits")
+
+    scaled_logits = (source_logits / temperature).masked_fill(
+        ~valid_channels, -torch.inf
+    )
+    # logsumexp(all -inf) has undefined backward.  Give wholly invalid blocks
+    # a finite disposable row before the final mask turns them into normal
+    # regions; no source gradient can flow through that branch.
+    scaled_logits = torch.where(
+        region_valid[..., None, None], scaled_logits, torch.zeros_like(scaled_logits)
+    )
+    valid_count = valid_blocks.sum(dim=2).clamp_min(1).to(source_logits.dtype)
+    pooled_logits = temperature * (
+        torch.logsumexp(scaled_logits, dim=2) - valid_count.log()[..., None]
+    )
+    pooled_logits = torch.where(
+        region_valid[..., None], pooled_logits, torch.zeros_like(pooled_logits)
+    )
+    pooled_log_witnesses = F.logsigmoid(pooled_logits)
+    pooled_log_nonwitnesses = F.logsigmoid(-pooled_logits)
+    pooled_log_witnesses = torch.where(
+        region_valid[..., None],
+        pooled_log_witnesses,
+        torch.full_like(pooled_log_witnesses, -torch.inf),
+    )
+    pooled_log_nonwitnesses = torch.where(
+        region_valid[..., None],
+        pooled_log_nonwitnesses,
+        torch.zeros_like(pooled_log_nonwitnesses),
+    )
+    pooled_witnesses = pooled_log_witnesses.exp()
+
+    # The maximum remains useful as boundary-specific provenance, but it is
+    # detached from the pooling computation: all valid cells define q_R.  Use
+    # the same stable logits as the envelope because distinct extreme logits
+    # can both round to witness probability 0 or 1 in FP32.
+    sortable = source_logits.masked_fill(~valid_channels, -torch.inf)
+    local_peak = sortable.argmax(dim=2)
+    gather_index = local_peak.unsqueeze(2)
+
+    # Convert block-local peak offsets back to flat source-lattice indices.
+    source_ids = torch.arange(p, device=witnesses.device).reshape(height, width)
+    source_blocks = (
+        source_ids.reshape(grid_h, block_h, grid_w, block_w)
+        .permute(0, 2, 1, 3)
+        .reshape(grid_h * grid_w, region_cells)
+    )
+    source_indices = torch.gather(
+        source_blocks[None, :, :, None].expand(n, -1, -1, boundaries),
+        2,
+        gather_index,
+    ).squeeze(2)
+    source_indices = torch.where(
+        region_valid[..., None], source_indices, torch.full_like(source_indices, -1)
+    )
+
+    # Every non-increasing cumulative vector defines one categorical ordinal
+    # state.  Reconstruct it so the serialized regional ledger remains a
+    # complete probability simplex rather than a collection of unrelated
+    # binary scores.
+    if boundaries > 1:
+        middle = pooled_witnesses[..., :-1] - pooled_witnesses[..., 1:]
+        pooled_states = torch.cat(
+            (
+                1.0 - pooled_witnesses[..., :1],
+                middle,
+                pooled_witnesses[..., -1:],
+            ),
+            dim=-1,
+        )
+    else:
+        pooled_states = torch.cat(
+            (1.0 - pooled_witnesses, pooled_witnesses), dim=-1
+        )
+    # Monotonic LogMeanExp preserves nesting mathematically.  A tolerance
+    # catches a future implementation regression without hiding it behind a
+    # broad clamp.
+    if boundaries > 1 and bool(
+        (pooled_witnesses[..., 1:] > pooled_witnesses[..., :-1] + 2e-7).any()
+    ):
+        raise RuntimeError("regional LogMeanExp pooling violated ordinal nesting")
+    if bool((pooled_states < -2e-7).any()):
+        raise RuntimeError("regional cumulative evidence is not a categorical simplex")
+    pooled_states = pooled_states.clamp_min(0.0)
+    pooled_states = pooled_states / pooled_states.sum(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(pooled_states.dtype).tiny
+    )
+    normal = torch.zeros_like(pooled_states)
+    normal[..., 0] = 1.0
+    pooled_states = torch.where(region_valid[..., None], pooled_states, normal)
+
+    return RegionalOrdinalEvidence(
+        evidence=LocalOrdinalEvidence(
+            state_probabilities=pooled_states,
+            witness_probabilities=pooled_witnesses,
+            log_witness_probabilities=pooled_log_witnesses,
+            log_nonwitness_probabilities=pooled_log_nonwitnesses,
+        ),
+        valid_mask=region_valid,
+        source_indices=source_indices,
+        source_lattice_size=(height, width),
+        block_size=(block_h, block_w),
+        temperature=temperature,
     )
 
 
@@ -701,6 +931,223 @@ class TruncatedPoissonBinomial(nn.Module):
                 log_conditional, log_survival = paired_log, paired_survival
         return log_conditional.squeeze(-2), log_survival.squeeze(-1)
 
+    def _empty_log_distribution(
+        self, leading_shape: Tuple[int, ...], device: torch.device
+    ) -> torch.Tensor:
+        distribution = torch.full(
+            (*leading_shape, self.max_count + 1),
+            -torch.inf,
+            device=device,
+            dtype=torch.float32,
+        )
+        distribution[..., 0] = 0.0
+        return distribution
+
+    def _update_log_distribution(
+        self,
+        distribution: torch.Tensor,
+        log_probability: torch.Tensor,
+        log_non_probability: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply one capped Poisson-binomial update entirely in log space."""
+
+        low = distribution[..., : self.max_count]
+        stay = low + log_non_probability.float().unsqueeze(-1)
+        shifted = torch.cat(
+            (
+                torch.full_like(low[..., :1], -torch.inf),
+                low[..., :-1] + log_probability.float().unsqueeze(-1),
+            ),
+            dim=-1,
+        )
+        new_low = self._safe_logaddexp(stay, shifted)
+        entered_overflow = low[..., -1] + log_probability.float()
+        overflow = self._safe_logaddexp(
+            distribution[..., self.max_count], entered_overflow
+        )
+        return torch.cat((new_low, overflow.unsqueeze(-1)), dim=-1)
+
+    def _merge_log_distributions(
+        self, left: torch.Tensor, right: torch.Tensor
+    ) -> torch.Tensor:
+        """Exactly merge two capped count distributions in log space."""
+
+        if left.shape != right.shape or left.shape[-1] != self.max_count + 1:
+            raise ValueError(
+                "log count distributions must have identical capped shapes"
+            )
+        r = self.max_count
+        low_coefficients = []
+        for count in range(r):
+            terms = (
+                left[..., : count + 1]
+                + torch.flip(right[..., : count + 1], dims=(-1,))
+            )
+            low_coefficients.append(self._safe_logsumexp(terms, dim=-1))
+        low = torch.stack(low_coefficients, dim=-1)
+
+        left_low = left[..., :r]
+        right_low = right[..., :r]
+        indices = torch.arange(r, device=left.device)
+        overflow_pairs = (indices[:, None] + indices[None, :]) >= r
+        low_pair_terms = (
+            left_low.unsqueeze(-1) + right_low.unsqueeze(-2)
+        )[..., overflow_pairs]
+        high_low = self._safe_logsumexp(low_pair_terms, dim=-1)
+        left_overflow = left[..., r] + self._safe_logsumexp(right, dim=-1)
+        right_overflow = right[..., r] + self._safe_logsumexp(left_low, dim=-1)
+        overflow = self._safe_logsumexp(
+            torch.stack((left_overflow, right_overflow, high_low), dim=-1),
+            dim=-1,
+        )
+        return torch.cat((low, overflow.unsqueeze(-1)), dim=-1)
+
+    def log_distribution(
+        self,
+        probabilities: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+        implementation: Optional[str] = None,
+        *,
+        log_probabilities: Optional[torch.Tensor] = None,
+        log_non_probabilities: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return exact capped count log masses without probability underflow."""
+
+        if probabilities.ndim < 1:
+            raise ValueError("probabilities must have at least one dimension")
+        probabilities = probabilities.float().clamp(0.0, 1.0)
+        if (log_probabilities is None) != (log_non_probabilities is None):
+            raise ValueError(
+                "log_probabilities and log_non_probabilities must be provided together"
+            )
+        if log_probabilities is None:
+            endpoint = (probabilities == 0.0) | (probabilities == 1.0)
+            safe = torch.where(
+                endpoint, torch.full_like(probabilities, 0.5), probabilities
+            )
+            log_probabilities = torch.where(
+                probabilities == 0.0,
+                torch.full_like(probabilities, -torch.inf),
+                torch.where(
+                    probabilities == 1.0,
+                    torch.zeros_like(probabilities),
+                    torch.log(safe),
+                ),
+            )
+            log_non_probabilities = torch.where(
+                probabilities == 1.0,
+                torch.full_like(probabilities, -torch.inf),
+                torch.where(
+                    probabilities == 0.0,
+                    torch.zeros_like(probabilities),
+                    torch.log1p(-safe),
+                ),
+            )
+        else:
+            if (
+                log_probabilities.shape != probabilities.shape
+                or log_non_probabilities is None
+                or log_non_probabilities.shape != probabilities.shape
+            ):
+                raise ValueError("log Bernoulli inputs must match probabilities")
+            log_probabilities = log_probabilities.float()
+            log_non_probabilities = log_non_probabilities.float()
+            pair_normalizer = torch.logsumexp(
+                torch.stack((log_probabilities, log_non_probabilities), dim=-1),
+                dim=-1,
+            )
+            log_probabilities = log_probabilities - pair_normalizer
+            log_non_probabilities = log_non_probabilities - pair_normalizer
+
+        if valid_mask is not None:
+            if valid_mask.shape != probabilities.shape:
+                raise ValueError("valid_mask must have the same shape as probabilities")
+            valid = valid_mask.to(device=probabilities.device, dtype=torch.bool)
+            log_probabilities = torch.where(
+                valid,
+                log_probabilities,
+                torch.full_like(log_probabilities, -torch.inf),
+            )
+            log_non_probabilities = torch.where(
+                valid,
+                log_non_probabilities,
+                torch.zeros_like(log_non_probabilities),
+            )
+
+        mode = self.implementation if implementation is None else implementation
+        if mode not in {"serial", "block_tree"}:
+            raise ValueError("implementation must be 'serial' or 'block_tree'")
+        num_events = probabilities.shape[-1]
+        if num_events == 0:
+            return self._empty_log_distribution(
+                tuple(probabilities.shape[:-1]), probabilities.device
+            )
+
+        if mode == "serial":
+            distribution = self._empty_log_distribution(
+                tuple(probabilities.shape[:-1]), probabilities.device
+            )
+            for index in range(num_events):
+                distribution = self._update_log_distribution(
+                    distribution,
+                    log_probabilities[..., index],
+                    log_non_probabilities[..., index],
+                )
+            return distribution
+
+        block_size = min(self.block_size, num_events)
+        padding = (-num_events) % block_size
+        if padding:
+            log_probabilities = F.pad(
+                log_probabilities, (0, padding), value=-torch.inf
+            )
+            log_non_probabilities = F.pad(
+                log_non_probabilities, (0, padding), value=0.0
+            )
+        num_blocks = log_probabilities.shape[-1] // block_size
+        probability_blocks = log_probabilities.reshape(
+            *log_probabilities.shape[:-1], num_blocks, block_size
+        )
+        non_probability_blocks = log_non_probabilities.reshape(
+            *log_non_probabilities.shape[:-1], num_blocks, block_size
+        )
+        distributions = self._empty_log_distribution(
+            tuple(probability_blocks.shape[:-1]), probabilities.device
+        )
+        for offset in range(block_size):
+            distributions = self._update_log_distribution(
+                distributions,
+                probability_blocks[..., offset],
+                non_probability_blocks[..., offset],
+            )
+        while distributions.shape[-2] > 1:
+            count = distributions.shape[-2]
+            pair_count = count // 2
+            paired = self._merge_log_distributions(
+                distributions[..., 0 : 2 * pair_count : 2, :],
+                distributions[..., 1 : 2 * pair_count : 2, :],
+            )
+            if count % 2:
+                distributions = torch.cat(
+                    (paired, distributions[..., -1:, :]), dim=-2
+                )
+            else:
+                distributions = paired
+        return distributions.squeeze(-2)
+
+    @staticmethod
+    def log_tails_from_distribution(log_distribution: torch.Tensor) -> torch.Tensor:
+        """Return log ``P(C>=r)`` for ``r=1,...,R`` from capped log masses."""
+
+        if log_distribution.shape[-1] < 2:
+            raise ValueError("log distribution must include low and overflow bins")
+        return torch.flip(
+            torch.logcumsumexp(
+                torch.flip(log_distribution[..., 1:], dims=(-1,)), dim=-1
+            ),
+            dims=(-1,),
+        )
+
     @staticmethod
     def log_stops_from_scaled_lower_tail(
         log_conditional_low: torch.Tensor, log_survival: torch.Tensor
@@ -846,6 +1293,39 @@ class OrdinalCardinalityCircuit(nn.Module):
             log_alpha + log_stops, dim=-1
         )
 
+    @staticmethod
+    def score_log_transitions(
+        log_distribution: torch.Tensor,
+        alpha: torch.Tensor,
+        log_alpha: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Mix exact log upper tails without probability-space underflow."""
+
+        log_tails = TruncatedPoissonBinomial.log_tails_from_distribution(
+            log_distribution
+        )
+        if log_alpha is None:
+            alpha = alpha.float().clamp_min(0.0)
+            alpha = alpha / alpha.sum(dim=-1, keepdim=True).clamp_min(
+                torch.finfo(alpha.dtype).tiny
+            )
+            tiny = torch.finfo(alpha.dtype).tiny
+            log_alpha = torch.where(
+                alpha > 0.0,
+                torch.log(alpha.clamp_min(tiny)),
+                torch.full_like(alpha, -torch.inf),
+            )
+        else:
+            log_alpha = log_alpha.float()
+            log_alpha = log_alpha - torch.logsumexp(
+                log_alpha, dim=-1, keepdim=True
+            )
+        while log_alpha.ndim < log_tails.ndim:
+            log_alpha = log_alpha.unsqueeze(0)
+        return TruncatedPoissonBinomial._safe_logsumexp(
+            log_alpha + log_tails, dim=-1
+        )
+
     def forward(
         self,
         witnesses: torch.Tensor,
@@ -889,15 +1369,25 @@ class OrdinalCardinalityCircuit(nn.Module):
             log_probabilities=log_probabilities,
             log_non_probabilities=log_non_probabilities,
         )
+        log_distribution = self.count.log_distribution(
+            probabilities,
+            count_mask,
+            log_probabilities=log_probabilities,
+            log_non_probabilities=log_non_probabilities,
+        )
         alpha = self.alpha
         log_alpha = self.log_alpha
         transitions, stops, tails = self.score_distributions(distributions, alpha)
+        log_transitions = self.score_log_transitions(
+            log_distribution, alpha, log_alpha
+        )
         log_stops = self.score_log_stops(
             log_conditional_low, log_low_survival, alpha, log_alpha
         )
         return CardinalityResult(
             transitions,
             stops,
+            log_transitions,
             log_stops,
             distributions,
             log_conditional_low,
@@ -1358,6 +1848,43 @@ class MOSAICOrdinalCore(nn.Module):
                 f"{local_logits.shape[-1]}"
             )
         evidence = nested_witness_probabilities(local_logits, valid_mask)
+        return self.forward_evidence(
+            evidence,
+            valid_mask=valid_mask,
+            project=project,
+            return_pivotality=return_pivotality,
+        )
+
+    def forward_evidence(
+        self,
+        evidence: LocalOrdinalEvidence,
+        valid_mask: Optional[torch.Tensor] = None,
+        project: bool = True,
+        return_pivotality: bool = False,
+    ) -> MOSAICOutput:
+        """Run the proof circuit from a complete ordinal evidence ledger.
+
+        This event-level entry point is what permits a fixed regional envelope
+        without converting stable log probabilities back into pseudo-logits.
+        It does not admit a global feature or a classifier bypass.
+        """
+
+        states = evidence.state_probabilities
+        witnesses = evidence.witness_probabilities
+        if states.ndim != 3 or witnesses.ndim != 3:
+            raise ValueError("ordinal evidence must be rank-three")
+        if states.shape[-1] != self.num_classes:
+            raise ValueError(
+                f"expected {self.num_classes} local states, got {states.shape[-1]}"
+            )
+        if witnesses.shape != (*states.shape[:2], self.num_boundaries):
+            raise ValueError("ordinal state and witness shapes disagree")
+        if evidence.log_witness_probabilities.shape != witnesses.shape or (
+            evidence.log_nonwitness_probabilities.shape != witnesses.shape
+        ):
+            raise ValueError("log-space evidence must match witness probabilities")
+        if valid_mask is not None and valid_mask.shape != states.shape[:2]:
+            raise ValueError("valid_mask must match the evidence event axes")
         dense = self.circuit(
             evidence.witness_probabilities,
             valid_mask,
@@ -1376,7 +1903,7 @@ class MOSAICOrdinalCore(nn.Module):
             n, p, boundaries = evidence.witness_probabilities.shape
             if valid_mask is None:
                 selected = torch.ones(
-                    n, p, boundaries, device=local_logits.device, dtype=torch.bool
+                    n, p, boundaries, device=witnesses.device, dtype=torch.bool
                 )
             else:
                 selected = valid_mask[:, :, None].expand(n, p, boundaries).bool()
@@ -1446,7 +1973,18 @@ class MOSAICOrdinalCore(nn.Module):
                 dense.alpha,
                 dense.log_alpha,
             )
+            projected_log_distribution = self.circuit.count.log_distribution(
+                projected_probabilities,
+                log_probabilities=projected_log_probabilities,
+                log_non_probabilities=projected_log_non_probabilities,
+            )
+            projected_log_transitions = self.circuit.score_log_transitions(
+                projected_log_distribution,
+                dense.alpha,
+                dense.log_alpha,
+            )
         else:
+            projected_log_transitions = dense.log_transition_probabilities
             projected_log_stops = dense.log_stop_probabilities
         cumulative, classes = continuation_probabilities(
             proof.projected_transition,
@@ -1474,9 +2012,13 @@ class MOSAICOrdinalCore(nn.Module):
             log_alpha=dense.log_alpha,
             dense_transitions=dense.transitions,
             dense_stop_probabilities=dense.stop_probabilities,
+            dense_log_transition_probabilities=(
+                dense.log_transition_probabilities
+            ),
             dense_log_stop_probabilities=dense.log_stop_probabilities,
             transitions=proof.projected_transition,
             stop_probabilities=projected_stops,
+            log_transition_probabilities=projected_log_transitions,
             log_stop_probabilities=projected_log_stops,
             cumulative_probabilities=cumulative,
             class_probabilities=classes,
@@ -1485,6 +2027,13 @@ class MOSAICOrdinalCore(nn.Module):
             argmax_grade=classes.argmax(dim=-1),
             proof=proof,
             pivotality=pivotality,
+            evidence_valid_mask=(
+                torch.ones(
+                    states.shape[:2], device=states.device, dtype=torch.bool
+                )
+                if valid_mask is None
+                else valid_mask.to(device=states.device, dtype=torch.bool)
+            ),
         )
 
 
@@ -1503,8 +2052,16 @@ class MOSAICProofHead(nn.Module):
         implementation: str = "block_tree",
         block_size: int = 64,
         alpha_init_count: Optional[int] = 1,
+        region_grid_size: int = 0,
+        region_pool_temperature: float = 0.25,
     ) -> None:
         super().__init__()
+        if region_grid_size < 0:
+            raise ValueError("region_grid_size must be non-negative")
+        if not math.isfinite(region_pool_temperature) or region_pool_temperature <= 0.0:
+            raise ValueError("region_pool_temperature must be finite and positive")
+        self.region_grid_size = int(region_grid_size)
+        self.region_pool_temperature = float(region_pool_temperature)
         self.local_state_head = LocalOrdinalStateHead(
             input_dim=input_dim,
             num_classes=num_classes,
@@ -1525,6 +2082,7 @@ class MOSAICProofHead(nn.Module):
         self,
         local_features: torch.Tensor,
         valid_mask: Optional[torch.Tensor] = None,
+        lattice_size: Optional[Tuple[int, int]] = None,
         project: bool = True,
         return_pivotality: bool = False,
     ) -> MOSAICOutput:
@@ -1536,12 +2094,46 @@ class MOSAICProofHead(nn.Module):
         _require_finite(local_features, "MOSAIC local features")
         with torch.autocast(device_type=local_features.device.type, enabled=False):
             local_logits = self.local_state_head.logits(local_features.float())
-            return self.ordinal_core(
-                local_logits,
-                valid_mask=valid_mask,
+            local_evidence = nested_witness_probabilities(local_logits, valid_mask)
+            if self.region_grid_size == 0:
+                return self.ordinal_core.forward_evidence(
+                    local_evidence,
+                    valid_mask=valid_mask,
+                    project=project,
+                    return_pivotality=return_pivotality,
+                )
+            if lattice_size is None:
+                side = math.isqrt(int(local_features.shape[1]))
+                if side * side != int(local_features.shape[1]):
+                    raise ValueError(
+                        "lattice_size is required for regional pooling of a "
+                        "non-square feature sequence"
+                    )
+                lattice_size = (side, side)
+            if valid_mask is None:
+                valid_mask = torch.ones(
+                    local_features.shape[:2],
+                    device=local_features.device,
+                    dtype=torch.bool,
+                )
+            regional = regional_logmeanexp_ordinal_evidence(
+                local_evidence,
+                valid_mask,
+                lattice_size,
+                (self.region_grid_size, self.region_grid_size),
+                temperature=self.region_pool_temperature,
+            )
+            output = self.ordinal_core.forward_evidence(
+                regional.evidence,
+                valid_mask=regional.valid_mask,
                 project=project,
                 return_pivotality=return_pivotality,
             )
+            output.regional_source_indices = regional.source_indices
+            output.source_lattice_size = regional.source_lattice_size
+            output.regional_block_size = regional.block_size
+            output.regional_pool_temperature = regional.temperature
+            return output
 
 
 # A concise alias for downstream experiment code.
@@ -1552,6 +2144,7 @@ __all__ = [
     "CardinalityResult",
     "DualProofProjection",
     "LocalOrdinalEvidence",
+    "RegionalOrdinalEvidence",
     "LocalOrdinalStateHead",
     "MOSAICHead",
     "MOSAICOrdinalCore",
@@ -1563,4 +2156,5 @@ __all__ = [
     "continuation_probabilities",
     "fixed_proof_pivotality",
     "nested_witness_probabilities",
+    "regional_logmeanexp_ordinal_evidence",
 ]

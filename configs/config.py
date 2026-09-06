@@ -217,12 +217,19 @@ class MOSAICConfig(TrainConfig):
     num_workers: int = 4
     stratified: bool = False  # transition loss handles imbalance without double reweighting
 
-    # Local encoder. ``dl95`` keeps the RF-95 locality contract while carrying
-    # the representation through the deep EfficientNetV2-S stages at stride
-    # 32.  The historical taps remain the default for checkpoint compatibility.
-    local_stage: str = "rf_medium"  # rf_small / rf_medium / rf_large / dl95
+    # Local encoder. DL95 is retained in git history as a rejected ablation;
+    # active experiments use one of the pretrained spatial taps below.
+    local_stage: str = "rf_medium"  # rf_small / rf_medium / rf_large
     evidence_dim: int = 128
     grad_checkpoint: bool = False
+
+    # Optional fixed disjoint regional envelope. At the RF-medium 112x112
+    # source lattice, 8 gives 64 equal 14x14-cell regions. Each region uses a
+    # normalized LogMeanExp in witness-logit space; tau=0.25 is smooth while
+    # retaining focal evidence. Zero reproduces the historical cell-wise
+    # circuit exactly.
+    region_grid_size: int = 0
+    region_pool_temperature: float = 0.25
 
     # Exact truncated Poisson--binomial proof circuit.
     max_count: int = 32

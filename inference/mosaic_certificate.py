@@ -302,38 +302,142 @@ def _lattice_geometry(metadata: Mapping[str, Any], num_cells: int) -> dict[str, 
     }
 
 
+def _spatial_record(index: int, geometry: dict[str, Any]) -> dict[str, Any]:
+    """Render one lattice site using its truthful receptive-field support."""
+
+    row, column = divmod(index, geometry["width"])
+    center_y = geometry["offset"] + row * geometry["stride"]
+    center_x = geometry["offset"] + column * geometry["stride"]
+    half_extent = geometry["receptive_field"] / 2.0
+    return {
+        "index": int(index),
+        "row": int(row),
+        "column": int(column),
+        "center_yx": [float(center_y), float(center_x)],
+        # Half-open support box, clipped to the actual canvas.  It is
+        # receptive-field support, not a lesion segmentation box.
+        "receptive_field_box_yxyx": [
+            float(max(0.0, center_y - half_extent)),
+            float(max(0.0, center_x - half_extent)),
+            float(min(geometry["input_height"], center_y + half_extent)),
+            float(min(geometry["input_width"], center_x + half_extent)),
+        ],
+    }
+
+
 def _cell_record(
     index: int,
     boundary: int,
     witness: torch.Tensor,
     pivotality: torch.Tensor,
     geometry: dict[str, Any],
+    peak_source: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    record: dict[str, Any] = {
-        "index": int(index),
+    record = _spatial_record(index, geometry)
+    record.update({
         "witness_probability": float(witness[index, boundary]),
         "fixed_proof_pivotality": float(pivotality[index, boundary]),
-    }
-    row, column = divmod(index, geometry["width"])
-    center_y = geometry["offset"] + row * geometry["stride"]
-    center_x = geometry["offset"] + column * geometry["stride"]
-    half_extent = geometry["receptive_field"] / 2.0
-    record.update(
-        {
-            "row": int(row),
-            "column": int(column),
-            "center_yx": [float(center_y), float(center_x)],
-            # Half-open support box, clipped to the actual canvas.  It is
-            # receptive-field support, not a lesion segmentation box.
-            "receptive_field_box_yxyx": [
-                float(max(0.0, center_y - half_extent)),
-                float(max(0.0, center_x - half_extent)),
-                float(min(geometry["input_height"], center_y + half_extent)),
-                float(min(geometry["input_width"], center_x + half_extent)),
-            ],
-        }
-    )
+    })
+    if peak_source is not None:
+        # This representative source is provenance for the smooth regional
+        # envelope, not an additional causal event or standalone certificate.
+        record["regional_peak_source"] = peak_source
     return record
+
+
+def _regional_geometry_payload(
+    source_metadata: Mapping[str, Any],
+    source_valid: torch.Tensor,
+    peak_source_indices: torch.Tensor,
+    block_size: tuple[int, int],
+    region_geometry: dict[str, Any],
+    temperature: float,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    """Serialize fixed regions and boundary-specific source provenance."""
+
+    source_geometry = _lattice_geometry(source_metadata, source_valid.numel())
+    region_count, boundaries = peak_source_indices.shape
+    if region_count != region_geometry["height"] * region_geometry["width"]:
+        raise ValueError("regional source provenance and proof lattice disagree")
+    block_h, block_w = block_size
+    temperature = float(temperature)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("regional envelope temperature must be finite and positive")
+    if block_h <= 0 or block_w <= 0:
+        raise ValueError("regional block dimensions must be positive")
+    if (
+        source_geometry["height"] != region_geometry["height"] * block_h
+        or source_geometry["width"] != region_geometry["width"] * block_w
+    ):
+        raise ValueError("fixed regional blocks do not partition the source lattice")
+
+    regions: list[dict[str, Any]] = []
+    peak_records: dict[str, Any] = {}
+    for region_index in range(region_count):
+        region = _spatial_record(region_index, region_geometry)
+        region_row, region_column = divmod(region_index, region_geometry["width"])
+        row_start = region_row * block_h
+        column_start = region_column * block_w
+        block_valid = source_valid.reshape(
+            source_geometry["height"], source_geometry["width"]
+        )[
+            row_start : row_start + block_h,
+            column_start : column_start + block_w,
+        ]
+        region_valid = bool(block_valid.any())
+        region.update(
+            {
+                "source_row_range": [row_start, row_start + block_h],
+                "source_column_range": [column_start, column_start + block_w],
+                "valid": region_valid,
+            }
+        )
+        regions.append(region)
+        for boundary in range(boundaries):
+            source_index = int(peak_source_indices[region_index, boundary])
+            if not region_valid:
+                if source_index != -1:
+                    raise ValueError("invalid fixed region must use source index -1")
+                continue
+            if source_index < 0:
+                raise ValueError("valid fixed region is missing peak-source provenance")
+            if source_index >= source_valid.numel() or not bool(source_valid[source_index]):
+                raise ValueError("regional peak source is outside valid retinal support")
+            source_row, source_column = divmod(source_index, source_geometry["width"])
+            if not (
+                row_start <= source_row < row_start + block_h
+                and column_start <= source_column < column_start + block_w
+            ):
+                raise ValueError("regional peak source lies outside its fixed region")
+            source = _spatial_record(source_index, source_geometry)
+            source.update(
+                {
+                    "boundary": int(boundary),
+                    "provenance_scope": (
+                        "largest source witness in the smooth regional event; "
+                        "representative only, not a standalone sufficiency claim"
+                    ),
+                }
+            )
+            peak_records[f"{region_index}:{boundary}"] = source
+
+    payload = {
+        "aggregation": "fixed_disjoint_boundarywise_normalized_logmeanexp_logit",
+        "temperature": temperature,
+        "regional_block_size": [int(block_h), int(block_w)],
+        "source_lattice_metadata": source_metadata,
+        "source_valid_mask": source_valid,
+        "peak_source_indices": peak_source_indices,
+        "regions": regions,
+        "provenance_scope": (
+            "Each proof event is a fixed region. Peak source indices identify "
+            "the largest source-lattice witness for each boundary, with its "
+            "actual receptive-field support serialized above, while the event "
+            "itself smoothly aggregates every valid source in the region. The "
+            "peak is representative provenance, not a separate proof event."
+        ),
+    }
+    return payload, peak_records, regions
 
 
 def build_mosaic_certificate(
@@ -368,6 +472,12 @@ def build_mosaic_certificate(
     """
 
     wrapped_evidence = _optional_field(output, "evidence")
+    source_lattice_metadata = None
+    source_valid_mask_value = None
+    regional_source_indices_value = None
+    regional_source_lattice_size_value = None
+    regional_block_size_value = None
+    regional_pool_temperature_value = None
     if wrapped_evidence is not None:
         # A MOSAICModelOutput already carries the decoder that produced its
         # public ``predicted_grade``.  Infer that metadata by default so a
@@ -422,6 +532,20 @@ def build_mosaic_certificate(
             lattice_metadata = _optional_field(output, "lattice")
         if valid_mask is None:
             valid_mask = _optional_field(output, "valid_mask")
+        source_lattice_metadata = _optional_field(output, "source_lattice")
+        source_valid_mask_value = _optional_field(output, "source_valid_mask")
+        regional_source_indices_value = _optional_field(
+            wrapped_evidence, "regional_source_indices"
+        )
+        regional_source_lattice_size_value = _optional_field(
+            wrapped_evidence, "source_lattice_size"
+        )
+        regional_block_size_value = _optional_field(
+            wrapped_evidence, "regional_block_size"
+        )
+        regional_pool_temperature_value = _optional_field(
+            wrapped_evidence, "regional_pool_temperature"
+        )
         output = wrapped_evidence
     elif decision_rule is None:
         # Core outputs and legacy tensor mappings have no decoder metadata;
@@ -670,6 +794,77 @@ def build_mosaic_certificate(
     if not isinstance(metadata, Mapping):
         raise TypeError("lattice_metadata must serialize to an object")
     geometry = _lattice_geometry(metadata, p)
+    regional_payload = None
+    regional_peak_records: dict[str, Any] = {}
+    if regional_source_indices_value is not None:
+        if (
+            source_lattice_metadata is None
+            or source_valid_mask_value is None
+            or regional_source_lattice_size_value is None
+            or regional_block_size_value is None
+            or regional_pool_temperature_value is None
+        ):
+            raise ValueError(
+                "regional evidence requires MOSAICModelOutput source lattice, "
+                "source valid mask, and block metadata"
+            )
+        regional_source_indices = _sample(
+            regional_source_indices_value,
+            "regional_source_indices",
+            sample_index=sample_index,
+            batched_ndim=3,
+        ).detach().long().cpu()
+        if regional_source_indices.shape != witnesses.shape:
+            raise ValueError(
+                "regional source indices must match the regional witness ledger"
+            )
+        source_valid_tensor = _tensor(
+            source_valid_mask_value, "source_valid_mask"
+        )
+        if source_valid_tensor.ndim == 2:
+            source_valid_tensor = source_valid_tensor[sample_index]
+        if source_valid_tensor.ndim != 1:
+            raise ValueError("source_valid_mask must resolve to one source lattice")
+        source_valid = source_valid_tensor.detach().bool().cpu()
+        source_metadata = _json_safe(source_lattice_metadata)
+        if not isinstance(source_metadata, Mapping):
+            raise TypeError("source_lattice must serialize to an object")
+        try:
+            reported_source_size = tuple(
+                int(value) for value in regional_source_lattice_size_value
+            )
+            metadata_source_size = tuple(
+                int(value) for value in source_metadata["lattice_size"]
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("regional source lattice size is malformed") from exc
+        if reported_source_size != metadata_source_size:
+            raise ValueError(
+                "regional evidence source lattice disagrees with wrapper metadata"
+            )
+        try:
+            block_size = tuple(int(value) for value in regional_block_size_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("regional_block_size must contain two integers") from exc
+        if len(block_size) != 2:
+            raise ValueError("regional_block_size must contain two integers")
+        regional_payload, regional_peak_records, regions = (
+            _regional_geometry_payload(
+                source_metadata,
+                source_valid,
+                regional_source_indices,
+                (block_size[0], block_size[1]),
+                geometry,
+                float(regional_pool_temperature_value),
+            )
+        )
+        derived_region_valid = torch.tensor(
+            [bool(region["valid"]) for region in regions], dtype=torch.bool
+        )
+        if not torch.equal(derived_region_valid, valid):
+            raise ValueError(
+                "source valid mask does not reproduce the regional proof mask"
+            )
     _replay_dense_log_stop, dense_log_conditional, dense_log_survival = (
         _log_stop_ledger(
             witnesses, alpha, log_alpha,
@@ -695,7 +890,14 @@ def build_mosaic_certificate(
         selected_indices.append([int(index) for index in ids])
         selected_cells.append(
             [
-                _cell_record(index, boundary, witnesses, pivotality, geometry)
+                _cell_record(
+                    index,
+                    boundary,
+                    witnesses,
+                    pivotality,
+                    geometry,
+                    regional_peak_records.get(f"{index}:{boundary}"),
+                )
                 for index in ids
             ]
         )
@@ -838,12 +1040,21 @@ def build_mosaic_certificate(
         },
         "receptive_field_metadata": metadata,
         "interpretation_scope": (
-            "Fine-grid computational evidence with the serialized receptive-field "
-            "support; not pixel segmentation or a named-lesion annotation. Proof "
+            (
+                "Fixed-region computational evidence with boundary-specific "
+                "fine-lattice peak provenance; peak sources are not standalone "
+                "proof events. "
+                if regional_payload is not None
+                else "Fine-grid computational evidence with the serialized "
+                "receptive-field support; "
+            )
+            + "not pixel segmentation or a named-lesion annotation. Proof "
             "sufficiency and necessity refer to raw cardinality scores, while the "
             "final grade may apply the serialized deterministic deweighting rule."
         ),
     }
+    if regional_payload is not None:
+        certificate["regional_envelope_provenance"] = regional_payload
     # A round-trip with allow_nan=False is the final strict JSON-safety check.
     safe = _json_safe(certificate)
     safe["integrity"] = {
@@ -1041,6 +1252,59 @@ def verify_mosaic_certificate(
     except (KeyError, TypeError, ValueError):
         geometry_valid = False
 
+    # v3 certificates created before regional pooling have no provenance
+    # section and remain replayable.  When the optional section is present,
+    # however, it must be the exact deterministic rendering of a fixed source
+    # partition, smooth-envelope temperature, and representative peak locations.
+    regional_peak_records: dict[str, Any] = {}
+    regional_provenance_valid = True
+    regional_value = certificate.get("regional_envelope_provenance")
+    if regional_value is not None:
+        try:
+            if not isinstance(regional_value, Mapping) or geometry is None:
+                raise ValueError("regional provenance must be an object")
+            source_metadata_value = regional_value["source_lattice_metadata"]
+            if not isinstance(source_metadata_value, Mapping):
+                raise ValueError("source lattice metadata must be an object")
+            source_valid_value = torch.tensor(
+                regional_value["source_valid_mask"], dtype=torch.bool
+            )
+            peak_indices_value = torch.tensor(
+                regional_value["peak_source_indices"], dtype=torch.long
+            )
+            block_value = tuple(
+                int(value) for value in regional_value["regional_block_size"]
+            )
+            temperature_value = float(regional_value["temperature"])
+            if source_valid_value.ndim != 1 or peak_indices_value.shape != witnesses.shape:
+                raise ValueError("regional provenance tensor shapes disagree")
+            if len(block_value) != 2:
+                raise ValueError("regional block size must have two dimensions")
+            expected_regional, regional_peak_records, expected_regions = (
+                _regional_geometry_payload(
+                    source_metadata_value,
+                    source_valid_value,
+                    peak_indices_value,
+                    (block_value[0], block_value[1]),
+                    geometry,
+                    temperature_value,
+                )
+            )
+            regional_provenance_valid = _json_safe(regional_value) == _json_safe(
+                expected_regional
+            )
+            derived_region_valid = torch.tensor(
+                [bool(region["valid"]) for region in expected_regions],
+                dtype=torch.bool,
+            )
+            regional_provenance_valid = bool(
+                regional_provenance_valid
+                and torch.equal(derived_region_valid, valid)
+            )
+        except (KeyError, TypeError, ValueError, IndexError):
+            regional_provenance_valid = False
+            regional_peak_records = {}
+
     selected_mask = torch.zeros_like(witnesses, dtype=torch.bool)
     raw_selected_indices = proof.get("selected_indices")
     selected_indices_structure_valid = bool(
@@ -1155,6 +1419,7 @@ def verify_mosaic_certificate(
             and "replay_rtol" in numerical
         ),
         "receptive_field_metadata": geometry_valid,
+        "regional_envelope_provenance": regional_provenance_valid,
         "selected_indices_valid": not duplicate_or_invalid,
         "transition_weights": weights_valid,
         "decision_rule": decision_rule_valid,
@@ -1651,7 +1916,14 @@ def verify_mosaic_certificate(
             actual_cells = cells_value[boundary]
             ids = [int(index) for index in selected_indices[boundary]]
             expected_cells = [
-                _cell_record(index, boundary, witnesses, replay_pivotality, geometry)
+                _cell_record(
+                    index,
+                    boundary,
+                    witnesses,
+                    replay_pivotality,
+                    geometry,
+                    regional_peak_records.get(f"{index}:{boundary}"),
+                )
                 for index in ids
             ]
             if not isinstance(actual_cells, list) or len(actual_cells) != len(expected_cells):
@@ -1684,6 +1956,10 @@ def verify_mosaic_certificate(
                         for a, e in zip(actual_values, expected_values)
                     ):
                         selected_cells_valid = False
+                expected_peak = expected_cell.get("regional_peak_source")
+                actual_peak = actual.get("regional_peak_source")
+                if _json_safe(actual_peak) != _json_safe(expected_peak):
+                    selected_cells_valid = False
     checks["selected_cell_records"] = selected_cells_valid
 
     ok = all(checks.values())

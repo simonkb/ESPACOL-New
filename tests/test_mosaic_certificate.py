@@ -23,7 +23,11 @@ from inference.mosaic_certificate import (
     save_mosaic_certificate,
     verify_mosaic_certificate,
 )
-from models.mosaic import MOSAICOrdinalCore
+from models.mosaic import (
+    MOSAICOrdinalCore,
+    nested_witness_probabilities,
+    regional_logmeanexp_ordinal_evidence,
+)
 from models.mosaic_decoder import proof_only_decisions
 
 
@@ -62,7 +66,142 @@ def _example_output():
     return output, valid, metadata
 
 
+def _regional_example_output():
+    torch.manual_seed(111)
+    source_logits = torch.randn(1, 16, 3)
+    # Put a distinct severe peak in every fixed 2x2 source block.
+    for index in (0, 2, 8, 10):
+        source_logits[0, index] = torch.tensor([-4.0, -2.0, 5.0])
+    source_valid = torch.ones(1, 16, dtype=torch.bool)
+    source_evidence = nested_witness_probabilities(source_logits, source_valid)
+    regional = regional_logmeanexp_ordinal_evidence(
+        source_evidence, source_valid, (4, 4), (2, 2), temperature=0.25
+    )
+    core = MOSAICOrdinalCore(
+        num_classes=3,
+        max_count=3,
+        sufficiency_tolerance=0.05,
+        complement_suppression=0.5,
+        implementation="serial",
+        block_size=3,
+    )
+    with torch.no_grad():
+        output = core.forward_evidence(
+            regional.evidence,
+            valid_mask=regional.valid_mask,
+            project=True,
+            return_pivotality=True,
+        )
+    output.evidence_valid_mask = regional.valid_mask
+    output.regional_source_indices = regional.source_indices
+    output.source_lattice_size = regional.source_lattice_size
+    output.regional_block_size = regional.block_size
+    output.regional_pool_temperature = regional.temperature
+    source_metadata = {
+        "input_size": [32, 32],
+        "lattice_size": [4, 4],
+        "local_dim": 8,
+        "receptive_field": {
+            "tap": "rf_medium",
+            "feature_index": 3,
+            "channels": 64,
+            "output_stride": 8,
+            "receptive_field": 7,
+            "center_offset": 0.5,
+            "squeeze_excitation_removed": False,
+            "globally_mixed": False,
+        },
+    }
+    regional_metadata = copy.deepcopy(source_metadata)
+    regional_metadata["lattice_size"] = [2, 2]
+    regional_metadata["receptive_field"].update(
+        {
+            "tap": "rf_medium_regional_lme_2x2",
+            "output_stride": 16,
+            "receptive_field": 15,
+            "center_offset": 4.5,
+        }
+    )
+    wrapped = SimpleNamespace(
+        evidence=output,
+        valid_mask=regional.valid_mask,
+        lattice=regional_metadata,
+        source_lattice=source_metadata,
+        source_valid_mask=source_valid,
+        decision_rule="rounded_expected",
+        decision_transition_weights=torch.ones(2, 2),
+    )
+    return wrapped
+
+
 class MosaicCertificateTests(unittest.TestCase):
+    def test_regional_wrapper_serializes_fixed_geometry_and_peak_provenance(self) -> None:
+        wrapped = _regional_example_output()
+        certificate = build_mosaic_certificate(
+            wrapped,
+            sufficiency_tolerance=0.05,
+            complement_suppression=0.5,
+        )
+
+        provenance = certificate["regional_envelope_provenance"]
+        self.assertEqual(
+            provenance["aggregation"],
+            "fixed_disjoint_boundarywise_normalized_logmeanexp_logit",
+        )
+        self.assertEqual(provenance["temperature"], 0.25)
+        self.assertEqual(provenance["regional_block_size"], [2, 2])
+        self.assertEqual(
+            provenance["source_lattice_metadata"]["lattice_size"], [4, 4]
+        )
+        self.assertEqual(len(provenance["regions"]), 4)
+        self.assertEqual(provenance["regions"][0]["source_row_range"], [0, 2])
+        self.assertEqual(provenance["regions"][0]["source_column_range"], [0, 2])
+        self.assertEqual(len(provenance["peak_source_indices"]), 4)
+        selected = [
+            cell
+            for boundary_cells in certificate["proof"]["selected_cells"]
+            for cell in boundary_cells
+        ]
+        self.assertTrue(selected)
+        for cell in selected:
+            peak = cell["regional_peak_source"]
+            self.assertIn("receptive_field_box_yxyx", peak)
+            self.assertIn("not a standalone sufficiency claim", peak["provenance_scope"])
+        report = verify_mosaic_certificate(certificate)
+        self.assertTrue(report["ok"], report)
+        self.assertTrue(report["checks"]["regional_envelope_provenance"])
+
+    def test_legacy_v3_without_regional_provenance_still_replays(self) -> None:
+        output, valid, metadata = _example_output()
+        certificate = build_mosaic_certificate(
+            output,
+            lattice_metadata=metadata,
+            valid_mask=valid,
+            sufficiency_tolerance=0.05,
+            complement_suppression=0.5,
+        )
+        self.assertNotIn("regional_envelope_provenance", certificate)
+        report = verify_mosaic_certificate(certificate)
+        self.assertTrue(report["ok"], report)
+        self.assertTrue(report["checks"]["regional_envelope_provenance"])
+
+    def test_regional_peak_outside_fixed_block_fails_even_if_rehashed(self) -> None:
+        certificate = build_mosaic_certificate(
+            _regional_example_output(),
+            sufficiency_tolerance=0.05,
+            complement_suppression=0.5,
+        )
+        tampered = copy.deepcopy(certificate)
+        # Region zero owns source rows/columns [0,2); source 15 lies in the
+        # diagonally opposite block.  Rehash to show this is a semantic check,
+        # not merely detection by the payload digest.
+        tampered["regional_envelope_provenance"]["peak_source_indices"][0][0] = 15
+        tampered["integrity"]["payload_sha256"] = _payload_sha256(tampered)
+        report = verify_mosaic_certificate(tampered)
+        self.assertFalse(report["ok"])
+        self.assertTrue(report["checks"]["integrity_sha256"])
+        self.assertFalse(report["checks"]["regional_envelope_provenance"])
+
     def test_certificate_contains_required_trace_and_replays(self) -> None:
         output, valid, metadata = _example_output()
         certificate = build_mosaic_certificate(

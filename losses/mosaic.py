@@ -233,6 +233,7 @@ def balanced_continuation_nll(
     *,
     at_risk_counts: torch.Tensor | None = None,
     stop_probabilities: torch.Tensor | None = None,
+    log_transition_probabilities: torch.Tensor | None = None,
     log_stop_probabilities: torch.Tensor | None = None,
     eps: float = 1e-7,
     reduction: Reduction = "mean",
@@ -259,9 +260,51 @@ def balanced_continuation_nll(
     if reduction not in ("none", "mean", "sum", "boundary_mean"):
         raise ValueError(f"unknown reduction {reduction!r}")
 
+    boundary_losses = _continuation_boundary_losses(
+        transitions,
+        labels,
+        transition_weights,
+        stop_probabilities=stop_probabilities,
+        log_transition_probabilities=log_transition_probabilities,
+        log_stop_probabilities=log_stop_probabilities,
+    )
+    return _reduce_continuation_boundary_losses(
+        boundary_losses,
+        at_risk_counts=at_risk_counts,
+        reduction=reduction,
+    )
+
+
+def _continuation_boundary_losses(
+    transitions: torch.Tensor,
+    labels: torch.Tensor,
+    transition_weights: torch.Tensor | None = None,
+    *,
+    stop_probabilities: torch.Tensor | None = None,
+    log_transition_probabilities: torch.Tensor | None = None,
+    log_stop_probabilities: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return the weighted at-risk likelihood term for every ``(n, k)``.
+
+    Keeping reduction separate lets :class:`MosaicLoss` replace only a dead
+    positive proof entry with its dense counterpart without changing either
+    the historical sample-mean coefficients or the fixed boundary-mean
+    coefficients.
+    """
+
     _, labels = _validate_transition_inputs(transitions, labels, transition_weights)
     work_dtype = torch.float64 if transitions.dtype == torch.float64 else torch.float32
     c = transitions.to(dtype=work_dtype).clamp(min=0.0, max=1.0)
+    if log_transition_probabilities is not None:
+        if log_transition_probabilities.shape != transitions.shape:
+            raise ValueError("log_transition_probabilities must match transitions")
+        log_advance = log_transition_probabilities.to(dtype=work_dtype)
+        if torch.isnan(log_advance).any() or torch.isposinf(log_advance).any():
+            raise ValueError(
+                "log_transition_probabilities must not contain NaN or +inf"
+            )
+    else:
+        log_advance = None
     if log_stop_probabilities is not None:
         if log_stop_probabilities.shape != transitions.shape:
             raise ValueError("log_stop_probabilities must match transitions")
@@ -306,12 +349,33 @@ def balanced_continuation_nll(
     if log_stop_probabilities is None:
         assert stop is not None
         log_stop = torch.log(stop.clamp_min(tiny))
-    log_likelihood = torch.where(advance, torch.log(c.clamp_min(tiny)), log_stop)
+    if log_advance is None:
+        log_advance = torch.log(c.clamp_min(tiny))
+    log_likelihood = torch.where(advance, log_advance, log_stop)
     boundary_losses = -torch.where(
         at_risk,
         outcome_weights * log_likelihood,
         torch.zeros_like(log_likelihood),
     )
+    return boundary_losses
+
+
+def _reduce_continuation_boundary_losses(
+    boundary_losses: torch.Tensor,
+    *,
+    at_risk_counts: torch.Tensor | None,
+    reduction: Reduction,
+) -> torch.Tensor:
+    """Reduce a precomputed ``(N, K-1)`` continuation-loss matrix."""
+
+    if boundary_losses.ndim != 2:
+        raise ValueError(
+            "boundary_losses must have shape (N, K-1), got "
+            f"{tuple(boundary_losses.shape)}"
+        )
+    if reduction not in ("none", "mean", "sum", "boundary_mean"):
+        raise ValueError(f"unknown reduction {reduction!r}")
+
     per_sample = boundary_losses.sum(dim=1)
 
     if reduction == "none":
@@ -323,8 +387,11 @@ def balanced_continuation_nll(
             raise ValueError(
                 "at_risk_counts are required for boundary_mean reduction"
             )
+        num_boundaries = boundary_losses.shape[1]
         counts = torch.as_tensor(
-            at_risk_counts, device=c.device, dtype=work_dtype
+            at_risk_counts,
+            device=boundary_losses.device,
+            dtype=boundary_losses.dtype,
         )
         if counts.ndim != 1 or counts.numel() != num_boundaries:
             raise ValueError(
@@ -438,6 +505,8 @@ class MosaicLoss(nn.Module):
             raise ValueError("num_classes must be at least 2")
         if dense_weight < 0.0 or stability_weight < 0.0:
             raise ValueError("loss weights must be non-negative")
+        if eps <= 0.0 or eps >= 0.5:
+            raise ValueError(f"eps must lie in (0, 0.5), got {eps}")
         if transition_reduction not in ("sample_mean", "boundary_mean"):
             raise ValueError(
                 "transition_reduction must be 'sample_mean' or 'boundary_mean'"
@@ -527,10 +596,13 @@ class MosaicLoss(nn.Module):
         labels: torch.Tensor,
         *,
         projected_stop_probabilities: torch.Tensor | None = None,
+        projected_log_transition_probabilities: torch.Tensor | None = None,
         projected_log_stop_probabilities: torch.Tensor | None = None,
         dense_transitions: torch.Tensor | None = None,
         dense_stop_probabilities: torch.Tensor | None = None,
+        dense_log_transition_probabilities: torch.Tensor | None = None,
         dense_log_stop_probabilities: torch.Tensor | None = None,
+        proof_sizes: torch.Tensor | None = None,
         witness_states_a: torch.Tensor | None = None,
         witness_states_b: torch.Tensor | None = None,
         valid_mask: torch.Tensor | None = None,
@@ -546,32 +618,94 @@ class MosaicLoss(nn.Module):
             if self.transition_reduction == "boundary_mean"
             else "mean"
         )
-        projected = balanced_continuation_nll(
+        labels_on_device = labels.to(
+            device=projected_transitions.device, dtype=torch.long
+        )
+        boundaries = torch.arange(
+            self.num_classes - 1, device=projected_transitions.device
+        ).unsqueeze(0)
+        positive_entries = labels_on_device.unsqueeze(1) > boundaries
+        if proof_sizes is not None:
+            if proof_sizes.shape != projected_transitions.shape:
+                raise ValueError("proof_sizes must match projected_transitions")
+            empty_proof = proof_sizes.detach().to(
+                device=projected_transitions.device
+            ).eq(0)
+        else:
+            empty_proof = torch.zeros_like(
+                projected_transitions, dtype=torch.bool
+            )
+        dead_positive = positive_entries & (
+            empty_proof | projected_transitions.detach().eq(0)
+        )
+
+        projected_boundary_losses = _continuation_boundary_losses(
             projected_transitions,
             labels,
             self.transition_weights,
-            at_risk_counts=self.at_risk_counts,
             stop_probabilities=projected_stop_probabilities,
+            log_transition_probabilities=projected_log_transition_probabilities,
             log_stop_probabilities=projected_log_stop_probabilities,
-            eps=self.eps,
-            reduction=reduction,
         )
 
         zero = projected_transitions.float().sum() * 0.0
-        dense = zero
-        if self.dense_weight > 0.0:
+        needs_dense = self.dense_weight > 0.0 or bool(dead_positive.any())
+        dense_boundary_losses: torch.Tensor | None = None
+        if needs_dense:
             if dense_transitions is None:
-                raise ValueError("dense_transitions are required when dense_weight > 0")
-            dense = balanced_continuation_nll(
+                raise ValueError(
+                    "dense_transitions are required when dense_weight > 0 or "
+                    "a positive proof entry is dead"
+                )
+            dense_boundary_losses = _continuation_boundary_losses(
                 dense_transitions,
                 labels,
                 self.transition_weights,
-                at_risk_counts=self.at_risk_counts,
                 stop_probabilities=dense_stop_probabilities,
+                log_transition_probabilities=dense_log_transition_probabilities,
                 log_stop_probabilities=dense_log_stop_probabilities,
-                eps=self.eps,
-                reduction=reduction,
             )
+
+        if dense_boundary_losses is None:
+            primary_boundary_losses = projected_boundary_losses
+            dense_aux_boundary_losses = torch.zeros_like(projected_boundary_losses)
+            rescued_boundary_losses = torch.zeros_like(projected_boundary_losses)
+        else:
+            # A dead positive proof has no recovery gradient through the hard
+            # prefix projection. Route that entry through the dense circuit
+            # exactly once. In particular, do not also apply ``dense_weight``
+            # to the same entry, which would make it ``(1 + eta) * dense``.
+            primary_boundary_losses = torch.where(
+                dead_positive,
+                dense_boundary_losses,
+                projected_boundary_losses,
+            )
+            dense_aux_boundary_losses = torch.where(
+                dead_positive,
+                torch.zeros_like(dense_boundary_losses),
+                dense_boundary_losses,
+            )
+            rescued_boundary_losses = torch.where(
+                dead_positive,
+                dense_boundary_losses,
+                torch.zeros_like(dense_boundary_losses),
+            )
+
+        projected = _reduce_continuation_boundary_losses(
+            primary_boundary_losses,
+            at_risk_counts=self.at_risk_counts,
+            reduction=reduction,
+        )
+        dense = _reduce_continuation_boundary_losses(
+            dense_aux_boundary_losses,
+            at_risk_counts=self.at_risk_counts,
+            reduction=reduction,
+        )
+        rescued = _reduce_continuation_boundary_losses(
+            rescued_boundary_losses,
+            at_risk_counts=self.at_risk_counts,
+            reduction=reduction,
+        )
 
         stability = zero
         if self.stability_weight > 0.0:
@@ -594,8 +728,14 @@ class MosaicLoss(nn.Module):
             "loss_total": total.detach(),
             "loss_ccl": projected.detach(),
             "loss_dense": dense.detach(),
+            "loss_dead_positive_rescue": rescued.detach(),
             "loss_stability": stability.detach(),
             "mean_projected_transition": projected_transitions.detach().float().mean(),
+            "dead_positive_count": dead_positive.sum().detach().float(),
+            "dead_positive_rate": (
+                dead_positive.sum().detach().float()
+                / positive_entries.sum().detach().float().clamp_min(1.0)
+            ),
         }
         if dense_transitions is not None:
             diagnostics["mean_dense_transition"] = (
@@ -604,7 +744,6 @@ class MosaicLoss(nn.Module):
 
         # Flat scalar diagnostics remain compatible with the repository's
         # existing metric accumulation and expose late-boundary failure modes.
-        labels_on_device = labels.to(projected_transitions.device)
         for k in range(self.num_classes - 1):
             risk = labels_on_device >= k
             risk_count = risk.sum().detach().float()
@@ -612,6 +751,9 @@ class MosaicLoss(nn.Module):
             diagnostics[f"at_risk_boundary_{k}"] = risk_count
             diagnostics[f"advance_rate_boundary_{k}"] = (
                 advance_count / risk_count.clamp_min(1.0)
+            )
+            diagnostics[f"dead_positive_boundary_{k}"] = (
+                dead_positive[:, k].sum().detach().float()
             )
 
         return total, diagnostics
