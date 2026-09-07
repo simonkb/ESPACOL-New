@@ -25,7 +25,7 @@ from .local_efficientnet import (
     ReceptiveFieldMetadata,
     downsample_retinal_field_mask,
 )
-from .mosaic import MOSAICOutput, MOSAICProofHead
+from .mosaic import MOSAICOutput, MOSAICProofHead, normalize_region_pool_type
 from .mosaic_decoder import (
     PROOF_DECISION_RULES,
     ProofOnlyDecisionBundle,
@@ -191,7 +191,8 @@ class MOSAICModel(nn.Module):
         decision_rule: str = "rounded_expected",
         transition_weights: torch.Tensor | Sequence[Sequence[float]] | None = None,
         region_grid_size: int = 0,
-        region_pool_temperature: float = 0.25,
+        region_pool_temperature: Optional[float] = 0.25,
+        region_pool_type: str = "normalized_logmeanexp",
     ) -> None:
         super().__init__()
         self.num_classes = int(num_classes)
@@ -199,9 +200,19 @@ class MOSAICModel(nn.Module):
         if region_grid_size < 0:
             raise ValueError("region_grid_size must be non-negative")
         self.region_grid_size = int(region_grid_size)
-        if not math.isfinite(region_pool_temperature) or region_pool_temperature <= 0.0:
-            raise ValueError("region_pool_temperature must be finite and positive")
-        self.region_pool_temperature = float(region_pool_temperature)
+        self.region_pool_type = normalize_region_pool_type(region_pool_type)
+        if self.region_pool_type == "normalized_logmeanexp":
+            if (
+                region_pool_temperature is None
+                or not math.isfinite(region_pool_temperature)
+                or region_pool_temperature <= 0.0
+            ):
+                raise ValueError("region_pool_temperature must be finite and positive")
+            self.region_pool_temperature: Optional[float] = float(
+                region_pool_temperature
+            )
+        else:
+            self.region_pool_temperature = None
         self.encoder = LocalEfficientNetV2S(
             tap=local_stage,
             local_dim=local_dim,
@@ -246,8 +257,8 @@ class MOSAICModel(nn.Module):
             input_dim=local_dim,
             num_classes=self.num_classes,
             # The head bias calibrates the events consumed by the count
-            # circuit. The normalised regional LogMeanExp has equal-input
-            # identity, so one fixed region is one
+            # circuit. Both regional compilers have equal-input identity, so
+            # one fixed region is one
             # Bernoulli event; using all 9,864 source sites here would reduce
             # the intended initial evidence mass by roughly two orders of
             # magnitude because LME_tau(logit(p),...,logit(p))=logit(p).
@@ -260,6 +271,7 @@ class MOSAICModel(nn.Module):
             block_size=count_block_size,
             region_grid_size=self.region_grid_size,
             region_pool_temperature=self.region_pool_temperature,
+            region_pool_type=self.region_pool_type,
         )
         # Runtime decoder metadata is deliberately non-persistent.  It is
         # reconstructed from the training criterion/checkpoint, so legacy
@@ -361,9 +373,9 @@ class MOSAICModel(nn.Module):
     def _proof_lattice(self, source: LatticeMetadata) -> LatticeMetadata:
         """Return truthful geometry for the events consumed by the proof.
 
-        A regional LogMeanExp event depends on every valid source RF inside its
-        fixed block, so its theoretical support is the union of those RFs. The
-        finer source-lattice peak remains available separately as provenance.
+        A regional event can depend on any valid source RF inside its fixed
+        block, so its theoretical support is the union of those RFs. The finer
+        source-lattice peak remains available separately as provenance.
         """
 
         if not self.region_grid_size:
@@ -377,8 +389,13 @@ class MOSAICModel(nn.Module):
             )
         block = source_h // grid
         source_rf = source.receptive_field
+        pool_tag = (
+            "lme"
+            if self.region_pool_type == "normalized_logmeanexp"
+            else "existential_max"
+        )
         regional_rf = ReceptiveFieldMetadata(
-            tap=f"{source_rf.tap}_regional_lme_{grid}x{grid}",
+            tap=f"{source_rf.tap}_regional_{pool_tag}_{grid}x{grid}",
             feature_index=source_rf.feature_index,
             channels=source_rf.channels,
             output_stride=source_rf.output_stride * block,

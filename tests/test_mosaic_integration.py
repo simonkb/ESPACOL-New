@@ -98,7 +98,11 @@ def _tiny_trainer(
     cfg_values.update(cfg_overrides or {})
     cfg = MOSAICConfig(**cfg_values)
     trainer = MosaicTrainer(
-        _tiny_model(),
+        _tiny_model(
+            region_grid_size=cfg.region_grid_size,
+            region_pool_type=cfg.region_pool_type,
+            region_pool_temperature=cfg.region_pool_temperature,
+        ),
         [],
         [],
         [],
@@ -252,6 +256,38 @@ def test_regional_model_counts_only_smooth_disjoint_events_and_reports_honest_ge
     assert model.expected_valid_regions == int(output.valid_mask.sum())
     # The normalized LME equal-input identity preserves the requested initial
     # abnormal evidence mass independently of source cells per region.
+    expected_abnormal = output.evidence.witness_probabilities[..., 0].sum()
+    assert abs(float(expected_abnormal) - 0.5) < 0.03
+
+
+def test_regional_max_model_is_explicit_and_preserves_source_provenance() -> None:
+    model = _tiny_model(
+        region_grid_size=2,
+        region_pool_type="existential_max",
+        # Accepted for controlled CLI compatibility but mathematically unused.
+        region_pool_temperature=0.25,
+    )
+    with torch.no_grad():
+        output = model(
+            torch.zeros(1, 3, 64, 64),
+            return_local_features=True,
+        )
+
+    assert model.region_pool_type == "existential_max"
+    assert model.region_pool_temperature is None
+    assert output.lattice.receptive_field.tap.endswith(
+        "_regional_existential_max_2x2"
+    )
+    assert output.evidence.regional_pool_type == "existential_max"
+    assert output.evidence.regional_pool_temperature is None
+    assert output.evidence.regional_source_indices is not None
+    assert output.evidence.regional_source_indices.shape == (1, 4, 4)
+    assert torch.all(
+        output.evidence.witness_probabilities[..., :-1]
+        >= output.evidence.witness_probabilities[..., 1:]
+    )
+    # The state head starts identically at every source. Existential max has
+    # equal-input identity, retaining the requested regional evidence mass.
     expected_abnormal = output.evidence.witness_probabilities[..., 0].sum()
     assert abs(float(expected_abnormal) - 0.5) < 0.03
 
@@ -626,6 +662,42 @@ def test_transition_reduction_is_resume_critical_with_legacy_identity(
         boundary_mean._validate_resume_checkpoint(legacy_state)
 
 
+def test_region_pool_type_is_resume_critical_and_checkpoint_explicit(
+    tmp_path: Path,
+) -> None:
+    max_trainer = _tiny_trainer(
+        tmp_path / "max",
+        cfg_overrides={
+            "region_grid_size": 2,
+            "region_pool_type": "existential_max",
+        },
+    )
+    state = max_trainer._checkpoint_payload(
+        epoch=1, metrics={}, best_accuracy=0.0
+    )
+    assert state["config"]["region_pool_type"] == "existential_max"
+    assert state["architecture"]["region_pool_type"] == "existential_max"
+    assert state["architecture"]["regional_pool"] == "existential_max_logit"
+    assert state["architecture"]["region_pool_temperature"] is None
+
+    lme_trainer = _tiny_trainer(
+        tmp_path / "lme",
+        cfg_overrides={
+            "region_grid_size": 2,
+            "region_pool_type": "normalized_logmeanexp",
+        },
+    )
+    with pytest.raises(ValueError, match="region_pool_type"):
+        lme_trainer._validate_resume_checkpoint(state)
+
+    legacy = lme_trainer._checkpoint_payload(
+        epoch=1, metrics={}, best_accuracy=0.0
+    )
+    legacy["config"] = dict(legacy["config"])
+    legacy["config"].pop("region_pool_type")
+    lme_trainer._validate_resume_checkpoint(legacy)
+
+
 def test_boundary_mean_rejects_nonuniform_training_sampler(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="uniformly sampled"):
         _tiny_trainer(
@@ -905,6 +977,12 @@ def test_training_cli_retires_dl95_and_accepts_regional_envelope() -> None:
     assert args.local_stage == "rf_medium"
     assert args.region_grid_size == 8
     assert args.region_pool_temperature == 0.4
+    assert args.region_pool_type == "normalized_logmeanexp"
+
+    max_args = build_parser().parse_args(
+        ["--region_grid_size", "8", "--region_pool", "max"]
+    )
+    assert max_args.region_pool_type == "max"
 
 
 def test_dataset_item_preserves_label_and_stable_sample_index(tmp_path: Path) -> None:

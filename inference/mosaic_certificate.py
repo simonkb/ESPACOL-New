@@ -29,6 +29,7 @@ from models.mosaic import (
     ProofProjectionResult,
     TruncatedPoissonBinomial,
     fixed_proof_pivotality,
+    normalize_region_pool_type,
 )
 from models.mosaic_decoder import (
     PROOF_DECISION_RULES,
@@ -351,18 +352,27 @@ def _regional_geometry_payload(
     peak_source_indices: torch.Tensor,
     block_size: tuple[int, int],
     region_geometry: dict[str, Any],
-    temperature: float,
+    temperature: float | None,
+    pool_type: str = "normalized_logmeanexp",
+    *,
+    declare_pool_type: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     """Serialize fixed regions and boundary-specific source provenance."""
 
+    pool_type = normalize_region_pool_type(pool_type)
     source_geometry = _lattice_geometry(source_metadata, source_valid.numel())
     region_count, boundaries = peak_source_indices.shape
     if region_count != region_geometry["height"] * region_geometry["width"]:
         raise ValueError("regional source provenance and proof lattice disagree")
     block_h, block_w = block_size
-    temperature = float(temperature)
-    if not math.isfinite(temperature) or temperature <= 0.0:
-        raise ValueError("regional envelope temperature must be finite and positive")
+    if pool_type == "normalized_logmeanexp":
+        if temperature is None:
+            raise ValueError("regional LogMeanExp provenance requires a temperature")
+        temperature = float(temperature)
+        if not math.isfinite(temperature) or temperature <= 0.0:
+            raise ValueError("regional envelope temperature must be finite and positive")
+    elif temperature is not None:
+        raise ValueError("existential-max provenance must not declare a temperature")
     if block_h <= 0 or block_w <= 0:
         raise ValueError("regional block dimensions must be positive")
     if (
@@ -410,33 +420,54 @@ def _regional_geometry_payload(
             ):
                 raise ValueError("regional peak source lies outside its fixed region")
             source = _spatial_record(source_index, source_geometry)
+            if pool_type == "normalized_logmeanexp":
+                source_scope = (
+                    "largest source witness in the smooth regional event; "
+                    "representative only, not a standalone sufficiency claim"
+                )
+            else:
+                source_scope = (
+                    "deterministic source maximizer that realizes the exact "
+                    "existential regional witness; tied maximizers may also exist"
+                )
             source.update(
                 {
                     "boundary": int(boundary),
-                    "provenance_scope": (
-                        "largest source witness in the smooth regional event; "
-                        "representative only, not a standalone sufficiency claim"
-                    ),
+                    "provenance_scope": source_scope,
                 }
             )
             peak_records[f"{region_index}:{boundary}"] = source
 
-    payload = {
-        "aggregation": "fixed_disjoint_boundarywise_normalized_logmeanexp_logit",
-        "temperature": temperature,
-        "regional_block_size": [int(block_h), int(block_w)],
-        "source_lattice_metadata": source_metadata,
-        "source_valid_mask": source_valid,
-        "peak_source_indices": peak_source_indices,
-        "regions": regions,
-        "provenance_scope": (
+    if pool_type == "normalized_logmeanexp":
+        aggregation = "fixed_disjoint_boundarywise_normalized_logmeanexp_logit"
+        provenance_scope = (
             "Each proof event is a fixed region. Peak source indices identify "
             "the largest source-lattice witness for each boundary, with its "
             "actual receptive-field support serialized above, while the event "
             "itself smoothly aggregates every valid source in the region. The "
             "peak is representative provenance, not a separate proof event."
-        ),
+        )
+    else:
+        aggregation = "fixed_disjoint_boundarywise_existential_max_logit"
+        provenance_scope = (
+            "Each proof event is a fixed region whose probability is exactly "
+            "the maximum valid source witness at that boundary. Peak source "
+            "indices identify a deterministic maximizer and serialize its "
+            "actual receptive-field support; tied maximizers may also exist."
+        )
+    payload = {
+        "aggregation": aggregation,
+        "regional_block_size": [int(block_h), int(block_w)],
+        "source_lattice_metadata": source_metadata,
+        "source_valid_mask": source_valid,
+        "peak_source_indices": peak_source_indices,
+        "regions": regions,
+        "provenance_scope": provenance_scope,
     }
+    if declare_pool_type:
+        payload["pool_type"] = pool_type
+    if temperature is not None:
+        payload["temperature"] = temperature
     return payload, peak_records, regions
 
 
@@ -478,6 +509,7 @@ def build_mosaic_certificate(
     regional_source_lattice_size_value = None
     regional_block_size_value = None
     regional_pool_temperature_value = None
+    regional_pool_type_value = None
     if wrapped_evidence is not None:
         # A MOSAICModelOutput already carries the decoder that produced its
         # public ``predicted_grade``.  Infer that metadata by default so a
@@ -545,6 +577,9 @@ def build_mosaic_certificate(
         )
         regional_pool_temperature_value = _optional_field(
             wrapped_evidence, "regional_pool_temperature"
+        )
+        regional_pool_type_value = _optional_field(
+            wrapped_evidence, "regional_pool_type"
         )
         output = wrapped_evidence
     elif decision_rule is None:
@@ -802,7 +837,6 @@ def build_mosaic_certificate(
             or source_valid_mask_value is None
             or regional_source_lattice_size_value is None
             or regional_block_size_value is None
-            or regional_pool_temperature_value is None
         ):
             raise ValueError(
                 "regional evidence requires MOSAICModelOutput source lattice, "
@@ -848,6 +882,18 @@ def build_mosaic_certificate(
             raise ValueError("regional_block_size must contain two integers") from exc
         if len(block_size) != 2:
             raise ValueError("regional_block_size must contain two integers")
+        # Regional outputs predating explicit compiler metadata necessarily
+        # used normalized LogMeanExp, so retain that interpretation.
+        regional_pool_type = normalize_region_pool_type(
+            "normalized_logmeanexp"
+            if regional_pool_type_value is None
+            else str(regional_pool_type_value)
+        )
+        regional_temperature = (
+            None
+            if regional_pool_temperature_value is None
+            else float(regional_pool_temperature_value)
+        )
         regional_payload, regional_peak_records, regions = (
             _regional_geometry_payload(
                 source_metadata,
@@ -855,7 +901,8 @@ def build_mosaic_certificate(
                 regional_source_indices,
                 (block_size[0], block_size[1]),
                 geometry,
-                float(regional_pool_temperature_value),
+                regional_temperature,
+                regional_pool_type,
             )
         )
         derived_region_valid = torch.tensor(
@@ -1255,7 +1302,7 @@ def verify_mosaic_certificate(
     # v3 certificates created before regional pooling have no provenance
     # section and remain replayable.  When the optional section is present,
     # however, it must be the exact deterministic rendering of a fixed source
-    # partition, smooth-envelope temperature, and representative peak locations.
+    # partition, declared compiler semantics, and representative peak locations.
     regional_peak_records: dict[str, Any] = {}
     regional_provenance_valid = True
     regional_value = certificate.get("regional_envelope_provenance")
@@ -1275,7 +1322,17 @@ def verify_mosaic_certificate(
             block_value = tuple(
                 int(value) for value in regional_value["regional_block_size"]
             )
-            temperature_value = float(regional_value["temperature"])
+            declared_pool_type = regional_value.get("pool_type")
+            pool_type_value = normalize_region_pool_type(
+                "normalized_logmeanexp"
+                if declared_pool_type is None
+                else str(declared_pool_type)
+            )
+            temperature_value = (
+                float(regional_value["temperature"])
+                if pool_type_value == "normalized_logmeanexp"
+                else None
+            )
             if source_valid_value.ndim != 1 or peak_indices_value.shape != witnesses.shape:
                 raise ValueError("regional provenance tensor shapes disagree")
             if len(block_value) != 2:
@@ -1288,6 +1345,8 @@ def verify_mosaic_certificate(
                     (block_value[0], block_value[1]),
                     geometry,
                     temperature_value,
+                    pool_type_value,
+                    declare_pool_type=declared_pool_type is not None,
                 )
             )
             regional_provenance_valid = _json_safe(regional_value) == _json_safe(

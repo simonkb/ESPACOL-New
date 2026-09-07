@@ -29,6 +29,7 @@ from Datasets.mosaic_data import (
     load_eyepacs_items,
     make_mosaic_loaders,
 )
+from models.mosaic import normalize_region_pool_type
 from models.mosaic_model import build_mosaic_model
 from training.mosaic_trainer import MosaicTrainer
 
@@ -176,6 +177,25 @@ def build_parser() -> argparse.ArgumentParser:
             "witness-logit space."
         ),
     )
+    parser.add_argument(
+        "--region_pool_type",
+        "--region_pool",
+        dest="region_pool_type",
+        choices=(
+            "normalized_logmeanexp",
+            "logmeanexp",
+            "lme",
+            "existential_max",
+            "hard_max",
+            "max",
+        ),
+        default="normalized_logmeanexp",
+        help=(
+            "Regional evidence compiler. 'max' is an alias for the focal "
+            "existential_max rule; normalized_logmeanexp preserves the v3 "
+            "behavior."
+        ),
+    )
 
     parser.add_argument("--max_count", type=int, default=32)
     parser.add_argument("--count_block_size", type=int, default=64)
@@ -257,6 +277,7 @@ def main() -> None:
         evidence_dim=args.evidence_dim,
         grad_checkpoint=args.grad_checkpoint,
         region_grid_size=args.region_grid_size,
+        region_pool_type=normalize_region_pool_type(args.region_pool_type),
         region_pool_temperature=args.region_pool_temperature,
         pretrained=not args.no_pretrained,
         max_count=args.max_count,
@@ -348,6 +369,7 @@ def main() -> None:
             pretrained=cfg.pretrained,
             grad_checkpoint=cfg.grad_checkpoint,
             region_grid_size=cfg.region_grid_size,
+            region_pool_type=cfg.region_pool_type,
             region_pool_temperature=cfg.region_pool_temperature,
             initial_abnormal_count=cfg.normal_expected_count,
             max_count=cfg.max_count,

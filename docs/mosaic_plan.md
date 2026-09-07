@@ -2,10 +2,11 @@
 
 Status: **Core implementation complete on `mosaic-ordinal-proof`; independent
 APTOS and EyePACS fold-0 decoder audits complete; raw posterior median locked
-prospectively for new folds; DL95 rejected; RF-medium regional-event v3 ready
-for one controlled APTOS fold-0 validation**
+prospectively for new folds; DL95 and normalized-LogMeanExp regional v3
+rejected; RF-medium hard-existential regional v4 ready for one controlled
+APTOS fold-0 validation**
 
-Date: 2026-09-06
+Date: 2026-09-07
 
 Data constraint: **EyePACS/Kaggle DR and APTOS image-level grades only**. No
 lesion masks, text encoder, concept labels, manual annotation, or clinician
@@ -54,7 +55,7 @@ The implementation remains in git history as a negative ablation; it is no
 longer exposed by the active training CLI. The general non-finite forward and
 optimizer-state protections introduced during that audit are retained.
 
-### 1.2 Active correction: disjoint regional event envelope
+### 1.2 Rejected ablation: normalized-LogMeanExp regional envelope
 
 The successful RF-medium checkpoint reveals a different, measured defect. It
 feeds 9,864 stride-8 cells with RF 95 into a circuit truncated at count 32.
@@ -64,7 +65,7 @@ one and hundreds of overlapping cells can enter one proof. The count then
 models replicated views of one pattern as if they were distinct Bernoulli
 events.
 
-MOSAIC-v3 keeps the proven RF-medium encoder unchanged and partitions its
+MOSAIC-v3 kept the proven RF-medium encoder unchanged and partitioned its
 112-by-112 source lattice into a fixed 8-by-8 grid of equal, disjoint
 14-by-14-cell regions. For region $G_b$, boundary $k$, and
 $a_{n,i,k}=\operatorname{logit}(\lambda_{n,i,k})$, the count event is
@@ -75,22 +76,62 @@ r_{n,b,k}=\sigma\!\left(\tau_R\left[
 -\log|G_b^{\rm valid}|\right]\right),\qquad \tau_R=0.25.
 \]
 
-This normalized LogMeanExp preserves both a constant source probability and
-the cumulative order $r_{b,k}\ge r_{b,k+1}$, while distributing gradient to
-all valid sources. The existing exact
-Poisson--binomial circuit, proof projector, posterior-median decoder, imbalance
-weights, optimizer, and schedule then operate on at most 64 fixed regional
-events. The boundary-specific largest RF-95 source is serialized as
-representative provenance, but causal sufficiency belongs to the whole smooth
-regional event. A regional event's conservative
-receptive field is the union of its source RFs (199 pixels at 896 input), not
-the 112-pixel distance between regional centers.
+The completed validation-only decoder audit rejects this compiler, not the
+proof selector. On the 293-image APTOS fold-0 inner validation split, the
+checkpoint-declared posterior median obtained 79.18% accuracy, 0.8544 QWK, and
+0.2730 MAE. Replaying the same regional ledger immediately before proof
+selection gave 78.50% accuracy, 0.8584 QWK, and 0.2765 MAE. It changed only
+seven predictions, correcting two while harming four. The dense regional path
+therefore did not recover the lost accuracy: the defect is upstream of proof
+selection.
+
+The same audit replayed the compiler exactly and measured a mean reduction of
+1.12 source log-odds at every ordinal boundary (maximum source-to-envelope
+probability reduction 0.318). This is the expected
+$\tau_R\log |G_b|\approx0.25\log196=1.32$ dilution of a focal source inside a
+14-by-14 block. The equal-input property that made the envelope well calibrated
+at initialization also suppresses precisely the isolated high response needed
+for small retinal lesions. MOSAIC-v3 is therefore a completed negative
+ablation; no more optimizer, learning-rate, or decoder experiments are assigned
+to it.
 
 The event-head normal bias is calibrated against the number of valid regional
 events. This is necessary because the initial source-cell probabilities are
 equal and normalized LogMeanExp has exact equal-input identity; calibrating
 against 9,864 source cells would make the initial regional abnormal count
 almost zero.
+
+### 1.3 Active correction: hard existential regional compiler
+
+MOSAIC-v4 changes exactly one architectural choice: each fixed region emits
+its strongest valid cumulative witness rather than a normalized smooth
+average. For boundary $k$,
+
+\[
+r^{\max}_{n,b,k}
+=\max_{i\in G_b:\,v_i=1}\lambda_{n,i,k}
+=\sigma\!\left(\max_{i\in G_b:\,v_i=1}a_{n,i,k}\right).
+\]
+
+This is an **existential maximum**, not generic feature max pooling: the
+pointwise head first constructs calibrated, nested ordinal witness
+probabilities, and only then asks whether any bounded source site inside each
+disjoint region supports crossing boundary $k$. It preserves a focal lesion
+response without the v3 block-size penalty, preserves cumulative order, and
+still lets the Poisson--binomial law measure spatial extent by counting distinct
+regions. The source attaining the maximum is now both the event's exact
+provenance and its active causal support (with every tied maximizer producing
+the same event value). The trade-off is explicit: non-maximal source sites
+receive no direct compiler gradient and within-region multiplicity is
+intentionally discarded.
+
+The single controlled v4 experiment uses the same APTOS fold 0, RF-medium
+encoder, 8-by-8 partition, loss, posterior-median decoder, optimizer, seed, and
+35-epoch budget as v3. Promote v4 only if it restores at least the prior
+RF-medium reference of 83.96% validation accuracy (246/293) and 0.8808 QWK,
+with mean proof fraction no greater than 0.25 and all proof invariants intact.
+Otherwise reject regional compilation and return to the uncompiled RF-medium
+architecture; do not tune the threshold after seeing the run.
 
 ## 2. Why the granularity must change
 
@@ -260,37 +301,47 @@ E\,P(L_i>0)\approx\mu_0.
 
 For four equal abnormal-state logits, the normal-state logit advantage is
 approximately \(\log(4E/\mu_0)\). Here \(E\) is the number of valid regional
-events for v3 and the number of valid source cells only when regional pooling
-is disabled. Grade-0 images then provide abundant negative-bag supervision
-that drives abnormal probabilities down without pixel labels.
+events when either regional compiler is enabled and the number of valid source
+cells only when regional compilation is disabled. Both normalized LogMeanExp
+and the existential maximum preserve equal inputs, so the same 64-event bias
+calibration remains correct for v4. Grade-0 images then provide abundant
+negative-bag supervision that drives abnormal probabilities down without pixel
+labels.
 
-### 4.3 Fixed disjoint regional event envelope
+### 4.3 Fixed disjoint hard-existential regional compiler
 
 Let \(G_1,\ldots,G_B\) be the fixed 8-by-8 partition of the source lattice.
 For \(a_{n,i,k}=\operatorname{logit}(\lambda_{n,i,k})\), the event ledger
-consumed by the count circuit is the normalized LogMeanExp envelope
+consumed by the v4 count circuit is
 
 \[
-r_{n,b,k}=\sigma\!\left(
-\tau_R\left[
-\log\sum_{i\in G_b:\,v_i=1}\exp(a_{n,i,k}/\tau_R)
--\log |G_b^{\rm valid}|
-\right]\right),
+r^{\max}_{n,b,k}
+=\max_{i\in G_b:\,v_i=1}\lambda_{n,i,k}
+=\sigma\!\left(\max_{i\in G_b:\,v_i=1}a_{n,i,k}\right),
 \qquad b=1,\ldots,B,\quad B\le64.
 \]
 
-We fix \(\tau_R=0.25\). Subtracting \(\log |G_b^{\rm valid}|\) gives exact
-equal-input identity: a constant source field \(\lambda_{n,i,k}=p\) maps to
-the regional event \(r_{n,b,k}=p\), independent of block size. An empty region
-is invalid and excluded. The partition is identical for every image and cannot
-communicate acquisition shape or label information. Because logit, LogMeanExp,
-and sigmoid are monotone, \(r_{n,b,k}\ge r_{n,b,k+1}\) follows directly from
-the nested source witnesses. All valid source cells receive gradient. The
-largest source witness is carried through only as boundary-specific spatial
-provenance; it does not define or individually certify the regional event.
-This is not a noisy-OR and must not be described as the probability that any
-independent lesion occurs inside a region; it is a deterministic smooth
-envelope over correlated local scores.
+An empty region is invalid and excluded. The partition is identical for every
+image and cannot communicate acquisition shape or label information. A
+constant source field \(\lambda_{n,i,k}=p\) maps to \(r^{\max}_{n,b,k}=p\),
+independent of block size. Since each source is nested over boundaries,
+\(r^{\max}_{n,b,k}\ge r^{\max}_{n,b,k+1}\); the compiler cannot violate the
+ordinal order. The maximizing source index is stored separately for every
+region and boundary and is the exact provenance of that regional event.
+
+The operator is a deterministic existential envelope over correlated local
+scores. It must not be described as noisy-OR or as the calibrated probability
+that at least one statistically independent lesion occurs. Its intended
+semantics are narrower: **the strongest bounded local witness in this disjoint
+region supports crossing this ordinal boundary with score
+\(r^{\max}_{n,b,k}\)**. Only maximizing source sites receive local compiler
+gradient; `torch.amax` shares that gradient across exact ties, while a separate
+deterministic `argmax` chooses one tied source for serialized provenance. The
+cardinality law downstream counts evidence across disjoint regions. This choice
+deliberately preserves focal support and inter-region extent but does not
+represent within-region multiplicity. The v3 normalized-LogMeanExp
+compiler remains implemented only as the matched negative ablation documented
+in Sec. 1.2.
 
 ### 4.4 Exact truncated Poisson--binomial cardinality law
 
@@ -589,7 +640,7 @@ as causal evidence. Black, grey, blur, and inpainting baselines can introduce
 out-of-distribution content; mask colour and shape can themselves encode the
 label.
 
-In MOSAIC-v3, the proof circuit can intervene at one explicit regional
+In MOSAIC-v4, the proof circuit can intervene at one explicit regional
 boundary-witness node:
 
 \[
@@ -598,11 +649,12 @@ boundary-witness node:
 
 The coherent whole-region intervention sets the complete regional cumulative
 state to normal, \(r_{n,b,0}=\cdots=r_{n,b,K-2}=0\). The fixed source-cell
-partition and the LogMeanExp denominator do not change under either
-intervention; removing cells from the validity mask would redefine the event
-rather than hide its evidence. A source-level intervention is possible only by
-recomputing the regional envelope and is not equivalent to removing its
-representative peak, because other source cells continue to contribute.
+partition does not change under either intervention; removing cells from the
+validity mask would redefine the event rather than hide its evidence. A
+source-level intervention is possible only by recomputing the existential
+maximum. Removing the current maximizing source can expose the runner-up and
+is therefore not equivalent to setting the compiled regional event directly
+to zero.
 
 For a fixed certificate, the exact direct effect of hiding selected region \(b\)
 at boundary \(k\) is
@@ -769,8 +821,9 @@ For each predicted image, return a machine-readable certificate:
 - the predicted class distribution;
 - four transition probabilities \(c_k\);
 - the learned extent distributions \(\alpha_k\);
-- the selected regional coordinates and their conservative receptive-field
-  boxes, plus a boundary-specific peak source as representative provenance;
+- the selected regional coordinates and their conservative union
+  receptive-field boxes, plus the boundary-specific maximizing source and its
+  RF-95 box as the realized event provenance;
 - the local categorical states \(\rho_i\);
 - retained and complement count distributions and tail probabilities;
 - sufficiency gap \(\widetilde c_k-c_k\);

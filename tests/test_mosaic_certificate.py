@@ -27,6 +27,7 @@ from models.mosaic import (
     MOSAICOrdinalCore,
     nested_witness_probabilities,
     regional_logmeanexp_ordinal_evidence,
+    regional_max_ordinal_evidence,
 )
 from models.mosaic_decoder import proof_only_decisions
 
@@ -66,7 +67,7 @@ def _example_output():
     return output, valid, metadata
 
 
-def _regional_example_output():
+def _regional_example_output(pool_type: str = "normalized_logmeanexp"):
     torch.manual_seed(111)
     source_logits = torch.randn(1, 16, 3)
     # Put a distinct severe peak in every fixed 2x2 source block.
@@ -74,9 +75,18 @@ def _regional_example_output():
         source_logits[0, index] = torch.tensor([-4.0, -2.0, 5.0])
     source_valid = torch.ones(1, 16, dtype=torch.bool)
     source_evidence = nested_witness_probabilities(source_logits, source_valid)
-    regional = regional_logmeanexp_ordinal_evidence(
-        source_evidence, source_valid, (4, 4), (2, 2), temperature=0.25
-    )
+    if pool_type == "normalized_logmeanexp":
+        regional = regional_logmeanexp_ordinal_evidence(
+            source_evidence, source_valid, (4, 4), (2, 2), temperature=0.25
+        )
+        pool_tag = "lme"
+    elif pool_type == "existential_max":
+        regional = regional_max_ordinal_evidence(
+            source_evidence, source_valid, (4, 4), (2, 2)
+        )
+        pool_tag = "existential_max"
+    else:
+        raise ValueError(pool_type)
     core = MOSAICOrdinalCore(
         num_classes=3,
         max_count=3,
@@ -97,6 +107,7 @@ def _regional_example_output():
     output.source_lattice_size = regional.source_lattice_size
     output.regional_block_size = regional.block_size
     output.regional_pool_temperature = regional.temperature
+    output.regional_pool_type = regional.pool_type
     source_metadata = {
         "input_size": [32, 32],
         "lattice_size": [4, 4],
@@ -116,7 +127,7 @@ def _regional_example_output():
     regional_metadata["lattice_size"] = [2, 2]
     regional_metadata["receptive_field"].update(
         {
-            "tap": "rf_medium_regional_lme_2x2",
+            "tap": f"rf_medium_regional_{pool_tag}_2x2",
             "output_stride": 16,
             "receptive_field": 15,
             "center_offset": 4.5,
@@ -148,6 +159,7 @@ class MosaicCertificateTests(unittest.TestCase):
             provenance["aggregation"],
             "fixed_disjoint_boundarywise_normalized_logmeanexp_logit",
         )
+        self.assertEqual(provenance["pool_type"], "normalized_logmeanexp")
         self.assertEqual(provenance["temperature"], 0.25)
         self.assertEqual(provenance["regional_block_size"], [2, 2])
         self.assertEqual(
@@ -170,6 +182,45 @@ class MosaicCertificateTests(unittest.TestCase):
         report = verify_mosaic_certificate(certificate)
         self.assertTrue(report["ok"], report)
         self.assertTrue(report["checks"]["regional_envelope_provenance"])
+
+    def test_existential_max_certificate_declares_exact_region_semantics(self) -> None:
+        certificate = build_mosaic_certificate(
+            _regional_example_output("existential_max"),
+            sufficiency_tolerance=0.05,
+            complement_suppression=0.5,
+        )
+        provenance = certificate["regional_envelope_provenance"]
+        self.assertEqual(provenance["pool_type"], "existential_max")
+        self.assertEqual(
+            provenance["aggregation"],
+            "fixed_disjoint_boundarywise_existential_max_logit",
+        )
+        self.assertNotIn("temperature", provenance)
+        selected = [
+            cell
+            for boundary_cells in certificate["proof"]["selected_cells"]
+            for cell in boundary_cells
+        ]
+        self.assertTrue(selected)
+        for cell in selected:
+            self.assertIn(
+                "exact existential regional witness",
+                cell["regional_peak_source"]["provenance_scope"],
+            )
+        report = verify_mosaic_certificate(certificate)
+        self.assertTrue(report["ok"], report)
+
+    def test_legacy_regional_v3_without_pool_type_still_replays(self) -> None:
+        certificate = build_mosaic_certificate(
+            _regional_example_output(),
+            sufficiency_tolerance=0.05,
+            complement_suppression=0.5,
+        )
+        legacy = copy.deepcopy(certificate)
+        legacy["regional_envelope_provenance"].pop("pool_type")
+        legacy["integrity"]["payload_sha256"] = _payload_sha256(legacy)
+        report = verify_mosaic_certificate(legacy)
+        self.assertTrue(report["ok"], report)
 
     def test_legacy_v3_without_regional_provenance_still_replays(self) -> None:
         output, valid, metadata = _example_output()

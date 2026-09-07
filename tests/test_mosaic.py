@@ -21,7 +21,9 @@ from models.mosaic import (
     continuation_probabilities,
     fixed_proof_pivotality,
     nested_witness_probabilities,
+    normalize_region_pool_type,
     regional_logmeanexp_ordinal_evidence,
+    regional_max_ordinal_evidence,
 )
 
 
@@ -203,6 +205,154 @@ def test_regional_logmeanexp_requires_a_fixed_partition_and_positive_temperature
                 (2, 2),
                 temperature=temperature,
             )
+
+
+def test_regional_max_is_exact_nested_and_excludes_invalid_sources() -> None:
+    logits = torch.tensor(
+        [
+            [
+                [4.0, 0.0, 0.0, 0.0],
+                [0.0, 4.0, 0.0, 0.0],
+                [0.0, 0.0, 4.0, 0.0],
+                [0.0, 0.0, 0.0, 4.0],
+            ]
+            * 4
+        ]
+    ).requires_grad_()
+    valid = torch.ones(1, 16, dtype=torch.bool)
+    valid[:, 10:] = False
+    source = nested_witness_probabilities(logits, valid)
+    pooled = regional_max_ordinal_evidence(
+        source, valid, (4, 4), (2, 2)
+    )
+
+    assert pooled.pool_type == "existential_max"
+    assert pooled.temperature is None
+    assert torch.equal(
+        pooled.valid_mask, torch.tensor([[True, True, True, False]])
+    )
+    assert torch.equal(pooled.source_indices[0, 3], torch.full((3,), -1))
+    assert torch.equal(
+        pooled.evidence.state_probabilities[0, 3],
+        torch.tensor([1.0, 0.0, 0.0, 0.0]),
+    )
+    assert torch.all(
+        pooled.evidence.witness_probabilities[..., :-1]
+        >= pooled.evidence.witness_probabilities[..., 1:]
+    )
+    torch.testing.assert_close(
+        pooled.evidence.state_probabilities.sum(dim=-1), torch.ones(1, 4)
+    )
+
+    source_blocks = (
+        torch.arange(16)
+        .reshape(2, 2, 2, 2)
+        .permute(0, 2, 1, 3)
+        .reshape(4, 4)
+    )
+    for region in range(3):
+        block_indices = source_blocks[region]
+        block_indices = block_indices[valid[0, block_indices]]
+        source_logits = (
+            source.log_witness_probabilities[0, block_indices]
+            - source.log_nonwitness_probabilities[0, block_indices]
+        )
+        expected_logits, expected_offsets = source_logits.max(dim=0)
+        torch.testing.assert_close(
+            pooled.evidence.log_witness_probabilities[0, region],
+            torch.nn.functional.logsigmoid(expected_logits),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            pooled.evidence.log_nonwitness_probabilities[0, region],
+            torch.nn.functional.logsigmoid(-expected_logits),
+            atol=0,
+            rtol=0,
+        )
+        expected_sources = block_indices[expected_offsets]
+        assert torch.equal(pooled.source_indices[0, region], expected_sources)
+
+    pooled.evidence.witness_probabilities.sum().backward()
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+    assert torch.equal(logits.grad[~valid], torch.zeros_like(logits.grad[~valid]))
+
+
+def test_regional_max_equal_input_identity_splits_tie_gradients() -> None:
+    base = torch.tensor([2.0, 0.5, -1.0])
+    logits = base.reshape(1, 1, 3).repeat(1, 16, 1).requires_grad_()
+    valid = torch.ones(1, 16, dtype=torch.bool)
+    source = nested_witness_probabilities(logits, valid)
+    pooled = regional_max_ordinal_evidence(
+        source, valid, (4, 4), (2, 2)
+    )
+    torch.testing.assert_close(
+        pooled.evidence.witness_probabilities,
+        source.witness_probabilities[:, :1].expand(-1, 4, -1),
+        atol=0,
+        rtol=0,
+    )
+
+    pooled.evidence.witness_probabilities.sum().backward()
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+    # Each 2x2 block begins tied. torch.amax shares each boundary gradient
+    # across all four sources instead of starving all but index zero.
+    gradient = logits.grad.reshape(1, 2, 2, 2, 2, 3).permute(0, 1, 3, 2, 4, 5)
+    gradient = gradient.reshape(1, 4, 4, 3)
+    assert torch.all(gradient.abs().sum(dim=-1) > 0)
+    torch.testing.assert_close(
+        gradient,
+        gradient[:, :, :1].expand_as(gradient),
+        atol=1e-8,
+        rtol=1e-6,
+    )
+
+
+def test_regional_max_uses_stable_logits_for_saturated_provenance() -> None:
+    logits = torch.tensor([[[-50.0, 50.0], [-100.0, 100.0]]])
+    valid = torch.ones(1, 2, dtype=torch.bool)
+    source = nested_witness_probabilities(logits, valid)
+    assert torch.equal(
+        source.witness_probabilities,
+        torch.ones_like(source.witness_probabilities),
+    )
+    pooled = regional_max_ordinal_evidence(
+        source, valid, (1, 2), (1, 1)
+    )
+    assert int(pooled.source_indices[0, 0, 0]) == 1
+    expected_logit = (
+        source.log_witness_probabilities[0, 1, 0]
+        - source.log_nonwitness_probabilities[0, 1, 0]
+    )
+    torch.testing.assert_close(
+        pooled.evidence.log_witness_probabilities[0, 0, 0],
+        torch.nn.functional.logsigmoid(expected_logit),
+        atol=0,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    [
+        ("lme", "normalized_logmeanexp"),
+        ("normalized_logmeanexp", "normalized_logmeanexp"),
+        ("max", "existential_max"),
+        ("hard_max", "existential_max"),
+        ("existential_max", "existential_max"),
+    ],
+)
+def test_region_pool_aliases_have_checkpoint_canonical_names(
+    alias: str, canonical: str
+) -> None:
+    assert normalize_region_pool_type(alias) == canonical
+
+
+def test_unknown_region_pool_is_rejected() -> None:
+    with pytest.raises(ValueError, match="unknown regional pool"):
+        normalize_region_pool_type("learned_attention")
 
 
 def test_local_head_bias_matches_requested_initial_abnormal_count() -> None:

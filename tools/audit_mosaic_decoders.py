@@ -18,9 +18,11 @@ alternative model selection rule: it isolates information removed by proof
 selection from information already lost by the regional evidence compiler.
 
 For regional checkpoints the audit also replays the exact source-cell to
-regional LogMeanExp operator and measures its attenuation relative to the
-strongest source cell.  These intermediate measurements are read-only; no
-feature, global logit, or fitted calibration path is introduced.
+regional compiler.  Legacy normalized-LogMeanExp checkpoints retain the
+source-peak attenuation audit; existential-max checkpoints instead verify the
+architectural identity between every regional event and its recorded source
+peak.  These intermediate measurements are read-only; no feature, global
+logit, or fitted calibration path is introduced.
 """
 
 from __future__ import annotations
@@ -61,8 +63,12 @@ from models.mosaic_decoder import (
     proof_only_decisions,
 )
 from models.mosaic import (
+    LocalOrdinalEvidence,
+    REGION_POOL_TYPES,
+    RegionalOrdinalEvidence,
     nested_witness_probabilities,
     regional_logmeanexp_ordinal_evidence,
+    regional_max_ordinal_evidence,
 )
 from models.mosaic_model import build_mosaic_model
 from training.mosaic_trainer import mosaic_implementation_signature
@@ -96,6 +102,23 @@ def _checkpoint_decision_rule(stored_config: dict[str, Any]) -> str:
             f"expected one of {PROOF_DECISION_RULES}"
         )
     return rule
+
+
+def _checkpoint_region_pool_type(stored_config: dict[str, Any]) -> str:
+    """Recover the regional compiler without changing legacy checkpoints.
+
+    ``region_pool_type`` did not exist for the original regional experiments;
+    normalized LogMeanExp was their only implementation and is therefore the
+    sole valid backward-compatible default.
+    """
+
+    pool_type = stored_config.get("region_pool_type", "normalized_logmeanexp")
+    if pool_type not in REGION_POOL_TYPES:
+        raise ValueError(
+            f"checkpoint has unknown MOSAIC regional pool {pool_type!r}; "
+            f"expected one of {REGION_POOL_TYPES}"
+        )
+    return str(pool_type)
 
 
 def _split_signature(*named_splits) -> str:
@@ -624,6 +647,66 @@ def _fixed_region_valid_counts(
     )
 
 
+def _replay_regional_evidence(
+    *,
+    source_evidence: LocalOrdinalEvidence,
+    source_valid_mask: torch.Tensor,
+    source_lattice_size: tuple[int, int],
+    region_grid_size: tuple[int, int],
+    pool_type: str,
+    temperature: float | None,
+) -> RegionalOrdinalEvidence:
+    """Replay the checkpoint-declared compiler through its exact core helper."""
+
+    if pool_type == "normalized_logmeanexp":
+        if temperature is None:
+            raise ValueError(
+                "normalized LogMeanExp replay requires its checkpoint temperature"
+            )
+        return regional_logmeanexp_ordinal_evidence(
+            source_evidence,
+            source_valid_mask,
+            source_lattice_size,
+            region_grid_size,
+            temperature=temperature,
+        )
+    if pool_type == "existential_max":
+        return regional_max_ordinal_evidence(
+            source_evidence,
+            source_valid_mask,
+            source_lattice_size,
+            region_grid_size,
+        )
+    raise ValueError(
+        f"unknown regional pool {pool_type!r}; expected one of "
+        f"{REGION_POOL_TYPES}"
+    )
+
+
+def _masked_max_absolute_error(
+    replayed: torch.Tensor,
+    recorded: torch.Tensor,
+    regional_valid_mask: torch.Tensor,
+) -> float:
+    """Compare regional tensors without subtracting invalid ``-inf`` sentinels."""
+
+    if replayed.shape != recorded.shape:
+        raise ValueError("replayed and recorded regional tensors must match")
+    valid = regional_valid_mask.detach().bool().to(replayed.device)
+    while valid.ndim < replayed.ndim:
+        valid = valid.unsqueeze(-1)
+    valid = valid.expand_as(replayed)
+    if not bool(valid.any()):
+        return 0.0
+    replayed_valid = replayed.detach()[valid].float()
+    recorded_valid = recorded.detach()[valid].float()
+    if not bool(torch.isfinite(replayed_valid).all()) or not bool(
+        torch.isfinite(recorded_valid).all()
+    ):
+        raise ValueError("valid regional replay values must be finite")
+    return float((replayed_valid - recorded_valid).abs().max().cpu())
+
+
 def _batch_regional_lme_attenuation(
     *,
     source_log_witness_probabilities: torch.Tensor,
@@ -701,6 +784,39 @@ def _batch_regional_lme_attenuation(
     }
 
 
+def _batch_regional_max_attenuation(
+    *,
+    source_log_witness_probabilities: torch.Tensor,
+    source_log_nonwitness_probabilities: torch.Tensor,
+    regional_log_witness_probabilities: torch.Tensor,
+    regional_log_nonwitness_probabilities: torch.Tensor,
+    peak_source_indices: torch.Tensor,
+    regional_valid_mask: torch.Tensor,
+    valid_source_counts: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Collect the exact source-peak identity for existential max pooling."""
+
+    common = _batch_regional_lme_attenuation(
+        source_log_witness_probabilities=source_log_witness_probabilities,
+        source_log_nonwitness_probabilities=source_log_nonwitness_probabilities,
+        regional_log_witness_probabilities=regional_log_witness_probabilities,
+        regional_log_nonwitness_probabilities=regional_log_nonwitness_probabilities,
+        peak_source_indices=peak_source_indices,
+        regional_valid_mask=regional_valid_mask,
+        valid_source_counts=valid_source_counts,
+    )
+    return {
+        "valid_mask": common["valid_mask"],
+        "valid_source_counts": common["valid_source_counts"],
+        "source_peak_logit": common["source_peak_logit"],
+        "regional_max_logit": common["regional_lme_logit"],
+        "logit_attenuation": common["logit_attenuation"],
+        "source_peak_probability": common["source_peak_probability"],
+        "regional_max_probability": common["regional_lme_probability"],
+        "probability_attenuation": common["probability_attenuation"],
+    }
+
+
 def _merge_regional_lme_attenuation_batches(
     batches: list[dict[str, torch.Tensor]],
 ) -> dict[str, torch.Tensor]:
@@ -712,6 +828,113 @@ def _merge_regional_lme_attenuation_batches(
     return {
         name: torch.cat([batch[name] for batch in batches], dim=0)
         for name in keys
+    }
+
+
+def _regional_max_attenuation_summary(
+    attenuation: dict[str, torch.Tensor],
+    *,
+    source_lattice_size: tuple[int, int],
+    regional_block_size: tuple[int, int],
+    replay_max_probability_error: float,
+    replay_max_logit_error: float,
+    replay_peak_index_mismatches: int,
+) -> dict[str, Any]:
+    """Summarize and enforce the source-peak identity of existential max."""
+
+    replay_tolerance = 1e-7
+    valid = attenuation["valid_mask"].bool()
+    if valid.ndim != 3:
+        raise ValueError("regional attenuation valid mask must have shape (N,R,K-1)")
+    logit_identity_violations = int(
+        (attenuation["logit_attenuation"][valid].abs() > 1e-6).sum()
+    )
+    probability_identity_violations = int(
+        (attenuation["probability_attenuation"][valid].abs() > 1e-6).sum()
+    )
+    if logit_identity_violations or probability_identity_violations:
+        raise RuntimeError(
+            "existential-max regional events do not equal their recorded source "
+            "peaks"
+        )
+    replay_all_hold = bool(
+        replay_max_probability_error <= replay_tolerance
+        and replay_max_logit_error <= replay_tolerance
+        and replay_peak_index_mismatches == 0
+    )
+    if not replay_all_hold:
+        raise RuntimeError(
+            "existential-max audit replay does not match the checkpoint forward "
+            "trace"
+        )
+
+    rows: list[dict[str, Any]] = []
+    for boundary in range(valid.shape[2]):
+        mask = valid[..., boundary]
+        logit_attenuation = attenuation["logit_attenuation"][..., boundary][mask]
+        probability_attenuation = attenuation["probability_attenuation"][
+            ..., boundary
+        ][mask]
+        rows.append(
+            {
+                "boundary": boundary,
+                "valid_region_events": int(mask.sum()),
+                "valid_source_cells_per_region": _distribution_summary(
+                    attenuation["valid_source_counts"][mask]
+                ),
+                "source_peak_logit": _distribution_summary(
+                    attenuation["source_peak_logit"][..., boundary][mask]
+                ),
+                "regional_max_logit": _distribution_summary(
+                    attenuation["regional_max_logit"][..., boundary][mask]
+                ),
+                "source_peak_minus_regional_max_logit": (
+                    _signed_delta_summary(logit_attenuation)
+                ),
+                "source_peak_probability": _distribution_summary(
+                    attenuation["source_peak_probability"][..., boundary][mask]
+                ),
+                "regional_max_probability": _distribution_summary(
+                    attenuation["regional_max_probability"][..., boundary][mask]
+                ),
+                "source_peak_minus_regional_max_probability": (
+                    _signed_delta_summary(probability_attenuation)
+                ),
+                "nonzero_peak_logit_attenuation_count_tolerance_1e-6": int(
+                    (logit_attenuation.abs() > 1e-6).sum()
+                ),
+                "nonzero_peak_probability_attenuation_count_tolerance_1e-6": int(
+                    (probability_attenuation.abs() > 1e-6).sum()
+                ),
+            }
+        )
+    return {
+        "available": True,
+        "operator": "existential_max_in_source_logit_space",
+        "temperature": None,
+        "source_lattice_size": list(source_lattice_size),
+        "regional_block_size": list(regional_block_size),
+        "regional_event_count": int(valid.shape[1]),
+        "definition": (
+            "each regional event is exactly its strongest valid source-cell "
+            "logit; peak attenuation is structurally zero"
+        ),
+        "zero_peak_attenuation_identity": {
+            "tolerance": 1e-6,
+            "logit_violation_count": logit_identity_violations,
+            "probability_violation_count": probability_identity_violations,
+            "all_hold": True,
+        },
+        "architecture_replay": {
+            "tolerance": replay_tolerance,
+            "regional_probability_max_absolute_error": float(
+                replay_max_probability_error
+            ),
+            "regional_logit_max_absolute_error": float(replay_max_logit_error),
+            "peak_source_index_mismatches": int(replay_peak_index_mismatches),
+            "all_hold": replay_all_hold,
+        },
+        "boundaries": rows,
     }
 
 
@@ -1153,6 +1376,7 @@ def main() -> None:
     if not isinstance(stored, dict):
         raise ValueError("checkpoint has no usable MOSAIC configuration")
     checkpoint_decision_rule = _checkpoint_decision_rule(stored)
+    checkpoint_region_pool_type = _checkpoint_region_pool_type(stored)
     cfg = MOSAICConfig(
         **{
             key: value
@@ -1161,6 +1385,7 @@ def main() -> None:
         }
     )
     cfg.decision_rule = checkpoint_decision_rule
+    cfg.region_pool_type = checkpoint_region_pool_type
     dataset_name = cfg.dataset.lower()
     if dataset_name not in {"aptos", "dr"}:
         raise ValueError(f"unsupported checkpoint dataset {cfg.dataset!r}")
@@ -1242,6 +1467,7 @@ def main() -> None:
         count_implementation=cfg.count_implementation,
         count_block_size=cfg.count_block_size,
         region_grid_size=cfg.region_grid_size,
+        region_pool_type=cfg.region_pool_type,
         region_pool_temperature=cfg.region_pool_temperature,
     ).to(device)
     model.load_state_dict(checkpoint["model_state"], strict=True)
@@ -1284,7 +1510,8 @@ def main() -> None:
     witness_concentration_batches: list[dict[str, Any]] = []
     overflow_batches: list[torch.Tensor] = []
     regional_attenuation_batches: list[dict[str, torch.Tensor]] = []
-    regional_replay_max_errors: list[float] = []
+    regional_replay_probability_max_errors: list[float] = []
+    regional_replay_logit_max_errors: list[float] = []
     regional_replay_peak_mismatches = 0
     regional_source_lattice_size: tuple[int, int] | None = None
     regional_block_size: tuple[int, int] | None = None
@@ -1385,7 +1612,11 @@ def main() -> None:
                     or output.source_lattice is None
                     or output.evidence.regional_source_indices is None
                     or output.evidence.regional_block_size is None
-                    or output.evidence.regional_pool_temperature is None
+                    or output.evidence.regional_pool_type is None
+                    or (
+                        checkpoint_region_pool_type == "normalized_logmeanexp"
+                        and output.evidence.regional_pool_temperature is None
+                    )
                 ):
                     raise RuntimeError(
                         "regional checkpoint omitted source-to-region audit trace"
@@ -1406,6 +1637,20 @@ def main() -> None:
                     raise RuntimeError(
                         "regional source geometry unexpectedly changed across batches"
                     )
+                if output.evidence.regional_pool_type != checkpoint_region_pool_type:
+                    raise RuntimeError(
+                        "regional checkpoint compiler differs from the forward trace: "
+                        f"{checkpoint_region_pool_type!r} != "
+                        f"{output.evidence.regional_pool_type!r}"
+                    )
+                if (
+                    checkpoint_region_pool_type == "existential_max"
+                    and output.evidence.regional_pool_temperature is not None
+                ):
+                    raise RuntimeError(
+                        "existential-max forward trace must not expose a pooling "
+                        "temperature"
+                    )
 
                 # Replay the exact pointwise state head and exact regional
                 # compiler used by the forward pass.  This reads an internal
@@ -1418,12 +1663,28 @@ def main() -> None:
                         source_logits,
                         output.source_valid_mask,
                     )
-                    replayed_regional = regional_logmeanexp_ordinal_evidence(
-                        source_evidence,
-                        output.source_valid_mask,
-                        current_source_lattice_size,
-                        (cfg.region_grid_size, cfg.region_grid_size),
+                    replayed_regional = _replay_regional_evidence(
+                        source_evidence=source_evidence,
+                        source_valid_mask=output.source_valid_mask,
+                        source_lattice_size=current_source_lattice_size,
+                        region_grid_size=(
+                            cfg.region_grid_size,
+                            cfg.region_grid_size,
+                        ),
+                        pool_type=checkpoint_region_pool_type,
                         temperature=output.evidence.regional_pool_temperature,
+                    )
+                if replayed_regional.pool_type != checkpoint_region_pool_type:
+                    raise RuntimeError(
+                        "regional audit helper replayed the wrong compiler: "
+                        f"{replayed_regional.pool_type!r}"
+                    )
+                if (
+                    checkpoint_region_pool_type == "existential_max"
+                    and replayed_regional.temperature is not None
+                ):
+                    raise RuntimeError(
+                        "existential-max audit replay unexpectedly used a temperature"
                     )
                 if not torch.equal(
                     replayed_regional.valid_mask,
@@ -1440,7 +1701,20 @@ def main() -> None:
                     .abs()
                     .max()
                 )
-                regional_replay_max_errors.append(replay_error)
+                regional_replay_probability_max_errors.append(replay_error)
+                regional_replay_logit_max_errors.append(
+                    _masked_max_absolute_error(
+                        (
+                            replayed_regional.evidence.log_witness_probabilities
+                            - replayed_regional.evidence.log_nonwitness_probabilities
+                        ),
+                        (
+                            output.evidence.log_witness_probabilities
+                            - output.evidence.log_nonwitness_probabilities
+                        ),
+                        replayed_regional.valid_mask,
+                    )
+                )
                 regional_replay_peak_mismatches += int(
                     (
                         replayed_regional.source_indices
@@ -1452,8 +1726,13 @@ def main() -> None:
                     current_source_lattice_size,
                     current_block_size,
                 )
+                attenuation_builder = (
+                    _batch_regional_lme_attenuation
+                    if checkpoint_region_pool_type == "normalized_logmeanexp"
+                    else _batch_regional_max_attenuation
+                )
                 regional_attenuation_batches.append(
-                    _batch_regional_lme_attenuation(
+                    attenuation_builder(
                         source_log_witness_probabilities=(
                             source_evidence.log_witness_probabilities
                         ),
@@ -1589,16 +1868,32 @@ def main() -> None:
         regional_attenuation = _merge_regional_lme_attenuation_batches(
             regional_attenuation_batches
         )
-        regional_attenuation_summary: dict[str, Any] = (
-            _regional_lme_attenuation_summary(
+        if checkpoint_region_pool_type == "normalized_logmeanexp":
+            regional_attenuation_summary: dict[str, Any] = (
+                _regional_lme_attenuation_summary(
+                    regional_attenuation,
+                    temperature=cfg.region_pool_temperature,
+                    source_lattice_size=regional_source_lattice_size,
+                    regional_block_size=regional_block_size,
+                    replay_max_probability_error=max(
+                        regional_replay_probability_max_errors
+                    ),
+                    replay_peak_index_mismatches=(
+                        regional_replay_peak_mismatches
+                    ),
+                )
+            )
+        else:
+            regional_attenuation_summary = _regional_max_attenuation_summary(
                 regional_attenuation,
-                temperature=cfg.region_pool_temperature,
                 source_lattice_size=regional_source_lattice_size,
                 regional_block_size=regional_block_size,
-                replay_max_probability_error=max(regional_replay_max_errors),
+                replay_max_probability_error=max(
+                    regional_replay_probability_max_errors
+                ),
+                replay_max_logit_error=max(regional_replay_logit_max_errors),
                 replay_peak_index_mismatches=regional_replay_peak_mismatches,
             )
-        )
     else:
         regional_attenuation_summary = {
             "available": False,
@@ -1728,6 +2023,7 @@ def main() -> None:
         "samples": int(labels.numel()),
         "true_class_counts": label_counts.tolist(),
         "checkpoint_decision_rule": checkpoint_decision_rule,
+        "checkpoint_region_pool_type": checkpoint_region_pool_type,
         "checkpoint_metric_reproduction": metric_reproduction,
         "checkpoint_metric_absolute_differences": reproduction_differences,
         "implementation_signature_match": implementation_match,
@@ -1865,7 +2161,28 @@ def main() -> None:
             ),
         },
         "boundary_transition_comparison": boundary_path_diagnostics,
-        "source_to_regional_lme_attenuation": regional_attenuation_summary,
+        "source_to_regional_pool_audit": regional_attenuation_summary,
+        # Preserve the original key and payload for legacy LogMeanExp audit
+        # consumers. Max checkpoints receive a separate, honestly named
+        # identity audit instead of relabelling max values as LogMeanExp.
+        "source_to_regional_lme_attenuation": (
+            regional_attenuation_summary
+            if checkpoint_region_pool_type == "normalized_logmeanexp"
+            else {
+                "available": False,
+                "reason": "checkpoint uses existential_max regional pooling",
+            }
+        ),
+        "source_to_regional_max_identity": (
+            regional_attenuation_summary
+            if checkpoint_region_pool_type == "existential_max"
+            else {
+                "available": False,
+                "reason": (
+                    "checkpoint does not use existential_max regional pooling"
+                ),
+            }
+        ),
         "hard_proof_diagnostics": _proof_diagnostics(
             proof_sizes,
             transitions,
@@ -2124,7 +2441,10 @@ def main() -> None:
             f"{delta_summary['maximum_absolute']:11.6f}"
         )
 
-    if regional_attenuation_summary["available"]:
+    if (
+        regional_attenuation_summary["available"]
+        and checkpoint_region_pool_type == "normalized_logmeanexp"
+    ):
         print("\nSource maximum to normalized regional LogMeanExp attenuation")
         print("Boundary  Peak-prob  LME-prob  Mean-delta-prob  Mean-delta-logit")
         for row in regional_attenuation_summary["boundaries"]:
@@ -2135,8 +2455,22 @@ def main() -> None:
                 f"{row['source_peak_minus_regional_lme_probability']['mean']:16.4f} "
                 f"{row['source_peak_minus_regional_lme_logit']['mean']:16.4f}"
             )
+    elif (
+        regional_attenuation_summary["available"]
+        and checkpoint_region_pool_type == "existential_max"
+    ):
+        print("\nSource maximum to existential regional max identity")
+        print("Boundary  Peak-prob  Max-prob  Mean-delta-prob  Mean-delta-logit")
+        for row in regional_attenuation_summary["boundaries"]:
+            print(
+                f"Y>{row['boundary']:<5d} "
+                f"{row['source_peak_probability']['mean']:10.4f} "
+                f"{row['regional_max_probability']['mean']:9.4f} "
+                f"{row['source_peak_minus_regional_max_probability']['mean']:16.4f} "
+                f"{row['source_peak_minus_regional_max_logit']['mean']:16.4f}"
+            )
     else:
-        print("\nSource-to-regional attenuation unavailable: "
+        print("\nSource-to-regional compiler audit unavailable: "
               f"{regional_attenuation_summary['reason']}")
     print(f"Checkpoint metrics reproduced: {metric_reproduction}")
     print(f"Summary: {output_dir / 'summary.json'}")

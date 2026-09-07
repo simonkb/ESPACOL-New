@@ -11,8 +11,10 @@ from tools.audit_mosaic_decoders import (
     _alpha_diagnostics,
     _batch_witness_concentration,
     _batch_regional_lme_attenuation,
+    _batch_regional_max_attenuation,
     _binary_auroc,
     _checkpoint_decision_rule,
+    _checkpoint_region_pool_type,
     _declared_decision_replay_mismatches,
     _fixed_region_valid_counts,
     _log_probability_invariants,
@@ -20,8 +22,11 @@ from tools.audit_mosaic_decoders import (
     _proof_diagnostics,
     _proof_only_decisions_from_log_pairs,
     _regional_lme_attenuation_summary,
+    _regional_max_attenuation_summary,
+    _replay_regional_evidence,
     _transition_path_diagnostics,
 )
+from models.mosaic import nested_witness_probabilities
 
 
 def test_legacy_checkpoint_uses_historical_rounded_expected_rule() -> None:
@@ -38,6 +43,22 @@ def test_explicit_checkpoint_decision_rule_is_preserved() -> None:
 def test_unknown_checkpoint_decision_rule_is_rejected() -> None:
     with pytest.raises(ValueError, match="unknown MOSAIC decision rule"):
         _checkpoint_decision_rule({"decision_rule": "validation_tuned"})
+
+
+def test_legacy_checkpoint_uses_historical_regional_lme_pool() -> None:
+    assert _checkpoint_region_pool_type({}) == "normalized_logmeanexp"
+
+
+def test_explicit_existential_max_pool_is_preserved() -> None:
+    assert (
+        _checkpoint_region_pool_type({"region_pool_type": "existential_max"})
+        == "existential_max"
+    )
+
+
+def test_unknown_checkpoint_regional_pool_is_rejected() -> None:
+    with pytest.raises(ValueError, match="unknown MOSAIC regional pool"):
+        _checkpoint_region_pool_type({"region_pool_type": "average"})
 
 
 def test_model_replay_uses_declared_checkpoint_rule_not_historical_default() -> None:
@@ -324,6 +345,111 @@ def test_fixed_region_counts_and_lme_attenuation_are_exact() -> None:
         summary["boundaries"][0]["lme_above_source_max_count_tolerance_1e-6"]
         == 0
     )
+
+
+def test_existential_max_replay_has_exact_peak_values_and_provenance() -> None:
+    source_state_logits = torch.tensor(
+        [[
+            [2.0, 1.0, -1.0],
+            [-1.0, 2.0, 1.0],
+            [1.0, -1.0, 2.0],
+            [0.0, 1.0, 3.0],
+        ]]
+    )
+    source_valid = torch.tensor([[True, True, True, True]])
+    source_evidence = nested_witness_probabilities(
+        source_state_logits,
+        source_valid,
+    )
+    replayed = _replay_regional_evidence(
+        source_evidence=source_evidence,
+        source_valid_mask=source_valid,
+        source_lattice_size=(1, 4),
+        region_grid_size=(1, 2),
+        pool_type="existential_max",
+        temperature=None,
+    )
+
+    source_logits = (
+        source_evidence.log_witness_probabilities
+        - source_evidence.log_nonwitness_probabilities
+    )
+    expected_source_indices = torch.tensor([[[1, 1], [3, 3]]])
+    expected_peak_logits = torch.gather(
+        source_logits,
+        1,
+        expected_source_indices,
+    )
+    regional_logits = (
+        replayed.evidence.log_witness_probabilities
+        - replayed.evidence.log_nonwitness_probabilities
+    )
+    assert replayed.pool_type == "existential_max"
+    assert replayed.temperature is None
+    torch.testing.assert_close(replayed.source_indices, expected_source_indices)
+    torch.testing.assert_close(regional_logits, expected_peak_logits)
+
+    attenuation = _batch_regional_max_attenuation(
+        source_log_witness_probabilities=(
+            source_evidence.log_witness_probabilities
+        ),
+        source_log_nonwitness_probabilities=(
+            source_evidence.log_nonwitness_probabilities
+        ),
+        regional_log_witness_probabilities=(
+            replayed.evidence.log_witness_probabilities
+        ),
+        regional_log_nonwitness_probabilities=(
+            replayed.evidence.log_nonwitness_probabilities
+        ),
+        peak_source_indices=replayed.source_indices,
+        regional_valid_mask=replayed.valid_mask,
+        valid_source_counts=torch.tensor([[2, 2]]),
+    )
+    torch.testing.assert_close(
+        attenuation["logit_attenuation"],
+        torch.zeros_like(attenuation["logit_attenuation"]),
+        atol=1e-6,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        attenuation["probability_attenuation"],
+        torch.zeros_like(attenuation["probability_attenuation"]),
+        atol=1e-6,
+        rtol=0.0,
+    )
+
+    summary = _regional_max_attenuation_summary(
+        attenuation,
+        source_lattice_size=(1, 4),
+        regional_block_size=(1, 2),
+        replay_max_probability_error=0.0,
+        replay_max_logit_error=0.0,
+        replay_peak_index_mismatches=0,
+    )
+    json.dumps(summary, allow_nan=False)
+    assert summary["operator"] == "existential_max_in_source_logit_space"
+    assert summary["temperature"] is None
+    assert summary["zero_peak_attenuation_identity"] == {
+        "tolerance": 1e-6,
+        "logit_violation_count": 0,
+        "probability_violation_count": 0,
+        "all_hold": True,
+    }
+    assert summary["architecture_replay"] == {
+        "tolerance": 1e-7,
+        "regional_probability_max_absolute_error": 0.0,
+        "regional_logit_max_absolute_error": 0.0,
+        "peak_source_index_mismatches": 0,
+        "all_hold": True,
+    }
+    for boundary in summary["boundaries"]:
+        assert boundary[
+            "nonzero_peak_logit_attenuation_count_tolerance_1e-6"
+        ] == 0
+        assert boundary[
+            "nonzero_peak_probability_attenuation_count_tolerance_1e-6"
+        ] == 0
 
 
 def test_proof_diagnostics_condition_on_boundary_risk_and_summarize_alpha() -> None:

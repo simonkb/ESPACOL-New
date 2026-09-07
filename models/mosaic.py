@@ -27,6 +27,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+REGION_POOL_TYPES = ("normalized_logmeanexp", "existential_max")
+
+
+def normalize_region_pool_type(value: str) -> str:
+    """Return the canonical checkpoint spelling for a regional compiler."""
+
+    aliases = {
+        "normalized_logmeanexp": "normalized_logmeanexp",
+        "logmeanexp": "normalized_logmeanexp",
+        "lme": "normalized_logmeanexp",
+        "existential_max": "existential_max",
+        "hard_max": "existential_max",
+        "max": "existential_max",
+    }
+    try:
+        return aliases[str(value).strip().lower()]
+    except KeyError as exc:
+        raise ValueError(
+            f"unknown regional pool {value!r}; expected one of {REGION_POOL_TYPES}"
+        ) from exc
+
+
 def _require_finite(tensor: torch.Tensor, name: str) -> None:
     """Fail at the first corrupted proof-path tensor with useful provenance."""
 
@@ -70,7 +92,8 @@ class RegionalOrdinalEvidence:
     source_indices: torch.Tensor
     source_lattice_size: Tuple[int, int]
     block_size: Tuple[int, int]
-    temperature: float
+    temperature: Optional[float]
+    pool_type: str = "normalized_logmeanexp"
 
 
 @dataclass
@@ -137,6 +160,7 @@ class MOSAICOutput:
     source_lattice_size: Optional[Tuple[int, int]] = None
     regional_block_size: Optional[Tuple[int, int]] = None
     regional_pool_temperature: Optional[float] = None
+    regional_pool_type: Optional[str] = None
 
 
 def nested_witness_probabilities(
@@ -398,6 +422,185 @@ def regional_logmeanexp_ordinal_evidence(
         source_lattice_size=(height, width),
         block_size=(block_h, block_w),
         temperature=temperature,
+        pool_type="normalized_logmeanexp",
+    )
+
+
+def regional_max_ordinal_evidence(
+    evidence: LocalOrdinalEvidence,
+    valid_mask: torch.Tensor,
+    lattice_size: Tuple[int, int],
+    region_grid_size: Tuple[int, int],
+) -> RegionalOrdinalEvidence:
+    r"""Compile each fixed region into one existential ordinal event.
+
+    For source-cell continuation witnesses :math:`\lambda_{i,k}`, the event
+    consumed by the cardinality circuit is
+
+    .. math::
+
+       q_{R,k}=\max_{i\in R:\,v_i=1}\lambda_{i,k}.
+
+    The maximum is evaluated in stable log-odds space using ``torch.amax``.
+    Consequently equal inputs retain their value *and* split their gradient
+    across tied cells, while a separate deterministic ``argmax`` records the
+    source-cell provenance.  Coordinate-wise maxima preserve the nested
+    cumulative law ``q[R,k] >= q[R,k+1]`` exactly.  Invalid cells cannot win;
+    a wholly invalid region is represented as the normal categorical state
+    and excluded from the downstream count circuit.
+    """
+
+    states = evidence.state_probabilities
+    witnesses = evidence.witness_probabilities
+    log_witnesses = evidence.log_witness_probabilities
+    log_nonwitnesses = evidence.log_nonwitness_probabilities
+    if states.ndim != 3 or witnesses.ndim != 3:
+        raise ValueError("ordinal evidence must have shapes (N,P,K) and (N,P,K-1)")
+    if (
+        witnesses.shape[:2] != states.shape[:2]
+        or witnesses.shape[-1] + 1 != states.shape[-1]
+    ):
+        raise ValueError("state and witness evidence shapes disagree")
+    if (
+        log_witnesses.shape != witnesses.shape
+        or log_nonwitnesses.shape != witnesses.shape
+    ):
+        raise ValueError("log witness tensors must match witness probabilities")
+
+    n, p, boundaries = witnesses.shape
+    height, width = (int(lattice_size[0]), int(lattice_size[1]))
+    grid_h, grid_w = (int(region_grid_size[0]), int(region_grid_size[1]))
+    if height < 1 or width < 1 or height * width != p:
+        raise ValueError(
+            f"lattice_size must contain P={p} cells; got {lattice_size}"
+        )
+    if grid_h < 1 or grid_w < 1 or grid_h > height or grid_w > width:
+        raise ValueError(
+            "region grid must be positive and no larger than the source lattice"
+        )
+    if height % grid_h or width % grid_w:
+        raise ValueError(
+            "source lattice must divide exactly into fixed disjoint regions; "
+            f"got lattice {height}x{width} and grid {grid_h}x{grid_w}"
+        )
+    if valid_mask.shape != (n, p):
+        raise ValueError(f"valid_mask must have shape {(n, p)}")
+
+    block_h, block_w = height // grid_h, width // grid_w
+    region_cells = block_h * block_w
+    valid = valid_mask.to(device=witnesses.device, dtype=torch.bool)
+
+    def blocks(tensor: torch.Tensor) -> torch.Tensor:
+        channels = tensor.shape[-1]
+        return (
+            tensor.reshape(n, height, width, channels)
+            .reshape(n, grid_h, block_h, grid_w, block_w, channels)
+            .permute(0, 1, 3, 2, 4, 5)
+            .reshape(n, grid_h * grid_w, region_cells, channels)
+        )
+
+    valid_blocks = (
+        valid.reshape(n, height, width)
+        .reshape(n, grid_h, block_h, grid_w, block_w)
+        .permute(0, 1, 3, 2, 4)
+        .reshape(n, grid_h * grid_w, region_cells)
+    )
+    region_valid = valid_blocks.any(dim=2)
+    log_witness_blocks = blocks(log_witnesses.float())
+    log_nonwitness_blocks = blocks(log_nonwitnesses.float())
+    valid_channels = valid_blocks[..., None].expand_as(log_witness_blocks)
+
+    # The paired log probabilities preserve finite source log-odds even when
+    # the corresponding FP32 probability has rounded to exactly zero or one.
+    source_logits = log_witness_blocks - log_nonwitness_blocks
+    _require_finite(
+        source_logits.masked_select(valid_channels),
+        "valid regional source witness logits",
+    )
+    sortable = source_logits.masked_fill(~valid_channels, -torch.inf)
+
+    # amax, unlike gather(argmax), distributes gradients over exact ties. This
+    # matters at the calibrated all-equal initialization: no arbitrary first
+    # source cell is starved before visual evidence breaks the symmetry.
+    pooled_logits = torch.amax(sortable, dim=2)
+    pooled_logits = torch.where(
+        region_valid[..., None], pooled_logits, torch.zeros_like(pooled_logits)
+    )
+    pooled_log_witnesses = F.logsigmoid(pooled_logits)
+    pooled_log_nonwitnesses = F.logsigmoid(-pooled_logits)
+    pooled_log_witnesses = torch.where(
+        region_valid[..., None],
+        pooled_log_witnesses,
+        torch.full_like(pooled_log_witnesses, -torch.inf),
+    )
+    pooled_log_nonwitnesses = torch.where(
+        region_valid[..., None],
+        pooled_log_nonwitnesses,
+        torch.zeros_like(pooled_log_nonwitnesses),
+    )
+    pooled_witnesses = pooled_log_witnesses.exp()
+
+    # Argmax is metadata only. PyTorch's stable first-index tie rule makes the
+    # serialized provenance deterministic without controlling max gradients.
+    local_peak = sortable.argmax(dim=2)
+    source_ids = torch.arange(p, device=witnesses.device).reshape(height, width)
+    source_blocks = (
+        source_ids.reshape(grid_h, block_h, grid_w, block_w)
+        .permute(0, 2, 1, 3)
+        .reshape(grid_h * grid_w, region_cells)
+    )
+    source_indices = torch.gather(
+        source_blocks[None, :, :, None].expand(n, -1, -1, boundaries),
+        2,
+        local_peak.unsqueeze(2),
+    ).squeeze(2)
+    source_indices = torch.where(
+        region_valid[..., None],
+        source_indices,
+        torch.full_like(source_indices, -1),
+    )
+
+    if boundaries > 1:
+        middle = pooled_witnesses[..., :-1] - pooled_witnesses[..., 1:]
+        pooled_states = torch.cat(
+            (
+                1.0 - pooled_witnesses[..., :1],
+                middle,
+                pooled_witnesses[..., -1:],
+            ),
+            dim=-1,
+        )
+    else:
+        pooled_states = torch.cat(
+            (1.0 - pooled_witnesses, pooled_witnesses), dim=-1
+        )
+    if boundaries > 1 and bool(
+        (pooled_witnesses[..., 1:] > pooled_witnesses[..., :-1] + 2e-7).any()
+    ):
+        raise RuntimeError("regional max pooling violated ordinal nesting")
+    if bool((pooled_states < -2e-7).any()):
+        raise RuntimeError("regional cumulative evidence is not a categorical simplex")
+    pooled_states = pooled_states.clamp_min(0.0)
+    pooled_states = pooled_states / pooled_states.sum(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(pooled_states.dtype).tiny
+    )
+    normal = torch.zeros_like(pooled_states)
+    normal[..., 0] = 1.0
+    pooled_states = torch.where(region_valid[..., None], pooled_states, normal)
+
+    return RegionalOrdinalEvidence(
+        evidence=LocalOrdinalEvidence(
+            state_probabilities=pooled_states,
+            witness_probabilities=pooled_witnesses,
+            log_witness_probabilities=pooled_log_witnesses,
+            log_nonwitness_probabilities=pooled_log_nonwitnesses,
+        ),
+        valid_mask=region_valid,
+        source_indices=source_indices,
+        source_lattice_size=(height, width),
+        block_size=(block_h, block_w),
+        temperature=None,
+        pool_type="existential_max",
     )
 
 
@@ -2053,15 +2256,27 @@ class MOSAICProofHead(nn.Module):
         block_size: int = 64,
         alpha_init_count: Optional[int] = 1,
         region_grid_size: int = 0,
-        region_pool_temperature: float = 0.25,
+        region_pool_temperature: Optional[float] = 0.25,
+        region_pool_type: str = "normalized_logmeanexp",
     ) -> None:
         super().__init__()
         if region_grid_size < 0:
             raise ValueError("region_grid_size must be non-negative")
-        if not math.isfinite(region_pool_temperature) or region_pool_temperature <= 0.0:
-            raise ValueError("region_pool_temperature must be finite and positive")
+        self.region_pool_type = normalize_region_pool_type(region_pool_type)
+        if self.region_pool_type == "normalized_logmeanexp":
+            if (
+                region_pool_temperature is None
+                or not math.isfinite(region_pool_temperature)
+                or region_pool_temperature <= 0.0
+            ):
+                raise ValueError("region_pool_temperature must be finite and positive")
+            self.region_pool_temperature: Optional[float] = float(
+                region_pool_temperature
+            )
+        else:
+            # Temperature has no mathematical role in existential max pooling.
+            self.region_pool_temperature = None
         self.region_grid_size = int(region_grid_size)
-        self.region_pool_temperature = float(region_pool_temperature)
         self.local_state_head = LocalOrdinalStateHead(
             input_dim=input_dim,
             num_classes=num_classes,
@@ -2116,13 +2331,22 @@ class MOSAICProofHead(nn.Module):
                     device=local_features.device,
                     dtype=torch.bool,
                 )
-            regional = regional_logmeanexp_ordinal_evidence(
-                local_evidence,
-                valid_mask,
-                lattice_size,
-                (self.region_grid_size, self.region_grid_size),
-                temperature=self.region_pool_temperature,
-            )
+            if self.region_pool_type == "normalized_logmeanexp":
+                assert self.region_pool_temperature is not None
+                regional = regional_logmeanexp_ordinal_evidence(
+                    local_evidence,
+                    valid_mask,
+                    lattice_size,
+                    (self.region_grid_size, self.region_grid_size),
+                    temperature=self.region_pool_temperature,
+                )
+            else:
+                regional = regional_max_ordinal_evidence(
+                    local_evidence,
+                    valid_mask,
+                    lattice_size,
+                    (self.region_grid_size, self.region_grid_size),
+                )
             output = self.ordinal_core.forward_evidence(
                 regional.evidence,
                 valid_mask=regional.valid_mask,
@@ -2133,6 +2357,7 @@ class MOSAICProofHead(nn.Module):
             output.source_lattice_size = regional.source_lattice_size
             output.regional_block_size = regional.block_size
             output.regional_pool_temperature = regional.temperature
+            output.regional_pool_type = regional.pool_type
             return output
 
 
@@ -2156,5 +2381,8 @@ __all__ = [
     "continuation_probabilities",
     "fixed_proof_pivotality",
     "nested_witness_probabilities",
+    "normalize_region_pool_type",
     "regional_logmeanexp_ordinal_evidence",
+    "regional_max_ordinal_evidence",
+    "REGION_POOL_TYPES",
 ]

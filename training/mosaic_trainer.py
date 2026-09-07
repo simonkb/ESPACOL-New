@@ -119,6 +119,7 @@ class MosaicTrainer:
         "local_stage",
         "evidence_dim",
         "region_grid_size",
+        "region_pool_type",
         "region_pool_temperature",
         "pretrained",
         "grad_checkpoint",
@@ -852,7 +853,14 @@ class MosaicTrainer:
                 "source_receptive_field": self.model.receptive_field,
                 "source_expected_valid_cells": self.model.expected_valid_cells,
                 "region_grid_size": self.model.region_grid_size,
-                "regional_pool": "normalized_logmeanexp_logit",
+                # Retain the legacy descriptive key for downstream readers;
+                # ``region_pool_type`` is the canonical resume identity.
+                "regional_pool": (
+                    "normalized_logmeanexp_logit"
+                    if self.model.region_pool_type == "normalized_logmeanexp"
+                    else "existential_max_logit"
+                ),
+                "region_pool_type": self.model.region_pool_type,
                 "region_pool_temperature": self.model.region_pool_temperature,
                 "proof_output_stride": self.model.proof_output_stride,
                 "proof_receptive_field": self.model.proof_receptive_field,
@@ -920,6 +928,11 @@ class MosaicTrainer:
         # missing value to inherit the prospective boundary-mean default.
         saved_config_values = dict(saved_config)
         saved_config_values.setdefault("transition_reduction", "sample_mean")
+        # Checkpoints predating explicit compiler metadata always used the
+        # normalized LogMeanExp rule.
+        saved_config_values.setdefault(
+            "region_pool_type", "normalized_logmeanexp"
+        )
         mismatches = {
             field: (saved_config_values.get(field), current_config.get(field))
             for field in self._RESUME_CRITICAL_CONFIG_FIELDS
@@ -1004,7 +1017,7 @@ class MosaicTrainer:
     def fit(self, *, evaluate_test: bool = True) -> dict:
         logger.info(
             "MOSAIC fold=%d device=%s source_stride=%d source_RF=%d "
-            "region_grid=%d region_tau=%.4g proof_stride=%d proof_RF=%d "
+            "region_grid=%d region_pool=%s region_tau=%s proof_stride=%d proof_RF=%d "
             "proof_events=%d decision=%s "
             "transition_reduction=%s at_risk_counts=%s transition_weights=%s",
             self.fold,
@@ -1012,7 +1025,12 @@ class MosaicTrainer:
             self.model.output_stride,
             self.model.receptive_field,
             self.model.region_grid_size,
-            self.model.region_pool_temperature,
+            self.model.region_pool_type,
+            (
+                "none"
+                if self.model.region_pool_temperature is None
+                else f"{self.model.region_pool_temperature:.4g}"
+            ),
             self.model.proof_output_stride,
             self.model.proof_receptive_field,
             self.model.expected_valid_regions,

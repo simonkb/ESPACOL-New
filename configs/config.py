@@ -224,11 +224,13 @@ class MOSAICConfig(TrainConfig):
     grad_checkpoint: bool = False
 
     # Optional fixed disjoint regional envelope. At the RF-medium 112x112
-    # source lattice, 8 gives 64 equal 14x14-cell regions. Each region uses a
-    # normalized LogMeanExp in witness-logit space; tau=0.25 is smooth while
-    # retaining focal evidence. Zero reproduces the historical cell-wise
-    # circuit exactly.
+    # source lattice, 8 gives 64 equal 14x14-cell regions. The compatibility
+    # default is normalized LogMeanExp in witness-logit space. The
+    # ``existential_max`` compiler instead makes a region true when its
+    # strongest valid source cell is true, preserving focal lesion evidence.
+    # Zero reproduces the historical cell-wise circuit exactly.
     region_grid_size: int = 0
+    region_pool_type: str = "normalized_logmeanexp"
     region_pool_temperature: float = 0.25
 
     # Exact truncated Poisson--binomial proof circuit.
