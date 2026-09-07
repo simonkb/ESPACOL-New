@@ -3,8 +3,9 @@
 Status: **Core implementation complete on `mosaic-ordinal-proof`; independent
 APTOS and EyePACS fold-0 decoder audits complete; raw posterior median locked
 prospectively for new folds; DL95 and normalized-LogMeanExp regional v3
-rejected; RF-medium hard-existential regional v4 ready for one controlled
-APTOS fold-0 validation**
+rejected; hard-existential regional v4 empirically rejected; RF-medium
+Ordinal Receptive-Field Packing (ORFP) v5 is the active controlled APTOS
+fold-0 experiment**
 
 Date: 2026-09-07
 
@@ -23,8 +24,9 @@ fine-grid **ordinal proof circuit**:
 
 1. a spatially bounded encoder emits cumulative severity-witness probabilities on a
    fine retinal lattice;
-2. a monotone cardinality law computes every adjacent ordinal transition from
-   those regional probabilities;
+2. ORFP forms a boundary-shared set of spatially distinct RF events, and a
+   monotone cardinality law computes every adjacent ordinal transition from
+   their nested probabilities;
 3. a deterministic projection finds the smallest retained micro-region set
    that preserves the transition and whose removal sufficiently weakens it;
 4. only that projected proof is allowed to produce the final continuation
@@ -101,9 +103,9 @@ equal and normalized LogMeanExp has exact equal-input identity; calibrating
 against 9,864 source cells would make the initial regional abnormal count
 almost zero.
 
-### 1.3 Active correction: hard existential regional compiler
+### 1.3 Rejected ablation: hard existential regional compiler
 
-MOSAIC-v4 changes exactly one architectural choice: each fixed region emits
+MOSAIC-v4 changed exactly one architectural choice: each fixed region emits
 its strongest valid cumulative witness rather than a normalized smooth
 average. For boundary $k$,
 
@@ -125,13 +127,133 @@ the same event value). The trade-off is explicit: non-maximal source sites
 receive no direct compiler gradient and within-region multiplicity is
 intentionally discarded.
 
-The single controlled v4 experiment uses the same APTOS fold 0, RF-medium
-encoder, 8-by-8 partition, loss, posterior-median decoder, optimizer, seed, and
-35-epoch budget as v3. Promote v4 only if it restores at least the prior
-RF-medium reference of 83.96% validation accuracy (246/293) and 0.8808 QWK,
-with mean proof fraction no greater than 0.25 and all proof invariants intact.
-Otherwise reject regional compilation and return to the uncompiled RF-medium
-architecture; do not tune the threshold after seeing the run.
+The controlled APTOS fold-0 run completed all 35 epochs without a structural
+or numerical failure. Its selected posterior-median checkpoint reached only
+79.52% accuracy (233/293), 0.8443 QWK, and 0.2765 MAE. The dense regional path
+immediately before proof projection also reached 79.52% accuracy, with 0.8497
+QWK and 0.2730 MAE. Thus neither proof selection nor the point decoder explains
+the deficit. The audit also confirmed exact source-maximum identity and showed
+late-boundary AUROC falling to 0.7808 for (Y>2) and 0.6917 for (Y>3).
+
+Hard existential pooling removed the measured v3 attenuation but retained its
+load-bearing information bottleneck: roughly 9,864 fine responses still became
+only 60 valid regional scalars, all within-region multiplicity was discarded,
+and only the winning source received compiler gradient. Compared with the
+uncompiled RF-medium reference (83.96% accuracy, 0.8808 QWK, 0.2184 MAE), v4
+lost 13 correct validation predictions. It therefore fails its preregistered
+gate and is rejected. It must not be extended to EyePACS, tuned by learning
+rate, or rescued by selecting a diagnostic decoder after observing this fold.
+
+### 1.4 Active correction: Ordinal Receptive-Field Packing (ORFP)
+
+MOSAIC-v5 returns to the complete stride-8 RF-medium source lattice and removes
+fixed blocks. It instead constructs a content-adaptive set of spatially
+distinct events before the cardinality circuit. Let (B_i) be the theoretical,
+unclipped RF-95 square of source site (i), and use the expected local ordinal
+state as one boundary-shared priority:
+
+\[
+q_{n,i}=\mathbb E[L_{n,i}]
+=\sum_{k=0}^{K-2}\lambda_{n,i,k}.
+\]
+
+Let \(\pi_n\) be the stable descending ordering of valid sites by \(q_{n,i}\),
+with exact ties resolved by the lower row-major lattice index. Starting from
+\(P_n^{(0)}=\varnothing\), ORFP greedily accepts one source site only when its
+RF support does not overlap any previously accepted support beyond the fixed
+fraction \(\omega_{\mathrm{RF}}\):
+
+\[
+P_n^{(j)}=
+\begin{cases}
+P_n^{(j-1)}\cup\{\pi_{n,j}\}, &
+v_{\pi_{n,j}}=1\ \land\
+\displaystyle\max_{r\in P_n^{(j-1)}}
+\frac{|B_{\pi_{n,j}}\cap B_r|}{|B_{\pi_{n,j}}|}\le\omega_{\mathrm{RF}},\\[5pt]
+P_n^{(j-1)}, & \text{otherwise},
+\end{cases}
+\qquad \omega_{\mathrm{RF}}=0.5.
+\]
+
+The maximum over an empty set is zero. Because all theoretical RF squares have
+equal area, the implementation is equivalent to greedy NMS with IoU threshold
+\(\eta=\omega_{\mathrm{RF}}/(2-\omega_{\mathrm{RF}})=1/3\); candidates are
+suppressed only when the overlap is strictly greater than
+\(\omega_{\mathrm{RF}}\), so equality is retained. The same packed set is
+used for all ordinal boundaries. An excluded site's complete categorical state
+is replaced by normal, rather than independently zeroing boundary scores:
+
+\[
+\widetilde\rho_{n,i,m}=
+\begin{cases}
+\rho_{n,i,m}, & i\in P_n,\\
+\mathbf 1[m=0], & i\notin P_n,
+\end{cases}
+\qquad
+\widetilde\lambda_{n,i,k}
+=\sum_{m=k+1}^{K-1}\widetilde\rho_{n,i,m}.
+\]
+
+The exact Poisson--binomial circuit and minimum dual proof then consume only
+the packed ledger. This construction preserves focal values and exact source
+coordinates, unlike v3; avoids a fixed-grid winner and its aliasing, unlike
+v4; and prevents highly overlapping RF views from being counted as separate
+events. Since one mask is applied to the complete local categorical state,
+\(\widetilde\lambda_{n,i,k}\ge\widetilde\lambda_{n,i,k+1}\) remains structural.
+The selected proof is still the exclusive grade path, and every retained event
+can be replayed or set to normal inside the actual circuit.
+
+The scoped novelty is **not** greedy NMS by itself. It is the coupling of a
+boundary-shared, expected-ordinal-state RF packing rule with nested local
+severity events, exact cardinality grading, and a sufficient/necessary proof
+that is itself the prediction. The resulting certificate makes a verifiable
+claim about distinct computational RF supports; without lesion masks it does
+not claim pixel segmentation, named lesion identity, or statistical
+independence of the retained events.
+
+The risks are explicit. Packing membership is discrete and can change when two
+priorities swap; gradients flow through retained event values but not through
+the membership decision. A widespread lower-grade pattern can outrank and
+suppress a nearby rare severe pattern. Theoretical receptive fields are
+conservative architectural supports, not measured biological lesion extents,
+and the fixed \(\omega_{\mathrm{RF}}=0.5\) may discard useful correlated context. These are
+falsifiable architectural risks, not parameters to retune after inspecting the
+same APTOS validation fold.
+
+The controlled run is matched to the accepted uncompiled RF-medium reference:
+the same APTOS fold 0 and seed 42; 2,636/293/733 train/inner-validation/locked-
+test split; 896-pixel input; ImageNet-pretrained stride-8 RF-95 encoder;
+128-dimensional pointwise head; posterior-median decoder; boundary-mean
+effective-number objective; count cap 32 and block size 64; four dense warm-up
+plus four proof-ramp epochs; AdamW at encoder/head learning rates
+\(10^{-4}/5\times10^{-4}\); ReduceLROnPlateau on validation loss; and a
+50-epoch budget with patience 30. It changes only
+`rf_packing_max_overlap=0.5`. The outer test is skipped. The launcher uses a
+fresh run directory and refuses incompatible resume artifacts.
+
+The APTOS fold-0 protocol has three predeclared outcome levels:
+
+1. **Viability to EyePACS:** at least 235/293 correct (80.20%), QWK at least
+   0.85, grade-3 recall at least 4/15, grade-4 recall at least 8/24, mean proof
+   fraction no greater than 0.25, no RF-overlap violation above 0.5, and all
+   nesting, sufficiency, complement, and certificate-replay checks passing.
+2. **Reference recovery:** at least 246/293 correct (83.96%), with QWK at least
+   0.8808 and MAE no greater than 0.2284.
+3. **Stretch success:** at least 250/293 correct (85.32%), while retaining the
+   viability invariants above.
+
+APTOS accuracy above 85% is a stretch goal, not the condition for trying the
+larger dataset. Only level 1 is required to launch the gated EyePACS fold-0
+experiment. EyePACS is promoted beyond fold 0 only at 2,688/3,162 correct
+(85.01%) or better, QWK at least 0.82, grade-3 recall at least 41/83 (49.40%),
+grade-4 recall at least 16/64 (25.00%), and complete replay/packing invariants.
+Those upper-grade floors reproduce the prior uncompiled posterior-median audit
+and prevent a majority-class gain from masquerading as promotion. Neither
+target is guaranteed in advance.
+
+The grade-4 viability floor permits exactly one fewer correct grade-4 case than
+the uncompiled reference (8/24 rather than 9/24); this one-case tolerance is
+fixed because the subgroup is small, not selected after observing v5.
 
 ## 2. Why the granularity must change
 
@@ -183,10 +305,12 @@ The following ideas already exist and must not be claimed independently:
 The defensible gap is their exact coupling:
 
 > To our knowledge, MOSAIC is the first image-level-grade-supervised retinal
-> grader in which every continuation-ratio transition is computed solely by a
-> symmetric monotone regional cardinality circuit and replayed from a
-> deterministic, tolerance-conditioned minimum-cardinality certificate that
-> preserves the dense transition and suppresses its complement.
+> grader in which one expected-ordinal-state rule packs overlapping receptive
+> fields into a boundary-shared event ledger, every continuation-ratio
+> transition is computed solely by a symmetric monotone cardinality circuit,
+> and the prediction is replayed from a deterministic, tolerance-conditioned
+> minimum-cardinality certificate that preserves the dense transition and
+> suppresses its complement.
 
 This is a scoped `to our knowledge` claim, not proof of absolute novelty. Do
 not claim first local-evidence DR model, first intrinsic explanation, first
@@ -270,7 +394,7 @@ a_{n,i}=g_\phi(h_{n,i})\in\mathbb R^K,
 \quad m=0,\ldots,K-1.
 \]
 
-For boundary \(k\), define the regional witness probability
+For boundary \(k\), define the local witness probability
 
 \[
 \lambda_{n,i,k}
@@ -300,15 +424,15 @@ E\,P(L_i>0)\approx\mu_0.
 \]
 
 For four equal abnormal-state logits, the normal-state logit advantage is
-approximately \(\log(4E/\mu_0)\). Here \(E\) is the number of valid regional
-events when either regional compiler is enabled and the number of valid source
-cells only when regional compilation is disabled. Both normalized LogMeanExp
-and the existential maximum preserve equal inputs, so the same 64-event bias
-calibration remains correct for v4. Grade-0 images then provide abundant
-negative-bag supervision that drives abnormal probabilities down without pixel
-labels.
+approximately \(\log(4E/\mu_0)\). Here \(E\) is the number of events that the
+active circuit consumes at equal initialization: valid fixed regions for v3/v4,
+the deterministic canonical packing capacity for v5, or all valid source cells
+when both mechanisms are disabled. ORFP leaves every retained categorical state
+unchanged, so calibrating to its packed capacity preserves the intended initial
+abnormal mass. Grade-0 images then provide abundant negative-bag supervision
+that drives abnormal probabilities down without pixel labels.
 
-### 4.3 Fixed disjoint hard-existential regional compiler
+### 4.3 Historical fixed disjoint regional compilers (rejected)
 
 Let \(G_1,\ldots,G_B\) be the fixed 8-by-8 partition of the source lattice.
 For \(a_{n,i,k}=\operatorname{logit}(\lambda_{n,i,k})\), the event ledger
@@ -341,21 +465,52 @@ cardinality law downstream counts evidence across disjoint regions. This choice
 deliberately preserves focal support and inter-region extent but does not
 represent within-region multiplicity. The v3 normalized-LogMeanExp
 compiler remains implemented only as the matched negative ablation documented
-in Sec. 1.2.
+in Sec. 1.2. Sections 1.2--1.3 report why both fixed compilers were rejected;
+neither is part of the active v5 prediction path.
 
-### 4.4 Exact truncated Poisson--binomial cardinality law
+### 4.4 Ordinal Receptive-Field Packing (active v5)
 
-For boundary \(k\), treat every valid regional event as a Bernoulli witness:
+The active compiler operates directly on the RF-medium source lattice. For
+each image it stably orders sites by
 
 \[
-Z_{n,b,k}\sim\operatorname{Bernoulli}(r_{n,b,k}),
-\qquad
-C_{n,k}(S)=\sum_{b\in S}Z_{n,b,k}.
+q_{n,i}=\sum_{k=0}^{K-2}\lambda_{n,i,k}=\mathbb E[L_{n,i}]
 \]
 
-The model counts regional evidence events, not manually annotated lesions. The
-distinction matters: one certain witness and ten weak witnesses with the same
-summed probability have different Poisson--binomial count distributions.
+and greedily retains a site only if its theoretical RF-95 square intersects
+every already-retained RF square by at most \(\omega_{\mathrm{RF}}=0.5\) of either equal square's
+area. Exact priority ties use the lower row-major source index. This produces
+one boundary-shared mask \(M_{n,i}\), not four independently selected maps.
+The event state passed downstream is
+
+\[
+\widetilde\rho_{n,i,m}
+=M_{n,i}\rho_{n,i,m}+(1-M_{n,i})\mathbf1[m=0],
+\qquad
+\widetilde\lambda_{n,i,k}
+=\sum_{m=k+1}^{K-1}\widetilde\rho_{n,i,m}.
+\]
+
+Thus a rejected source becomes one coherent normal categorical state and
+ordinal nesting is retained exactly. The ledger keeps the original source axis
+and coordinates; the validity mask presented to counting and proof selection
+is \(M_n\). Section 1.4 specifies the stable greedy rule, equivalent NMS
+threshold, scoped claim, preregistered gate, and failure modes.
+
+### 4.5 Exact truncated Poisson--binomial cardinality law
+
+For boundary \(k\), treat every retained RF-packed event as a Bernoulli witness:
+
+\[
+Z_{n,i,k}\sim\operatorname{Bernoulli}(\widetilde\lambda_{n,i,k}),
+\qquad
+C_{n,k}(S)=\sum_{i\in S}Z_{n,i,k}.
+\]
+
+The model counts packed computational evidence events, not manually annotated
+lesions. The distinction matters: one certain witness and ten weak witnesses
+with the same summed probability have different Poisson--binomial count
+distributions.
 
 Only thresholds \(1,\ldots,R\) are learnable, so retain exact probability
 masses \(0,\ldots,R-1\) plus an overflow bucket \(R\equiv C\ge R\). Initialise
@@ -364,7 +519,7 @@ masses \(0,\ldots,R-1\) plus an overflow bucket \(R\equiv C\ge R\). Initialise
 D^{(0)}_0=1,\qquad D^{(0)}_r=0\quad(r=1,\ldots,R).
 \]
 
-After regional witness probability \(e=r_{n,b,k}\), update
+After packed witness probability \(e=\widetilde\lambda_{n,i,k}\), update
 
 \[
 D'_0=(1-e)D_0,
@@ -429,7 +584,7 @@ F_k(\boldsymbol\lambda)=
 \]
 
 Use \(R=32\) in the first screen and ablate \(R\in\{16,32,64\}\). The
-response is a valid number in \([0,1]\), is symmetric in the regional
+response is a valid number in \([0,1]\), is symmetric in the packed
 witnesses, and is coordinatewise nondecreasing because
 
 \[
@@ -440,7 +595,7 @@ witnesses, and is coordinatewise nondecreasing because
 Interpretation is boundary-specific:
 
 - \(\alpha_{k,1}\) dominant: one focal witness can pass the boundary;
-- mass at larger \(r\): multiple regional witness cells are required; and
+- mass at larger \(r\): multiple spatially distinct packed witnesses are required; and
 - broad mass: the training labels do not identify one sharp extent rule.
 
 The \(\alpha_k\) parameters are dataset-level and never image-conditioned. An
@@ -448,8 +603,8 @@ image-conditioned rule could become a hidden global classifier and would void
 the proof theorem. \(\alpha_k\) is a latent model cardinality preference, not a
 recovered clinical lesion count: witness calibration and \(\alpha_k\) can
 partially compensate for one another. Interpret it only after reporting its
-seed/fold stability. Adjacent cells influenced by one lesion may also count as
-multiple witnesses.
+seed/fold stability. ORFP bounds RF overlap between counted events but does not
+prove their statistical or biological independence.
 
 A literal Python loop over all \(P\) cells would create excessive GPU kernel
 launch overhead. Implement an exact block-tree recurrence:
@@ -477,7 +632,7 @@ arithmetic and stabilized in both simplex and log-tail representations;
 replay and intervention equalities are asserted to a serialized numerical
 tolerance rather than as bitwise identities across CPU and CUDA reductions.
 
-### 4.5 Deterministic dual proof projection
+### 4.6 Deterministic dual proof projection
 
 For boundary \(k\), sort valid witness probabilities
 
@@ -545,7 +700,7 @@ part of the computation because it determines \(\widetilde c_k\), the selected
 indices, and the proof size; it must be serialized so certificate replay
 reproduces selection as well as the final score.
 
-### 4.6 Exclusive continuation cascade
+### 4.7 Exclusive continuation cascade
 
 Interpret \(c_{n,k}\) as the conditional probability of advancing from rung
 \(k\) to \(k+1\), and compute its stop partner directly as
@@ -640,30 +795,31 @@ as causal evidence. Black, grey, blur, and inpainting baselines can introduce
 out-of-distribution content; mask colour and shape can themselves encode the
 label.
 
-In MOSAIC-v4, the proof circuit can intervene at one explicit regional
+In active MOSAIC-v5, the proof circuit can intervene at one explicit packed
 boundary-witness node:
 
 \[
-\operatorname{do}(r_{n,b,k}=0).
+\operatorname{do}(\widetilde\lambda_{n,i,k}=0).
 \]
 
-The coherent whole-region intervention sets the complete regional cumulative
-state to normal, \(r_{n,b,0}=\cdots=r_{n,b,K-2}=0\). The fixed source-cell
-partition does not change under either intervention; removing cells from the
-validity mask would redefine the event rather than hide its evidence. A
-source-level intervention is possible only by recomputing the existential
-maximum. Removing the current maximizing source can expose the runner-up and
-is therefore not equivalent to setting the compiled regional event directly
-to zero.
+The coherent whole-event intervention replaces the retained site's complete
+categorical state by normal, so
+\(\widetilde\lambda_{n,i,0}=\cdots=\widetilde\lambda_{n,i,K-2}=0\).
+For proof-conditional pivotality, the serialized ORFP membership is held fixed:
+changing the mask would redefine the witness ledger rather than intervene on
+the selected event. The separate adaptive effect first sets a source state to
+normal and then recomputes the priority ordering, RF packing, and proof; another
+source may enter the packed ledger. These two estimands must not be conflated.
 
-For a fixed certificate, the exact direct effect of hiding selected region \(b\)
+For a fixed certificate, the exact direct effect of hiding selected event \(i\)
 at boundary \(k\) is
 
 \[
-\delta_{n,b,k}
-=\mathbf1[b\in S_{n,k}^*]\left[
-F_k(\mathbf r^+_{n,k,m_k^*})
--F_k(\mathbf r^+_{n,k,m_k^*}\setminus r_{n,b,k})
+\delta_{n,i,k}
+=\mathbf1[i\in S_{n,k}^*]\left[
+F_k(\boldsymbol\lambda^+_{n,k,m_k^*})
+-F_k(\boldsymbol\lambda^+_{n,k,m_k^*}
+\setminus\widetilde\lambda_{n,i,k})
 \right].
 \]
 
@@ -671,10 +827,10 @@ Using the count distribution of the other selected witnesses gives the
 equivalent closed form
 
 \[
-\delta_{n,b,k}
-=\mathbf1[b\in S_{n,k}^*]r_{n,b,k}
+\delta_{n,i,k}
+=\mathbf1[i\in S_{n,k}^*]\widetilde\lambda_{n,i,k}
 \sum_{r=1}^{R}\alpha_{k,r}
-P(C_{S_{n,k}^*\setminus b}=r-1).
+P(C_{S_{n,k}^*\setminus i}=r-1).
 \]
 
 No backward pass, gradient approximation, surrogate mask network, new image,
@@ -684,17 +840,18 @@ the circuit's boundary probability.
 For the cumulative boundary \(j\ge k\), holding the other transitions fixed,
 
 \[
-q_{n,j}-q_{n,j}^{(-b,k)}
-=\delta_{n,b,k}
+q_{n,j}-q_{n,j}^{(-i,k)}
+=\delta_{n,i,k}
 \prod_{\substack{\ell=0\\\ell\ne k}}^{j}c_{n,\ell}.
 \]
 
-If the deterministic proof is recomputed after hiding \(b\), another region
-may replace it. Therefore report two quantities:
+If ORFP and the deterministic proof are recomputed after hiding \(i\), another
+source may replace it. Therefore report two quantities:
 
-1. **proof-conditional pivotality**: hide \(b\) while holding the proof fixed;
-2. **adaptive replacement effect**: hide \(b\), recompute the proof, and report
-   the end-to-end grade change.
+1. **proof-conditional pivotality**: hide \(i\) while holding packing and proof
+   fixed;
+2. **adaptive replacement effect**: hide \(i\), recompute packing and proof,
+   and report the end-to-end grade change.
 
 Adaptive reprojection is not guaranteed monotone: after evidence is reduced,
 the projection can expand and admit replacement regions, making its selected
@@ -781,7 +938,7 @@ The complete initial objective is deliberately small:
 \]
 
 Here \(\mathcal L_{\mathrm{stab}}\) is Jensen--Shannon consistency between the
-regional witness distributions of two geometry-identical photometric views.
+local ordinal-state distributions of two geometry-identical photometric views.
 Start with \(\lambda_{\mathrm{stab}}=0\); enable it only if witness maps are
 unstable. No CLIP loss, concept loss, generic multi-task head, or auxiliary
 global CE path is added.
@@ -821,14 +978,16 @@ For each predicted image, return a machine-readable certificate:
 - the predicted class distribution;
 - four transition probabilities \(c_k\);
 - the learned extent distributions \(\alpha_k\);
-- the selected regional coordinates and their conservative union
-  receptive-field boxes, plus the boundary-specific maximizing source and its
-  RF-95 box as the realized event provenance;
-- the local categorical states \(\rho_i\);
+- every packed source coordinate and its conservative RF-95 support, together
+  with the stable priority order, packed membership, fixed overlap threshold,
+  and maximum observed pairwise overlap;
+- the proof-selected packed coordinates and their conservative union RF boxes;
+- the complete pre-packing categorical/witness/log-witness source ledger and
+  the coherently normal-substituted packed ledger;
 - retained and complement count distributions and tail probabilities;
 - sufficiency gap \(\widetilde c_k-c_k\);
 - complement residual \(F_k(\boldsymbol\lambda_k^-)\);
-- proof-conditional pivotality for every selected regional event.
+- proof-conditional pivotality for every selected packed event.
 
 The current certificate implements the items above, together with source and
 checkpoint hashes and a serialized CPU/CUDA replay tolerance. Adaptive
@@ -845,6 +1004,10 @@ pixel-precise lesion borders.
 Unit tests can establish:
 
 - nested local ordinal witness probabilities;
+- deterministic boundary-shared ORFP membership from the raw ordinal ledger,
+  including the stable row-major tie rule and the exact RF-overlap bound;
+- coherent normal-state replacement outside the packed set and exact
+  reconstruction of the packed ledger from its serialized raw source ledger;
 - coordinatewise monotone transition laws;
 - minimum-cardinality dual proof for a fixed witness ledger;
 - certificate replay of the transition used for prediction within the
@@ -898,8 +1061,8 @@ The core has been implemented as a clean parallel path rather than branches
 inside OPTIC-C:
 
 - `models/mosaic.py`: local ordinal state, simplex- and log-tail-stabilized
-  truncated count law, dual-proof projection, continuation cascade, and
-  intervention effects;
+  truncated count law, ORFP compiler, dual-proof projection, continuation
+  cascade, and intervention effects;
 - `models/local_efficientnet.py`: bounded spatial taps and receptive-field
   metadata;
 - `utils/spatial_mask.py`: one image-independent canonical ellipse shared by
@@ -909,13 +1072,25 @@ inside OPTIC-C:
 - `Datasets/mosaic_data.py`: tight-field crop, direct canonical-square resize,
   fixed-support preprocessing, and disjoint APTOS/EyePACS splits;
 - `training/mosaic_trainer.py` and `train_mosaic.py`: end-to-end pilot training,
-  validation-only architecture selection, complete resume state, and diagnostics;
+  validation-only architecture selection, complete resume identity, and ORFP
+  event-retention diagnostics;
 - `inference/mosaic_certificate.py` and `export_mosaic_certificates.py`:
-  protected, replayable fixed-proof certificates; and
+  protected, replayable fixed-proof certificates. Schema v4 makes the evidence
+  compiler identity mandatory, requires its matching provenance section, and
+  rejects a rehashed certificate with a deleted ORFP trace. Audit and export
+  also cross-check the parameter-free ORFP configuration against the explicit
+  checkpoint architecture record; and
 - `tools/cache_spatial_features.py`: fp16 raw spatial-map cache writer keyed by
   source metadata, preprocessing, and encoder state; and
 - `tools/audit_mosaic_shortcuts.py`: validation-only acquisition-format and
   fixed-mask shortcut audit that never reads outer-test images by default.
+- `submit_mosaic_aptos_orfp_fold0_50.sh`: the single matched APTOS v5
+  falsification run, including split, structural-test, shortcut, and CUDA
+  preflights, followed by a trained-checkpoint decoder audit and one verified
+  certificate per validation grade; and
+- `submit_mosaic_dr_orfp_fold0_75.sh`: a separately gated EyePACS fold-0
+  launcher that refuses to run unless the APTOS viability decision is supplied
+  explicitly and applies the same post-training audit/replay protocol.
 
 The formal cached head-screen reader and matched baseline heads, adaptive
 replacement analysis, substitute-proof enumeration, and the anti-cheating
@@ -949,7 +1124,17 @@ For random, tied, empty-field, and saturated evidence tensors:
 13. the optimized block-tree and prefix/suffix implementation matches the
     serial \(O(PR)\) recurrence within numerical tolerance; and
 14. there is no model parameter path from full-canvas pooled features to the
-    output.
+    output;
+15. ORFP's expected-ordinal-state priority and exact ties reproduce the
+    predeclared stable row-major order;
+16. every retained RF pair has theoretical intersection fraction at most
+    \(\omega_{\mathrm{RF}}\), including an equality case that must be retained;
+17. ORFP uses one mask for every boundary, selects no invalid source, replaces
+    every excluded complete categorical state by normal, and preserves nesting;
+    and
+18. the serialized raw ledger, mask, priority order, geometry, and overlap
+    rule exactly reconstruct the packed ledger; rehashed tampering with any of
+    those fields must fail semantic certificate replay.
 
 ## 12. Fast falsification sequence
 
@@ -1048,17 +1233,24 @@ per-grade recall, confusion matrices, runtime, parameters, FLOPs, and memory.
 ## 13. Required ablations
 
 1. nominal local class maps versus nested local ordinal states;
-2. max, mean, Additive MIL, and learned Poisson--binomial cardinality
+2. uncompiled source cells, rejected fixed-region compilation, and active ORFP
+   on the identical RF-medium encoder and split;
+3. max, mean, Additive MIL, and learned Poisson--binomial cardinality
    aggregation;
-3. independent boundary BCE versus continuation likelihood;
-4. dense cardinality score versus proof-exclusive score;
-5. sufficiency-only prefix versus dual sufficiency/necessity prefix;
-6. fixed \(r=1\) versus learned \(\alpha_k\);
-7. \(R=16,32,64\);
-8. RF-small, RF-medium, RF-large;
-9. global-image bypass as a deliberately unfaithful accuracy ceiling;
-10. balanced versus unbalanced at-risk likelihood; and
-11. no stability loss versus photometric witness consistency.
+4. independent boundary BCE versus continuation likelihood;
+5. dense cardinality score versus proof-exclusive score;
+6. sufficiency-only prefix versus dual sufficiency/necessity prefix;
+7. fixed \(r=1\) versus learned \(\alpha_k\);
+8. \(R=16,32,64\);
+9. RF-small, RF-medium, RF-large;
+10. global-image bypass as a deliberately unfaithful accuracy ceiling;
+11. balanced versus unbalanced at-risk likelihood; and
+12. no stability loss versus photometric witness consistency.
+
+The primary v5 APTOS fold fixes \(\omega_{\mathrm{RF}}=0.5\) in advance. It is not a
+post-result overlap-threshold sweep. A later sensitivity analysis may compare
+a small preregistered set of \(\omega_{\mathrm{RF}}\) values on untouched folds after the
+primary gate has been resolved.
 
 The global-bypass ablation is useful precisely because it quantifies the price
 of structural faithfulness. It cannot be called MOSAIC.
@@ -1091,16 +1283,19 @@ Cache hashes must prevent leakage across preprocessing or backbone checkpoints.
 3. A larger receptive field may recover accuracy while weakening localization.
 4. Dense tiny background probabilities can accumulate; grade-0 supervision and normal
    bias initialization must prevent this.
-5. Adjacent cells can describe one lesion multiple times. The learned count is
-   evidence extent, not literal lesion count.
+5. ORFP bounds pairwise theoretical RF overlap but does not prove that retained
+   events are independent or correspond one-to-one with biological lesions.
 6. Conditional independence of Bernoulli witnesses is an inductive bias, not
    a biological law.
 7. The proof may be large when the image contains genuinely redundant evidence.
-8. Hard sorting and prefix changes can create optimization discontinuities.
-9. APTOS head rankings may not survive end-to-end EyePACS fine-tuning.
-10. Grade-label-only evaluation cannot establish lesion semantics or pixel
+8. Hard ORFP membership can change discontinuously when two severity priorities
+   swap; a common lower-grade response can suppress a nearby rare severe one.
+9. Hard proof sorting and prefix changes add a second piecewise-constant
+   selection boundary.
+10. APTOS head rankings may not survive end-to-end EyePACS fine-tuning.
+11. Grade-label-only evaluation cannot establish lesion semantics or pixel
     segmentation quality.
-11. The exact novelty depends on the full coupling; every component alone has
+12. The exact novelty depends on the full coupling; every component alone has
     close prior art.
 
 ## 16. Six-week project target
@@ -1127,12 +1322,13 @@ Working title:
 
 Three contributions:
 
-1. a fine-grid nested ordinal witness representation with a learned
-   boundary-specific focal-versus-distributed Poisson--binomial cardinality
-   law;
+1. a fine-grid nested ordinal witness representation with boundary-shared
+   severity-aware RF packing, preventing highly overlapping computational
+   views from becoming separate count events while retaining exact provenance;
 2. a deterministic, tolerance-conditioned minimum dual proof projection that
-   is the exclusive continuation prediction path; and
-3. exact proof-conditional boundary-witness intervention effects and
+   feeds a learned boundary-specific focal-versus-distributed
+   Poisson--binomial law as the exclusive continuation prediction path; and
+3. exact proof-conditional packed-witness intervention effects and
    replayable certificates, validated without raw-image deletion artifacts.
 
 The central figure should show one fundus, four boundary-specific witness maps,

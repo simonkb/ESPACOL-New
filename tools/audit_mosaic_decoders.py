@@ -71,7 +71,10 @@ from models.mosaic import (
     regional_max_ordinal_evidence,
 )
 from models.mosaic_model import build_mosaic_model
-from training.mosaic_trainer import mosaic_implementation_signature
+from training.mosaic_trainer import (
+    mosaic_implementation_signature,
+    require_mosaic_checkpoint_architecture_consistency,
+)
 from utils.metrics import evaluate_predictions
 
 
@@ -1386,6 +1389,7 @@ def main() -> None:
     )
     cfg.decision_rule = checkpoint_decision_rule
     cfg.region_pool_type = checkpoint_region_pool_type
+    require_mosaic_checkpoint_architecture_consistency(checkpoint, cfg)
     dataset_name = cfg.dataset.lower()
     if dataset_name not in {"aptos", "dr"}:
         raise ValueError(f"unsupported checkpoint dataset {cfg.dataset!r}")
@@ -1469,6 +1473,7 @@ def main() -> None:
         region_grid_size=cfg.region_grid_size,
         region_pool_type=cfg.region_pool_type,
         region_pool_temperature=cfg.region_pool_temperature,
+        rf_packing_max_overlap=cfg.rf_packing_max_overlap,
     ).to(device)
     model.load_state_dict(checkpoint["model_state"], strict=True)
     model.eval()
@@ -2024,6 +2029,7 @@ def main() -> None:
         "true_class_counts": label_counts.tolist(),
         "checkpoint_decision_rule": checkpoint_decision_rule,
         "checkpoint_region_pool_type": checkpoint_region_pool_type,
+        "checkpoint_rf_packing_max_overlap": cfg.rf_packing_max_overlap,
         "checkpoint_metric_reproduction": metric_reproduction,
         "checkpoint_metric_absolute_differences": reproduction_differences,
         "implementation_signature_match": implementation_match,

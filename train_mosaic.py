@@ -196,6 +196,17 @@ def build_parser() -> argparse.ArgumentParser:
             "behavior."
         ),
     )
+    parser.add_argument(
+        "--rf_packing_max_overlap",
+        type=float,
+        default=None,
+        help=(
+            "Enable content-adaptive receptive-field packing on the original "
+            "lattice. The value is the maximum pairwise intersection fraction "
+            "of equal theoretical RF boxes; omit to disable. Incompatible with "
+            "a nonzero region_grid_size."
+        ),
+    )
 
     parser.add_argument("--max_count", type=int, default=32)
     parser.add_argument("--count_block_size", type=int, default=64)
@@ -279,6 +290,7 @@ def main() -> None:
         region_grid_size=args.region_grid_size,
         region_pool_type=normalize_region_pool_type(args.region_pool_type),
         region_pool_temperature=args.region_pool_temperature,
+        rf_packing_max_overlap=args.rf_packing_max_overlap,
         pretrained=not args.no_pretrained,
         max_count=args.max_count,
         count_block_size=args.count_block_size,
@@ -371,6 +383,7 @@ def main() -> None:
             region_grid_size=cfg.region_grid_size,
             region_pool_type=cfg.region_pool_type,
             region_pool_temperature=cfg.region_pool_temperature,
+            rf_packing_max_overlap=cfg.rf_packing_max_overlap,
             initial_abnormal_count=cfg.normal_expected_count,
             max_count=cfg.max_count,
             sufficiency_tolerance=cfg.proof_epsilon,

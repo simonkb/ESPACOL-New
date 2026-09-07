@@ -25,6 +25,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.ops import nms
 
 
 REGION_POOL_TYPES = ("normalized_logmeanexp", "existential_max")
@@ -97,6 +98,28 @@ class RegionalOrdinalEvidence:
 
 
 @dataclass
+class ReceptiveFieldPackedEvidence:
+    """A complete ordinal ledger thinned by deterministic RF packing.
+
+    ``packing_mask`` is shared by every boundary.  This is essential: applying
+    a different spatial mask at each boundary could turn the nested cumulative
+    witnesses into a collection of unrelated Bernoulli maps.  Excluded sites
+    are represented by the normal categorical state rather than by an
+    incomplete collection of zeroed boundary scores.
+    """
+
+    evidence: LocalOrdinalEvidence
+    packing_mask: torch.Tensor
+    source_evidence: LocalOrdinalEvidence
+    source_valid_mask: torch.Tensor
+    lattice_size: Tuple[int, int]
+    output_stride: int
+    receptive_field: float
+    max_overlap: float
+    nms_iou_threshold: float
+
+
+@dataclass
 class CardinalityResult:
     """Output of a boundary-wise cardinality circuit."""
 
@@ -161,6 +184,15 @@ class MOSAICOutput:
     regional_block_size: Optional[Tuple[int, int]] = None
     regional_pool_temperature: Optional[float] = None
     regional_pool_type: Optional[str] = None
+    source_state_probabilities: Optional[torch.Tensor] = None
+    source_witness_probabilities: Optional[torch.Tensor] = None
+    source_log_witness_probabilities: Optional[torch.Tensor] = None
+    source_log_nonwitness_probabilities: Optional[torch.Tensor] = None
+    rf_packing_mask: Optional[torch.Tensor] = None
+    rf_packing_max_overlap: Optional[float] = None
+    rf_packing_nms_iou: Optional[float] = None
+    rf_packing_output_stride: Optional[int] = None
+    rf_packing_receptive_field: Optional[float] = None
 
 
 def nested_witness_probabilities(
@@ -219,6 +251,217 @@ def nested_witness_probabilities(
     witnesses = log_witness.exp().clamp(0.0, 1.0)
     return LocalOrdinalEvidence(
         state, witnesses, log_witness, log_nonwitness
+    )
+
+
+def receptive_field_packing_mask(
+    priority: torch.Tensor,
+    valid_mask: torch.Tensor,
+    lattice_size: Tuple[int, int],
+    *,
+    output_stride: int,
+    receptive_field: float,
+    max_overlap: float,
+) -> torch.Tensor:
+    r"""Greedily pack a lattice using bounded receptive-field support.
+
+    ``priority`` has shape ``(N,P)``.  Sites are visited in stable descending
+    priority order and retained only when their theoretical receptive-field
+    square overlaps every already-retained square by at most ``max_overlap``:
+
+    .. math::
+
+       |B_i\cap B_j| / |B_i| \leq \rho.
+
+    All boxes have equal, *unclipped* theoretical area, so torchvision's IoU
+    threshold is exactly ``rho / (2-rho)``.  Unique rank priorities are passed
+    to NMS after the stable sort; therefore exact score ties resolve to the
+    lower row-major lattice index on every device.  Membership is intentionally
+    discrete and is computed under ``no_grad`` just like the downstream proof
+    prefix.
+    """
+
+    if priority.ndim != 2:
+        raise ValueError("packing priority must have shape (N, P)")
+    n_batch, num_cells = priority.shape
+    height, width = (int(lattice_size[0]), int(lattice_size[1]))
+    if height < 1 or width < 1 or height * width != num_cells:
+        raise ValueError(
+            f"lattice_size must contain P={num_cells} cells; got {lattice_size}"
+        )
+    if valid_mask.shape != priority.shape:
+        raise ValueError("packing valid_mask must have shape (N, P)")
+    output_stride = int(output_stride)
+    receptive_field = float(receptive_field)
+    max_overlap = float(max_overlap)
+    if output_stride <= 0:
+        raise ValueError("packing output_stride must be positive")
+    if not math.isfinite(receptive_field) or receptive_field <= 0.0:
+        raise ValueError("packing receptive_field must be finite and positive")
+    if not math.isfinite(max_overlap) or not 0.0 <= max_overlap < 1.0:
+        raise ValueError("packing max_overlap must lie in [0, 1)")
+
+    valid = valid_mask.to(device=priority.device, dtype=torch.bool)
+    valid_priority = priority.detach().float().masked_fill(~valid, -torch.inf)
+    if bool(valid.any()):
+        _require_finite(
+            valid_priority.masked_select(valid), "valid RF-packing priorities"
+        )
+
+    with torch.no_grad():
+        try:
+            order = torch.argsort(
+                valid_priority, dim=-1, descending=True, stable=True
+            )
+        except TypeError:  # pragma: no cover - older PyTorch fallback
+            # Add a deterministic rank smaller than one FP32 ULP around one.
+            # This fallback is retained only for old runtimes; supported
+            # training versions provide stable argsort and do not perturb data.
+            index = torch.arange(
+                num_cells, device=priority.device, dtype=torch.float64
+            )
+            tie_break = (num_cells - index) * torch.finfo(torch.float64).eps
+            order = torch.argsort(
+                valid_priority.double() + tie_break[None, :],
+                dim=-1,
+                descending=True,
+            )
+
+        ranks = torch.empty_like(order)
+        rank_values = torch.arange(num_cells, device=priority.device)[None, :]
+        ranks.scatter_(1, order, rank_values.expand(n_batch, -1))
+        # Integers up to the active lattice size are represented exactly in
+        # FP32. NMS therefore receives unique priorities that preserve the
+        # stable source ordering without altering close model scores.
+        nms_priority = (num_cells - ranks).float()
+
+        rows = torch.arange(height, device=priority.device, dtype=torch.float32)
+        columns = torch.arange(width, device=priority.device, dtype=torch.float32)
+        yy, xx = torch.meshgrid(rows, columns, indexing="ij")
+        half = 0.5 * receptive_field
+        # Translate every theoretical square by the same half-width so the
+        # boxes satisfy torchvision NMS's non-negative-coordinate contract.
+        # Translation leaves every pairwise intersection and IoU unchanged;
+        # the encoder's true center offset remains in LatticeMetadata for
+        # certificate rendering.
+        center_y = yy.reshape(-1) * float(output_stride) + half
+        center_x = xx.reshape(-1) * float(output_stride) + half
+        boxes = torch.stack(
+            (
+                center_x - half,
+                center_y - half,
+                center_x + half,
+                center_y + half,
+            ),
+            dim=-1,
+        )
+        nms_iou = max_overlap / (2.0 - max_overlap)
+        # torchvision specifies suppression for IoU *strictly greater* than
+        # the threshold, but its kernels evaluate box arithmetic in FP32.  A
+        # mathematically equal rational overlap (for example 1/3) can round one
+        # ULP above the Python scalar and be suppressed accidentally.  Passing
+        # the next FP32 value makes the declared inclusive boundary robust.  On
+        # this finite regular lattice the next distinct geometric overlap is
+        # many ULPs away; certificate replay still records the exact eta above.
+        # Compute the scalar guard on CPU; placing it on the source CUDA device
+        # and then calling ``item`` would introduce an avoidable synchronization
+        # in every image forward.
+        nms_threshold_tensor = torch.tensor(nms_iou, dtype=torch.float32)
+        operational_nms_iou = float(
+            torch.nextafter(
+                nms_threshold_tensor,
+                torch.full_like(nms_threshold_tensor, torch.inf),
+            ).item()
+        )
+        packed = torch.zeros_like(valid)
+        for sample in range(n_batch):
+            source_indices = torch.nonzero(valid[sample], as_tuple=False).flatten()
+            if source_indices.numel() == 0:
+                continue
+            kept_local = nms(
+                boxes.index_select(0, source_indices),
+                nms_priority[sample].index_select(0, source_indices),
+                operational_nms_iou,
+            )
+            packed[sample, source_indices.index_select(0, kept_local)] = True
+    return packed
+
+
+def receptive_field_packed_ordinal_evidence(
+    evidence: LocalOrdinalEvidence,
+    valid_mask: torch.Tensor,
+    lattice_size: Tuple[int, int],
+    *,
+    output_stride: int,
+    receptive_field: float,
+    max_overlap: float,
+) -> ReceptiveFieldPackedEvidence:
+    """Turn redundant overlapping sites into one complete packed ledger.
+
+    The shared packing priority is the expected local ordinal state,
+    ``sum_k P(L>k)``.  A severe site therefore cannot be suppressed merely
+    because an adjacent site has a slightly larger low-boundary probability.
+    The selected mask is applied to the complete categorical state: every
+    excluded site becomes normal, preserving the exact cumulative semantics.
+    """
+
+    states = evidence.state_probabilities
+    witnesses = evidence.witness_probabilities
+    log_witnesses = evidence.log_witness_probabilities
+    log_nonwitnesses = evidence.log_nonwitness_probabilities
+    if states.ndim != 3 or witnesses.ndim != 3:
+        raise ValueError("ordinal evidence must have shapes (N,P,K) and (N,P,K-1)")
+    if (
+        witnesses.shape[:2] != states.shape[:2]
+        or witnesses.shape[-1] + 1 != states.shape[-1]
+    ):
+        raise ValueError("state and witness evidence shapes disagree")
+    if (
+        log_witnesses.shape != witnesses.shape
+        or log_nonwitnesses.shape != witnesses.shape
+    ):
+        raise ValueError("log witness tensors must match witness probabilities")
+    if valid_mask.shape != states.shape[:2]:
+        raise ValueError("packing valid_mask must match the evidence event axes")
+
+    priority = witnesses.float().sum(dim=-1)
+    packed_mask = receptive_field_packing_mask(
+        priority,
+        valid_mask,
+        lattice_size,
+        output_stride=output_stride,
+        receptive_field=receptive_field,
+        max_overlap=max_overlap,
+    )
+    selected = packed_mask.unsqueeze(-1)
+    normal = torch.zeros_like(states)
+    normal[..., 0] = 1.0
+    packed_states = torch.where(selected, states, normal)
+    packed_witnesses = torch.where(
+        selected, witnesses, torch.zeros_like(witnesses)
+    )
+    packed_log_witnesses = torch.where(
+        selected, log_witnesses, torch.full_like(log_witnesses, -torch.inf)
+    )
+    packed_log_nonwitnesses = torch.where(
+        selected, log_nonwitnesses, torch.zeros_like(log_nonwitnesses)
+    )
+    nms_iou = float(max_overlap) / (2.0 - float(max_overlap))
+    return ReceptiveFieldPackedEvidence(
+        evidence=LocalOrdinalEvidence(
+            state_probabilities=packed_states,
+            witness_probabilities=packed_witnesses,
+            log_witness_probabilities=packed_log_witnesses,
+            log_nonwitness_probabilities=packed_log_nonwitnesses,
+        ),
+        packing_mask=packed_mask,
+        source_evidence=evidence,
+        source_valid_mask=valid_mask.to(device=states.device, dtype=torch.bool),
+        lattice_size=(int(lattice_size[0]), int(lattice_size[1])),
+        output_stride=int(output_stride),
+        receptive_field=float(receptive_field),
+        max_overlap=float(max_overlap),
+        nms_iou_threshold=nms_iou,
     )
 
 
@@ -2258,10 +2501,41 @@ class MOSAICProofHead(nn.Module):
         region_grid_size: int = 0,
         region_pool_temperature: Optional[float] = 0.25,
         region_pool_type: str = "normalized_logmeanexp",
+        rf_packing_max_overlap: Optional[float] = None,
+        source_output_stride: Optional[int] = None,
+        source_receptive_field: Optional[float] = None,
     ) -> None:
         super().__init__()
         if region_grid_size < 0:
             raise ValueError("region_grid_size must be non-negative")
+        if rf_packing_max_overlap is not None:
+            rf_packing_max_overlap = float(rf_packing_max_overlap)
+            if (
+                not math.isfinite(rf_packing_max_overlap)
+                or not 0.0 <= rf_packing_max_overlap < 1.0
+            ):
+                raise ValueError("rf_packing_max_overlap must lie in [0, 1)")
+            if region_grid_size:
+                raise ValueError(
+                    "RF packing and fixed regional compilation are mutually exclusive"
+                )
+            if source_output_stride is None or int(source_output_stride) <= 0:
+                raise ValueError("RF packing requires a positive source_output_stride")
+            if (
+                source_receptive_field is None
+                or not math.isfinite(float(source_receptive_field))
+                or float(source_receptive_field) <= 0.0
+            ):
+                raise ValueError(
+                    "RF packing requires a finite positive source_receptive_field"
+                )
+        self.rf_packing_max_overlap = rf_packing_max_overlap
+        self.source_output_stride = (
+            None if source_output_stride is None else int(source_output_stride)
+        )
+        self.source_receptive_field = (
+            None if source_receptive_field is None else float(source_receptive_field)
+        )
         self.region_pool_type = normalize_region_pool_type(region_pool_type)
         if self.region_pool_type == "normalized_logmeanexp":
             if (
@@ -2311,6 +2585,55 @@ class MOSAICProofHead(nn.Module):
             local_logits = self.local_state_head.logits(local_features.float())
             local_evidence = nested_witness_probabilities(local_logits, valid_mask)
             if self.region_grid_size == 0:
+                if self.rf_packing_max_overlap is not None:
+                    if lattice_size is None:
+                        side = math.isqrt(int(local_features.shape[1]))
+                        if side * side != int(local_features.shape[1]):
+                            raise ValueError(
+                                "lattice_size is required for RF packing of a "
+                                "non-square feature sequence"
+                            )
+                        lattice_size = (side, side)
+                    if valid_mask is None:
+                        valid_mask = torch.ones(
+                            local_features.shape[:2],
+                            device=local_features.device,
+                            dtype=torch.bool,
+                        )
+                    assert self.source_output_stride is not None
+                    assert self.source_receptive_field is not None
+                    packed = receptive_field_packed_ordinal_evidence(
+                        local_evidence,
+                        valid_mask,
+                        lattice_size,
+                        output_stride=self.source_output_stride,
+                        receptive_field=self.source_receptive_field,
+                        max_overlap=self.rf_packing_max_overlap,
+                    )
+                    output = self.ordinal_core.forward_evidence(
+                        packed.evidence,
+                        valid_mask=packed.packing_mask,
+                        project=project,
+                        return_pivotality=return_pivotality,
+                    )
+                    output.source_state_probabilities = (
+                        packed.source_evidence.state_probabilities
+                    )
+                    output.source_witness_probabilities = (
+                        packed.source_evidence.witness_probabilities
+                    )
+                    output.source_log_witness_probabilities = (
+                        packed.source_evidence.log_witness_probabilities
+                    )
+                    output.source_log_nonwitness_probabilities = (
+                        packed.source_evidence.log_nonwitness_probabilities
+                    )
+                    output.rf_packing_mask = packed.packing_mask
+                    output.rf_packing_max_overlap = packed.max_overlap
+                    output.rf_packing_nms_iou = packed.nms_iou_threshold
+                    output.rf_packing_output_stride = packed.output_stride
+                    output.rf_packing_receptive_field = packed.receptive_field
+                    return output
                 return self.ordinal_core.forward_evidence(
                     local_evidence,
                     valid_mask=valid_mask,
@@ -2377,6 +2700,7 @@ __all__ = [
     "MOSAICProofHead",
     "OrdinalCardinalityCircuit",
     "ProofProjectionResult",
+    "ReceptiveFieldPackedEvidence",
     "TruncatedPoissonBinomial",
     "continuation_probabilities",
     "fixed_proof_pivotality",
@@ -2384,5 +2708,7 @@ __all__ = [
     "normalize_region_pool_type",
     "regional_logmeanexp_ordinal_evidence",
     "regional_max_ordinal_evidence",
+    "receptive_field_packed_ordinal_evidence",
+    "receptive_field_packing_mask",
     "REGION_POOL_TYPES",
 ]

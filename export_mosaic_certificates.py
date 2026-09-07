@@ -28,7 +28,10 @@ from inference.mosaic_certificate import (
     verify_mosaic_certificate,
 )
 from models.mosaic_model import build_mosaic_model
-from training.mosaic_trainer import mosaic_implementation_signature
+from training.mosaic_trainer import (
+    mosaic_implementation_signature,
+    require_mosaic_checkpoint_architecture_consistency,
+)
 
 
 def _file_sha256(path: str | Path) -> str:
@@ -134,13 +137,14 @@ def main() -> None:
     # expected grade.  Preserve that provenance instead of inheriting the new
     # configuration default when the stored field is absent.
     cfg.decision_rule = stored.get("decision_rule", "rounded_expected")
+    require_mosaic_checkpoint_architecture_consistency(checkpoint, cfg)
     criterion_state = checkpoint.get("criterion_state")
     if (
         not isinstance(criterion_state, dict)
         or "transition_weights" not in criterion_state
     ):
         raise ValueError(
-            "checkpoint has no training-fold transition weights; a v3 "
+            "checkpoint has no training-fold transition weights; a v4 "
             "decision certificate cannot replay its decoder"
         )
     transition_weights = torch.as_tensor(
@@ -241,6 +245,7 @@ def main() -> None:
         region_grid_size=cfg.region_grid_size,
         region_pool_type=cfg.region_pool_type,
         region_pool_temperature=cfg.region_pool_temperature,
+        rf_packing_max_overlap=cfg.rf_packing_max_overlap,
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.configure_proof_decoder(cfg.decision_rule, transition_weights)
@@ -331,6 +336,7 @@ def main() -> None:
         "fold": args.fold,
         "split": args.split,
         "decision_rule": cfg.decision_rule,
+        "rf_packing_max_overlap": cfg.rf_packing_max_overlap,
         "implementation_signature": active_implementation_signature,
         "limit": args.limit,
         "per_grade_limit": args.per_grade_limit,

@@ -1,10 +1,12 @@
 """Replayable JSON certificates for MOSAIC predictions.
 
-The certificate records the dense regional witness ledger which determines
-the proof, as well as the selected proof that is the exclusive numerical
-prediction path.  :func:`verify_mosaic_certificate` reconstructs the count
-distributions, transitions, continuation cascade, minimum-prefix conditions,
-and fixed-proof pivotalities from the serialized values.
+The certificate records the effective witness ledger which determines the
+proof, as well as the selected proof that is the exclusive numerical
+prediction path.  For receptive-field packing it additionally records the raw
+pre-packing ledger and deterministic exclusion geometry.  The verifier
+reconstructs the packing, count distributions, transitions, continuation
+cascade, minimum-prefix conditions, and fixed-proof pivotalities from the
+serialized values.
 
 The utility deliberately serializes receptive-field support metadata rather
 than drawing an interpolated heatmap.  A lattice centre is not a pixel-level
@@ -25,11 +27,13 @@ from typing import Any
 import torch
 
 from models.mosaic import (
+    LocalOrdinalEvidence,
     OrdinalCardinalityCircuit,
     ProofProjectionResult,
     TruncatedPoissonBinomial,
     fixed_proof_pivotality,
     normalize_region_pool_type,
+    receptive_field_packed_ordinal_evidence,
 )
 from models.mosaic_decoder import (
     PROOF_DECISION_RULES,
@@ -39,7 +43,14 @@ from models.mosaic_decoder import (
 )
 
 
-SCHEMA_VERSION = "mosaic-certificate-v3"
+SCHEMA_VERSION = "mosaic-certificate-v4"
+LEGACY_SCHEMA_VERSION = "mosaic-certificate-v3"
+EVIDENCE_COMPILERS = (
+    "source_lattice",
+    "regional_normalized_logmeanexp",
+    "regional_existential_max",
+    "rf_packing",
+)
 DEFAULT_REPLAY_ATOL = 2e-5
 DEFAULT_REPLAY_RTOL = 2e-5
 # Replay tolerances are part of the verifier's trust policy, not values that a
@@ -178,7 +189,7 @@ def _serialize_log_trace(value: torch.Tensor) -> torch.Tensor:
 
 
 def _deserialize_log_trace(value: Any) -> torch.Tensor:
-    tensor = torch.tensor(value, dtype=torch.float32)
+    tensor = torch.as_tensor(value, dtype=torch.float32)
     return torch.where(
         tensor <= -5.0e29, torch.full_like(tensor, -torch.inf), tensor
     )
@@ -471,6 +482,177 @@ def _regional_geometry_payload(
     return payload, peak_records, regions
 
 
+def _stable_severity_ranking(
+    witness_probabilities: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> list[int]:
+    """Return the canonical ORFP source order.
+
+    RF packing uses one boundary-shared priority: the expected local ordinal
+    state, equivalently the sum of the nested boundary witnesses.  Explicitly
+    serializing this stable order makes tie handling (lower row-major index
+    first) part of the replayable certificate rather than an implementation
+    accident.
+    """
+
+    if witness_probabilities.ndim != 2:
+        raise ValueError("source witnesses must have shape (P, K-1)")
+    if valid_mask.shape != witness_probabilities.shape[:1]:
+        raise ValueError("source valid mask must have shape (P,)")
+    priority = witness_probabilities.float().sum(dim=-1)
+    valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten().tolist()
+    if valid_indices and not bool(torch.isfinite(priority[valid_mask]).all()):
+        raise ValueError("valid source severity priorities must be finite")
+    return sorted(
+        (int(index) for index in valid_indices),
+        key=lambda index: (-float(priority[index]), index),
+    )
+
+
+def _rf_packing_payload(
+    *,
+    source_metadata: Mapping[str, Any],
+    source_valid_mask: torch.Tensor,
+    packed_mask: torch.Tensor,
+    source_state_probabilities: torch.Tensor,
+    source_witness_probabilities: torch.Tensor,
+    source_log_witness_probabilities: torch.Tensor,
+    source_log_nonwitness_probabilities: torch.Tensor,
+    max_overlap: float,
+    nms_iou_threshold: float,
+    output_stride: int,
+    receptive_field: float,
+) -> dict[str, Any]:
+    """Validate and serialize deterministic receptive-field packing inputs."""
+
+    if source_valid_mask.ndim != 1 or packed_mask.shape != source_valid_mask.shape:
+        raise ValueError("source and packed masks must both have shape (P,)")
+    p = int(source_valid_mask.numel())
+    geometry = _lattice_geometry(source_metadata, p)
+    if source_witness_probabilities.ndim != 2:
+        raise ValueError("source witnesses must have shape (P, K-1)")
+    boundaries = source_witness_probabilities.shape[-1]
+    if source_witness_probabilities.shape != (p, boundaries):
+        raise ValueError("source witnesses must have shape (P, K-1)")
+    if source_state_probabilities.shape != (p, boundaries + 1):
+        raise ValueError("source states and witnesses disagree")
+    if (
+        source_log_witness_probabilities.shape != (p, boundaries)
+        or source_log_nonwitness_probabilities.shape != (p, boundaries)
+    ):
+        raise ValueError("source log witnesses must match source witnesses")
+    if bool((packed_mask & ~source_valid_mask).any()):
+        raise ValueError("RF packing selects a source outside valid retinal support")
+
+    max_overlap = float(max_overlap)
+    nms_iou_threshold = float(nms_iou_threshold)
+    output_stride = int(output_stride)
+    receptive_field = float(receptive_field)
+    if not math.isfinite(max_overlap) or not 0.0 <= max_overlap < 1.0:
+        raise ValueError("RF packing max overlap must lie in [0, 1)")
+    expected_iou = max_overlap / (2.0 - max_overlap)
+    if not math.isfinite(nms_iou_threshold) or not math.isclose(
+        nms_iou_threshold, expected_iou, rel_tol=1e-12, abs_tol=1e-12
+    ):
+        raise ValueError("RF packing NMS IoU threshold is inconsistent")
+    if output_stride != geometry["stride"]:
+        raise ValueError("RF packing stride disagrees with source lattice metadata")
+    if not math.isclose(
+        receptive_field,
+        geometry["receptive_field"],
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+    ):
+        raise ValueError(
+            "RF packing receptive field disagrees with source lattice metadata"
+        )
+
+    severity_ranking = _stable_severity_ranking(
+        source_witness_probabilities, source_valid_mask
+    )
+    return {
+        "algorithm": "stable_descending_severity_receptive_field_nms",
+        "priority_definition": "sum_boundary_witness_probabilities",
+        "tie_break": "lower_row_major_source_index_first",
+        "source_lattice_metadata": source_metadata,
+        "source_valid_mask": source_valid_mask,
+        "packed_mask": packed_mask,
+        "severity_ranking": severity_ranking,
+        "max_overlap_fraction": max_overlap,
+        "converted_iou_threshold": nms_iou_threshold,
+        "max_observed_pairwise_overlap_fraction": (
+            _max_packed_pairwise_overlap_fraction(
+                packed_mask,
+                lattice_size=(geometry["height"], geometry["width"]),
+                output_stride=output_stride,
+                receptive_field=receptive_field,
+            )
+        ),
+        "geometry": {
+            "lattice_size": [geometry["height"], geometry["width"]],
+            "output_stride": output_stride,
+            "receptive_field": receptive_field,
+            "center_offset": geometry["offset"],
+            "support_box_convention": "equal_area_unclipped_theoretical_squares",
+        },
+        "raw_local_state_probabilities": source_state_probabilities,
+        "raw_witness_probabilities": source_witness_probabilities,
+        "raw_log_witness_probabilities": _serialize_log_trace(
+            torch.where(
+                source_valid_mask[:, None],
+                source_log_witness_probabilities,
+                torch.zeros_like(source_log_witness_probabilities),
+            )
+        ),
+        "raw_log_nonwitness_probabilities": _serialize_log_trace(
+            torch.where(
+                source_valid_mask[:, None],
+                source_log_nonwitness_probabilities,
+                torch.zeros_like(source_log_nonwitness_probabilities),
+            )
+        ),
+        "semantics": (
+            "The complete pre-packing ordinal state ledger is ranked once by "
+            "boundary-shared severity. Deterministic NMS retains receptive-field "
+            "supports whose pairwise intersection fraction does not exceed the "
+            "declared bound; excluded sites become the normal categorical state."
+        ),
+    }
+
+
+def _max_packed_pairwise_overlap_fraction(
+    packed_mask: torch.Tensor,
+    *,
+    lattice_size: tuple[int, int],
+    output_stride: int,
+    receptive_field: float,
+) -> float:
+    """Return the largest pairwise equal-area theoretical RF intersection."""
+
+    height, width = (int(lattice_size[0]), int(lattice_size[1]))
+    if packed_mask.ndim != 1 or packed_mask.numel() != height * width:
+        raise ValueError("packed mask and lattice geometry disagree")
+    indices = torch.nonzero(packed_mask, as_tuple=False).flatten().tolist()
+    rf_area = float(receptive_field) ** 2
+    maximum = 0.0
+    for position, first in enumerate(indices):
+        first_row, first_column = divmod(int(first), width)
+        for second in indices[position + 1 :]:
+            second_row, second_column = divmod(int(second), width)
+            overlap_height = max(
+                0.0,
+                float(receptive_field)
+                - abs(first_row - second_row) * int(output_stride),
+            )
+            overlap_width = max(
+                0.0,
+                float(receptive_field)
+                - abs(first_column - second_column) * int(output_stride),
+            )
+            maximum = max(maximum, overlap_height * overlap_width / rf_area)
+    return float(maximum)
+
+
 def build_mosaic_certificate(
     output: Any,
     *,
@@ -510,6 +692,15 @@ def build_mosaic_certificate(
     regional_block_size_value = None
     regional_pool_temperature_value = None
     regional_pool_type_value = None
+    source_state_probabilities_value = None
+    source_witness_probabilities_value = None
+    source_log_witness_probabilities_value = None
+    source_log_nonwitness_probabilities_value = None
+    rf_packing_mask_value = None
+    rf_packing_max_overlap_value = None
+    rf_packing_nms_iou_value = None
+    rf_packing_output_stride_value = None
+    rf_packing_receptive_field_value = None
     if wrapped_evidence is not None:
         # A MOSAICModelOutput already carries the decoder that produced its
         # public ``predicted_grade``.  Infer that metadata by default so a
@@ -586,6 +777,29 @@ def build_mosaic_certificate(
         # Core outputs and legacy tensor mappings have no decoder metadata;
         # retain their historical raw rounded-mean behavior.
         decision_rule = "rounded_expected"
+    source_state_probabilities_value = _optional_field(
+        output, "source_state_probabilities"
+    )
+    source_witness_probabilities_value = _optional_field(
+        output, "source_witness_probabilities"
+    )
+    source_log_witness_probabilities_value = _optional_field(
+        output, "source_log_witness_probabilities"
+    )
+    source_log_nonwitness_probabilities_value = _optional_field(
+        output, "source_log_nonwitness_probabilities"
+    )
+    rf_packing_mask_value = _optional_field(output, "rf_packing_mask")
+    rf_packing_max_overlap_value = _optional_field(
+        output, "rf_packing_max_overlap"
+    )
+    rf_packing_nms_iou_value = _optional_field(output, "rf_packing_nms_iou")
+    rf_packing_output_stride_value = _optional_field(
+        output, "rf_packing_output_stride"
+    )
+    rf_packing_receptive_field_value = _optional_field(
+        output, "rf_packing_receptive_field"
+    )
     if lattice_metadata is None:
         raise ValueError("lattice_metadata is required for a faithful certificate")
     if sufficiency_tolerance < 0.0:
@@ -830,6 +1044,7 @@ def build_mosaic_certificate(
         raise TypeError("lattice_metadata must serialize to an object")
     geometry = _lattice_geometry(metadata, p)
     regional_payload = None
+    rf_packing_payload = None
     regional_peak_records: dict[str, Any] = {}
     if regional_source_indices_value is not None:
         if (
@@ -912,6 +1127,116 @@ def build_mosaic_certificate(
             raise ValueError(
                 "source valid mask does not reproduce the regional proof mask"
             )
+
+    packing_values = (
+        source_state_probabilities_value,
+        source_witness_probabilities_value,
+        source_log_witness_probabilities_value,
+        source_log_nonwitness_probabilities_value,
+        rf_packing_mask_value,
+        rf_packing_max_overlap_value,
+        rf_packing_nms_iou_value,
+        rf_packing_output_stride_value,
+        rf_packing_receptive_field_value,
+    )
+    if any(value is not None for value in packing_values):
+        if any(value is None for value in packing_values):
+            raise ValueError("RF packing output metadata must be complete")
+        if regional_payload is not None:
+            raise ValueError("regional envelopes and RF packing are mutually exclusive")
+        if source_lattice_metadata is None or source_valid_mask_value is None:
+            raise ValueError(
+                "RF packing certificates require the wrapper source lattice and "
+                "source valid mask"
+            )
+        source_metadata = _json_safe(source_lattice_metadata)
+        if not isinstance(source_metadata, Mapping):
+            raise TypeError("source_lattice must serialize to an object")
+        source_valid_tensor = _tensor(
+            source_valid_mask_value, "source_valid_mask"
+        )
+        if source_valid_tensor.ndim == 2:
+            source_valid_tensor = source_valid_tensor[sample_index]
+        source_valid = source_valid_tensor.detach().bool().cpu()
+        packing_mask = _sample(
+            rf_packing_mask_value,
+            "rf_packing_mask",
+            sample_index=sample_index,
+            batched_ndim=2,
+        ).detach().bool().cpu()
+        source_states = _sample(
+            source_state_probabilities_value,
+            "source_state_probabilities",
+            sample_index=sample_index,
+            batched_ndim=3,
+        ).detach().float().cpu()
+        source_witnesses = _sample(
+            source_witness_probabilities_value,
+            "source_witness_probabilities",
+            sample_index=sample_index,
+            batched_ndim=3,
+        ).detach().float().cpu()
+        source_log_witnesses = _sample(
+            source_log_witness_probabilities_value,
+            "source_log_witness_probabilities",
+            sample_index=sample_index,
+            batched_ndim=3,
+        ).detach().float().cpu()
+        source_log_nonwitnesses = _sample(
+            source_log_nonwitness_probabilities_value,
+            "source_log_nonwitness_probabilities",
+            sample_index=sample_index,
+            batched_ndim=3,
+        ).detach().float().cpu()
+        rf_packing_payload = _rf_packing_payload(
+            source_metadata=source_metadata,
+            source_valid_mask=source_valid,
+            packed_mask=packing_mask,
+            source_state_probabilities=source_states,
+            source_witness_probabilities=source_witnesses,
+            source_log_witness_probabilities=source_log_witnesses,
+            source_log_nonwitness_probabilities=source_log_nonwitnesses,
+            max_overlap=float(rf_packing_max_overlap_value),
+            nms_iou_threshold=float(rf_packing_nms_iou_value),
+            output_stride=int(rf_packing_output_stride_value),
+            receptive_field=float(rf_packing_receptive_field_value),
+        )
+        if not torch.equal(packing_mask, valid):
+            raise ValueError("RF packing mask must be the proof ledger valid mask")
+        if _json_safe(source_metadata) != _json_safe(metadata):
+            raise ValueError("RF packing must preserve the source lattice geometry")
+        replayed_packing = receptive_field_packed_ordinal_evidence(
+            LocalOrdinalEvidence(
+                state_probabilities=source_states.unsqueeze(0),
+                witness_probabilities=source_witnesses.unsqueeze(0),
+                log_witness_probabilities=source_log_witnesses.unsqueeze(0),
+                log_nonwitness_probabilities=(
+                    source_log_nonwitnesses.unsqueeze(0)
+                ),
+            ),
+            source_valid.unsqueeze(0),
+            tuple(int(value) for value in source_metadata["lattice_size"]),
+            output_stride=int(rf_packing_output_stride_value),
+            receptive_field=float(rf_packing_receptive_field_value),
+            max_overlap=float(rf_packing_max_overlap_value),
+        )
+        if not torch.equal(replayed_packing.packing_mask[0], packing_mask):
+            raise ValueError("serialized source evidence does not reproduce RF packing")
+        replayed_evidence = replayed_packing.evidence
+        if not (
+            torch.equal(replayed_evidence.state_probabilities[0], local_states)
+            and torch.equal(replayed_evidence.witness_probabilities[0], witnesses)
+            and torch.equal(
+                replayed_evidence.log_witness_probabilities[0], log_witnesses
+            )
+            and torch.equal(
+                replayed_evidence.log_nonwitness_probabilities[0],
+                log_nonwitnesses,
+            )
+        ):
+            raise ValueError(
+                "serialized source evidence does not reproduce the packed ledger"
+            )
     _replay_dense_log_stop, dense_log_conditional, dense_log_survival = (
         _log_stop_ledger(
             witnesses, alpha, log_alpha,
@@ -925,6 +1250,13 @@ def build_mosaic_certificate(
             log_witnesses, log_nonwitnesses,
         )
     )
+
+    if rf_packing_payload is not None:
+        evidence_compiler = "rf_packing"
+    elif regional_payload is not None:
+        evidence_compiler = f"regional_{regional_payload['pool_type']}"
+    else:
+        evidence_compiler = "source_lattice"
 
     selected_indices: list[list[int]] = []
     selected_cells: list[list[dict[str, Any]]] = []
@@ -971,6 +1303,11 @@ def build_mosaic_certificate(
 
     certificate = {
         "schema_version": SCHEMA_VERSION,
+        # This discriminator is mandatory in v4.  The verifier couples it to
+        # the corresponding source-ledger provenance section, so deleting a
+        # compiler trace and merely re-hashing the remaining JSON cannot turn
+        # a packed/regional prediction into an apparently plain-lattice one.
+        "evidence_compiler": evidence_compiler,
         "sample_id": sample_id,
         "sample_index": int(sample_index),
         "provenance": {} if provenance is None else _json_safe(provenance),
@@ -1092,8 +1429,13 @@ def build_mosaic_certificate(
                 "fine-lattice peak provenance; peak sources are not standalone "
                 "proof events. "
                 if regional_payload is not None
-                else "Fine-grid computational evidence with the serialized "
-                "receptive-field support; "
+                else (
+                    "Deterministically receptive-field-packed fine-grid evidence "
+                    "with a replayable raw source ledger; "
+                    if rf_packing_payload is not None
+                    else "Fine-grid computational evidence with the serialized "
+                    "receptive-field support; "
+                )
             )
             + "not pixel segmentation or a named-lesion annotation. Proof "
             "sufficiency and necessity refer to raw cardinality scores, while the "
@@ -1102,6 +1444,8 @@ def build_mosaic_certificate(
     }
     if regional_payload is not None:
         certificate["regional_envelope_provenance"] = regional_payload
+    if rf_packing_payload is not None:
+        certificate["receptive_field_packing"] = rf_packing_payload
     # A round-trip with allow_nan=False is the final strict JSON-safety check.
     safe = _json_safe(certificate)
     safe["integrity"] = {
@@ -1191,20 +1535,21 @@ def verify_mosaic_certificate(
     witnesses correspond to clinically named lesions.
     """
 
-    if certificate.get("schema_version") != SCHEMA_VERSION:
-        if certificate.get("schema_version") == "mosaic-certificate-v1":
+    schema_version = certificate.get("schema_version")
+    if schema_version not in {SCHEMA_VERSION, LEGACY_SCHEMA_VERSION}:
+        if schema_version == "mosaic-certificate-v1":
             raise ValueError(
                 "mosaic-certificate-v1 has no stable log-stop trace; "
-                "regenerate it with the v3 exporter"
+                "regenerate it with the v4 exporter"
             )
-        if certificate.get("schema_version") == "mosaic-certificate-v2":
+        if schema_version == "mosaic-certificate-v2":
             raise ValueError(
                 "mosaic-certificate-v2 does not serialize the proof-only "
                 "decision rule and outcome weights; regenerate it with the "
-                "v3 exporter"
+                "v4 exporter"
             )
         raise ValueError(
-            f"unsupported certificate schema {certificate.get('schema_version')!r}"
+            f"unsupported certificate schema {schema_version!r}"
         )
     numerical = certificate.get("numerical_contract", {})
     if not isinstance(numerical, Mapping):
@@ -1306,6 +1651,36 @@ def verify_mosaic_certificate(
     regional_peak_records: dict[str, Any] = {}
     regional_provenance_valid = True
     regional_value = certificate.get("regional_envelope_provenance")
+    rf_packing_value = certificate.get("receptive_field_packing")
+    evidence_compiler_value = certificate.get("evidence_compiler")
+    if schema_version == LEGACY_SCHEMA_VERSION:
+        # A genuine v3 certificate predates the mandatory discriminator.  It
+        # may contain the then-optional regional trace, but it cannot make a
+        # v4 RF-packing claim.
+        evidence_compiler_valid = evidence_compiler_value is None
+    else:
+        evidence_compiler_valid = bool(
+            isinstance(evidence_compiler_value, str)
+            and evidence_compiler_value in EVIDENCE_COMPILERS
+        )
+        if evidence_compiler_valid:
+            if evidence_compiler_value == "source_lattice":
+                evidence_compiler_valid = bool(
+                    regional_value is None and rf_packing_value is None
+                )
+            elif evidence_compiler_value == "rf_packing":
+                evidence_compiler_valid = bool(
+                    rf_packing_value is not None and regional_value is None
+                )
+            else:
+                expected_pool_type = evidence_compiler_value.removeprefix(
+                    "regional_"
+                )
+                evidence_compiler_valid = bool(
+                    isinstance(regional_value, Mapping)
+                    and rf_packing_value is None
+                    and regional_value.get("pool_type") == expected_pool_type
+                )
     if regional_value is not None:
         try:
             if not isinstance(regional_value, Mapping) or geometry is None:
@@ -1363,6 +1738,243 @@ def verify_mosaic_certificate(
         except (KeyError, TypeError, ValueError, IndexError):
             regional_provenance_valid = False
             regional_peak_records = {}
+
+    # v4 optionally certifies ORFP's deterministic exclusion step itself, not
+    # merely the already-packed ledger.  Starting from the raw local ordinal
+    # states, replay the shared severity ranking, RF NMS mask, and complete
+    # normal-state substitution.  Legacy v3 certificates have no such claim
+    # and remain valid only when this v4-only section is absent.
+    rf_packing_provenance_valid = True
+    rf_packing_severity_ranking_valid = True
+    rf_packing_mask_valid = True
+    rf_packing_ledger_valid = True
+    rf_packing_pairwise_overlap_valid = True
+    if schema_version == LEGACY_SCHEMA_VERSION:
+        if rf_packing_value is not None:
+            rf_packing_provenance_valid = False
+            rf_packing_severity_ranking_valid = False
+            rf_packing_mask_valid = False
+            rf_packing_ledger_valid = False
+            rf_packing_pairwise_overlap_valid = False
+    elif rf_packing_value is not None:
+        try:
+            if not isinstance(rf_packing_value, Mapping):
+                raise ValueError("RF packing provenance must be an object")
+            source_metadata_value = rf_packing_value["source_lattice_metadata"]
+            if not isinstance(source_metadata_value, Mapping):
+                raise ValueError("RF packing source lattice must be an object")
+            source_valid = torch.tensor(
+                rf_packing_value["source_valid_mask"], dtype=torch.bool
+            )
+            serialized_packed_mask = torch.tensor(
+                rf_packing_value["packed_mask"], dtype=torch.bool
+            )
+            source_states = torch.tensor(
+                rf_packing_value["raw_local_state_probabilities"],
+                dtype=torch.float32,
+            )
+            source_witnesses = torch.tensor(
+                rf_packing_value["raw_witness_probabilities"],
+                dtype=torch.float32,
+            )
+            serialized_source_log_witnesses = torch.tensor(
+                rf_packing_value["raw_log_witness_probabilities"],
+                dtype=torch.float32,
+            )
+            serialized_source_log_nonwitnesses = torch.tensor(
+                rf_packing_value["raw_log_nonwitness_probabilities"],
+                dtype=torch.float32,
+            )
+            if source_valid.shape != (p,) or serialized_packed_mask.shape != (p,):
+                raise ValueError("RF packing masks must match the proof lattice")
+            if source_states.shape != (p, boundaries + 1):
+                raise ValueError("RF packing source states have the wrong shape")
+            if (
+                source_witnesses.shape != (p, boundaries)
+                or serialized_source_log_witnesses.shape != (p, boundaries)
+                or serialized_source_log_nonwitnesses.shape != (p, boundaries)
+            ):
+                raise ValueError("RF packing source witnesses have the wrong shape")
+            source_log_witnesses = torch.where(
+                source_valid[:, None],
+                _deserialize_log_trace(serialized_source_log_witnesses),
+                torch.full_like(serialized_source_log_witnesses, -torch.inf),
+            )
+            source_log_nonwitnesses = torch.where(
+                source_valid[:, None],
+                _deserialize_log_trace(serialized_source_log_nonwitnesses),
+                torch.zeros_like(serialized_source_log_nonwitnesses),
+            )
+            max_overlap = float(rf_packing_value["max_overlap_fraction"])
+            nms_iou = float(rf_packing_value["converted_iou_threshold"])
+            reported_max_pairwise_overlap = float(
+                rf_packing_value["max_observed_pairwise_overlap_fraction"]
+            )
+            geometry_value = rf_packing_value["geometry"]
+            if not isinstance(geometry_value, Mapping):
+                raise ValueError("RF packing geometry must be an object")
+            lattice_size = tuple(
+                int(value) for value in geometry_value["lattice_size"]
+            )
+            if len(lattice_size) != 2:
+                raise ValueError("RF packing lattice size must have two dimensions")
+            output_stride = int(geometry_value["output_stride"])
+            receptive_field = float(geometry_value["receptive_field"])
+
+            expected_packing_payload = _rf_packing_payload(
+                source_metadata=source_metadata_value,
+                source_valid_mask=source_valid,
+                packed_mask=serialized_packed_mask,
+                source_state_probabilities=source_states,
+                source_witness_probabilities=source_witnesses,
+                source_log_witness_probabilities=source_log_witnesses,
+                source_log_nonwitness_probabilities=source_log_nonwitnesses,
+                max_overlap=max_overlap,
+                nms_iou_threshold=nms_iou,
+                output_stride=output_stride,
+                receptive_field=receptive_field,
+            )
+            rf_packing_provenance_valid = bool(
+                _json_safe(rf_packing_value)
+                == _json_safe(expected_packing_payload)
+                and _json_safe(source_metadata_value)
+                == _json_safe(certificate["receptive_field_metadata"])
+                and regional_value is None
+            )
+            expected_ranking = _stable_severity_ranking(
+                source_witnesses, source_valid
+            )
+            try:
+                serialized_ranking = [
+                    int(index) for index in rf_packing_value["severity_ranking"]
+                ]
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("RF packing severity ranking is malformed") from exc
+            rf_packing_severity_ranking_valid = (
+                serialized_ranking == expected_ranking
+            )
+
+            # The raw source ledger is itself ordinal and complete.  This
+            # catches a rehashed certificate whose ranking happens to replay
+            # but whose source states no longer imply its source witnesses.
+            reconstructed_source_witnesses = torch.flip(
+                torch.cumsum(
+                    torch.flip(source_states[:, 1:], dims=(-1,)), dim=-1
+                ),
+                dims=(-1,),
+            ) * source_valid[:, None].float()
+            source_ledger_is_ordinal = bool(
+                torch.isfinite(source_states).all()
+                and (source_states >= -atol).all()
+                and torch.allclose(
+                    source_states.sum(dim=-1),
+                    torch.ones(p),
+                    atol=atol,
+                    rtol=rtol,
+                )
+                and torch.allclose(
+                    reconstructed_source_witnesses,
+                    source_witnesses,
+                    atol=atol,
+                    rtol=rtol,
+                )
+                and torch.all(source_witnesses[~source_valid].abs() <= atol)
+                and torch.all(source_states[~source_valid, 0] >= 1.0 - atol)
+                and torch.all(source_states[~source_valid, 1:].abs() <= atol)
+                and torch.isfinite(source_log_witnesses[source_valid]).all()
+                and torch.isfinite(source_log_nonwitnesses[source_valid]).all()
+                and torch.allclose(
+                    source_log_witnesses[source_valid].exp(),
+                    source_witnesses[source_valid],
+                    atol=atol,
+                    rtol=rtol,
+                )
+                and torch.allclose(
+                    torch.logsumexp(
+                        torch.stack(
+                            (
+                                source_log_witnesses[source_valid],
+                                source_log_nonwitnesses[source_valid],
+                            ),
+                            dim=-1,
+                        ),
+                        dim=-1,
+                    ),
+                    torch.zeros_like(source_log_witnesses[source_valid]),
+                    atol=atol,
+                    rtol=rtol,
+                )
+            )
+
+            replayed_packing = receptive_field_packed_ordinal_evidence(
+                LocalOrdinalEvidence(
+                    state_probabilities=source_states.unsqueeze(0),
+                    witness_probabilities=source_witnesses.unsqueeze(0),
+                    log_witness_probabilities=source_log_witnesses.unsqueeze(0),
+                    log_nonwitness_probabilities=(
+                        source_log_nonwitnesses.unsqueeze(0)
+                    ),
+                ),
+                source_valid.unsqueeze(0),
+                (lattice_size[0], lattice_size[1]),
+                output_stride=output_stride,
+                receptive_field=receptive_field,
+                max_overlap=max_overlap,
+            )
+            replayed_mask = replayed_packing.packing_mask[0]
+            rf_packing_mask_valid = bool(
+                torch.equal(replayed_mask, serialized_packed_mask)
+                and torch.equal(replayed_mask, valid)
+            )
+            replayed_evidence = replayed_packing.evidence
+            rf_packing_ledger_valid = bool(
+                source_ledger_is_ordinal
+                and torch.equal(
+                    replayed_evidence.state_probabilities[0], local_states
+                )
+                and torch.equal(
+                    replayed_evidence.witness_probabilities[0], raw_witnesses
+                )
+                and torch.equal(
+                    replayed_evidence.log_witness_probabilities[0],
+                    log_witnesses,
+                )
+                and torch.equal(
+                    replayed_evidence.log_nonwitness_probabilities[0],
+                    log_nonwitnesses,
+                )
+            )
+            replayed_max_pairwise_overlap = (
+                _max_packed_pairwise_overlap_fraction(
+                    serialized_packed_mask,
+                    lattice_size=(lattice_size[0], lattice_size[1]),
+                    output_stride=output_stride,
+                    receptive_field=receptive_field,
+                )
+            )
+            rf_packing_pairwise_overlap_valid = bool(
+                math.isfinite(reported_max_pairwise_overlap)
+                and math.isclose(
+                    reported_max_pairwise_overlap,
+                    replayed_max_pairwise_overlap,
+                    abs_tol=1e-12,
+                    rel_tol=1e-12,
+                )
+                and replayed_max_pairwise_overlap <= max_overlap + 1e-7
+            )
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            IndexError,
+            RuntimeError,
+            OverflowError,
+        ):
+            rf_packing_provenance_valid = False
+            rf_packing_severity_ranking_valid = False
+            rf_packing_mask_valid = False
+            rf_packing_ledger_valid = False
+            rf_packing_pairwise_overlap_valid = False
 
     selected_mask = torch.zeros_like(witnesses, dtype=torch.bool)
     raw_selected_indices = proof.get("selected_indices")
@@ -1469,6 +2081,7 @@ def verify_mosaic_certificate(
 
     checks: dict[str, bool] = {
         "integrity_sha256": integrity_valid,
+        "evidence_compiler": evidence_compiler_valid,
         "numerical_contract": bool(
             numerical.get("arithmetic")
             == "fp32_scaled_log_lower_tail_poisson_binomial"
@@ -1479,6 +2092,11 @@ def verify_mosaic_certificate(
         ),
         "receptive_field_metadata": geometry_valid,
         "regional_envelope_provenance": regional_provenance_valid,
+        "rf_packing_provenance": rf_packing_provenance_valid,
+        "rf_packing_severity_ranking": rf_packing_severity_ranking_valid,
+        "rf_packing_mask": rf_packing_mask_valid,
+        "rf_packing_ledger": rf_packing_ledger_valid,
+        "rf_packing_pairwise_overlap": rf_packing_pairwise_overlap_valid,
         "selected_indices_valid": not duplicate_or_invalid,
         "transition_weights": weights_valid,
         "decision_rule": decision_rule_valid,
@@ -1488,6 +2106,25 @@ def verify_mosaic_certificate(
             and "raw proof scores" in rule.get("scope", "")
         ),
     }
+    interpretation_scope = certificate.get("interpretation_scope")
+    if schema_version == LEGACY_SCHEMA_VERSION:
+        checks["interpretation_scope"] = isinstance(interpretation_scope, str)
+    else:
+        scope_prefix = {
+            "source_lattice": "Fine-grid computational evidence",
+            "rf_packing": (
+                "Deterministically receptive-field-packed fine-grid evidence"
+            ),
+            "regional_normalized_logmeanexp": (
+                "Fixed-region computational evidence"
+            ),
+            "regional_existential_max": "Fixed-region computational evidence",
+        }.get(evidence_compiler_value)
+        checks["interpretation_scope"] = bool(
+            isinstance(interpretation_scope, str)
+            and scope_prefix is not None
+            and interpretation_scope.startswith(scope_prefix)
+        )
     errors: dict[str, float] = {}
     checks["invalid_cells_are_normal"] = bool(
         torch.all(raw_witnesses[~valid].abs() <= atol)
@@ -2045,6 +2682,8 @@ def verify_mosaic_certificate(
 __all__ = [
     "CertificateReplayError",
     "SCHEMA_VERSION",
+    "LEGACY_SCHEMA_VERSION",
+    "EVIDENCE_COMPILERS",
     "DEFAULT_REPLAY_ATOL",
     "DEFAULT_REPLAY_RTOL",
     "MAX_REPLAY_ATOL",

@@ -25,7 +25,12 @@ from .local_efficientnet import (
     ReceptiveFieldMetadata,
     downsample_retinal_field_mask,
 )
-from .mosaic import MOSAICOutput, MOSAICProofHead, normalize_region_pool_type
+from .mosaic import (
+    MOSAICOutput,
+    MOSAICProofHead,
+    normalize_region_pool_type,
+    receptive_field_packing_mask,
+)
 from .mosaic_decoder import (
     PROOF_DECISION_RULES,
     ProofOnlyDecisionBundle,
@@ -193,6 +198,7 @@ class MOSAICModel(nn.Module):
         region_grid_size: int = 0,
         region_pool_temperature: Optional[float] = 0.25,
         region_pool_type: str = "normalized_logmeanexp",
+        rf_packing_max_overlap: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.num_classes = int(num_classes)
@@ -200,6 +206,18 @@ class MOSAICModel(nn.Module):
         if region_grid_size < 0:
             raise ValueError("region_grid_size must be non-negative")
         self.region_grid_size = int(region_grid_size)
+        if rf_packing_max_overlap is not None:
+            rf_packing_max_overlap = float(rf_packing_max_overlap)
+            if (
+                not math.isfinite(rf_packing_max_overlap)
+                or not 0.0 <= rf_packing_max_overlap < 1.0
+            ):
+                raise ValueError("rf_packing_max_overlap must lie in [0, 1)")
+            if self.region_grid_size:
+                raise ValueError(
+                    "RF packing and fixed regional compilation are mutually exclusive"
+                )
+        self.rf_packing_max_overlap = rf_packing_max_overlap
         self.region_pool_type = normalize_region_pool_type(region_pool_type)
         if self.region_pool_type == "normalized_logmeanexp":
             if (
@@ -220,7 +238,9 @@ class MOSAICModel(nn.Module):
             grad_checkpoint=grad_checkpoint,
             image_is_normalized=True,
         )
-        expected_side = (self.image_size + self.encoder.output_stride - 1) // self.encoder.output_stride
+        expected_side = (
+            self.image_size + self.encoder.output_stride - 1
+        ) // self.encoder.output_stride
         canonical_mask = centered_ellipse_mask(self.image_size, self.image_size)
         canonical_lattice_mask = downsample_retinal_field_mask(
             canonical_mask,
@@ -231,6 +251,19 @@ class MOSAICModel(nn.Module):
         if self.expected_valid_cells <= 0:
             raise RuntimeError("canonical MOSAIC support contains no valid lattice cells")
         self.expected_valid_regions = self.expected_valid_cells
+        if self.rf_packing_max_overlap is not None:
+            canonical_flat = canonical_lattice_mask.reshape(1, -1)
+            canonical_packing = receptive_field_packing_mask(
+                torch.zeros_like(canonical_flat, dtype=torch.float32),
+                canonical_flat,
+                (expected_side, expected_side),
+                output_stride=self.encoder.output_stride,
+                receptive_field=self.encoder.receptive_field,
+                max_overlap=self.rf_packing_max_overlap,
+            )
+            self.expected_valid_regions = int(canonical_packing.sum())
+            if self.expected_valid_regions <= 0:
+                raise RuntimeError("canonical MOSAIC RF packing contains no events")
         if self.region_grid_size:
             if expected_side % self.region_grid_size:
                 raise ValueError(
@@ -256,12 +289,12 @@ class MOSAICModel(nn.Module):
         self.proof_head = MOSAICProofHead(
             input_dim=local_dim,
             num_classes=self.num_classes,
-            # The head bias calibrates the events consumed by the count
-            # circuit. Both regional compilers have equal-input identity, so
-            # one fixed region is one
-            # Bernoulli event; using all 9,864 source sites here would reduce
-            # the intended initial evidence mass by roughly two orders of
-            # magnitude because LME_tau(logit(p),...,logit(p))=logit(p).
+            # The head bias calibrates the canonical number of events consumed
+            # by the count circuit. For fixed regions that is the number of
+            # valid regions; for ORFP it is the deterministic row-major packing
+            # capacity at the all-equal initialization. Using all 9,864 source
+            # sites would make the intended initial evidence mass wrong by one
+            # to two orders of magnitude.
             expected_num_cells=self.expected_valid_regions,
             initial_abnormal_count=initial_abnormal_count,
             max_count=max_count,
@@ -272,6 +305,9 @@ class MOSAICModel(nn.Module):
             region_grid_size=self.region_grid_size,
             region_pool_temperature=self.region_pool_temperature,
             region_pool_type=self.region_pool_type,
+            rf_packing_max_overlap=self.rf_packing_max_overlap,
+            source_output_stride=self.encoder.output_stride,
+            source_receptive_field=self.encoder.receptive_field,
         )
         # Runtime decoder metadata is deliberately non-persistent.  It is
         # reconstructed from the training criterion/checkpoint, so legacy
@@ -348,6 +384,14 @@ class MOSAICModel(nn.Module):
         self.proof_head.ordinal_core.projector.sufficiency_tolerance = float(value)
 
     @property
+    def rf_packing_enabled(self) -> bool:
+        return self.rf_packing_max_overlap is not None
+
+    @property
+    def expected_valid_proof_events(self) -> int:
+        return self.expected_valid_regions
+
+    @property
     def receptive_field(self) -> int:
         return self.encoder.receptive_field
 
@@ -359,14 +403,18 @@ class MOSAICModel(nn.Module):
     def proof_output_stride(self) -> int:
         if not self.region_grid_size:
             return self.encoder.output_stride
-        source_side = (self.image_size + self.encoder.output_stride - 1) // self.encoder.output_stride
+        source_side = (
+            self.image_size + self.encoder.output_stride - 1
+        ) // self.encoder.output_stride
         return self.encoder.output_stride * (source_side // self.region_grid_size)
 
     @property
     def proof_receptive_field(self) -> int:
         if not self.region_grid_size:
             return self.encoder.receptive_field
-        source_side = (self.image_size + self.encoder.output_stride - 1) // self.encoder.output_stride
+        source_side = (
+            self.image_size + self.encoder.output_stride - 1
+        ) // self.encoder.output_stride
         block = source_side // self.region_grid_size
         return self.encoder.receptive_field + (block - 1) * self.encoder.output_stride
 
@@ -481,8 +529,16 @@ class MOSAICModel(nn.Module):
             valid_mask=proof_valid_mask,
             lattice=proof_lattice,
             local_features=local.tokens if return_local_features else None,
-            source_lattice=(local.lattice if self.region_grid_size else None),
-            source_valid_mask=(local.valid_mask if self.region_grid_size else None),
+            source_lattice=(
+                local.lattice
+                if self.region_grid_size or self.rf_packing_enabled
+                else None
+            ),
+            source_valid_mask=(
+                local.valid_mask
+                if self.region_grid_size or self.rf_packing_enabled
+                else None
+            ),
             decision_rule=self._decision_rule,
             decision_transition_weights=self._decision_transition_weights,
             decisions=decisions,

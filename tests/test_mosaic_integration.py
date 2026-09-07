@@ -33,7 +33,10 @@ from train_mosaic import (
     split_signature,
     summary_filename,
 )
-from training.mosaic_trainer import MosaicTrainer
+from training.mosaic_trainer import (
+    MosaicTrainer,
+    require_mosaic_checkpoint_architecture_consistency,
+)
 
 
 def test_mosaic_output_validation_allows_only_negative_infinite_log_stops() -> None:
@@ -102,6 +105,7 @@ def _tiny_trainer(
             region_grid_size=cfg.region_grid_size,
             region_pool_type=cfg.region_pool_type,
             region_pool_temperature=cfg.region_pool_temperature,
+            rf_packing_max_overlap=cfg.rf_packing_max_overlap,
         ),
         [],
         [],
@@ -227,6 +231,63 @@ def test_model_initial_count_prior_matches_canonical_fallback_support() -> None:
         model.proof_head.local_state_head.expected_num_cells
         == model.expected_valid_cells
     )
+
+
+def test_rf_packed_model_uses_one_replayable_ordinal_ledger() -> None:
+    model = _tiny_model(rf_packing_max_overlap=0.5)
+    with torch.no_grad():
+        output = model(
+            torch.zeros(1, 3, 64, 64),
+            return_local_features=True,
+        )
+
+    packed = output.evidence.rf_packing_mask
+    assert model.rf_packing_enabled
+    assert output.source_lattice is not None
+    assert output.source_valid_mask is not None
+    assert output.local_features is not None
+    assert packed is not None
+    assert torch.equal(output.valid_mask, packed)
+    assert not bool((packed & ~output.source_valid_mask).any())
+    assert torch.equal(
+        output.proof.selected_mask & ~packed.unsqueeze(-1),
+        torch.zeros_like(output.proof.selected_mask),
+    )
+    assert output.evidence.source_state_probabilities is not None
+    assert output.evidence.source_witness_probabilities is not None
+    assert output.evidence.rf_packing_max_overlap == 0.5
+    assert output.evidence.rf_packing_output_stride == model.output_stride
+    assert output.evidence.rf_packing_receptive_field == model.receptive_field
+
+    excluded = ~packed
+    packed_states = output.evidence.local_state_probabilities
+    assert torch.all(packed_states[excluded, 0] == 1.0)
+    assert torch.all(packed_states[excluded, 1:] == 0.0)
+    assert torch.all(output.evidence.witness_probabilities[excluded] == 0.0)
+    assert model.expected_valid_proof_events == int(packed.sum())
+    assert (
+        model.proof_head.local_state_head.expected_num_cells
+        == model.expected_valid_proof_events
+    )
+    # The zero-initialized local head must preserve the requested 0.5 total
+    # abnormal-event prior after packing, not calibrate it to all source cells.
+    expected_abnormal = output.evidence.witness_probabilities[..., 0].sum()
+    assert abs(float(expected_abnormal) - 0.5) < 0.03
+
+    with torch.no_grad():
+        cached = model.forward_from_features(
+            output.local_features,
+            output.source_valid_mask,
+            lattice_size=output.source_lattice.lattice_size,
+            project=True,
+        )
+    assert torch.equal(cached.rf_packing_mask, packed)
+    torch.testing.assert_close(cached.transitions, output.transitions, atol=0, rtol=0)
+
+
+def test_rf_packing_and_fixed_regional_compilation_are_incompatible() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _tiny_model(region_grid_size=2, rf_packing_max_overlap=0.5)
 
 
 def test_regional_model_counts_only_smooth_disjoint_events_and_reports_honest_geometry() -> None:
@@ -698,6 +759,56 @@ def test_region_pool_type_is_resume_critical_and_checkpoint_explicit(
     lme_trainer._validate_resume_checkpoint(legacy)
 
 
+def test_rf_packing_is_resume_critical_and_checkpoint_explicit(
+    tmp_path: Path,
+) -> None:
+    packed_trainer = _tiny_trainer(
+        tmp_path / "packed",
+        cfg_overrides={"rf_packing_max_overlap": 0.5},
+    )
+    state = packed_trainer._checkpoint_payload(
+        epoch=1, metrics={}, best_accuracy=0.0
+    )
+    assert state["config"]["rf_packing_max_overlap"] == 0.5
+    assert state["architecture"]["rf_packing_enabled"] is True
+    assert state["architecture"]["rf_packing_max_overlap"] == 0.5
+    assert state["architecture"]["evidence_compiler"] == "rf_packing"
+    assert state["architecture"]["expected_valid_proof_events"] > 0
+    assert (
+        require_mosaic_checkpoint_architecture_consistency(
+            state, packed_trainer.cfg
+        )
+        == "rf_packing"
+    )
+
+    missing_architecture = dict(state)
+    missing_architecture.pop("architecture")
+    with pytest.raises(ValueError, match="no explicit architecture"):
+        require_mosaic_checkpoint_architecture_consistency(
+            missing_architecture, packed_trainer.cfg
+        )
+    with pytest.raises(ValueError, match="no explicit architecture"):
+        packed_trainer._validate_resume_checkpoint(missing_architecture)
+
+    wrong_overlap = dict(state)
+    wrong_overlap["architecture"] = dict(state["architecture"])
+    wrong_overlap["architecture"]["rf_packing_max_overlap"] = 0.4
+    with pytest.raises(ValueError, match="metadata disagree"):
+        require_mosaic_checkpoint_architecture_consistency(
+            wrong_overlap, packed_trainer.cfg
+        )
+    with pytest.raises(ValueError, match="metadata disagree"):
+        packed_trainer._validate_resume_checkpoint(wrong_overlap)
+
+    unpacked_trainer = _tiny_trainer(tmp_path / "unpacked")
+    with pytest.raises(ValueError, match="claims RF packing"):
+        require_mosaic_checkpoint_architecture_consistency(
+            state, unpacked_trainer.cfg
+        )
+    with pytest.raises(ValueError, match="rf_packing_max_overlap"):
+        unpacked_trainer._validate_resume_checkpoint(state)
+
+
 def test_boundary_mean_rejects_nonuniform_training_sampler(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="uniformly sampled"):
         _tiny_trainer(
@@ -968,7 +1079,7 @@ def test_dataset_default_run_dirs_and_fold_summaries_do_not_collide() -> None:
         parse_folds("0,0", 5)
 
 
-def test_training_cli_retires_dl95_and_accepts_regional_envelope() -> None:
+def test_training_cli_retires_dl95_and_accepts_evidence_compilers() -> None:
     with pytest.raises(SystemExit):
         build_parser().parse_args(["--local_stage", "dl95"])
     args = build_parser().parse_args(
@@ -983,6 +1094,12 @@ def test_training_cli_retires_dl95_and_accepts_regional_envelope() -> None:
         ["--region_grid_size", "8", "--region_pool", "max"]
     )
     assert max_args.region_pool_type == "max"
+
+    packing_args = build_parser().parse_args(
+        ["--region_grid_size", "0", "--rf_packing_max_overlap", "0.5"]
+    )
+    assert packing_args.region_grid_size == 0
+    assert packing_args.rf_packing_max_overlap == 0.5
 
 
 def test_dataset_item_preserves_label_and_stable_sample_index(tmp_path: Path) -> None:

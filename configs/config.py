@@ -15,6 +15,7 @@ Paper (Section 3 - Implementation details):
 """
 
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -232,6 +233,12 @@ class MOSAICConfig(TrainConfig):
     region_grid_size: int = 0
     region_pool_type: str = "normalized_logmeanexp"
     region_pool_temperature: float = 0.25
+
+    # Optional content-adaptive packing of the uncompiled RF lattice. Sites
+    # are ordered by expected local ordinal severity and retained only when no
+    # earlier site shares more than this fraction of the theoretical RF area.
+    # ``None`` preserves the historical dense cell-wise circuit exactly.
+    rf_packing_max_overlap: Optional[float] = None
 
     # Exact truncated Poisson--binomial proof circuit.
     max_count: int = 32

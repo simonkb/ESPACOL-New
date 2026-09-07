@@ -11,7 +11,8 @@ import random
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Optional
+from collections.abc import Mapping
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -65,6 +66,78 @@ def mosaic_implementation_signature() -> str:
         digest.update(path.read_bytes())
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def require_mosaic_checkpoint_architecture_consistency(
+    checkpoint: Mapping[str, Any],
+    cfg: MOSAICConfig,
+) -> str:
+    """Cross-check parameter-free compiler provenance in a checkpoint.
+
+    RF packing changes the prediction computation without adding a learned
+    tensor, so ``load_state_dict(strict=True)`` cannot distinguish a packed
+    model from an otherwise identical source-lattice model.  New ORFP
+    checkpoints therefore have to agree in both their serialized config and
+    explicit architecture record before audit or certificate export.
+
+    Historical non-ORFP checkpoints may predate the architecture fields and
+    remain readable.  Any checkpoint that claims ORFP on either side of the
+    config/architecture boundary must, however, provide the complete matching
+    record.
+    """
+
+    configured_overlap = cfg.rf_packing_max_overlap
+    architecture = checkpoint.get("architecture")
+    if configured_overlap is None:
+        if isinstance(architecture, Mapping):
+            if (
+                architecture.get("rf_packing_enabled") is True
+                or architecture.get("evidence_compiler") == "rf_packing"
+                or architecture.get("rf_packing_max_overlap") is not None
+            ):
+                raise ValueError(
+                    "checkpoint architecture claims RF packing but its "
+                    "configuration disables rf_packing_max_overlap"
+                )
+        return "source_or_regional_legacy_compatible"
+
+    try:
+        configured_overlap = float(configured_overlap)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "configured rf_packing_max_overlap is not a valid number"
+        ) from exc
+    if not math.isfinite(configured_overlap) or not 0.0 <= configured_overlap < 1.0:
+        raise ValueError("configured rf_packing_max_overlap must lie in [0, 1)")
+    if not isinstance(architecture, Mapping):
+        raise ValueError(
+            "ORFP checkpoint has no explicit architecture record; the "
+            "parameter-free evidence compiler cannot be authenticated"
+        )
+    try:
+        architecture_overlap = float(architecture["rf_packing_max_overlap"])
+        architecture_iou = float(architecture["rf_packing_nms_iou"])
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "ORFP checkpoint architecture has incomplete RF packing metadata"
+        ) from exc
+    expected_iou = configured_overlap / (2.0 - configured_overlap)
+    if (
+        architecture.get("rf_packing_enabled") is not True
+        or architecture.get("evidence_compiler") != "rf_packing"
+        or not math.isfinite(architecture_overlap)
+        or not math.isfinite(architecture_iou)
+        or not math.isclose(
+            architecture_overlap, configured_overlap, rel_tol=0.0, abs_tol=1e-12
+        )
+        or not math.isclose(
+            architecture_iou, expected_iou, rel_tol=0.0, abs_tol=1e-12
+        )
+    ):
+        raise ValueError(
+            "ORFP checkpoint config and architecture metadata disagree"
+        )
+    return "rf_packing"
 
 
 def _macro_metrics(predicted: torch.Tensor, labels: torch.Tensor, classes: int) -> dict[str, float]:
@@ -121,6 +194,7 @@ class MosaicTrainer:
         "region_grid_size",
         "region_pool_type",
         "region_pool_temperature",
+        "rf_packing_max_overlap",
         "pretrained",
         "grad_checkpoint",
         "max_count",
@@ -404,6 +478,8 @@ class MosaicTrainer:
         all_log_stops: list[torch.Tensor] = []
         proof_sizes: list[torch.Tensor] = []
         proof_fractions: list[torch.Tensor] = []
+        packing_event_counts: list[torch.Tensor] = []
+        packing_retained_fractions: list[torch.Tensor] = []
         sufficiency_gaps: list[torch.Tensor] = []
         complement_scores: list[torch.Tensor] = []
         sufficiency_violations: list[torch.Tensor] = []
@@ -620,6 +696,16 @@ class MosaicTrainer:
                 proof_fractions.append(
                     (output.proof.proof_size / valid_counts[:, None]).detach()
                 )
+                if self.model.rf_packing_enabled:
+                    if output.source_valid_mask is None:
+                        raise RuntimeError(
+                            "RF-packed MOSAIC output is missing its source valid mask"
+                        )
+                    source_counts = output.source_valid_mask.sum(dim=1).clamp_min(1)
+                    packing_event_counts.append(valid_counts.detach().float())
+                    packing_retained_fractions.append(
+                        (valid_counts / source_counts).detach().float()
+                    )
                 sufficiency_gaps.append(output.proof.sufficiency_gap.detach())
                 complement_scores.append(output.proof.complement_transition.detach())
                 target = (output.dense_transitions - tolerance).clamp_min(0.0)
@@ -704,6 +790,27 @@ class MosaicTrainer:
                 ),
             }
         )
+        if packing_event_counts:
+            event_counts = torch.cat(packing_event_counts).float().cpu()
+            retained_fractions = (
+                torch.cat(packing_retained_fractions).float().cpu()
+            )
+            metrics.update(
+                {
+                    "rf_packing_event_count_mean": float(event_counts.mean()),
+                    "rf_packing_event_count_min": float(event_counts.min()),
+                    "rf_packing_event_count_max": float(event_counts.max()),
+                    "rf_packing_retained_fraction_mean": float(
+                        retained_fractions.mean()
+                    ),
+                    "rf_packing_retained_fraction_min": float(
+                        retained_fractions.min()
+                    ),
+                    "rf_packing_retained_fraction_max": float(
+                        retained_fractions.max()
+                    ),
+                }
+            )
         for key, value in diagnostic_sums.items():
             if key in {"dead_positive_count", "dead_positive_rate"}:
                 # These are recomputed exactly from the complete epoch above;
@@ -862,9 +969,28 @@ class MosaicTrainer:
                 ),
                 "region_pool_type": self.model.region_pool_type,
                 "region_pool_temperature": self.model.region_pool_temperature,
+                "rf_packing_enabled": self.model.rf_packing_enabled,
+                "rf_packing_max_overlap": self.model.rf_packing_max_overlap,
+                "rf_packing_nms_iou": (
+                    None
+                    if self.model.rf_packing_max_overlap is None
+                    else self.model.rf_packing_max_overlap
+                    / (2.0 - self.model.rf_packing_max_overlap)
+                ),
+                "evidence_compiler": (
+                    "rf_packing"
+                    if self.model.rf_packing_enabled
+                    else (
+                        f"regional_{self.model.region_pool_type}"
+                        if self.model.region_grid_size
+                        else "source_lattice"
+                    )
+                ),
                 "proof_output_stride": self.model.proof_output_stride,
                 "proof_receptive_field": self.model.proof_receptive_field,
-                "expected_valid_proof_events": self.model.expected_valid_regions,
+                "expected_valid_proof_events": (
+                    self.model.expected_valid_proof_events
+                ),
                 "preprocessing_version": self.cfg.preprocessing_version,
                 "no_global_bypass": True,
                 "decision_rule": self.cfg.decision_rule,
@@ -947,6 +1073,7 @@ class MosaicTrainer:
                 "resume checkpoint uses incompatible training configuration (only "
                 f"epochs/runtime controls may change): {details}"
             )
+        require_mosaic_checkpoint_architecture_consistency(state, self.cfg)
 
     @staticmethod
     def _restore_rng_state(state: dict) -> None:
@@ -1017,7 +1144,9 @@ class MosaicTrainer:
     def fit(self, *, evaluate_test: bool = True) -> dict:
         logger.info(
             "MOSAIC fold=%d device=%s source_stride=%d source_RF=%d "
-            "region_grid=%d region_pool=%s region_tau=%s proof_stride=%d proof_RF=%d "
+            "region_grid=%d region_pool=%s region_tau=%s "
+            "rf_packing=%s rf_overlap=%s rf_nms_iou=%s "
+            "proof_stride=%d proof_RF=%d "
             "proof_events=%d decision=%s "
             "transition_reduction=%s at_risk_counts=%s transition_weights=%s",
             self.fold,
@@ -1031,9 +1160,24 @@ class MosaicTrainer:
                 if self.model.region_pool_temperature is None
                 else f"{self.model.region_pool_temperature:.4g}"
             ),
+            self.model.rf_packing_enabled,
+            (
+                "none"
+                if self.model.rf_packing_max_overlap is None
+                else f"{self.model.rf_packing_max_overlap:.4g}"
+            ),
+            (
+                "none"
+                if self.model.rf_packing_max_overlap is None
+                else format(
+                    self.model.rf_packing_max_overlap
+                    / (2.0 - self.model.rf_packing_max_overlap),
+                    ".4g",
+                )
+            ),
             self.model.proof_output_stride,
             self.model.proof_receptive_field,
-            self.model.expected_valid_regions,
+            self.model.expected_valid_proof_events,
             self.cfg.decision_rule,
             self.cfg.transition_reduction,
             (
@@ -1161,4 +1305,8 @@ class MosaicTrainer:
         return test_metrics
 
 
-__all__ = ["MosaicTrainer", "mosaic_implementation_signature"]
+__all__ = [
+    "MosaicTrainer",
+    "mosaic_implementation_signature",
+    "require_mosaic_checkpoint_architecture_consistency",
+]

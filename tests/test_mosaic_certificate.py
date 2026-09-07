@@ -26,6 +26,7 @@ from inference.mosaic_certificate import (
 from models.mosaic import (
     MOSAICOrdinalCore,
     nested_witness_probabilities,
+    receptive_field_packed_ordinal_evidence,
     regional_logmeanexp_ordinal_evidence,
     regional_max_ordinal_evidence,
 )
@@ -145,7 +146,221 @@ def _regional_example_output(pool_type: str = "normalized_logmeanexp"):
     return wrapped
 
 
+def _rf_packed_example_output():
+    torch.manual_seed(112)
+    source_logits = torch.randn(1, 16, 3)
+    # Adjacent high-severity cells force the deterministic RF exclusion rule
+    # to choose one representative rather than count both overlapping fields.
+    source_logits[0, 5] = torch.tensor([-5.0, -2.0, 6.0])
+    source_logits[0, 6] = torch.tensor([-4.0, -1.0, 5.0])
+    # A finite log probability below FP32's exp range must remain distinct
+    # from the certificate's encoded mathematical log-zero sentinel.
+    source_logits[0, 14] = torch.tensor([0.0, -1000.0, -1000.0])
+    source_valid = torch.ones(1, 16, dtype=torch.bool)
+    source_valid[0, 15] = False
+    source_evidence = nested_witness_probabilities(source_logits, source_valid)
+    packed = receptive_field_packed_ordinal_evidence(
+        source_evidence,
+        source_valid,
+        (4, 4),
+        output_stride=4,
+        receptive_field=7.0,
+        max_overlap=0.25,
+    )
+    core = MOSAICOrdinalCore(
+        num_classes=3,
+        max_count=3,
+        sufficiency_tolerance=0.05,
+        complement_suppression=0.5,
+        implementation="serial",
+        block_size=3,
+    )
+    with torch.no_grad():
+        output = core.forward_evidence(
+            packed.evidence,
+            valid_mask=packed.packing_mask,
+            project=True,
+            return_pivotality=True,
+        )
+    output.source_state_probabilities = source_evidence.state_probabilities
+    output.source_witness_probabilities = source_evidence.witness_probabilities
+    output.source_log_witness_probabilities = (
+        source_evidence.log_witness_probabilities
+    )
+    output.source_log_nonwitness_probabilities = (
+        source_evidence.log_nonwitness_probabilities
+    )
+    output.rf_packing_mask = packed.packing_mask
+    output.rf_packing_max_overlap = packed.max_overlap
+    output.rf_packing_nms_iou = packed.nms_iou_threshold
+    output.rf_packing_output_stride = packed.output_stride
+    output.rf_packing_receptive_field = packed.receptive_field
+    metadata = {
+        "input_size": [16, 16],
+        "lattice_size": [4, 4],
+        "local_dim": 8,
+        "receptive_field": {
+            "tap": "rf_medium",
+            "feature_index": 3,
+            "channels": 64,
+            "output_stride": 4,
+            "receptive_field": 7.0,
+            "center_offset": 0.5,
+            "squeeze_excitation_removed": False,
+            "globally_mixed": False,
+        },
+    }
+    return SimpleNamespace(
+        evidence=output,
+        valid_mask=packed.packing_mask,
+        lattice=metadata,
+        source_lattice=metadata,
+        source_valid_mask=source_valid,
+        decision_rule="rounded_expected",
+        decision_transition_weights=torch.ones(2, 2),
+    )
+
+
 class MosaicCertificateTests(unittest.TestCase):
+    def test_rf_packing_certificate_replays_raw_ledger_and_exclusion(self) -> None:
+        certificate = build_mosaic_certificate(
+            _rf_packed_example_output(),
+            sufficiency_tolerance=0.05,
+            complement_suppression=0.5,
+        )
+        packing = certificate["receptive_field_packing"]
+        self.assertEqual(certificate["evidence_compiler"], "rf_packing")
+        self.assertEqual(
+            packing["algorithm"],
+            "stable_descending_severity_receptive_field_nms",
+        )
+        self.assertEqual(
+            packing["priority_definition"],
+            "sum_boundary_witness_probabilities",
+        )
+        self.assertEqual(packing["max_overlap_fraction"], 0.25)
+        self.assertAlmostEqual(packing["converted_iou_threshold"], 1.0 / 7.0)
+        self.assertGreater(
+            packing["max_observed_pairwise_overlap_fraction"], 0.0
+        )
+        self.assertLessEqual(
+            packing["max_observed_pairwise_overlap_fraction"], 0.25
+        )
+        self.assertEqual(packing["geometry"]["lattice_size"], [4, 4])
+        self.assertEqual(packing["geometry"]["output_stride"], 4)
+        self.assertEqual(packing["geometry"]["receptive_field"], 7.0)
+        self.assertIn("raw_local_state_probabilities", packing)
+        self.assertIn("raw_witness_probabilities", packing)
+        self.assertLess(packing["raw_log_witness_probabilities"][14][1], -900.0)
+        self.assertGreater(
+            packing["raw_log_witness_probabilities"][14][1], -5.0e29
+        )
+        report = verify_mosaic_certificate(certificate)
+        self.assertTrue(report["ok"], report)
+        self.assertTrue(report["checks"]["rf_packing_provenance"])
+        self.assertTrue(report["checks"]["rf_packing_severity_ranking"])
+        self.assertTrue(report["checks"]["rf_packing_mask"])
+        self.assertTrue(report["checks"]["rf_packing_ledger"])
+        self.assertTrue(report["checks"]["rf_packing_pairwise_overlap"])
+        round_tripped = json.loads(certificate_to_json(certificate))
+        round_trip_report = verify_mosaic_certificate(round_tripped)
+        self.assertTrue(round_trip_report["ok"], round_trip_report)
+
+    def test_rehashed_rf_packing_mask_tampering_fails_semantic_replay(self) -> None:
+        certificate = build_mosaic_certificate(
+            _rf_packed_example_output(),
+            sufficiency_tolerance=0.05,
+            complement_suppression=0.5,
+        )
+        tampered = copy.deepcopy(certificate)
+        packed = tampered["receptive_field_packing"]["packed_mask"]
+        excluded = next(index for index, selected in enumerate(packed) if not selected)
+        packed[excluded] = True
+        tampered["integrity"]["payload_sha256"] = _payload_sha256(tampered)
+        report = verify_mosaic_certificate(tampered)
+        self.assertFalse(report["ok"])
+        self.assertTrue(report["checks"]["integrity_sha256"])
+        self.assertFalse(report["checks"]["rf_packing_mask"])
+        self.assertFalse(report["checks"]["rf_packing_pairwise_overlap"])
+
+    def test_rehashed_rf_packing_section_deletion_fails_compiler_contract(self) -> None:
+        certificate = build_mosaic_certificate(
+            _rf_packed_example_output(),
+            sufficiency_tolerance=0.05,
+            complement_suppression=0.5,
+        )
+        tampered = copy.deepcopy(certificate)
+        tampered.pop("receptive_field_packing")
+        tampered["integrity"]["payload_sha256"] = _payload_sha256(tampered)
+        report = verify_mosaic_certificate(tampered)
+        self.assertFalse(report["ok"])
+        self.assertTrue(report["checks"]["integrity_sha256"])
+        self.assertFalse(report["checks"]["evidence_compiler"])
+
+    def test_rehashed_rf_source_log_sentinel_tampering_fails(self) -> None:
+        certificate = build_mosaic_certificate(
+            _rf_packed_example_output(),
+            sufficiency_tolerance=0.05,
+            complement_suppression=0.5,
+        )
+        tampered = copy.deepcopy(certificate)
+        # The source state underflows to probability zero here, but its finite
+        # log probability is part of the stable evidence trace.  Replacing it
+        # by mathematical log-zero must not be silently accepted.
+        tampered["receptive_field_packing"][
+            "raw_log_witness_probabilities"
+        ][14][1] = -1.0e30
+        tampered["integrity"]["payload_sha256"] = _payload_sha256(tampered)
+        report = verify_mosaic_certificate(tampered)
+        self.assertFalse(report["ok"])
+        self.assertTrue(report["checks"]["integrity_sha256"])
+        self.assertFalse(report["checks"]["rf_packing_ledger"])
+
+    def test_rf_packed_ledger_requires_exact_source_reconstruction(self) -> None:
+        certificate = build_mosaic_certificate(
+            _rf_packed_example_output(),
+            sufficiency_tolerance=0.05,
+            complement_suppression=0.5,
+        )
+        tampered = copy.deepcopy(certificate)
+        selected = tampered["receptive_field_packing"]["packed_mask"].index(True)
+        # This perturbation is below the global numerical replay tolerance.
+        # ORFP provenance is nevertheless a deterministic tensor selection and
+        # therefore requires bit-exact reconstruction from the source ledger.
+        tampered["dense_ledger"]["witness_probabilities"][selected][0] += 1e-6
+        tampered["integrity"]["payload_sha256"] = _payload_sha256(tampered)
+        report = verify_mosaic_certificate(tampered)
+        self.assertFalse(report["ok"])
+        self.assertTrue(report["checks"]["integrity_sha256"])
+        self.assertFalse(report["checks"]["rf_packing_ledger"])
+
+    def test_legacy_v3_certificate_without_packing_remains_replayable(self) -> None:
+        output, valid, metadata = _example_output()
+        certificate = build_mosaic_certificate(
+            output,
+            lattice_metadata=metadata,
+            valid_mask=valid,
+            sufficiency_tolerance=0.05,
+            complement_suppression=0.5,
+        )
+        certificate["schema_version"] = "mosaic-certificate-v3"
+        certificate.pop("evidence_compiler")
+        certificate["integrity"]["payload_sha256"] = _payload_sha256(certificate)
+        report = verify_mosaic_certificate(certificate)
+        self.assertTrue(report["ok"], report)
+
+    def test_legacy_v3_cannot_make_an_unverified_packing_claim(self) -> None:
+        certificate = build_mosaic_certificate(
+            _rf_packed_example_output(),
+            sufficiency_tolerance=0.05,
+            complement_suppression=0.5,
+        )
+        certificate["schema_version"] = "mosaic-certificate-v3"
+        certificate["integrity"]["payload_sha256"] = _payload_sha256(certificate)
+        report = verify_mosaic_certificate(certificate)
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["checks"]["rf_packing_provenance"])
+
     def test_regional_wrapper_serializes_fixed_geometry_and_peak_provenance(self) -> None:
         wrapped = _regional_example_output()
         certificate = build_mosaic_certificate(
@@ -155,6 +370,10 @@ class MosaicCertificateTests(unittest.TestCase):
         )
 
         provenance = certificate["regional_envelope_provenance"]
+        self.assertEqual(
+            certificate["evidence_compiler"],
+            "regional_normalized_logmeanexp",
+        )
         self.assertEqual(
             provenance["aggregation"],
             "fixed_disjoint_boundarywise_normalized_logmeanexp_logit",
@@ -190,6 +409,9 @@ class MosaicCertificateTests(unittest.TestCase):
             complement_suppression=0.5,
         )
         provenance = certificate["regional_envelope_provenance"]
+        self.assertEqual(
+            certificate["evidence_compiler"], "regional_existential_max"
+        )
         self.assertEqual(provenance["pool_type"], "existential_max")
         self.assertEqual(
             provenance["aggregation"],
@@ -217,6 +439,8 @@ class MosaicCertificateTests(unittest.TestCase):
             complement_suppression=0.5,
         )
         legacy = copy.deepcopy(certificate)
+        legacy["schema_version"] = "mosaic-certificate-v3"
+        legacy.pop("evidence_compiler")
         legacy["regional_envelope_provenance"].pop("pool_type")
         legacy["integrity"]["payload_sha256"] = _payload_sha256(legacy)
         report = verify_mosaic_certificate(legacy)
@@ -265,7 +489,8 @@ class MosaicCertificateTests(unittest.TestCase):
             complement_suppression=0.5,
         )
         self.assertEqual(certificate["schema_version"], SCHEMA_VERSION)
-        self.assertEqual(SCHEMA_VERSION, "mosaic-certificate-v3")
+        self.assertEqual(certificate["evidence_compiler"], "source_lattice")
+        self.assertEqual(SCHEMA_VERSION, "mosaic-certificate-v4")
         self.assertEqual(certificate["sample_id"], "aptos-example")
         self.assertIn("witness_probabilities", certificate["dense_ledger"])
         self.assertIn("selected_indices", certificate["proof"])
