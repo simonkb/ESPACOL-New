@@ -1,7 +1,8 @@
 #!/bin/bash
 # GATED MOSAIC-v5 EyePACS experiment: RF-medium + Ordinal Receptive-Field
-# Packing (ORFP), fold 0, inner validation only. Do not submit until the APTOS
-# viability gate documented in docs/mosaic_plan.md has passed.
+# Packing (ORFP), fold 0, inner validation only. Ordinarily this follows the
+# APTOS viability gate; MOSAIC_DR_PARALLEL_PILOT=1 records an explicit
+# compute-availability override without falsely declaring that gate passed.
 # EyePACS fold 0 is promoted beyond this run only at >=2688/3162 correct
 # (85.01%), QWK >=.82, G3 recall >=41/83, G4 recall >=16/64, and complete
 # packing/proof/certificate invariants. The recall floors match the prior
@@ -26,13 +27,22 @@ source activate G || exit 1
 set -euo pipefail
 cd /dpc/kuin0170/ESPACOL-New
 
-if [[ "${MOSAIC_APTOS_ORFP_GATE:-}" != "passed" ]]; then
+if [[ "${MOSAIC_APTOS_ORFP_GATE:-}" == "passed" ]]; then
+  LAUNCH_AUTHORIZATION="aptos_gate_passed"
+elif [[ "${MOSAIC_DR_PARALLEL_PILOT:-0}" == "1" ]]; then
+  LAUNCH_AUTHORIZATION="parallel_resource_pilot_before_aptos_gate"
+  echo "WARNING: launching the fixed EyePACS fold-0 pilot before the APTOS result." >&2
+  echo "This run cannot authorize additional EyePACS folds by itself." >&2
+else
   echo "EyePACS ORFP is gated and was not launched." >&2
   echo "First verify the fixed APTOS gate in docs/mosaic_plan.md." >&2
   echo "After it passes, submit with:" >&2
   echo "  sbatch --export=ALL,MOSAIC_APTOS_ORFP_GATE=passed submit_mosaic_dr_orfp_fold0_75.sh" >&2
+  echo "For an explicitly authorized concurrent pilot, use:" >&2
+  echo "  sbatch --export=ALL,MOSAIC_DR_PARALLEL_PILOT=1 submit_mosaic_dr_orfp_fold0_75.sh" >&2
   exit 2
 fi
+export MOSAIC_DR_LAUNCH_AUTHORIZATION="${LAUNCH_AUTHORIZATION}"
 
 export HF_HUB_OFFLINE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -67,6 +77,7 @@ elif [[ -e "${FOLD_DIR}/last.pth" || -e "${FOLD_DIR}/history.csv" ]]; then
 fi
 
 echo "=== MOSAIC-v5 ORFP EyePACS fold 0 / 75 epochs (inner validation only) ==="
+echo "launch_authorization=${MOSAIC_DR_LAUNCH_AUTHORIZATION}"
 date --iso-8601=seconds
 git rev-parse HEAD
 git status --short
@@ -371,6 +382,7 @@ assessment = {
     "grade_4_recall": recalls[4],
     "proof_fraction_mean": proof_fraction,
     "metric_promotion_beyond_fold_0": promotion,
+    "launch_authorization": os.environ["MOSAIC_DR_LAUNCH_AUTHORIZATION"],
     "structural_gate": (
         "preflight passed; complete validation-certificate/anti-cheating "
         "analysis remains required before promotion"

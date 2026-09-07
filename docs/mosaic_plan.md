@@ -251,6 +251,13 @@ Those upper-grade floors reproduce the prior uncompiled posterior-median audit
 and prevent a majority-class gain from masquerading as promotion. Neither
 target is guaranteed in advance.
 
+When otherwise idle compute is available, the same already-fixed EyePACS
+fold-0 pilot may run concurrently via the explicit
+`MOSAIC_DR_PARALLEL_PILOT=1` launcher override. The log and gate JSON record
+that authorization separately; it does not assert that APTOS passed and cannot
+authorize further EyePACS folds on its own. The model, seed, split, decoder,
+hyperparameters, promotion thresholds, and locked outer test are unchanged.
+
 The grade-4 viability floor permits exactly one fewer correct grade-4 case than
 the uncompiled reference (8/24 rather than 9/24); this one-case tolerance is
 fixed because the subgroup is small, not selected after observing v5.
