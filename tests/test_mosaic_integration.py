@@ -261,8 +261,12 @@ def test_rf_packed_model_uses_one_replayable_ordinal_ledger() -> None:
 
     excluded = ~packed
     packed_states = output.evidence.local_state_probabilities
-    assert torch.all(packed_states[excluded, 0] == 1.0)
-    assert torch.all(packed_states[excluded, 1:] == 0.0)
+    # Apply the 2-D event mask first, then index the categorical axis.  The
+    # combined ``tensor[mask, column]`` form is interpreted differently across
+    # supported PyTorch releases when the mask spans two leading dimensions.
+    excluded_states = packed_states[excluded]
+    assert torch.all(excluded_states[:, 0] == 1.0)
+    assert torch.all(excluded_states[:, 1:] == 0.0)
     assert torch.all(output.evidence.witness_probabilities[excluded] == 0.0)
     assert model.expected_valid_proof_events == int(packed.sum())
     assert (
