@@ -50,7 +50,7 @@ def _output(batch: int = 2):
         atom_rate_init=0.02,
         prior_rate_init=0.001,
     ).eval()
-    return generator(OriginEncoderOutput(scales), force_decoder_fp32=False)
+    return generator(OriginEncoderOutput(scales), force_decoder_fp64=True)
 
 
 def test_exact_deletion_matches_direct_rate_subtraction_and_decoder() -> None:
@@ -62,12 +62,12 @@ def test_exact_deletion_matches_direct_rate_subtraction_and_decoder() -> None:
     removals["s4"][:, 0, 1] = True
     removals["s8"][:, 1, 0] = True
     intervention = replay_without(
-        baseline, removals, force_decoder_fp32=False
+        baseline, removals, force_decoder_fp64=True
     )
 
     expected_rates = baseline.total_rates - intervention.removed_rates
     torch.testing.assert_close(intervention.output.total_rates, expected_rates)
-    direct = decode_pure_birth_rates(expected_rates, force_fp32=False)
+    direct = decode_pure_birth_rates(expected_rates, force_fp64=True)
     torch.testing.assert_close(intervention.output.class_probs, direct.class_probs)
     torch.testing.assert_close(
         intervention.output.cumulative_probs, direct.cumulative_probs
@@ -106,13 +106,13 @@ def test_removing_every_valid_cell_leaves_only_visible_prior() -> None:
     baseline = _output()
     removals = {name: mask.clone() for name, mask in baseline.valid_masks.items()}
     intervention = replay_without(
-        baseline, removals, force_decoder_fp32=False
+        baseline, removals, force_decoder_fp64=True
     )
     torch.testing.assert_close(
         intervention.output.total_rates, baseline.prior_rates
     )
     prior_only = decode_pure_birth_rates(
-        baseline.prior_rates, force_fp32=False
+        baseline.prior_rates, force_fp64=True
     )
     torch.testing.assert_close(
         intervention.output.class_probs, prior_only.class_probs
@@ -146,7 +146,7 @@ def test_replaying_no_removals_reproduces_checkpoint_law() -> None:
 def test_topk_report_selects_valid_cells_and_matches_ordinary_replay() -> None:
     baseline = _output()
     report = topk_rate_intervention(
-        baseline, boundary=2, k=3, force_decoder_fp32=False
+        baseline, boundary=2, k=3, force_decoder_fp64=True
     )
     assert report.selected_flat_indices.shape == (2, 3)
     assert report.selected_boundary_rates.shape == (2, 3)
@@ -166,7 +166,7 @@ def test_topk_report_selects_valid_cells_and_matches_ordinary_replay() -> None:
     replayed = replay_without(
         baseline,
         report.intervention.removal_masks,
-        force_decoder_fp32=False,
+        force_decoder_fp64=True,
     )
     torch.testing.assert_close(
         report.intervention.output.total_rates, replayed.output.total_rates

@@ -31,6 +31,9 @@ exact same-circuit intervention explanation.
    posterior median and expected grade are retained as ordinal diagnostics.
    The monotonic intervention theorem applies to cumulative probabilities,
    expected grade, and posterior quantiles—not to MAP.
+   Numerically, \(\exp(Q)\) is evaluated by a degree-24 FP64 Taylor
+   scaling-and-squaring kernel with native autograd through elementary matrix
+   products. Generic matrix-exponential backward kernels are not used.
 7. The native explanation is the local boundary-rate ledger plus exact replay
    \(p^{(-A)}=e_0^\top\exp(Q-\sum_{i\in A}Q_i)\).
 

@@ -18,7 +18,9 @@ results:
 - unweighted categorical NLL + 0.25 ranked probability score;
 - no rate-magnitude penalty and no class oversampling;
 - ReduceLROnPlateau on validation loss;
-- outer test fold locked.
+- outer test fold locked;
+- an audited FP64 Taylor scaling-and-squaring generator decoder;
+- a one-time AMP loss-scale reset to 256 when the encoder unfreezes.
 
 ## Cluster preparation
 
@@ -42,9 +44,10 @@ sbatch scripts/submit_origin_preflight.sh
 ```
 
 The preflight must finish with `ORIGIN preflight passed.` It checks all ORIGIN
-unit tests, the exact pretrained ConvNeXt initialization, FP32 matrix
-exponential, normalized posterior, finite backward gradients, and CUDA
-availability. If this job fails, do not submit training.
+unit tests (including adversarial high-rate gradient checks), the exact
+pretrained ConvNeXt initialization, the FP64 structural decoder, normalized
+posterior, a real CUDA autocast/GradScaler optimizer step, finite backward
+gradients, and CUDA availability. If this job fails, do not submit training.
 
 ## Gate 1: APTOS fold-0 inner validation
 
@@ -54,7 +57,8 @@ After Gate 0 passes:
 sbatch scripts/submit_origin_aptos_f0.sh
 ```
 
-The default run directory is `runs/origin_aptos_f0_v1/fold0`. The outer fold
+The repaired run must use a new directory such as
+`runs/origin_aptos_f0_v2_stable/fold0`. The outer fold
 is constructed and hashed byte-for-byte for provenance but is not evaluated.
 Monitor with:
 
@@ -76,8 +80,8 @@ validation split:
 Inspect:
 
 ```bash
-cat runs/origin_aptos_f0_v1/fold0/result.json
-cat runs/origin_aptos_f0_v1/fold0/validation_certificates.json
+cat runs/origin_aptos_f0_v2_stable/fold0/result.json
+cat runs/origin_aptos_f0_v2_stable/fold0/validation_certificates.json
 ```
 
 Certificates are exact interventions on stored generator ledger units. Each
@@ -96,6 +100,11 @@ sbatch scripts/submit_origin_dr_f0.sh
 The target is at least 85% inner-validation accuracy and QWK above 0.82. A
 result below this target is not repaired by repeatedly reading the locked outer
 test. Diagnose only from training and inner-validation histories.
+
+The original September 8 v1 runs used the generic `torch.matrix_exp` backward
+in FP32. Their forward predictions are diagnostic only: adversarial replay of
+their logged rate vectors revealed incorrect backward derivatives. Do not
+resume those checkpoints or report their metrics as final evidence.
 
 ## Mandatory publication controls
 

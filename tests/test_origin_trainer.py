@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
+import training.origin_trainer as origin_trainer_module
 from training.origin_trainer import (
     OriginTrainer,
     build_class_weights,
@@ -37,7 +38,7 @@ class _TinyOrigin(nn.Module):
             ),
             dim=1,
         )
-        probs = scores.softmax(dim=1)
+        probs = scores.double().softmax(dim=1)
         cumulative = torch.stack((probs[:, 1:].sum(1), probs[:, 2]), dim=1)
         expected = (probs * torch.arange(3, device=probs.device)).sum(1)
         median = (probs.cumsum(1) < 0.5).sum(1)
@@ -64,9 +65,9 @@ class _TinyOrigin(nn.Module):
         images: torch.Tensor,
         *,
         pixel_valid_mask: torch.Tensor | None = None,
-        force_decoder_fp32: bool = True,
+        force_decoder_fp64: bool = True,
     ):
-        del pixel_valid_mask, force_decoder_fp32
+        del pixel_valid_mask, force_decoder_fp64
         features = self.encoder(images)
         rates = F.softplus(self.rate_head(features)).float()
         local = rates[:, None, None, :]
@@ -77,9 +78,9 @@ class _TinyOrigin(nn.Module):
         baseline,
         removal_masks,
         *,
-        force_decoder_fp32: bool = True,
+        force_decoder_fp64: bool = True,
     ):
-        del force_decoder_fp32
+        del force_decoder_fp64
         mask = removal_masks["s8"].unsqueeze(-1)
         removed = (baseline.local_rate_maps["s8"] * mask).sum(dim=(1, 2))
         surviving = baseline.local_rate_maps["s8"].masked_fill(mask, 0.0)
@@ -133,6 +134,9 @@ def _config(**changes):
         "lr_min": 1e-7,
         "grad_clip_norm": 5.0,
         "amp": False,
+        "amp_init_scale": 4096.0,
+        "amp_unfreeze_scale": 256.0,
+        "amp_growth_interval": 2000,
         "early_stopping_patience": 5,
         "rps_weight": 0.2,
         "evidence_budget_weight": 0.0,
@@ -146,6 +150,7 @@ def _config(**changes):
         "class_weight_cap": 10.0,
         "allow_weighted_likelihood": False,
         "encoder_freeze_epochs": 0,
+        "force_decoder_fp64": True,
         "certificate_samples": 2,
         "certificate_replay_tolerance": 1e-6,
     }
@@ -205,6 +210,50 @@ def test_stratified_sampling_does_not_claim_population_proper_objective(tmp_path
     assert not trainer.population_objective_proper
 
 
+def test_amp_scaler_resets_once_at_encoder_unfreeze(monkeypatch, tmp_path) -> None:
+    class _FakeScaler:
+        def __init__(
+            self,
+            device,
+            *,
+            enabled,
+            init_scale,
+            growth_interval,
+        ) -> None:
+            self.device = device
+            self.enabled = enabled
+            self.scale_value = float(init_scale)
+            self.growth_interval = int(growth_interval)
+
+        def get_scale(self) -> float:
+            return self.scale_value
+
+    monkeypatch.setattr(origin_trainer_module, "GradScaler", _FakeScaler)
+    loader = DataLoader(_dataset(), batch_size=3, shuffle=False)
+    trainer = OriginTrainer(
+        _TinyOrigin(),
+        loader,
+        loader,
+        None,
+        _config(encoder_freeze_epochs=2, amp_unfreeze_scale=256.0),
+        tmp_path,
+        device="cpu",
+    )
+    # Exercise the CUDA-only phase policy without requiring CUDA in the unit
+    # test; the fake scaler records construction arguments only.
+    trainer.use_amp = True
+    trainer.scaler.scale_value = 32768.0
+    original = trainer.scaler
+    assert not trainer._reset_amp_scaler_at_encoder_unfreeze(2)
+    assert trainer.scaler is original
+    assert trainer._reset_amp_scaler_at_encoder_unfreeze(3)
+    assert trainer.scaler is not original
+    assert trainer.scaler.get_scale() == 256.0
+    assert trainer.scaler.growth_interval == 2000
+    assert not trainer._reset_amp_scaler_at_encoder_unfreeze(3)
+    assert not trainer._reset_amp_scaler_at_encoder_unfreeze(4)
+
+
 def test_fit_defaults_to_validation_only_and_writes_exact_certificates(tmp_path) -> None:
     torch.manual_seed(7)
     train = DataLoader(_dataset(), batch_size=3, shuffle=False)
@@ -241,6 +290,10 @@ def test_fit_defaults_to_validation_only_and_writes_exact_certificates(tmp_path)
     assert payload["scope"] == "inner_validation_only"
     assert len(payload["certificates"]) == 2
     assert payload["exact_replay_max_abs_total_rate_error"] <= 1e-6
+    assert payload["exact_replay_max_abs_total_rate_error"] <= payload[
+        "exact_replay_total_rate_tolerance"
+    ]
+    assert payload["exact_ledger_partition_max_abs_error"] == 0.0
 
 
 def test_resume_guard_rejects_numerically_changed_configuration(tmp_path) -> None:

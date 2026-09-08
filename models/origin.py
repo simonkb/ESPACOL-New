@@ -34,6 +34,10 @@ from .origin_encoder import (
 
 
 _ATOM_MODES = frozenset(("cumulative", "independent", "hybrid"))
+_DECODER_DTYPE = torch.float64
+_EXP_TAYLOR_DEGREE = 24
+_EXP_SCALING_THETA = 0.5
+_MAX_DECODER_RATE = 700.0
 
 
 def _require_finite(tensor: torch.Tensor, name: str) -> None:
@@ -90,6 +94,52 @@ def pure_birth_generator(rates: torch.Tensor) -> torch.Tensor:
     return torch.diag_embed(diagonal) + torch.diag_embed(rates, offset=1)
 
 
+def _stable_matrix_exp(matrix: torch.Tensor) -> torch.Tensor:
+    """Evaluate a small matrix exponential using elementary FP64 operations.
+
+    ``torch.matrix_exp`` has an accurate forward pass for ORIGIN's generator,
+    but its generic backward can be catastrophically inaccurate for the
+    highly non-normal, unequal-rate upper-bidiagonal matrices encountered in
+    training.  This implementation first scales every matrix in the batch so
+    its infinity norm is at most 0.5, evaluates the degree-24 Taylor series,
+    and then squares back to the requested scale.  Autograd therefore sees
+    only additions and matrix multiplications.  The Taylor remainder at the
+    scaled norm is below FP64 roundoff for this decoder.
+
+    The integer scaling choice is made from a detached norm.  It changes only
+    the numerical evaluation graph, not the represented matrix exponential.
+    """
+
+    if matrix.ndim < 2 or matrix.shape[-1] != matrix.shape[-2]:
+        raise ValueError("matrix must have shape (..., K, K)")
+    if matrix.dtype != _DECODER_DTYPE:
+        raise TypeError("the stable matrix exponential requires FP64 input")
+    _require_finite(matrix, "stable matrix-exponential input")
+
+    norm = matrix.detach().abs().sum(dim=-1).amax()
+    norm_value = float(norm.item())
+    if norm_value <= _EXP_SCALING_THETA:
+        squarings = 0
+    else:
+        squarings = int(
+            math.ceil(math.log2(norm_value / _EXP_SCALING_THETA))
+        )
+    scale = math.ldexp(1.0, squarings)
+    scaled = matrix / scale
+
+    size = matrix.shape[-1]
+    identity = torch.eye(size, dtype=matrix.dtype, device=matrix.device)
+    identity = identity.expand(matrix.shape[:-2] + (size, size))
+    result = identity
+    term = identity
+    for order in range(1, _EXP_TAYLOR_DEGREE + 1):
+        term = torch.matmul(term, scaled) / float(order)
+        result = result + term
+    for _ in range(squarings):
+        result = torch.matmul(result, result)
+    return result
+
+
 @dataclass
 class OriginDecodedDistribution:
     """Endpoint law produced by a pure-birth ordinal generator."""
@@ -133,43 +183,63 @@ class OriginDecodedDistribution:
 def decode_pure_birth_rates(
     rates: torch.Tensor,
     *,
-    force_fp32: bool = True,
-    probability_tolerance: float = 2e-6,
+    force_fp64: bool = True,
+    probability_tolerance: float = 5e-12,
 ) -> OriginDecodedDistribution:
     """Evolve a unit-time pure-birth chain from grade zero.
 
-    The numerically sensitive matrix exponential runs in FP32 under mixed
-    precision.  Passing ``force_fp32=False`` preserves FP64 for mathematical
-    tests while still promoting FP16/BF16, which ``matrix_exp`` cannot safely
-    evaluate on all devices.
+    The structural decoder is always evaluated in FP64 with an audited Taylor
+    scaling-and-squaring exponential.  This is an invariant, not a tunable
+    precision option: generic matrix-exponential backward kernels can return
+    incorrect gradients for ORIGIN's high, unequal transition rates.  The
+    source rate ledger is retained in its original dtype while the generator,
+    posterior, and log posterior remain FP64 through the training loss.
     """
 
     if not math.isfinite(probability_tolerance) or probability_tolerance < 0:
         raise ValueError("probability_tolerance must be finite and non-negative")
-    if force_fp32 or rates.dtype in (torch.float16, torch.bfloat16):
-        decoder_rates = rates.float()
-    else:
-        decoder_rates = rates
+    if not force_fp64:
+        raise ValueError("ORIGIN's structural decoder must run in FP64")
+    if rates.ndim < 1 or rates.shape[-1] < 1 or rates.numel() < 1:
+        raise ValueError("rates must have non-empty shape (..., K-1) with K >= 2")
+    if not rates.is_floating_point():
+        raise TypeError("rates must be floating point")
+    _require_finite(rates, "pure-birth rates")
+    if bool((rates < 0).any()):
+        raise ValueError("pure-birth rates must be non-negative")
+    maximum_rate = float(rates.detach().amax().item())
+    if maximum_rate > _MAX_DECODER_RATE:
+        raise FloatingPointError(
+            "pure-birth rate exceeds the audited FP64 decoder range "
+            f"[0, {_MAX_DECODER_RATE:g}]: {maximum_rate:g}"
+        )
+    decoder_rates = rates.to(dtype=_DECODER_DTYPE)
     generator = pure_birth_generator(decoder_rates)
 
-    # Disable an outer autocast region: generator probabilities, their logs,
-    # and all exact replays must use the same precision boundary.
+    # Disable any outer autocast region. Probabilities and their logs must stay
+    # FP64; exp(-141), already seen in a run, underflows in FP32.
     device_type = generator.device.type
     with torch.autocast(device_type=device_type, enabled=False):
-        transition = torch.matrix_exp(generator)
+        transition = _stable_matrix_exp(generator)
     _require_finite(transition, "pure-birth transition matrix")
 
     probabilities = transition[..., 0, :]
-    if bool((probabilities < -probability_tolerance).any()):
+    if bool((probabilities < 0.0).any()):
         minimum = float(probabilities.min().item())
         raise FloatingPointError(
-            "matrix exponential produced a materially negative probability "
+            "stable matrix exponential produced a negative probability "
             f"({minimum})"
         )
-    # Matrix exponential roundoff can produce values a few ulps outside the
-    # simplex. Projection is deterministic and therefore replayable.
-    probabilities = probabilities.clamp_min(0.0)
-    probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True)
+    # Do not clamp or renormalize the posterior. Either operation could hide a
+    # catastrophic relative error in a clinically rare class and would modify
+    # the exact generator law and its intervention derivatives.
+    row_error = (probabilities.sum(dim=-1) - 1.0).abs()
+    if bool((row_error > probability_tolerance).any()):
+        maximum_error = float(row_error.max().item())
+        raise FloatingPointError(
+            "stable matrix exponential violated probability conservation "
+            f"(maximum row-sum error={maximum_error:g})"
+        )
     _require_finite(probabilities, "pure-birth class probabilities")
 
     cumulative = probabilities[..., 1:].flip((-1,)).cumsum(dim=-1).flip((-1,))
@@ -185,7 +255,7 @@ def decode_pure_birth_rates(
     log_probabilities = probabilities.clamp_min(tiny).log()
 
     return OriginDecodedDistribution(
-        total_rates=decoder_rates,
+        total_rates=rates,
         generator=generator,
         transition_matrix=transition,
         class_probs=probabilities,
@@ -202,7 +272,7 @@ def fit_pure_birth_rates(
     *,
     tolerance: float = 1e-10,
     max_iterations: int = 160,
-    maximum_rate: float = 1e6,
+    maximum_rate: float = _MAX_DECODER_RATE,
 ) -> torch.Tensor:
     """Invert one interior categorical law into unit-time birth rates.
 
@@ -242,7 +312,7 @@ def fit_pure_birth_rates(
         def state_probability(candidate: float) -> float:
             trial = rates.clone()
             trial[state] = candidate
-            decoded = decode_pure_birth_rates(trial, force_fp32=False)
+            decoded = decode_pure_birth_rates(trial, force_fp64=True)
             return float(decoded.class_probs[state].item())
 
         while state_probability(high) > target and high < maximum_rate:
@@ -583,7 +653,7 @@ class ConservedOrdinalGenerator(nn.Module):
         self,
         encoder_output: OriginEncoderOutput,
         *,
-        force_decoder_fp32: bool = True,
+        force_decoder_fp64: bool = True,
         retain_encoder_output: bool = False,
     ) -> OriginOutput:
         if tuple(name for name in self.evidence_scales if name not in encoder_output.scales):
@@ -606,7 +676,7 @@ class ConservedOrdinalGenerator(nn.Module):
                 valid_mask = valid_mask.bool()
 
             # Evidence heads are tiny relative to ConvNeXt and sit immediately
-            # before softplus/matrix_exp. Keep this numerically sensitive path
+            # before softplus/the structural decoder. Keep this sensitive path
             # in FP32 even if the image trunk runs under AMP.
             with torch.autocast(device_type=features.device.type, enabled=False):
                 atom_logits, atoms = self.heads[name](features.float())
@@ -650,7 +720,7 @@ class ConservedOrdinalGenerator(nn.Module):
             {name: item.local_rate_map for name, item in scale_evidence.items()},
             prior,
         )
-        decoded = decode_pure_birth_rates(total, force_fp32=force_decoder_fp32)
+        decoded = decode_pure_birth_rates(total, force_fp64=force_decoder_fp64)
         return _origin_output_from_decoded(
             decoded,
             scale_evidence=scale_evidence,
@@ -722,7 +792,7 @@ def replay_without(
     output: OriginOutput,
     removal_masks: Mapping[str, torch.Tensor],
     *,
-    force_decoder_fp32: bool = True,
+    force_decoder_fp64: bool = True,
 ) -> OriginInterventionOutput:
     """Delete stored local contributions and replay the same CTMC decoder.
 
@@ -767,9 +837,7 @@ def replay_without(
         {name: item.local_rate_map for name, item in replayed.items()},
         output.prior_rates,
     )
-    decoded = decode_pure_birth_rates(
-        replay_rates, force_fp32=force_decoder_fp32
-    )
+    decoded = decode_pure_birth_rates(replay_rates, force_fp64=force_decoder_fp64)
     replay_output = _origin_output_from_decoded(
         decoded,
         scale_evidence=replayed,
@@ -804,7 +872,7 @@ def topk_rate_intervention(
     *,
     boundary: int,
     k: int,
-    force_decoder_fp32: bool = True,
+    force_decoder_fp64: bool = True,
 ) -> TopKOriginInterventionReport:
     """Remove the k largest valid local witnesses for one boundary exactly."""
 
@@ -846,7 +914,7 @@ def topk_rate_intervention(
         removals[name] = (flat_counts > 0).reshape_as(evidence.valid_mask)
 
     intervention = replay_without(
-        output, removals, force_decoder_fp32=force_decoder_fp32
+        output, removals, force_decoder_fp64=force_decoder_fp64
     )
     return TopKOriginInterventionReport(
         boundary=boundary,
@@ -922,7 +990,7 @@ class OriginModel(nn.Module):
             "evidence_scales": list(self.evidence_scales),
             "atom_mode": self.generator.atom_mode,
             "reference_count": self.generator.reference_count,
-            "decoder": "unit_time_upper_bidiagonal_pure_birth_matrix_exponential",
+            "decoder": "fp64_taylor24_scaled_squared_pure_birth_exponential",
             "available_decisions": [
                 "posterior_median",
                 "class_map",
@@ -940,13 +1008,13 @@ class OriginModel(nn.Module):
         images: torch.Tensor,
         pixel_valid_mask: Optional[torch.Tensor] = None,
         *,
-        force_decoder_fp32: bool = True,
+        force_decoder_fp64: bool = True,
         return_encoder_maps: bool = False,
     ) -> OriginOutput:
         encoded = self.encoder(images, pixel_valid_mask)
         return self.generator(
             encoded,
-            force_decoder_fp32=force_decoder_fp32,
+            force_decoder_fp64=force_decoder_fp64,
             retain_encoder_output=return_encoder_maps,
         )
 
@@ -955,12 +1023,12 @@ class OriginModel(nn.Module):
         output: OriginOutput,
         removal_masks: Mapping[str, torch.Tensor],
         *,
-        force_decoder_fp32: bool = True,
+        force_decoder_fp64: bool = True,
     ) -> OriginInterventionOutput:
         return replay_without(
             output,
             removal_masks,
-            force_decoder_fp32=force_decoder_fp32,
+            force_decoder_fp64=force_decoder_fp64,
         )
 
     def topk_intervention(
@@ -969,13 +1037,13 @@ class OriginModel(nn.Module):
         *,
         boundary: int,
         k: int,
-        force_decoder_fp32: bool = True,
+        force_decoder_fp64: bool = True,
     ) -> TopKOriginInterventionReport:
         return topk_rate_intervention(
             output,
             boundary=boundary,
             k=k,
-            force_decoder_fp32=force_decoder_fp32,
+            force_decoder_fp64=force_decoder_fp64,
         )
 
 

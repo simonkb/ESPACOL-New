@@ -5,7 +5,7 @@ particular encoder implementation.  An ORIGIN model must return an object with
 ``class_probs``, ``log_class_probs``, ``cumulative_probs``,
 ``expected_grade``, ``posterior_median``, ``class_map``, ``total_rates``,
 ``local_rate_maps``, and ``valid_masks``.  Its forward pass must keep the
-generator/matrix-exponential decoder in FP32, even when the visual encoder runs
+generator/matrix-exponential decoder in FP64, even when the visual encoder runs
 under AMP.  Exact certificates use ``model.replay_without(output, masks)``.
 
 Validation drives every training decision.  The outer test loader is untouched
@@ -435,8 +435,8 @@ class OriginTrainer:
                 "ORIGIN fixes primary categorical NLL weight to 1.0; scale the "
                 "auxiliary RPS/budget terms instead"
             )
-        if not bool(_cfg_get(cfg, "force_decoder_fp32", True)):
-            raise ValueError("ORIGIN's structural decoder must run in FP32")
+        if not bool(_cfg_get(cfg, "force_decoder_fp64", True)):
+            raise ValueError("ORIGIN's structural decoder must run in FP64")
         self.early_stopping_patience = int(
             _cfg_get(cfg, "early_stopping_patience", _cfg_get(cfg, "early_stop_patience", 30))
         )
@@ -482,15 +482,25 @@ class OriginTrainer:
         self.model.to(self.device)
         self.criterion.to(self.device)
         self.use_amp = bool(_cfg_get(cfg, "amp", True) and self.device.type == "cuda")
+        self.amp_init_scale = float(_cfg_get(cfg, "amp_init_scale", 4096.0))
+        self.amp_unfreeze_scale = float(_cfg_get(cfg, "amp_unfreeze_scale", 256.0))
+        self.amp_growth_interval = int(_cfg_get(cfg, "amp_growth_interval", 2000))
+        if not math.isfinite(self.amp_init_scale) or self.amp_init_scale <= 0.0:
+            raise ValueError("amp_init_scale must be finite and positive")
+        if not math.isfinite(self.amp_unfreeze_scale) or self.amp_unfreeze_scale <= 0.0:
+            raise ValueError("amp_unfreeze_scale must be finite and positive")
+        if self.amp_growth_interval < 1:
+            raise ValueError("amp_growth_interval must be positive")
         self.scaler = GradScaler(
             "cuda",
             enabled=self.use_amp,
-            init_scale=float(_cfg_get(cfg, "amp_init_scale", 65536.0)),
-            growth_interval=int(_cfg_get(cfg, "amp_growth_interval", 2000)),
+            init_scale=self.amp_init_scale,
+            growth_interval=self.amp_growth_interval,
         )
         self.max_consecutive_amp_skips = int(_cfg_get(cfg, "amp_max_consecutive_skips", 8))
         self.amp_total_skipped_steps = 0
         self.amp_consecutive_skipped_steps = 0
+        self._amp_unfreeze_reset_done = False
 
         encoder = getattr(self.model, "encoder", None)
         encoder_parameters = list(encoder.parameters()) if isinstance(encoder, nn.Module) else []
@@ -547,7 +557,7 @@ class OriginTrainer:
             for parameter in parameters.values()
         )
         self._accepts_pixel_mask = "pixel_valid_mask" in parameters or self._forward_accepts_kwargs
-        self._accepts_force_fp32 = "force_decoder_fp32" in parameters or self._forward_accepts_kwargs
+        self._accepts_force_fp64 = "force_decoder_fp64" in parameters or self._forward_accepts_kwargs
 
     def _set_encoder_trainable(self, epoch: int) -> None:
         encoder = getattr(self.model, "encoder", None)
@@ -556,6 +566,41 @@ class OriginTrainer:
         trainable = epoch > self.encoder_freeze_epochs
         for parameter in encoder.parameters():
             parameter.requires_grad_(trainable)
+
+    def _reset_amp_scaler_at_encoder_unfreeze(self, epoch: int) -> bool:
+        """Reset loss scaling exactly when the half-precision trunk enters backprop.
+
+        Frozen warm-up exercises only the FP64 decoder/FP32 evidence heads, so
+        its successful steps can grow a scale that has never been validated by
+        ConvNeXt's FP16 backward path.  The reset is a phase transition, not an
+        adaptive response to validation performance, and therefore leaves the
+        optimizer, learning rates, and objective unchanged.
+        """
+
+        transition_epoch = self.encoder_freeze_epochs + 1
+        if (
+            not self.use_amp
+            or self.encoder_freeze_epochs < 1
+            or epoch != transition_epoch
+            or self._amp_unfreeze_reset_done
+        ):
+            return False
+        old_scale = float(self.scaler.get_scale())
+        self.scaler = GradScaler(
+            "cuda",
+            enabled=True,
+            init_scale=self.amp_unfreeze_scale,
+            growth_interval=self.amp_growth_interval,
+        )
+        self.amp_consecutive_skipped_steps = 0
+        self._amp_unfreeze_reset_done = True
+        logger.info(
+            "ORIGIN AMP phase reset at encoder unfreeze: epoch=%d old_scale=%.1f new_scale=%.1f",
+            epoch,
+            old_scale,
+            self.amp_unfreeze_scale,
+        )
+        return True
 
     def _unpack_batch(self, batch: object) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, Any]:
         if isinstance(batch, Mapping):
@@ -594,20 +639,25 @@ class OriginTrainer:
         kwargs: dict[str, Any] = {}
         if pixel_mask is not None and self._accepts_pixel_mask:
             kwargs["pixel_valid_mask"] = pixel_mask
-        if self._accepts_force_fp32:
-            kwargs["force_decoder_fp32"] = True
+        if self._accepts_force_fp64:
+            kwargs["force_decoder_fp64"] = True
         output = self.model(images, **kwargs)
-        # Half-precision matrix exponentials are neither necessary nor accepted
-        # by this experiment.  This assertion catches a model implementation
-        # that accidentally lets autocast leak into the structural decoder.
-        for name in ("class_probs", "log_class_probs", "cumulative_probs", "total_rates"):
+        # The posterior graph is required to remain FP64 through the loss.  The
+        # source rate ledger intentionally remains FP32 so its local accounting
+        # has the same dtype as the evidence heads.
+        for name in ("class_probs", "log_class_probs", "cumulative_probs", "expected_grade"):
             tensor = _tensor_field(output, name)
-            if tensor.dtype in (torch.float16, torch.bfloat16):
-                raise FloatingPointError(
-                    f"ORIGIN decoder field {name} is {tensor.dtype}; decoder must run in FP32"
+            if tensor.dtype != torch.float64:
+                raise TypeError(
+                    f"ORIGIN decoder field {name} is {tensor.dtype}; posterior must remain FP64"
                 )
             if not bool(torch.isfinite(tensor).all()):
                 raise FloatingPointError(f"ORIGIN decoder field {name} contains non-finite values")
+        rates = _tensor_field(output, "total_rates")
+        if rates.dtype in (torch.float16, torch.bfloat16):
+            raise TypeError("ORIGIN source rate ledger must be at least FP32")
+        if not bool(torch.isfinite(rates).all()):
+            raise FloatingPointError("ORIGIN decoder field total_rates contains non-finite values")
         return output
 
     def _predictions(self, output: object) -> torch.Tensor:
@@ -654,8 +704,8 @@ class OriginTrainer:
                     self.optimizer.zero_grad(set_to_none=True)
                 with autocast(device_type="cuda", enabled=self.use_amp):
                     output = self._forward(images, pixel_mask)
-                # Structural probabilities are already FP32.  Keep the scoring
-                # rules outside autocast as an additional numerical guard.
+                # Structural probabilities are already FP64. Keep the scoring
+                # rules outside autocast so no caller can downcast the loss.
                 with autocast(device_type="cuda", enabled=False):
                     loss, diagnostics = self.criterion(output, labels, epoch=epoch)
                 if not bool(torch.isfinite(loss)):
@@ -765,7 +815,7 @@ class OriginTrainer:
             metrics[f"max_total_rate_boundary_{boundary}"] = float(total_rate_max[boundary])
         if metrics["max_total_rate"] > _RATE_STABILITY_WARNING:
             logger.warning(
-                "ORIGIN rates entered the FP32 saturation-risk regime: "
+                "ORIGIN rates entered the decoder saturation-risk regime: "
                 "%s max_total_rate=%.4f boundary_maxima=%s",
                 "train" if train else "validation",
                 metrics["max_total_rate"],
@@ -832,7 +882,7 @@ class OriginTrainer:
     ) -> dict[str, Any]:
         sampler = getattr(self.train_loader, "batch_sampler", None)
         return {
-            "schema": "origin-checkpoint-v1",
+            "schema": "origin-checkpoint-v2",
             "epoch": int(epoch),
             "fold": self.fold,
             "split_signature": self.split_signature,
@@ -1011,20 +1061,73 @@ class OriginTrainer:
             intervention = replay(
                 baseline,
                 removal_masks,
-                force_decoder_fp32=True,
+                force_decoder_fp64=True,
             )
             replayed = getattr(intervention, "output", intervention)
             removed_rates = getattr(intervention, "removed_rates", None)
             if not torch.is_tensor(removed_rates):
                 raise TypeError("ORIGIN replay result must expose removed_rates")
-            expected_rates = _tensor_field(baseline, "total_rates") - removed_rates
+            baseline_rates = _tensor_field(baseline, "total_rates")
+            replayed_rates = _tensor_field(replayed, "total_rates")
+            expected_rates = baseline_rates - removed_rates
             replay_error = float(
-                (expected_rates - _tensor_field(replayed, "total_rates")).abs().max().cpu()
+                (expected_rates - replayed_rates).abs().max().cpu()
             )
-            tolerance = float(_cfg_get(self.cfg, "certificate_replay_tolerance", 2e-5))
+            if not baseline_rates.is_floating_point():
+                raise TypeError("ORIGIN replay ledger must be floating point")
+            configured_tolerance = float(
+                _cfg_get(self.cfg, "certificate_replay_tolerance", 2e-5)
+            )
+            if not math.isfinite(configured_tolerance) or configured_tolerance < 0.0:
+                raise ValueError(
+                    "certificate_replay_tolerance must be finite and non-negative"
+                )
+            rate_scale = max(
+                1.0,
+                float(baseline_rates.detach().abs().max().cpu()),
+                float(replayed_rates.detach().abs().max().cpu()),
+            )
+            # The ledger is stored in FP32. Baseline-minus-removed and a fresh
+            # survivor reduction are mathematically identical but can differ
+            # by several ulps after reductions over thousands of cells. Scale
+            # the audit bound with the source dtype; never relax the posterior
+            # calculation itself, which remains FP64.
+            roundoff_tolerance = (
+                16.0 * torch.finfo(baseline_rates.dtype).eps * rate_scale
+            )
+            tolerance = max(configured_tolerance, roundoff_tolerance)
             if replay_error > tolerance:
                 raise AssertionError(
                     f"ORIGIN exact replay failed: rate error {replay_error:.3g} > {tolerance:.3g}"
+                )
+
+            # Independently certify the stronger elementwise statement: every
+            # stored ledger entry is partitioned exactly into a kept or removed
+            # entry. This check has zero arithmetic tolerance because each side
+            # is either x + 0 or 0 + x.
+            replayed_maps = _mapping_field(replayed, "local_rate_maps")
+            if set(replayed_maps) != set(rate_maps):
+                raise AssertionError("ORIGIN replay changed the ledger scale set")
+            ledger_partition_error = 0.0
+            for scale, original_map in rate_maps.items():
+                mask = removal_masks[scale]
+                while mask.ndim < original_map.ndim:
+                    mask = mask.unsqueeze(-1)
+                removed_map = torch.where(
+                    mask,
+                    original_map,
+                    torch.zeros_like(original_map),
+                )
+                partition_error = (
+                    original_map - (replayed_maps[scale] + removed_map)
+                ).abs().max()
+                ledger_partition_error = max(
+                    ledger_partition_error,
+                    float(partition_error.detach().cpu()),
+                )
+            if ledger_partition_error != 0.0:
+                raise AssertionError(
+                    "ORIGIN replay did not exactly partition the stored local ledger"
                 )
 
             base_probs = _tensor_field(baseline, "class_probs").detach().cpu()
@@ -1081,7 +1184,7 @@ class OriginTrainer:
                     }
                 )
         payload: dict[str, Any] = {
-            "schema": "origin-exact-validation-certificates-v1",
+            "schema": "origin-exact-validation-certificates-v2",
             "scope": "inner_validation_only",
             "fold": self.fold,
             "split_signature": self.split_signature,
@@ -1095,6 +1198,8 @@ class OriginTrainer:
                 "exact_stored_ledger_intervention_not_causal_pixel_deletion"
             ),
             "exact_replay_max_abs_total_rate_error": replay_error,
+            "exact_replay_total_rate_tolerance": tolerance,
+            "exact_ledger_partition_max_abs_error": ledger_partition_error,
             "certificates": certificates,
         }
         payload["content_checksum_sha256"] = _canonical_sha256(payload)
@@ -1150,6 +1255,7 @@ class OriginTrainer:
 
         for epoch in range(start_epoch, epochs + 1):
             started = time.time()
+            self._reset_amp_scaler_at_encoder_unfreeze(epoch)
             self._set_encoder_trainable(epoch)
             train_metrics = self._run_epoch(self.train_loader, train=True, epoch=epoch)
             val_metrics = self._run_epoch(self.val_loader, train=False, epoch=epoch)

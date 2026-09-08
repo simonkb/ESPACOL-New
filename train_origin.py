@@ -365,6 +365,12 @@ def build_parser() -> argparse.ArgumentParser:
     amp_group.add_argument("--no_amp", dest="amp", action="store_false")
     amp_group.set_defaults(amp=True)
     training.add_argument("--amp_init_scale", type=float, default=4096.0)
+    training.add_argument(
+        "--amp_unfreeze_scale",
+        type=float,
+        default=256.0,
+        help="one-time AMP loss scale used when the frozen encoder enters backprop",
+    )
     training.add_argument("--amp_growth_interval", type=int, default=2000)
     training.add_argument("--amp_max_consecutive_skips", type=int, default=8)
     return parser
@@ -427,7 +433,7 @@ def main() -> None:
         atom_mode=args.atom_mode,
         hybrid_cumulative_init=args.hybrid_cumulative_init,
         evidence_dropout=args.evidence_dropout,
-        force_decoder_fp32=True,
+        force_decoder_fp64=True,
         decision_rule=args.decision_rule,
         rps_weight=args.rps_weight,
         evidence_budget_weight=args.evidence_budget_weight,
@@ -453,6 +459,7 @@ def main() -> None:
         selection_qwk_weight=args.selection_qwk_weight,
         amp=args.amp,
         amp_init_scale=args.amp_init_scale,
+        amp_unfreeze_scale=args.amp_unfreeze_scale,
         amp_growth_interval=args.amp_growth_interval,
         amp_max_consecutive_skips=args.amp_max_consecutive_skips,
         resume=args.resume,

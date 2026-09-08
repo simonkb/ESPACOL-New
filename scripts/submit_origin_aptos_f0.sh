@@ -25,7 +25,7 @@ REPO_ROOT="${ORIGIN_REPO_ROOT:-/dpc/kuin0170/ESPACOL-New}"
 cd "${REPO_ROOT}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-RUN_DIR="${ORIGIN_RUN_DIR:-runs/origin_aptos_f0_v1}"
+RUN_DIR="${ORIGIN_RUN_DIR:-runs/origin_aptos_f0_v2_stable}"
 DATA_ROOT="${ORIGIN_APTOS_ROOT:-Datasets/aptos2019-blindness-detection}"
 FOLD_DIR="${RUN_DIR}/fold0"
 mkdir -p "${FOLD_DIR}"
@@ -121,6 +121,7 @@ TRAIN_ARGS=(
   --rps_weight "${ORIGIN_RPS_WEIGHT:-0.25}"
   --evidence_budget_weight "${ORIGIN_BUDGET_WEIGHT:-0.0}"
   --class_weighting none
+  --amp_unfreeze_scale "${ORIGIN_AMP_UNFREEZE_SCALE:-256}"
   --skip_test
 )
 if (( ${#RESUME_ARGS[@]} )); then

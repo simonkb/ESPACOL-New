@@ -59,7 +59,7 @@ class OriginConfig:
     atom_mode: str = "cumulative"
     hybrid_cumulative_init: float = 0.9
     evidence_dropout: float = 0.0
-    force_decoder_fp32: bool = True
+    force_decoder_fp64: bool = True
     decision_rule: str = "class_map"
 
     # Proper ordinal objective and optional evidence budget regularizer.
@@ -90,6 +90,7 @@ class OriginConfig:
     selection_qwk_weight: float = 0.10
     amp: bool = True
     amp_init_scale: float = 4096.0
+    amp_unfreeze_scale: float = 256.0
     amp_growth_interval: int = 2000
     amp_max_consecutive_skips: int = 8
     resume: bool = False
@@ -183,8 +184,8 @@ class OriginConfig:
                 "the prospective ORIGIN protocol fixes scheduler='plateau' on "
                 "validation loss"
             )
-        if not self.force_decoder_fp32:
-            raise ValueError("ORIGIN's matrix-exponential decoder must run in FP32")
+        if not self.force_decoder_fp64:
+            raise ValueError("ORIGIN's structural decoder must run in FP64")
         if self.decision_rule not in {"posterior_median", "class_map", "rounded_expected"}:
             raise ValueError(f"unsupported decision_rule: {self.decision_rule!r}")
         if self.checkpoint_selection not in {"acc_then_qwk", "acc_qwk_score"}:
@@ -209,8 +210,13 @@ class OriginConfig:
             raise ValueError("epoch/patience counters must be non-negative")
         if self.early_stopping_patience == 0 or self.amp_growth_interval == 0:
             raise ValueError("early stopping patience and AMP growth interval must be positive")
-        if self.amp_init_scale <= 0.0:
-            raise ValueError("amp_init_scale must be positive")
+        if (
+            not math.isfinite(self.amp_init_scale)
+            or not math.isfinite(self.amp_unfreeze_scale)
+            or self.amp_init_scale <= 0.0
+            or self.amp_unfreeze_scale <= 0.0
+        ):
+            raise ValueError("AMP scales must be finite and positive")
 
 
 __all__ = ["ORIGIN_PREPROCESSING_VERSION", "OriginConfig"]
