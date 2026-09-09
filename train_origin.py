@@ -303,6 +303,30 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument("--prior_rate_init", type=float, default=1e-4)
     model.add_argument("--boundary_scale_init", type=float, default=1.0)
     model.add_argument(
+        "--total_rate_cap",
+        type=float,
+        default=64.0,
+        help="ORIGIN-v3 architectural cap on each image-level boundary rate",
+    )
+    model.add_argument(
+        "--prior_rate_cap",
+        type=float,
+        default=1.0,
+        help="ORIGIN-v3 architectural cap on each null-generator rate",
+    )
+    model.add_argument(
+        "--boundary_scale_cap",
+        type=float,
+        default=2.0,
+        help="ORIGIN-v3 architectural cap on positive boundary calibration",
+    )
+    model.add_argument(
+        "--rate_roundoff_margin",
+        type=float,
+        default=1.0,
+        help="reserved gap between the proved real-arithmetic rate and total cap",
+    )
+    model.add_argument(
         "--atom_mode",
         choices=("cumulative", "independent", "hybrid"),
         default="cumulative",
@@ -430,6 +454,10 @@ def main() -> None:
         atom_rate_init=args.atom_rate_init,
         prior_rate_init=args.prior_rate_init,
         boundary_scale_init=args.boundary_scale_init,
+        total_rate_cap=args.total_rate_cap,
+        prior_rate_cap=args.prior_rate_cap,
+        boundary_scale_cap=args.boundary_scale_cap,
+        rate_roundoff_margin=args.rate_roundoff_margin,
         atom_mode=args.atom_mode,
         hybrid_cumulative_init=args.hybrid_cumulative_init,
         evidence_dropout=args.evidence_dropout,
@@ -521,7 +549,7 @@ def main() -> None:
         fold_dir = Path(cfg.run_dir) / f"fold{fold}"
         fold_dir.mkdir(parents=True, exist_ok=True)
         split_manifest = {
-            "schema": "origin-split-v1",
+            "schema": "origin-split-v2",
             "dataset": cfg.dataset,
             "fold": fold,
             "signature": signature,
@@ -570,6 +598,10 @@ def main() -> None:
             atom_rate_init=cfg.atom_rate_init,
             prior_rate_init=cfg.prior_rate_init,
             boundary_scale_init=cfg.boundary_scale_init,
+            total_rate_cap=cfg.total_rate_cap,
+            prior_rate_cap=cfg.prior_rate_cap,
+            boundary_scale_cap=cfg.boundary_scale_cap,
+            rate_roundoff_margin=cfg.rate_roundoff_margin,
             atom_mode=cfg.atom_mode,
             hybrid_cumulative_init=cfg.hybrid_cumulative_init,
             evidence_dropout=cfg.evidence_dropout,

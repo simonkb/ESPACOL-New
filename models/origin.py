@@ -51,13 +51,21 @@ def _require_finite(tensor: torch.Tensor, name: str) -> None:
         )
 
 
-def _inverse_softplus(value: float) -> float:
+def _inverse_sigmoid_fraction(value: float, maximum: float, *, name: str) -> float:
+    """Return the logit whose bounded sigmoid equals ``value``.
+
+    Keeping bounded parameter initialisation explicit avoids silently changing
+    ORIGIN's near-null starting law when replacing the former unbounded
+    softplus parameterisation.
+    """
+
     value = float(value)
-    if not math.isfinite(value) or value <= 0.0:
-        raise ValueError("softplus initialization values must be finite and positive")
-    # log(expm1(x)) is accurate near zero; x is returned directly where expm1
-    # would overflow and softplus(x) is already indistinguishable from x.
-    return value if value > 20.0 else math.log(math.expm1(value))
+    maximum = float(maximum)
+    if not math.isfinite(maximum) or maximum <= 0.0:
+        raise ValueError(f"{name} maximum must be finite and positive")
+    if not math.isfinite(value) or not 0.0 < value < maximum:
+        raise ValueError(f"{name} initialization must lie strictly in (0, maximum)")
+    return math.log(value) - math.log(maximum - value)
 
 
 def reverse_cumulative_atoms(atoms: torch.Tensor, *, dim: int = 1) -> torch.Tensor:
@@ -351,7 +359,15 @@ class ChannelLayerNorm2d(nn.Module):
 
 
 class PointwiseSeverityAtomHead(nn.Module):
-    """A channel-only MLP that emits non-negative incremental atoms."""
+    """A channel-only MLP that emits a bounded local severity measure.
+
+    In cumulative/hybrid modes, each cell distributes a fixed finite mass
+    budget between the ordinal severity atoms and an explicit null atom. In
+    the matched independent ablation, each boundary instead receives its own
+    bounded sigmoid atom so boundaries do not compete. Both constructions are
+    non-negative and guarantee the per-boundary ``atom_mass_cap`` used by the
+    generator's proof-level rate bound.
+    """
 
     def __init__(
         self,
@@ -360,6 +376,8 @@ class PointwiseSeverityAtomHead(nn.Module):
         num_boundaries: int,
         *,
         atom_rate_init: float = 1e-4,
+        atom_mass_cap: float = 1.0,
+        atom_mode: str = "cumulative",
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
@@ -367,13 +385,37 @@ class PointwiseSeverityAtomHead(nn.Module):
             raise ValueError("head dimensions must be positive")
         if not 0.0 <= dropout < 1.0:
             raise ValueError("dropout must lie in [0, 1)")
+        if not math.isfinite(atom_mass_cap) or atom_mass_cap <= 0.0:
+            raise ValueError("atom_mass_cap must be finite and positive")
+        atom_mode = str(atom_mode).lower()
+        if atom_mode not in _ATOM_MODES:
+            raise ValueError(f"atom_mode must be one of {sorted(_ATOM_MODES)}")
+        initial_fraction = float(atom_rate_init) / float(atom_mass_cap)
+        active_multiplicity = 1 if atom_mode == "independent" else num_boundaries
+        null_fraction = 1.0 - active_multiplicity * initial_fraction
+        if (
+            not math.isfinite(initial_fraction)
+            or initial_fraction <= 0.0
+            or null_fraction <= 0.0
+        ):
+            raise ValueError(
+                "atom_rate_init must be positive and leave non-zero null mass "
+                "inside atom_mass_cap"
+            )
+        self.num_boundaries = int(num_boundaries)
+        self.atom_mass_cap = float(atom_mass_cap)
+        self.atom_mode = atom_mode
         self.projection = nn.Conv2d(in_channels, hidden_channels, 1)
         self.norm = ChannelLayerNorm2d(hidden_channels)
         self.activation = nn.GELU()
         self.dropout = nn.Dropout2d(dropout)
         self.atom_logits = nn.Conv2d(hidden_channels, num_boundaries, 1)
         nn.init.normal_(self.atom_logits.weight, mean=0.0, std=0.01)
-        nn.init.constant_(self.atom_logits.bias, _inverse_softplus(atom_rate_init))
+        # For cumulative/hybrid modes, equal active logits b and a fixed null
+        # logit zero give q_active/q_null=exp(b). For the independent ablation,
+        # the same expression is the inverse sigmoid of each uncoupled atom.
+        initial_logit = math.log(initial_fraction / null_fraction)
+        nn.init.constant_(self.atom_logits.bias, initial_logit)
 
     def forward(self, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if features.ndim != 4:
@@ -382,7 +424,14 @@ class PointwiseSeverityAtomHead(nn.Module):
         x = self.dropout(self.activation(self.norm(x)))
         logits = self.atom_logits(x)
         _require_finite(logits, "severity atom logits")
-        atoms = F.softplus(logits)
+        if self.atom_mode == "independent":
+            # Preserve a genuinely independent matched ablation: changing one
+            # boundary atom does not suppress another through a shared simplex.
+            atoms = logits.sigmoid() * self.atom_mass_cap
+        else:
+            null_logits = torch.zeros_like(logits[:, :1])
+            atom_probabilities = torch.cat((logits, null_logits), dim=1).softmax(dim=1)
+            atoms = atom_probabilities[:, : self.num_boundaries] * self.atom_mass_cap
         _require_finite(atoms, "severity atoms")
         return logits, atoms
 
@@ -424,6 +473,11 @@ class OriginOutput:
     atom_mode: str
     scale_simplex: torch.Tensor
     boundary_scales: torch.Tensor
+    total_rate_cap: float
+    prior_rate_cap: float
+    boundary_scale_cap: float
+    atom_mass_cap: float
+    rate_roundoff_margin: float
     encoder_output: Optional[OriginEncoderOutput] = None
 
     @property
@@ -487,6 +541,11 @@ def _origin_output_from_decoded(
     atom_mode: str,
     scale_simplex: torch.Tensor,
     boundary_scales: torch.Tensor,
+    total_rate_cap: float,
+    prior_rate_cap: float,
+    boundary_scale_cap: float,
+    atom_mass_cap: float,
+    rate_roundoff_margin: float,
     encoder_output: Optional[OriginEncoderOutput],
 ) -> OriginOutput:
     return OriginOutput(
@@ -504,6 +563,11 @@ def _origin_output_from_decoded(
         atom_mode=atom_mode,
         scale_simplex=scale_simplex,
         boundary_scales=boundary_scales,
+        total_rate_cap=total_rate_cap,
+        prior_rate_cap=prior_rate_cap,
+        boundary_scale_cap=boundary_scale_cap,
+        atom_mass_cap=atom_mass_cap,
+        rate_roundoff_margin=rate_roundoff_margin,
         encoder_output=encoder_output,
     )
 
@@ -529,7 +593,7 @@ def sum_local_rate_maps(
         _require_finite(rate_map, f"local rate map {name}")
         if bool((rate_map < 0).any()):
             raise ValueError(f"local rate map {name!r} must be non-negative")
-        result = result + rate_map.sum(dim=(-2, -1))
+        result = result + rate_map.to(dtype=result.dtype).sum(dim=(-2, -1))
     _require_finite(result, "conserved total rates")
     return result
 
@@ -558,6 +622,10 @@ class ConservedOrdinalGenerator(nn.Module):
         atom_rate_init: float = 1e-6,
         prior_rate_init: float = 1e-4,
         boundary_scale_init: float = 1.0,
+        total_rate_cap: float = 64.0,
+        prior_rate_cap: float = 1.0,
+        boundary_scale_cap: float = 2.0,
+        rate_roundoff_margin: float = 1.0,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
@@ -569,6 +637,26 @@ class ConservedOrdinalGenerator(nn.Module):
             pass
         if not math.isfinite(reference_count) or reference_count <= 0:
             raise ValueError("reference_count must be finite and positive")
+        if not math.isfinite(total_rate_cap) or total_rate_cap <= 0.0:
+            raise ValueError("total_rate_cap must be finite and positive")
+        if total_rate_cap > _MAX_DECODER_RATE:
+            raise ValueError(
+                "total_rate_cap must not exceed the audited decoder limit "
+                f"{_MAX_DECODER_RATE:g}"
+            )
+        if not math.isfinite(prior_rate_cap) or not 0.0 < prior_rate_cap < total_rate_cap:
+            raise ValueError("prior_rate_cap must lie strictly in (0, total_rate_cap)")
+        if not math.isfinite(boundary_scale_cap) or boundary_scale_cap <= 0.0:
+            raise ValueError("boundary_scale_cap must be finite and positive")
+        if (
+            not math.isfinite(rate_roundoff_margin)
+            or rate_roundoff_margin <= 0.0
+            or rate_roundoff_margin >= total_rate_cap - prior_rate_cap
+        ):
+            raise ValueError(
+                "rate_roundoff_margin must lie strictly in "
+                "(0, total_rate_cap - prior_rate_cap)"
+            )
         atom_mode = str(atom_mode).lower()
         if atom_mode not in _ATOM_MODES:
             raise ValueError(f"atom_mode must be one of {sorted(_ATOM_MODES)}")
@@ -589,6 +677,18 @@ class ConservedOrdinalGenerator(nn.Module):
         self.num_boundaries = self.num_classes - 1
         self.evidence_scales = selected
         self.reference_count = float(reference_count)
+        self.total_rate_cap = float(total_rate_cap)
+        self.prior_rate_cap = float(prior_rate_cap)
+        self.boundary_scale_cap = float(boundary_scale_cap)
+        self.rate_roundoff_margin = float(rate_roundoff_margin)
+        self.atom_mass_cap = (
+            (
+                self.total_rate_cap
+                - self.prior_rate_cap
+                - self.rate_roundoff_margin
+            )
+            / (self.reference_count * self.boundary_scale_cap)
+        )
         self.atom_mode = atom_mode
         self.heads = nn.ModuleDict(
             {
@@ -597,6 +697,8 @@ class ConservedOrdinalGenerator(nn.Module):
                     hidden_channels,
                     self.num_boundaries,
                     atom_rate_init=atom_rate_init,
+                    atom_mass_cap=self.atom_mass_cap,
+                    atom_mode=self.atom_mode,
                     dropout=dropout,
                 )
                 for name in selected
@@ -609,13 +711,21 @@ class ConservedOrdinalGenerator(nn.Module):
         self.raw_boundary_scales = nn.Parameter(
             torch.full(
                 (self.num_boundaries,),
-                _inverse_softplus(boundary_scale_init),
+                _inverse_sigmoid_fraction(
+                    boundary_scale_init,
+                    self.boundary_scale_cap,
+                    name="boundary scale",
+                ),
             )
         )
         self.raw_prior_rates = nn.Parameter(
             torch.full(
                 (self.num_boundaries,),
-                _inverse_softplus(prior_rate_init),
+                _inverse_sigmoid_fraction(
+                    prior_rate_init,
+                    self.prior_rate_cap,
+                    name="prior rate",
+                ),
             )
         )
         if atom_mode == "hybrid":
@@ -628,11 +738,11 @@ class ConservedOrdinalGenerator(nn.Module):
 
     @property
     def prior_rates(self) -> torch.Tensor:
-        return F.softplus(self.raw_prior_rates)
+        return self.prior_rate_cap * self.raw_prior_rates.sigmoid()
 
     @property
     def boundary_scales(self) -> torch.Tensor:
-        return F.softplus(self.raw_boundary_scales)
+        return self.boundary_scale_cap * self.raw_boundary_scales.sigmoid()
 
     @property
     def scale_simplex(self) -> torch.Tensor:
@@ -676,8 +786,8 @@ class ConservedOrdinalGenerator(nn.Module):
                 valid_mask = valid_mask.bool()
 
             # Evidence heads are tiny relative to ConvNeXt and sit immediately
-            # before softplus/the structural decoder. Keep this sensitive path
-            # in FP32 even if the image trunk runs under AMP.
+            # before the bounded atom transform and structural decoder. Keep
+            # this sensitive path in FP32 even if the image trunk runs under AMP.
             with torch.autocast(device_type=features.device.type, enabled=False):
                 atom_logits, atoms = self.heads[name](features.float())
                 compiled = self._compile_atoms(atoms)
@@ -714,12 +824,25 @@ class ConservedOrdinalGenerator(nn.Module):
             )
 
         first = scale_evidence[self.evidence_scales[0]].local_rate_map
-        prior = self.prior_rates.to(device=first.device, dtype=first.dtype)
+        # Sum the stored FP32 local ledger in FP64. This makes the declared
+        # roundoff reserve conservative even for the densest s4 lattice and
+        # leaves the decoder on one continuous FP64 path.
+        prior = self.prior_rates.to(device=first.device, dtype=_DECODER_DTYPE)
         prior = prior.unsqueeze(0).expand(first.shape[0], -1)
         total = sum_local_rate_maps(
             {name: item.local_rate_map for name, item in scale_evidence.items()},
             prior,
         )
+        # The bounded atom transform, bounded scale, scale simplex, and
+        # conserved geometry imply in exact arithmetic:
+        #   total <= prior_cap + reference_count * scale_cap * atom_mass_cap
+        #         = total_rate_cap - rate_roundoff_margin.
+        maximum_total = float(total.detach().amax().item())
+        if maximum_total > self.total_rate_cap:
+            raise FloatingPointError(
+                "ORIGIN bounded generator violated its architectural rate cap "
+                f"{self.total_rate_cap:g}: {maximum_total:g}"
+            )
         decoded = decode_pure_birth_rates(total, force_fp64=force_decoder_fp64)
         return _origin_output_from_decoded(
             decoded,
@@ -728,6 +851,11 @@ class ConservedOrdinalGenerator(nn.Module):
             atom_mode=self.atom_mode,
             scale_simplex=scale_simplex,
             boundary_scales=boundary_scales,
+            total_rate_cap=self.total_rate_cap,
+            prior_rate_cap=self.prior_rate_cap,
+            boundary_scale_cap=self.boundary_scale_cap,
+            atom_mass_cap=self.atom_mass_cap,
+            rate_roundoff_margin=self.rate_roundoff_margin,
             encoder_output=encoder_output if retain_encoder_output else None,
         )
 
@@ -824,7 +952,9 @@ def replay_without(
             evidence.local_rate_map,
             torch.zeros_like(evidence.local_rate_map),
         )
-        removed_rates = removed_rates + removed_map.sum(dim=(-2, -1))
+        removed_rates = removed_rates + removed_map.to(
+            dtype=removed_rates.dtype
+        ).sum(dim=(-2, -1))
         kept = torch.where(
             mask[:, None],
             torch.zeros_like(evidence.local_rate_map),
@@ -845,6 +975,11 @@ def replay_without(
         atom_mode=output.atom_mode,
         scale_simplex=output.scale_simplex,
         boundary_scales=output.boundary_scales,
+        total_rate_cap=output.total_rate_cap,
+        prior_rate_cap=output.prior_rate_cap,
+        boundary_scale_cap=output.boundary_scale_cap,
+        atom_mass_cap=output.atom_mass_cap,
+        rate_roundoff_margin=output.rate_roundoff_margin,
         encoder_output=output.encoder_output,
     )
     return OriginInterventionOutput(
@@ -943,6 +1078,10 @@ class OriginModel(nn.Module):
         atom_rate_init: float = 1e-6,
         prior_rate_init: float = 1e-4,
         boundary_scale_init: float = 1.0,
+        total_rate_cap: float = 64.0,
+        prior_rate_cap: float = 1.0,
+        boundary_scale_cap: float = 2.0,
+        rate_roundoff_margin: float = 1.0,
         evidence_dropout: float = 0.0,
         mask_valid_fraction: float = 0.5,
         grad_checkpoint: bool = False,
@@ -973,6 +1112,10 @@ class OriginModel(nn.Module):
             atom_rate_init=atom_rate_init,
             prior_rate_init=prior_rate_init,
             boundary_scale_init=boundary_scale_init,
+            total_rate_cap=total_rate_cap,
+            prior_rate_cap=prior_rate_cap,
+            boundary_scale_cap=boundary_scale_cap,
+            rate_roundoff_margin=rate_roundoff_margin,
             dropout=evidence_dropout,
         )
 
@@ -983,6 +1126,11 @@ class OriginModel(nn.Module):
     def architecture_metadata(self) -> Dict[str, object]:
         """Serializable declaration recorded beside every checkpoint."""
 
+        rate_parameterization = (
+            "bounded_independent_sigmoid_v1"
+            if self.generator.atom_mode == "independent"
+            else "bounded_null_simplex_v1"
+        )
         return {
             "name": "ORIGIN",
             "encoder": self.encoder_name,
@@ -990,6 +1138,12 @@ class OriginModel(nn.Module):
             "evidence_scales": list(self.evidence_scales),
             "atom_mode": self.generator.atom_mode,
             "reference_count": self.generator.reference_count,
+            "rate_parameterization": rate_parameterization,
+            "total_rate_cap": self.generator.total_rate_cap,
+            "prior_rate_cap": self.generator.prior_rate_cap,
+            "boundary_scale_cap": self.generator.boundary_scale_cap,
+            "atom_mass_cap": self.generator.atom_mass_cap,
+            "rate_roundoff_margin": self.generator.rate_roundoff_margin,
             "decoder": "fp64_taylor24_scaled_squared_pure_birth_exponential",
             "available_decisions": [
                 "posterior_median",

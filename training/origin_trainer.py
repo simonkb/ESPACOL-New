@@ -54,7 +54,7 @@ _IMPLEMENTATION_FILES = (
     "utils/spatial_mask.py",
 )
 
-_RATE_STABILITY_WARNING = 80.0
+_RATE_CAP_WARNING_FRACTION = 0.80
 
 _RUNTIME_CONFIG_FIELDS = {
     "epochs",             # may be extended after a preemption
@@ -437,6 +437,9 @@ class OriginTrainer:
             )
         if not bool(_cfg_get(cfg, "force_decoder_fp64", True)):
             raise ValueError("ORIGIN's structural decoder must run in FP64")
+        self.total_rate_cap = float(_cfg_get(cfg, "total_rate_cap", 64.0))
+        if not math.isfinite(self.total_rate_cap) or self.total_rate_cap <= 0.0:
+            raise ValueError("total_rate_cap must be finite and positive")
         self.early_stopping_patience = int(
             _cfg_get(cfg, "early_stopping_patience", _cfg_get(cfg, "early_stop_patience", 30))
         )
@@ -810,15 +813,23 @@ class OriginTrainer:
         mean_rates = total_rate_sum / sample_count
         metrics["mean_total_rate"] = float(mean_rates.mean())
         metrics["max_total_rate"] = float(total_rate_max.max())
+        metrics["total_rate_cap"] = self.total_rate_cap
+        metrics["max_total_rate_cap_fraction"] = (
+            metrics["max_total_rate"] / self.total_rate_cap
+        )
         for boundary in range(int(mean_rates.numel())):
             metrics[f"mean_total_rate_boundary_{boundary}"] = float(mean_rates[boundary])
             metrics[f"max_total_rate_boundary_{boundary}"] = float(total_rate_max[boundary])
-        if metrics["max_total_rate"] > _RATE_STABILITY_WARNING:
+        warning_threshold = _RATE_CAP_WARNING_FRACTION * self.total_rate_cap
+        if metrics["max_total_rate"] > warning_threshold:
             logger.warning(
-                "ORIGIN rates entered the decoder saturation-risk regime: "
-                "%s max_total_rate=%.4f boundary_maxima=%s",
+                "ORIGIN rates are approaching the architectural cap: "
+                "%s max_total_rate=%.4f cap=%.4f utilization=%.1f%% "
+                "boundary_maxima=%s",
                 "train" if train else "validation",
                 metrics["max_total_rate"],
+                self.total_rate_cap,
+                100.0 * metrics["max_total_rate_cap_fraction"],
                 [float(value) for value in total_rate_max],
             )
         return metrics
@@ -882,7 +893,7 @@ class OriginTrainer:
     ) -> dict[str, Any]:
         sampler = getattr(self.train_loader, "batch_sampler", None)
         return {
-            "schema": "origin-checkpoint-v2",
+            "schema": "origin-checkpoint-v3",
             "epoch": int(epoch),
             "fold": self.fold,
             "split_signature": self.split_signature,
@@ -941,6 +952,11 @@ class OriginTrainer:
                 temporary.unlink()
 
     def _validate_resume(self, state: Mapping[str, Any]) -> None:
+        if state.get("schema") != "origin-checkpoint-v3":
+            raise ValueError(
+                "ORIGIN-v3 resume requires an origin-checkpoint-v3 checkpoint; "
+                "start a fresh bounded-rate run directory"
+            )
         checks = {
             "implementation_signature": self.implementation_signature,
             "architecture_signature": self.architecture_signature,
@@ -1087,13 +1103,16 @@ class OriginTrainer:
                 float(baseline_rates.detach().abs().max().cpu()),
                 float(replayed_rates.detach().abs().max().cpu()),
             )
-            # The ledger is stored in FP32. Baseline-minus-removed and a fresh
+            # Local ledger maps are normally FP32 even though their conserved
+            # total is accumulated in FP64. Baseline-minus-removed and a fresh
             # survivor reduction are mathematically identical but can differ
-            # by several ulps after reductions over thousands of cells. Scale
-            # the audit bound with the source dtype; never relax the posterior
-            # calculation itself, which remains FP64.
+            # by several source-ledger ulps after reductions over thousands of
+            # cells. Never relax the posterior calculation itself.
+            ledger_dtype = next(iter(rate_maps.values())).dtype
+            if not ledger_dtype.is_floating_point:
+                raise TypeError("ORIGIN local replay ledger must be floating point")
             roundoff_tolerance = (
-                16.0 * torch.finfo(baseline_rates.dtype).eps * rate_scale
+                16.0 * torch.finfo(ledger_dtype).eps * rate_scale
             )
             tolerance = max(configured_tolerance, roundoff_tolerance)
             if replay_error > tolerance:
@@ -1184,7 +1203,7 @@ class OriginTrainer:
                     }
                 )
         payload: dict[str, Any] = {
-            "schema": "origin-exact-validation-certificates-v2",
+            "schema": "origin-exact-validation-certificates-v3",
             "scope": "inner_validation_only",
             "fold": self.fold,
             "split_signature": self.split_signature,

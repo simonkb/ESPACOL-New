@@ -4,7 +4,8 @@
 
 Implementation target: APTOS, EyePACS DR, then BUSI
 
-Status: architecture frozen for the first controlled experiment
+Status: ORIGIN-v3 bounded-rate architecture frozen for a fresh controlled
+experiment; v1 and v2 remain historical diagnostics only
 
 ## One-sentence idea
 
@@ -17,12 +18,29 @@ exact same-circuit intervention explanation.
 
 1. A multi-scale image encoder returns spatial maps at strides 4, 8, 16, and
    32; it never globally pools features for prediction.
-2. Local heads produce nonnegative severity atoms
-   \(a_{s,i,m}=\operatorname{softplus}(z_{s,i,m})\).
-3. A level-\(m\) atom supports its boundary and all prerequisites:
+2. In the primary cumulative model, each local head distributes a bounded mass
+   between \(K-1\) active severity atoms and a fixed-logit null atom:
+   \[
+   (q_{s,i,0},\ldots,q_{s,i,K-2},q_{s,i,\varnothing})
+   =\operatorname{softmax}(z_{s,i,0},\ldots,z_{s,i,K-2},0),
+   \qquad a_{s,i,m}=Aq_{s,i,m}.
+   \]
+   Thus every atom is nonnegative, all active evidence may be absent, and
+   \(\sum_m a_{s,i,m}\leq A\). The matched independent-mode ablation instead
+   uses uncoupled \(a_{s,i,k}=A\sigma(z_{s,i,k})\), so changing one boundary
+   atom does not suppress another through a shared simplex.
+3. In cumulative mode, a level-\(m\) atom supports its boundary and all
+   prerequisites:
    \(\rho_{s,i,k}=\sum_{m\ge k}a_{s,i,m}\).
-4. Fixed geometry weights, learned positive boundary calibration, and a learned
-   simplex across scales turn these into local boundary rates \(r_{s,i,k}\).
+4. Fixed geometry weights, a learned simplex across scales, and bounded
+   boundary calibration turn these into local boundary rates. For valid cells,
+   \[
+   r_{s,i,k}=g_{s,i}w_{s,k}b_k\rho_{s,i,k},\qquad
+   g_{s,i}=R/n_s,\quad \sum_s w_{s,k}=1,\quad
+   b_k=B\sigma(\beta_k).
+   \]
+   Invalid cells contribute exactly zero. The learned null-prior rate is also
+   bounded: \(\pi_k=P\sigma(\nu_k)\).
 5. Every rate vector becomes an upper-bidiagonal local generator \(Q_{s,i}\),
    and the image generator is
    \(Q=Q_\varnothing+\sum_{s,i}Q_{s,i}\).
@@ -31,11 +49,39 @@ exact same-circuit intervention explanation.
    posterior median and expected grade are retained as ordinal diagnostics.
    The monotonic intervention theorem applies to cumulative probabilities,
    expected grade, and posterior quantiles—not to MAP.
-   Numerically, \(\exp(Q)\) is evaluated by a degree-24 FP64 Taylor
+   The stored local ledger remains FP32, but its image totals and intervention
+   removals are accumulated in FP64. Numerically, \(\exp(Q)\) is evaluated by a degree-24 FP64 Taylor
    scaling-and-squaring kernel with native autograd through elementary matrix
    products. Generic matrix-exponential backward kernels are not used.
 7. The native explanation is the local boundary-rate ledger plus exact replay
    \(p^{(-A)}=e_0^\top\exp(Q-\sum_{i\in A}Q_i)\).
+
+### ORIGIN-v3 rate bound
+
+For each nonempty scale, the valid-cell geometry weights sum to the reference
+exposure \(R\), and the scale weights sum to one. In cumulative mode
+\(\rho_{s,i,k}\leq A\); the independent atom is also at most \(A\), and the
+hybrid ablation is a convex mixture of quantities in this interval. Therefore
+
+\[
+\lambda_k
+=\pi_k+\sum_{s,i}r_{s,i,k}
+\leq P+RBA.
+\]
+
+The frozen defaults are \(C=64\), \(P=1\), \(B=2\), \(R=4096\), and an FP32
+ledger-roundoff reserve \(\delta=1\). The atom mass cap is derived rather than
+independently tuned:
+
+\[
+A=\frac{C-P-\delta}{RB}
+=\frac{62}{8192}=0.007568359375.
+\]
+
+Thus the usable real-arithmetic envelope is at most \(P+RBA=63\). FP64
+accumulation absorbs ordinary ledger-reduction error, and the implementation
+fails closed if a computed rate exceeds the declared ceiling 64. This ceiling
+is an architectural invariant, not an optimizer clamp or a loss penalty.
 
 ## What is new—and what is not
 
@@ -68,8 +114,12 @@ cannot be guaranteed; the paper must use the scoped phrase “to our knowledge.�
 
 ## Why it is interpretable by construction
 
-There is no hidden classification bypass. If a ledger unit is absent from the
-ledger, it cannot affect the image-dependent posterior. Each entry reports:
+There is no hidden classification bypass. The bounded atom transform changes
+how the stored rates are produced, but the posterior still depends only on the
+prior plus their additive sum. If a stored ledger unit is deleted, its rate is
+set to zero, every surviving stored unit and the original geometry weights are
+left unchanged, and the same pure-birth decoder is replayed. Each entry
+reports:
 
 - its input-space receptive-field footprint and scale;
 - its incremental severity atoms;
@@ -134,6 +184,8 @@ targets, not guarantees.
   across scales, cells, atoms, or the learned null prior;
 - positive-only evidence cannot encode explicit counter-evidence;
 - global context in a feature receptive field weakens pixel-local claims;
+- a bounded local atom can saturate, and the null-simplex active atoms compete
+  for finite mass; cap utilization and gradients must therefore be monitored;
 - higher accuracy may come from the new encoder rather than the generator,
   hence the mandatory matched-head comparison;
 - grade labels may contain clinical inconsistency or label noise;

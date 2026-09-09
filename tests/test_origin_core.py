@@ -348,7 +348,7 @@ def test_spatial_permutation_preserves_total_rates_and_posterior() -> None:
         num_classes=5,
         hidden_channels=7,
         evidence_scales=("s4",),
-        atom_rate_init=0.01,
+        atom_rate_init=1e-6,
     ).eval()
     baseline = generator(encoded)
 

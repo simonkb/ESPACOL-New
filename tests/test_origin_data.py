@@ -51,6 +51,10 @@ def test_origin_config_defaults_are_internally_valid() -> None:
     assert cfg.reference_count == 4096.0
     assert cfg.atom_rate_init == 1e-6
     assert cfg.prior_rate_init == 1e-4
+    assert cfg.total_rate_cap == 64.0
+    assert cfg.prior_rate_cap == 1.0
+    assert cfg.boundary_scale_cap == 2.0
+    assert cfg.rate_roundoff_margin == 1.0
     assert cfg.decision_rule == "class_map"
     assert cfg.force_decoder_fp64
     assert cfg.amp_unfreeze_scale == 256.0
@@ -68,6 +72,8 @@ def test_origin_cli_defaults_to_locked_outer_test() -> None:
     assert not args.include_test
     assert not args.skip_test
     assert args.decision_rule == "class_map"
+    assert args.total_rate_cap == 64.0
+    assert args.rate_roundoff_margin == 1.0
     assert args.amp_unfreeze_scale == 256.0
     assert args.scales == ("s4", "s8", "s16", "s32")
 

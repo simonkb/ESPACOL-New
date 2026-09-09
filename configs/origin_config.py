@@ -56,6 +56,13 @@ class OriginConfig:
     atom_rate_init: float = 1e-6
     prior_rate_init: float = 1e-4
     boundary_scale_init: float = 1.0
+    # ORIGIN-v3 uses bounded null, atom-mass, and boundary-scale
+    # parameterizations.  These bounds are part of the architecture identity,
+    # not an optimizer-side clamp.
+    total_rate_cap: float = 64.0
+    prior_rate_cap: float = 1.0
+    boundary_scale_cap: float = 2.0
+    rate_roundoff_margin: float = 1.0
     atom_mode: str = "cumulative"
     hybrid_cumulative_init: float = 0.9
     evidence_dropout: float = 0.0
@@ -156,6 +163,48 @@ class OriginConfig:
             raise ValueError("initial rates must be positive")
         if not math.isfinite(self.boundary_scale_init) or self.boundary_scale_init <= 0.0:
             raise ValueError("boundary_scale_init must be positive")
+        caps = (self.total_rate_cap, self.prior_rate_cap, self.boundary_scale_cap)
+        if not all(math.isfinite(value) and value > 0.0 for value in caps):
+            raise ValueError("ORIGIN-v3 rate caps must be finite and positive")
+        if self.total_rate_cap > 700.0:
+            raise ValueError(
+                "total_rate_cap must not exceed the audited decoder limit 700"
+            )
+        if self.total_rate_cap <= self.prior_rate_cap:
+            raise ValueError("total_rate_cap must exceed prior_rate_cap")
+        if (
+            not math.isfinite(self.rate_roundoff_margin)
+            or self.rate_roundoff_margin <= 0.0
+            or self.rate_roundoff_margin
+            >= self.total_rate_cap - self.prior_rate_cap
+        ):
+            raise ValueError(
+                "rate_roundoff_margin must lie strictly in "
+                "(0, total_rate_cap - prior_rate_cap)"
+            )
+        if self.prior_rate_init >= self.prior_rate_cap:
+            raise ValueError("prior_rate_init must be smaller than prior_rate_cap")
+        if self.boundary_scale_init >= self.boundary_scale_cap:
+            raise ValueError(
+                "boundary_scale_init must be smaller than boundary_scale_cap"
+            )
+        atom_mass_cap = (
+            (
+                self.total_rate_cap
+                - self.prior_rate_cap
+                - self.rate_roundoff_margin
+            )
+            / (self.reference_count * self.boundary_scale_cap)
+        )
+        active_multiplicity = (
+            1 if self.atom_mode == "independent" else self.n_classes - 1
+        )
+        if active_multiplicity * self.atom_rate_init >= atom_mass_cap:
+            raise ValueError(
+                "the initialized active atoms must leave non-zero null mass "
+                "inside the derived ORIGIN-v3 atom_mass_cap "
+                f"({atom_mass_cap:g})"
+            )
         if self.atom_mode not in {"cumulative", "independent", "hybrid"}:
             raise ValueError(f"unsupported atom_mode: {self.atom_mode!r}")
         if not 0.0 < self.hybrid_cumulative_init < 1.0:
