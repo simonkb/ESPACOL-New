@@ -551,7 +551,13 @@ def audit_origin_validation(
                     start, stop = offsets[scale]
                     if start <= selected < stop:
                         local = selected - start
-                        spatial = list(np.unravel_index(local, valid_masks[scale].shape[1:]))
+                        spatial = [
+                            int(value)
+                            for value in np.unravel_index(
+                                int(local),
+                                tuple(int(size) for size in valid_masks[scale].shape[1:]),
+                            )
+                        ]
                         strongest_masks[scale][(row, *spatial)] = True
                         strongest_meta.append(
                             (scale, spatial, float(combined_scores[row, selected].cpu()))
@@ -603,9 +609,13 @@ def audit_origin_validation(
                 cell_mask = torch.zeros_like(valid_masks[scale], dtype=torch.bool)
                 selected_meta: list[tuple[list[int], float]] = []
                 for row, flat_index in enumerate(selected.tolist()):
-                    spatial = list(
-                        np.unravel_index(flat_index, valid_masks[scale].shape[1:])
-                    )
+                    spatial = [
+                        int(value)
+                        for value in np.unravel_index(
+                            int(flat_index),
+                            tuple(int(size) for size in valid_masks[scale].shape[1:]),
+                        )
+                    ]
                     cell_mask[(row, *spatial)] = True
                     selected_meta.append(
                         (spatial, float(flat_scores[row, flat_index].cpu()))

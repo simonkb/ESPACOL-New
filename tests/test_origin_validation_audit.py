@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -126,6 +127,12 @@ def test_full_validation_audit_is_stratified_and_exact() -> None:
     )
 
     assert audit["schema"] == "origin-full-validation-audit-v2"
+    # Production hashes and writes this object with strict stdlib JSON. Keep
+    # NumPy scalar types out of certificates and every other public field.
+    encoded = json.dumps(
+        audit, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    assert json.loads(encoded)["schema"] == "origin-full-validation-audit-v2"
     assert audit["scope"] == "inner_validation_only"
     assert audit["n"] == 6
     assert audit["validation_sample_ids"] == list(range(6))
