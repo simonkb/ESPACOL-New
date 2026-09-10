@@ -179,6 +179,51 @@ pre-existing split signature; they are never decoded, transformed, inferred
 on, or evaluated, and are not used to choose an architectural change,
 threshold, audit setting, or CV decision.
 
+## Post-audit controlled experiment: RF-sealed local evidence
+
+The completed v3 audit passes its exact ledger, replay, grade-0 factorization,
+and bounded-rate checks. It does not pass the intended fine-local explanation
+gate: `s16+s32` account for 96.57% of the raw evidence rate, while their
+theoretical receptive fields (1096 and 1688 pixels) exceed the 640-pixel input.
+The v3 result remains an immutable performance and mechanism baseline; do not
+launch full CV from it for a fine-local interpretability claim.
+
+The next registered comparison changes only the active evidence scales from
+`s4,s8,s16,s32` to `s4,s8`. The encoder, initialization, likelihood, RPS,
+optimizer, learning rates, schedule, epochs, split, seed, decision rule, rate
+caps, and locked-test policy remain identical. Every active evidence unit then
+has a theoretical receptive field no larger than 224 pixels. This is an
+RF-sealed evidence experiment, not yet proof of pixel causality or lesion
+semantics.
+
+Run the inexpensive APTOS screen and the target EyePACS fold in separate new
+directories:
+
+```bash
+sbatch scripts/submit_origin_v4_local_aptos_f0.sh
+sbatch scripts/submit_origin_v4_local_dr_f0.sh
+```
+
+Default artifacts are written under:
+
+```text
+runs/origin_aptos_f0_v4_local_s4s8/fold0
+runs/origin_dr_f0_v4_local_s4s8/fold0
+```
+
+Do not resume either run from a v3 all-scale checkpoint. Before full CV,
+require the EyePACS local model to meet the pre-registered performance target
+(at least 85% accuracy and QWK above 0.82), then repeat the validation-wide
+structural audit against its own checkpoint. Interpretability assessment must
+use set-valued deletion curves as well as single-cell effects: distributed DR
+evidence need not be reducible to one necessary cell.
+
+After a successful EyePACS training job, submit its matching audit with:
+
+```bash
+sbatch scripts/submit_origin_v4_local_dr_validation_audit.sh
+```
+
 ## Historical failed runs
 
 The original September 8 v1 runs used the generic `torch.matrix_exp` backward

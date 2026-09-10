@@ -40,6 +40,27 @@ OUTPUT="${ORIGIN_AUDIT_OUTPUT:-runs/origin_dr_f0_v3_bounded/fold0/audits/full_va
   exit 4
 }
 
+if [[ -n "${ORIGIN_EXPECTED_SCALES:-}" ]]; then
+  ORIGIN_AUDIT_CHECKPOINT="${CHECKPOINT}" python - <<'PY'
+import os
+import torch
+
+checkpoint = os.environ["ORIGIN_AUDIT_CHECKPOINT"]
+expected = tuple(
+    part.strip()
+    for part in os.environ["ORIGIN_EXPECTED_SCALES"].split(",")
+    if part.strip()
+)
+state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+actual = tuple(state.get("config", {}).get("evidence_scales", ()))
+if actual != expected:
+    raise RuntimeError(
+        f"audit checkpoint evidence scales {actual} do not match expected {expected}"
+    )
+print("expected_evidence_scales", expected)
+PY
+fi
+
 echo "=== ORIGIN-v3 EyePACS full inner-validation structural audit ==="
 date --iso-8601=seconds
 git rev-parse HEAD
