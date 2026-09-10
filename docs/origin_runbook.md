@@ -136,6 +136,49 @@ The target is at least 85% inner-validation accuracy and QWK above 0.82. A
 result below this target is not repaired by repeatedly reading the locked outer
 test. Diagnose only from training and inner-validation histories.
 
+The completed bounded fold-0 run meets this performance target: inner-
+validation accuracy is 85.7369% and QWK is 0.82007. This is a performance-gate
+result, not yet authorization to launch full cross-validation.
+
+## Post-Gate 2: full inner-validation structural audit
+
+Before full EyePACS cross-validation, run the validation-wide audit against the
+selected checkpoint:
+
+```bash
+sbatch scripts/submit_origin_v3_dr_validation_audit.sh
+```
+
+The default artifact is separate from the training result and smoke
+certificates:
+
+```text
+runs/origin_dr_f0_v3_bounded/fold0/audits/full_validation_audit_v1.json
+```
+
+Do not overwrite `result.json` or `validation_certificates.json`. Keep any
+additional audit configuration as a separately named immutable artifact, for
+example `full_validation_audit_<audit-tag>.json`, with its own checksum.
+
+Proceed to full CV only if the audit covers every inner-validation sample,
+passes its stored-ledger conservation and FP64 replay tolerances, shows no rate
+above the architectural cap, reports the boundary and scale concentration
+behind any near-cap rate, and provides grade-stratified effects including the
+exact grade-0 local-versus-prior factorization. Persistent boundary saturation
+or unexplained single-scale dominance requires a targeted validation-only
+diagnosis before CV; it is not repaired by raising the cap.
+
+These interventions delete already-computed stored-ledger entries without
+renormalization. They are not causal pixel masking or image re-encoding.
+Raw-rate top-k deletion is likewise neither a posterior-impact ranking nor a
+proof of a minimal necessary or sufficient region. Locality claims must be
+scoped by each unit's theoretical receptive field: a unit whose receptive
+field covers the input is global-support evidence even when it has a spatial
+index. Locked outer images are read only as opaque bytes to verify the
+pre-existing split signature; they are never decoded, transformed, inferred
+on, or evaluated, and are not used to choose an architectural change,
+threshold, audit setting, or CV decision.
+
 ## Historical failed runs
 
 The original September 8 v1 runs used the generic `torch.matrix_exp` backward
