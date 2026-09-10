@@ -412,7 +412,9 @@ def audit_origin_validation(
     argmax: dict[int, dict[str, Any]] = {}
     replay_error = 0.0
     prior_only_identity_error = 0.0
-    grade0_factorization_error = 0.0
+    grade0_log_identity_error = 0.0
+    boundary0_fp64_reconstruction_error = 0.0
+    boundary0_fp32_reduction_difference = 0.0
 
     with torch.inference_mode():
         for batch in validation_loader:
@@ -455,21 +457,53 @@ def audit_origin_validation(
                 if bool((rates.masked_select(~valid.unsqueeze(-1)) != 0).any()):
                     raise AssertionError(f"invalid/background cells contribute at {scale}")
 
+            # Match the model's conservation path: the public maps are NHWK
+            # views of an NCHW FP32 ledger, which is cast to FP64 before each
+            # spatial reduction. A direct FP32 NHWK reduction can differ by
+            # several ulps over the 160x160 s4 lattice.
             batch_scale_totals = torch.stack(
-                [rate_maps[name].sum(dim=(1, 2)) for name in scale_names], dim=1
+                [
+                    rate_maps[name]
+                    .permute(0, 3, 1, 2)
+                    .to(dtype=total_rates.dtype)
+                    .sum(dim=(-2, -1))
+                    for name in scale_names
+                ],
+                dim=1,
             )
-            local_boundary0 = batch_scale_totals[:, :, 0].sum(1)
-            rate_tolerance = max(
-                2e-5,
-                16.0 * torch.finfo(next(iter(rate_maps.values())).dtype).eps
-                * max(1.0, float(total_rates.abs().max().cpu())),
+            summed_local_boundary0 = batch_scale_totals[:, :, 0].sum(1)
+            fp32_summed_local_boundary0 = torch.stack(
+                [rate_maps[name].sum(dim=(1, 2))[:, 0] for name in scale_names],
+                dim=1,
+            ).sum(1)
+            conserved_local_boundary0 = (
+                total_rates[:, 0] - prior_rates[:, 0].to(total_rates.dtype)
             )
-            if float((
-                total_rates[:, 0]
-                - prior_rates[:, 0].to(total_rates.dtype)
-                - local_boundary0.to(total_rates.dtype)
-            ).abs().max()) > rate_tolerance:
-                raise AssertionError("boundary-0 total != prior + local evidence")
+            fp64_reconstruction_error = float((
+                conserved_local_boundary0
+                - summed_local_boundary0.to(total_rates.dtype)
+            ).abs().max())
+            fp64_identity_tolerance = max(
+                2e-10,
+                128.0
+                * torch.finfo(torch.float64).eps
+                * max(1.0, float(total_rates[:, 0].abs().max().cpu())),
+            )
+            boundary0_fp64_reconstruction_error = max(
+                boundary0_fp64_reconstruction_error, fp64_reconstruction_error
+            )
+            if fp64_reconstruction_error > fp64_identity_tolerance:
+                raise AssertionError("FP64 boundary-0 ledger conservation failed")
+            fp32_reduction_difference = float((
+                conserved_local_boundary0
+                - fp32_summed_local_boundary0.to(total_rates.dtype)
+            ).abs().max())
+            boundary0_fp32_reduction_difference = max(
+                boundary0_fp32_reduction_difference, fp32_reduction_difference
+            )
+            # This alternate reduction is deliberately non-canonical and is
+            # retained only to quantify source-ledger roundoff. The exact
+            # conservation assertion above is the one that may fail the audit.
             batch_scale_peaks = torch.stack(
                 [
                     rate_maps[name].masked_fill(
@@ -617,9 +651,13 @@ def audit_origin_validation(
             prior_only = model.replay_without(
                 output, all_local_removals, force_decoder_fp64=True
             ).output
-            full_p0 = _field(output, "class_probs")[:, 0].double()
             prior_only_p0 = _field(prior_only, "class_probs")[:, 0].double()
-            expected_local_factor = torch.exp(-local_boundary0.double())
+            full_log_p0 = _field(output, "log_class_probs")[:, 0].double()
+            prior_only_log_p0 = _field(prior_only, "log_class_probs")[:, 0].double()
+            # Use the conserved FP64 total-minus-prior value in this exact
+            # generator identity. Re-reducing the exposed FP32 maps in a
+            # different order is equivalent mathematically but can differ by
+            # several source-ledger ulps; that discrepancy is audited above.
             prior_only_identity_error = max(
                 prior_only_identity_error,
                 float((_field(prior_only, "total_rates") - prior_rates.to(
@@ -631,14 +669,25 @@ def audit_origin_validation(
             )
             if prior_only_identity_error > 2e-10:
                 raise AssertionError("prior-only boundary-0 identity failed")
-            grade0_factorization_error = max(
-                grade0_factorization_error,
+            log_identity_tolerance = max(
+                2e-10,
+                128.0
+                * torch.finfo(torch.float64).eps
+                * max(1.0, float(total_rates[:, 0].abs().max().cpu())),
+            )
+            batch_log_identity_error = max(
+                float((full_log_p0 + total_rates[:, 0].double()).abs().max().cpu()),
+                float((prior_only_log_p0 + prior_rates[:, 0].double()).abs().max().cpu()),
                 float((
-                    full_p0 / prior_only_p0.clamp_min(torch.finfo(torch.float64).tiny)
-                    - expected_local_factor
+                    full_log_p0
+                    - prior_only_log_p0
+                    + conserved_local_boundary0.double()
                 ).abs().max().cpu()),
             )
-            if grade0_factorization_error > 2e-10:
+            grade0_log_identity_error = max(
+                grade0_log_identity_error, batch_log_identity_error
+            )
+            if batch_log_identity_error > log_identity_tolerance:
                 raise AssertionError("grade-0 local-evidence factorization failed")
             prior_only_grade0_probabilities.append(prior_only_p0.detach().cpu())
 
@@ -705,7 +754,7 @@ def audit_origin_validation(
             sample_ids_all.append(sample_ids.cpu())
             rates_all.append(total_cpu)
             prior_rates_all.append(prior_rates.detach().cpu())
-            local_boundary0_all.append(local_boundary0.detach().cpu())
+            local_boundary0_all.append(conserved_local_boundary0.detach().cpu())
 
     if scale_names is None:
         raise ValueError("validation loader is empty")
@@ -838,7 +887,15 @@ def audit_origin_validation(
             "P_full(Y=0) / P_prior_only(Y=0) = exp(-summed_local_boundary0_evidence)"
         ),
         "max_prior_only_identity_error": prior_only_identity_error,
-        "max_local_factorization_identity_error": grade0_factorization_error,
+        "max_log_space_local_factorization_identity_error": (
+            grade0_log_identity_error
+        ),
+        "max_fp64_ledger_reconstruction_error": (
+            boundary0_fp64_reconstruction_error
+        ),
+        "max_alternative_fp32_reduction_difference": (
+            boundary0_fp32_reduction_difference
+        ),
         "true_grade0": boundary0_group(labels == 0),
         "predicted_grade0": boundary0_group(predicted == 0),
     }
@@ -894,7 +951,7 @@ def audit_origin_validation(
     }
 
     return {
-        "schema": "origin-full-validation-audit-v1",
+        "schema": "origin-full-validation-audit-v2",
         "scope": "inner_validation_only",
         "n": len(labels),
         "decision_rule": decision_rule,
@@ -1046,7 +1103,7 @@ def main() -> None:
     destination = (
         Path(args.output)
         if args.output
-        else fold_dir / "audits" / "full_validation_audit_v1.json"
+        else fold_dir / "audits" / "full_validation_audit_v2.json"
     )
     if destination.exists() and not args.overwrite:
         raise FileExistsError(f"refusing to overwrite existing audit: {destination}")

@@ -153,7 +153,7 @@ The default artifact is separate from the training result and smoke
 certificates:
 
 ```text
-runs/origin_dr_f0_v3_bounded/fold0/audits/full_validation_audit_v1.json
+runs/origin_dr_f0_v3_bounded/fold0/audits/full_validation_audit_v2.json
 ```
 
 Do not overwrite `result.json` or `validation_certificates.json`. Keep any

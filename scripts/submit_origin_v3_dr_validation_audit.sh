@@ -28,7 +28,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 CHECKPOINT="${ORIGIN_CHECKPOINT:-runs/origin_dr_f0_v3_bounded/fold0/best.pth}"
 DATA_ROOT="${ORIGIN_DR_ROOT:-Datasets/DR}"
-OUTPUT="${ORIGIN_AUDIT_OUTPUT:-runs/origin_dr_f0_v3_bounded/fold0/audits/full_validation_audit_v1.json}"
+OUTPUT="${ORIGIN_AUDIT_OUTPUT:-runs/origin_dr_f0_v3_bounded/fold0/audits/full_validation_audit_v2.json}"
 
 [[ -f "${CHECKPOINT}" ]] || { echo "Missing checkpoint: ${CHECKPOINT}" >&2; exit 2; }
 [[ -f "$(dirname "${CHECKPOINT}")/split_manifest.json" ]] || {

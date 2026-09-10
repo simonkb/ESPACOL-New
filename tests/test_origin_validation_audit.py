@@ -30,7 +30,13 @@ class _AuditModel(nn.Module):
 
     @staticmethod
     def _output(local_rate_maps, valid_masks):
-        total = sum(value.sum(dim=(1, 2)) for value in local_rate_maps.values())
+        # Match production: conserve the channels-first source ledger in FP64,
+        # while the audit is free to aggregate its exposed NHWK view for
+        # descriptive scale summaries in FP32.
+        total = sum(
+            value.permute(0, 3, 1, 2).double().sum(dim=(-2, -1))
+            for value in local_rate_maps.values()
+        )
         decoded = decode_pure_birth_rates(total.double(), force_fp64=True)
         metadata = {
             "s4": SimpleNamespace(
@@ -83,7 +89,12 @@ class _AuditModel(nn.Module):
         for scale, rates in baseline.local_rate_maps.items():
             mask = removals.get(scale, torch.zeros_like(baseline.valid_masks[scale])).bool()
             canonical[scale] = mask
-            removed += (rates * mask.unsqueeze(-1)).sum(dim=(1, 2)).double()
+            removed += (
+                (rates * mask.unsqueeze(-1))
+                .permute(0, 3, 1, 2)
+                .double()
+                .sum(dim=(-2, -1))
+            )
             kept[scale] = rates.masked_fill(mask.unsqueeze(-1), 0.0)
         output = self._output(kept, baseline.valid_masks)
         return SimpleNamespace(
@@ -114,6 +125,7 @@ def test_full_validation_audit_is_stratified_and_exact() -> None:
         amp=False,
     )
 
+    assert audit["schema"] == "origin-full-validation-audit-v2"
     assert audit["scope"] == "inner_validation_only"
     assert audit["n"] == 6
     assert audit["validation_sample_ids"] == list(range(6))
@@ -143,7 +155,7 @@ def test_full_validation_audit_is_stratified_and_exact() -> None:
     grade0 = audit["grade0_boundary0_evidence_diagnostics"]
     assert grade0["true_grade0"]["support"] == 2
     assert grade0["max_prior_only_identity_error"] < 1e-12
-    assert grade0["max_local_factorization_identity_error"] < 1e-12
+    assert grade0["max_log_space_local_factorization_identity_error"] < 1e-12
     assert set(audit["grade_and_scale_stratified_certificates"]) == {"s4", "s32"}
     assert any(
         item["global_input_support"]
@@ -152,6 +164,54 @@ def test_full_validation_audit_is_stratified_and_exact() -> None:
     )
     for name, value in model.state_dict().items():
         assert torch.equal(value, state_before[name])
+
+
+class _DenseReductionAuditModel(_AuditModel):
+    """Production-shaped ledger exposing the FP32 reduction-order trap."""
+
+    def forward(self, images, pixel_valid_mask=None, force_decoder_fp64=True):
+        del pixel_valid_mask, force_decoder_fp64
+        batch = len(images)
+        # Construct NCHW first, as the real pointwise atom head does. The
+        # public audit interface exposes a zero-copy NHWK permutation.
+        channels_first = torch.full(
+            (batch, 4, 160, 160),
+            1e-5,
+            dtype=torch.float32,
+            device=images.device,
+        )
+        exposed = channels_first.permute(0, 2, 3, 1)
+        valid = torch.ones(
+            batch, 160, 160, dtype=torch.bool, device=images.device
+        )
+        return self._output({"s4": exposed}, {"s4": valid})
+
+
+def test_grade0_factorization_uses_the_conserved_fp64_ledger() -> None:
+    loader = DataLoader(
+        TensorDataset(
+            torch.zeros(1, 1, 1, 1),
+            torch.ones(1, 1, 1, 1, dtype=torch.bool),
+            torch.zeros(1, dtype=torch.long),
+            torch.zeros(1, dtype=torch.long),
+        )
+    )
+    audit = audit_origin_validation(
+        _DenseReductionAuditModel(),
+        loader,
+        validation_items=[("dense.png", 0)],
+        top_ks=(1,),
+        certificates_per_grade=1,
+        split_signature="dense-reduction-regression",
+        device="cpu",
+        amp=False,
+    )
+    diagnostics = audit["grade0_boundary0_evidence_diagnostics"]
+    assert diagnostics["max_log_space_local_factorization_identity_error"] < 2e-10
+    assert diagnostics["max_fp64_ledger_reconstruction_error"] < 2e-10
+    # A direct FP32 reduction of 25,600 cells is measurably different. This
+    # diagnostic proves the regression exercises the exact cluster failure.
+    assert diagnostics["max_alternative_fp32_reduction_difference"] > 1e-9
 
 
 def test_audit_rejects_invalid_topk() -> None:
