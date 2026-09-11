@@ -138,18 +138,31 @@ class OriginConfig:
             raise ValueError("img_size, batch_size, and epochs must be positive")
         if self.num_workers < 0:
             raise ValueError("num_workers must be non-negative")
-        if self.encoder != "convnext_tiny":
-            raise ValueError("the initial ORIGIN implementation supports convnext_tiny")
+        if self.encoder not in {"convnext_tiny", "convnext_tiny_srff"}:
+            raise ValueError(
+                "ORIGIN supports encoder='convnext_tiny' or "
+                "'convnext_tiny_srff'"
+            )
+        if self.encoder == "convnext_tiny_srff" and self.img_size % 128:
+            raise ValueError(
+                "convnext_tiny_srff requires img_size divisible by 128 so its "
+                "fixed 16x16 s8 windows exactly partition the image"
+            )
         if self.projection_dim <= 0:
             raise ValueError("projection_dim must be positive")
-        allowed_scales = {"s4", "s8", "s16", "s32"}
+        allowed_scales = (
+            {"s4", "s8", "s128"}
+            if self.encoder == "convnext_tiny_srff"
+            else {"s4", "s8", "s16", "s32"}
+        )
         if not self.evidence_scales or not set(self.evidence_scales).issubset(allowed_scales):
             raise ValueError(
-                "evidence_scales must be selected from s4,s8,s16,s32"
+                "evidence_scales are incompatible with encoder "
+                f"{self.encoder!r}; choose from {sorted(allowed_scales)}"
             )
         if len(set(self.evidence_scales)) != len(self.evidence_scales):
             raise ValueError("evidence_scales must not contain duplicates")
-        scale_stride = {"s4": 4, "s8": 8, "s16": 16, "s32": 32}
+        scale_stride = {"s4": 4, "s8": 8, "s16": 16, "s32": 32, "s128": 128}
         if tuple(sorted(self.evidence_scales, key=scale_stride.__getitem__)) != self.evidence_scales:
             raise ValueError("evidence_scales must be strictly increasing")
         if not math.isfinite(self.reference_count) or self.reference_count <= 0.0:

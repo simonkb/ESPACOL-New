@@ -40,7 +40,7 @@ OUTPUT="${ORIGIN_AUDIT_OUTPUT:-runs/origin_dr_f0_v3_bounded/fold0/audits/full_va
   exit 4
 }
 
-if [[ -n "${ORIGIN_EXPECTED_SCALES:-}" ]]; then
+if [[ -n "${ORIGIN_EXPECTED_SCALES:-}" || -n "${ORIGIN_EXPECTED_ENCODER:-}" ]]; then
   ORIGIN_AUDIT_CHECKPOINT="${CHECKPOINT}" python - <<'PY'
 import os
 import torch
@@ -52,12 +52,21 @@ expected = tuple(
     if part.strip()
 )
 state = torch.load(checkpoint, map_location="cpu", weights_only=False)
-actual = tuple(state.get("config", {}).get("evidence_scales", ()))
-if actual != expected:
+config = state.get("config", {})
+actual = tuple(config.get("evidence_scales", ()))
+if expected and actual != expected:
     raise RuntimeError(
         f"audit checkpoint evidence scales {actual} do not match expected {expected}"
     )
+expected_encoder = os.environ.get("ORIGIN_EXPECTED_ENCODER", "").strip()
+actual_encoder = str(config.get("encoder", ""))
+if expected_encoder and actual_encoder != expected_encoder:
+    raise RuntimeError(
+        f"audit checkpoint encoder {actual_encoder!r} does not match "
+        f"expected {expected_encoder!r}"
+    )
 print("expected_evidence_scales", expected)
+print("expected_encoder", expected_encoder or "<not constrained>")
 PY
 fi
 

@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 from .origin_encoder import (
     ConvNeXtTinyPyramidEncoder,
+    ConvNeXtTinySRFFEncoder,
     OriginEncoderOutput,
     OriginEncoderScale,
     OriginScaleMetadata,
@@ -1088,10 +1089,19 @@ class OriginModel(nn.Module):
         encoder: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
-        if encoder_name != "convnext_tiny":
-            raise ValueError("the initial ORIGIN implementation supports convnext_tiny")
+        encoder_name = str(encoder_name).lower()
+        if encoder_name not in {"convnext_tiny", "convnext_tiny_srff"}:
+            raise ValueError(
+                "ORIGIN supports encoder_name='convnext_tiny' or "
+                "'convnext_tiny_srff'"
+            )
         if encoder is None:
-            encoder = ConvNeXtTinyPyramidEncoder(
+            encoder_class = (
+                ConvNeXtTinySRFFEncoder
+                if encoder_name == "convnext_tiny_srff"
+                else ConvNeXtTinyPyramidEncoder
+            )
+            encoder = encoder_class(
                 pretrained=pretrained,
                 grad_checkpoint=grad_checkpoint,
                 mask_valid_fraction=mask_valid_fraction,
@@ -1131,9 +1141,44 @@ class OriginModel(nn.Module):
             if self.generator.atom_mode == "independent"
             else "bounded_null_simplex_v1"
         )
+        spatial_contract_factory = getattr(self.encoder, "spatial_contract", None)
+        encoder_spatial_contract = (
+            spatial_contract_factory()
+            if callable(spatial_contract_factory)
+            else {
+                "kind": "native_convnext_pyramid_v1",
+                "source_masking_inside_trunk": False,
+            }
+        )
+        receptive_fields = {
+            "s4": 76,
+            "s8": 224,
+            "s16": 1096,
+            "s32": 1688,
+            "s128": 344,
+        }
+        selected_receptive_fields = [
+            receptive_fields[name]
+            for name in self.evidence_scales
+            if name in receptive_fields
+        ]
+        is_srff = self.encoder_name == "convnext_tiny_srff"
         return {
             "name": "ORIGIN",
             "encoder": self.encoder_name,
+            "encoder_spatial_contract": encoder_spatial_contract,
+            "evidence_dependency_policy": (
+                "spatial_receptive_field_firewall_v1"
+                if is_srff
+                else "native_convnext_stage_receptive_fields"
+            ),
+            "srff_window_cells": (
+                ConvNeXtTinySRFFEncoder.WINDOW_CELLS if is_srff else None
+            ),
+            "sealed_source_masking": True if is_srff else None,
+            "max_evidence_receptive_field": (
+                max(selected_receptive_fields) if selected_receptive_fields else None
+            ),
             "num_classes": self.num_classes,
             "evidence_scales": list(self.evidence_scales),
             "atom_mode": self.generator.atom_mode,

@@ -224,6 +224,83 @@ After a successful EyePACS training job, submit its matching audit with:
 sbatch scripts/submit_origin_v4_local_dr_validation_audit.sh
 ```
 
+## ORIGIN-v5: Spatial Receptive-Field Firewall (SRFF)
+
+The v4 experiment isolates the remaining architectural problem. Removing the
+full-support `s16` and `s32` ledgers establishes bounded support, but its
+completed APTOS result falls to 82.25% accuracy and 0.8723 QWK; the EyePACS
+trajectory likewise remains below v3. Shallow features provide locality but
+do not retain enough pretrained semantic depth. This is an architectural
+deficit, not a decoder, learning-rate, or numerical-stability failure.
+
+V5 introduces one replacement dependency path. The `convnext_tiny_srff`
+encoder preserves the ordinary `s4` and `s8` feature ledgers. It then applies
+an immutable-validity mask to the `80x80` stride-8 map, partitions that map
+into non-overlapping `16x16` windows, and runs the pretrained ConvNeXt deep
+suffix independently inside every window. No suffix operation may communicate
+across a window boundary. Average pooling produces one descriptor per window,
+forming a `5x5` `s128` regional ledger. Its conservative input receptive-field
+bound is
+
+```text
+RF(s128) = RF(s8) + (16 - 1) * stride(s8)
+          = 224 + 15 * 8 = 344 pixels.
+```
+
+Thus v5 recovers deep semantic processing without restoring v3's global-support
+evidence cells. The only active prediction path remains
+`s4,s8,s128 -> conserved rates -> pure-birth generator -> grade posterior`.
+The deepest evidence unit is a 344-pixel regional unit, not a pixel-level
+lesion mask. The `s4` and `s8` ledgers retain finer-resolution evidence.
+
+This comparison keeps the v3 split, preprocessing, seed, ImageNet
+initialization, generator, cumulative atoms, proper NLL plus RPS objective,
+rate caps, optimizer, learning rates, batch size, freeze schedule, LR schedule,
+epoch budget, checkpoint rule, and MAP decision fixed. Class weighting,
+evidence-budget regularization, and outer-test evaluation remain disabled.
+
+Run the structural preflight first, then both fold-0 inner-validation jobs if
+resources are available:
+
+```bash
+PREFLIGHT_JOB=$(sbatch --parsable scripts/submit_origin_v5_srff_preflight.sh | cut -d';' -f1)
+APTOS_JOB=$(sbatch --parsable --dependency=afterok:${PREFLIGHT_JOB} scripts/submit_origin_v5_srff_aptos_f0.sh | cut -d';' -f1)
+DR_JOB=$(sbatch --parsable --dependency=afterok:${PREFLIGHT_JOB} scripts/submit_origin_v5_srff_dr_f0.sh | cut -d';' -f1)
+printf 'preflight=%s aptos=%s eyepacs=%s\n' "${PREFLIGHT_JOB}" "${APTOS_JOB}" "${DR_JOB}"
+```
+
+Default artifacts are isolated under:
+
+```text
+runs/origin_aptos_f0_v5_srff_w16/fold0
+runs/origin_dr_f0_v5_srff_w16/fold0
+```
+
+APTOS is a screening diagnostic: 84% accuracy and 0.90 QWK is the prospective
+promising threshold, while the run must at minimum improve upon v4's
+82.25%/0.8723 result. The target-dataset gate is stricter. On the same EyePACS
+fold-0 validation split and the same selected checkpoint, v5 must exceed both
+v3 metrics (85.7369% accuracy and 0.82007 QWK) without falling below v3's
+56.86% balanced accuracy or 0.6118 macro-F1. Do not launch full cross-validation
+from a checkpoint that fails this joint gate.
+
+Only after the EyePACS gate passes, run the complete 3,162-image validation
+audit:
+
+```bash
+sbatch scripts/submit_origin_v5_srff_dr_validation_audit.sh
+```
+
+The audit must reconstruct the `convnext_tiny_srff`/`s4,s8,s128` checkpoint,
+verify conservation and exact replay, report no evidence unit with receptive
+field above 344 pixels, and evaluate set-valued deletion curves. Single-cell
+necessity is not required because DR evidence can be distributed across
+multiple retinal regions. At the observed v3 throughput, expected V100 runtime
+is approximately 50 minutes for APTOS and 18--21 hours at the full EyePACS
+epoch budget; the packed suffix has approximately the same aggregate spatial
+area as the ordinary suffix, so batch size 8 and 32 GB GPU memory should remain
+adequate.
+
 ## Historical failed runs
 
 The original September 8 v1 runs used the generic `torch.matrix_exp` backward

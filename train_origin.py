@@ -117,11 +117,11 @@ def parse_scales(value: str) -> tuple[str, ...]:
         scales.append(token if token.startswith("s") else f"s{token}")
     if not scales:
         raise argparse.ArgumentTypeError("at least one evidence scale is required")
-    allowed = {"s4", "s8", "s16", "s32"}
+    allowed = {"s4", "s8", "s16", "s32", "s128"}
     invalid = sorted(set(scales) - allowed)
     if invalid:
         raise argparse.ArgumentTypeError(
-            f"invalid evidence scales {invalid}; choose from s4,s8,s16,s32"
+            f"invalid evidence scales {invalid}; choose from s4,s8,s16,s32,s128"
         )
     if len(scales) != len(set(scales)):
         raise argparse.ArgumentTypeError("evidence scales must be unique")
@@ -294,7 +294,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     model = parser.add_argument_group("model")
     model.add_argument("--image_size", type=int, default=640)
-    model.add_argument("--encoder", choices=("convnext_tiny",), default="convnext_tiny")
+    model.add_argument(
+        "--encoder",
+        choices=("convnext_tiny", "convnext_tiny_srff"),
+        default="convnext_tiny",
+    )
     model.add_argument("--no_pretrained", action="store_true")
     model.add_argument("--scales", type=parse_scales, default=parse_scales("s4,s8,s16,s32"))
     model.add_argument("--projection_dim", type=int, default=128)
