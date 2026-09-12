@@ -301,6 +301,116 @@ epoch budget; the packed suffix has approximately the same aggregate spatial
 area as the ordinary suffix, so batch size 8 and 32 GB GPU memory should remain
 adequate.
 
+## ORIGIN-v6: conserved regional-relation transition ledger
+
+V5 did not exceed the immutable v3 EyePACS baseline. V6 therefore restores
+the exact v3 encoder and all four unary ledgers and tests one new mechanism:
+explicit directed region-pair evidence in the adjacent-severity transition
+path. A fixed `10x10` partition of the stride-8 feature lattice yields 100
+regional endpoints. The pooled lattice blocks are non-overlapping, but their
+theoretical input-space receptive fields overlap substantially; therefore they
+must not be described as disjoint retinal pixel supports. Boundary-specific
+signed pair messages are geometry-normalized,
+compiled reverse-cumulatively across ordinal prerequisites, bounded by
+`|D_k| <= 2`, and merged with the v3 boundary rate through
+
+```text
+lambda_v6,k = C * sigmoid(logit(lambda_v3,k / C) + D_k),  C = 64.
+```
+
+The final grade posterior is still generated exclusively by the pure-birth
+chain. There is no relation-side classifier or auxiliary prediction bypass.
+Deleting an edge removes its stored message, reaggregates the cumulative
+field, and replays this same bounded merge and decoder without re-encoding.
+This makes a directed pair certificate part of the computation rather than an
+attention visualization.
+
+The learned pair term is **relation evidence**, not automatically a pure
+statistical interaction or biological synergy. A pair network can redundantly
+encode singleton information from either endpoint. Any stronger interaction
+claim requires the matched controls below; until then, use “directed learned
+regional relation term” in figures and text.
+
+The sole pair-output tensor is initialized to exactly zero. Consequently a
+strict v3 state migration is an exact function identity at epoch 0. The
+source file SHA-256, internal checkpoint schema, architecture/configuration
+signatures, fold, split signature, state shapes, and state-key partition are
+validated. Only `generator.relation_field.*` may be absent from the v3 source.
+Epoch 0 is evaluated and remains eligible as the best checkpoint, so this
+pilot has a hash-bound, verified-content baseline floor. SHA-256 binds the
+experiment to exact checkpoint bytes; it does not establish checkpoint
+authorship or trust by itself.
+
+A trained v6 candidate can replace epoch 0 only when it both wins under the
+ordinary preregistered selector and passes the v3 multi-metric safety floor:
+accuracy must be strictly higher, QWK, balanced accuracy, and macro-F1 must not
+decrease beyond `1e-6`, and MAE must not increase beyond `1e-6`. The thresholds
+and each epoch's eligibility checks are stored in the checkpoint; the selected
+check is copied into `result.json`.
+
+The first screen is deliberately relation-only. Every v3 parameter and its
+stochastic behavior remain frozen/evaluation-mode for all 15 APTOS epochs and
+all 25 EyePACS epochs. The relation field alone uses the existing head LR
+`5e-4`; ReduceLROnPlateau and the proper unweighted NLL + RPS objective are
+unchanged. Do not introduce joint fine-tuning into these run directories.
+
+On the cluster, compute and verify each dataset's own v3 checkpoint content
+hash, then submit its preflight and training job:
+
+```bash
+# APTOS
+export ORIGIN_V3_CHECKPOINT=runs/origin_aptos_f0_v3_bounded/fold0/best.pth
+export ORIGIN_V3_CHECKPOINT_SHA256=$(sha256sum "$ORIGIN_V3_CHECKPOINT" | cut -d' ' -f1)
+PRE=$(sbatch --parsable scripts/submit_origin_v6_relation_preflight.sh | cut -d';' -f1)
+APTOS=$(sbatch --parsable --dependency=afterok:${PRE} scripts/submit_origin_v6_relation_aptos_f0.sh | cut -d';' -f1)
+printf 'preflight=%s aptos=%s\n' "$PRE" "$APTOS"
+
+# EyePACS (use the EyePACS v3 source, not the APTOS source)
+export ORIGIN_V3_CHECKPOINT=runs/origin_dr_f0_v3_bounded/fold0/best.pth
+export ORIGIN_V3_CHECKPOINT_SHA256=$(sha256sum "$ORIGIN_V3_CHECKPOINT" | cut -d' ' -f1)
+PRE=$(sbatch --parsable scripts/submit_origin_v6_relation_preflight.sh | cut -d';' -f1)
+DR=$(sbatch --parsable --dependency=afterok:${PRE} scripts/submit_origin_v6_relation_dr_f0.sh | cut -d';' -f1)
+printf 'preflight=%s eyepacs=%s\n' "$PRE" "$DR"
+```
+
+Default outputs are isolated in
+`runs/origin_aptos_f0_v6_relation_only/fold0` and
+`runs/origin_dr_f0_v6_relation_only/fold0`. Logs expose mean/max absolute
+cumulative relation log-odds, final-rate deltas, and edge messages. A field
+that stays numerically zero has not learned; a field persistently near its
+bound is saturated and must not be described as calibrated relational
+evidence.
+
+The primary success gate is paired against epoch 0 on the same validation
+examples. APTOS is only a directional screen. EyePACS v6 must strictly exceed
+v3's 85.7369% accuracy without regressing its exact source-checkpoint QWK,
+balanced accuracy, macro-F1, or MAE beyond the registered `1e-6` numerical
+tolerance. After a passing completed run,
+audit the entire inner validation set:
+
+```bash
+sbatch scripts/submit_origin_v6_relation_validation_audit.sh
+```
+
+For APTOS, override `ORIGIN_V6_RUN_DIR`, `ORIGIN_DATA_ROOT`, and optionally
+`ORIGIN_AUDIT_OUTPUT`. The v6 audit must verify unchanged unary-source rates,
+exact edge-message partition, exact relation reaggregation and bounded merge,
+recovery of the v3 rates when all edges are removed, and grade-stratified
+largest-edge certificates. A relation certificate proves the effect of a
+stored directed regional term in the prediction circuit; it is not a claim
+that deleting the corresponding input pixels causes the same effect.
+
+Before claiming that pair terms add information unavailable to unary regional
+evidence, run two matched architectural controls: (1) a parameter-matched
+regional unary-residual field compiled through the same cumulative bounded-rate
+path, and (2) shuffled-pair training/evaluation that preserves endpoint
+marginals and the v3 unary ledger while breaking the registered source-target
+pairing. Report both accuracy and all safety-floor metrics. Interpretation must
+also include set-level interventions: delete all incoming edges, all outgoing
+edges, and all pair edges for a selected region, alongside deletion of that
+region's unary cells. Single-edge certificates alone do not establish regional
+necessity, synergy, or causal pixel effects.
+
 ## Historical failed runs
 
 The original September 8 v1 runs used the generic `torch.matrix_exp` backward

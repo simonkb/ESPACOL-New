@@ -276,6 +276,69 @@ def decode_pure_birth_rates(
     )
 
 
+def bounded_rate_log_odds_merge(
+    base_rates: torch.Tensor,
+    cumulative_log_odds: torch.Tensor,
+    *,
+    total_rate_cap: float,
+) -> torch.Tensor:
+    """Apply a bounded relational correction to transition-rate log-odds.
+
+    For a pre-relation rate ``lambda`` and cumulative pair field ``D``, the
+    represented law is
+
+    ``C * sigmoid(log(lambda) - log(C - lambda) + D)``.
+
+    The computation stays in FP64.  A numerically reconstructed zero-shift
+    value is subtracted before adding the correction to ``base_rates``.  This
+    is algebraically identical to the expression above, while making an
+    exactly zero pair field an exact machine-level identity with a non-zero
+    derivative with respect to ``D``.  ORIGIN's one-unit roundoff reserve
+    keeps the base rate strictly inside ``(0, C)``.
+    """
+
+    if base_rates.shape != cumulative_log_odds.shape:
+        raise ValueError(
+            "base_rates and cumulative_log_odds must have identical shapes; "
+            f"got {tuple(base_rates.shape)} and {tuple(cumulative_log_odds.shape)}"
+        )
+    if not base_rates.is_floating_point() or not cumulative_log_odds.is_floating_point():
+        raise TypeError("rate-log-odds merge inputs must be floating point")
+    if not math.isfinite(total_rate_cap) or total_rate_cap <= 0.0:
+        raise ValueError("total_rate_cap must be finite and positive")
+    _require_finite(base_rates, "pre-relation transition rates")
+    _require_finite(cumulative_log_odds, "cumulative pair log-odds")
+
+    device_type = base_rates.device.type
+    with torch.autocast(device_type=device_type, enabled=False):
+        rates = base_rates.to(dtype=_DECODER_DTYPE)
+        correction = cumulative_log_odds.to(device=rates.device, dtype=_DECODER_DTYPE)
+        cap = torch.as_tensor(total_rate_cap, dtype=rates.dtype, device=rates.device)
+        if bool(((rates <= 0.0) | (rates >= cap)).any()):
+            minimum = float(rates.detach().amin().item())
+            maximum = float(rates.detach().amax().item())
+            raise ValueError(
+                "pre-relation rates must lie strictly inside (0, total_rate_cap); "
+                f"observed [{minimum:g}, {maximum:g}] with cap {total_rate_cap:g}"
+            )
+        base_log_odds = rates.log() - (cap - rates).log()
+        reconstructed_zero = cap * base_log_odds.sigmoid()
+        shifted = cap * (base_log_odds + correction).sigmoid()
+        # Parentheses are intentional: when correction is exactly zero, the
+        # subtraction is exactly zero before it is added to the original rate.
+        merged = rates + (shifted - reconstructed_zero)
+
+    _require_finite(merged, "relation-corrected transition rates")
+    if bool(((merged <= 0.0) | (merged >= total_rate_cap)).any()):
+        minimum = float(merged.detach().amin().item())
+        maximum = float(merged.detach().amax().item())
+        raise FloatingPointError(
+            "bounded relational merge left the open decoder interval "
+            f"(0, {total_rate_cap:g}); observed [{minimum:g}, {maximum:g}]"
+        )
+    return merged
+
+
 def fit_pure_birth_rates(
     class_probs: torch.Tensor | Sequence[float],
     *,
@@ -437,6 +500,318 @@ class PointwiseSeverityAtomHead(nn.Module):
         return logits, atoms
 
 
+def aggregate_ordinal_pair_messages(
+    edge_messages: torch.Tensor,
+    edge_valid_mask: torch.Tensor,
+    region_valid_mask: torch.Tensor,
+    *,
+    delta_cap: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Aggregate stored pair messages into a bounded cumulative rate field.
+
+    ``edge_messages[n,m,i,j]`` is the signed message from source region ``j``
+    to target region ``i`` for incremental severity atom ``m``.  The first
+    aggregation is target-local and normalized only by immutable geometry.
+    Valid targets are then averaged, and reverse cumulative compilation makes
+    a high-severity interaction affect all prerequisite transition-rate
+    log-odds.  Dividing the per-atom budget by the number of boundaries proves
+    ``abs(cumulative_log_odds) <= delta_cap``.
+    """
+
+    if edge_messages.ndim != 4:
+        raise ValueError("edge_messages must have shape (N,K-1,M,M)")
+    batch, boundaries, targets, sources = edge_messages.shape
+    if targets != sources:
+        raise ValueError("edge_messages must use a square region-pair lattice")
+    if edge_valid_mask.shape != (batch, targets, sources):
+        raise ValueError(
+            "edge_valid_mask must have shape (N,M,M); got "
+            f"{tuple(edge_valid_mask.shape)}"
+        )
+    if region_valid_mask.shape != (batch, targets):
+        raise ValueError(
+            "region_valid_mask must have shape (N,M); got "
+            f"{tuple(region_valid_mask.shape)}"
+        )
+    if boundaries < 1:
+        raise ValueError("at least one ordinal boundary is required")
+    if not math.isfinite(delta_cap) or delta_cap <= 0.0:
+        raise ValueError("delta_cap must be finite and positive")
+    if edge_valid_mask.dtype != torch.bool:
+        edge_valid_mask = edge_valid_mask.bool()
+    if region_valid_mask.dtype != torch.bool:
+        region_valid_mask = region_valid_mask.bool()
+    _require_finite(edge_messages, "ordinal pair messages")
+    tolerance = 2e-6
+    if bool((edge_messages.abs() > 1.0 + tolerance).any()):
+        raise ValueError("ordinal pair messages must lie in [-1, 1]")
+
+    masked_messages = torch.where(
+        edge_valid_mask[:, None], edge_messages, torch.zeros_like(edge_messages)
+    )
+    source_count = edge_valid_mask.sum(dim=-1).to(edge_messages.dtype)
+    source_normalizer = source_count.clamp_min(1.0).sqrt()
+    target_raw = masked_messages.sum(dim=-1) / source_normalizer[:, None]
+    incremental_cap = float(delta_cap) / float(boundaries)
+    target_incremental = incremental_cap * target_raw.tanh()
+    target_incremental = torch.where(
+        region_valid_mask[:, None],
+        target_incremental,
+        torch.zeros_like(target_incremental),
+    )
+    _require_finite(target_incremental, "target-local ordinal pair log-odds")
+    target_count = region_valid_mask.sum(dim=-1).to(edge_messages.dtype)
+    if bool((target_count <= 0).any()):
+        raise ValueError("every sample must contain at least one valid relation region")
+    incremental = target_incremental.sum(dim=-1) / target_count[:, None]
+    _require_finite(incremental, "incremental ordinal pair log-odds")
+    cumulative = reverse_cumulative_atoms(incremental, dim=1)
+    _require_finite(cumulative, "cumulative ordinal pair log-odds")
+    if bool((cumulative.abs() > float(delta_cap) + tolerance).any()):
+        raise FloatingPointError("cumulative ordinal pair field exceeded its bound")
+    return target_incremental, incremental, cumulative
+
+
+@dataclass
+class OriginRelationEvidence:
+    """Stored, replayable trace of ORIGIN's explicit regional interactions."""
+
+    source_scale: str
+    grid_size: Tuple[int, int]
+    block_size: Tuple[int, int]
+    region_valid_mask: torch.Tensor
+    edge_valid_mask: torch.Tensor
+    pair_gates: torch.Tensor
+    edge_messages: torch.Tensor
+    target_incremental_log_odds: torch.Tensor
+    incremental_log_odds: torch.Tensor
+    cumulative_log_odds: torch.Tensor
+    region_centers_yx: torch.Tensor
+    source_receptive_field: int
+    region_receptive_field: int
+    region_output_stride: int
+    delta_cap: float
+
+    @property
+    def num_regions(self) -> int:
+        return self.grid_size[0] * self.grid_size[1]
+
+
+class OrdinalPairInteractionField(nn.Module):
+    """Compile bounded two-region messages into cumulative rate log-odds.
+
+    The field pools a deterministic set of non-overlapping feature-lattice
+    blocks.  Their receptive-field-qualified supports in input pixels can
+    overlap and are reported explicitly; the architecture therefore claims
+    interactions between regional representations, not disjoint or pure
+    lesion synergy.  Every raw edge message depends only on its target and
+    source tokens plus their fixed relative displacement; there is no softmax
+    denominator involving other regions.  The trilinear output weights are
+    initialized to exactly zero, making this module an exact function-
+    preserving extension of a trained ORIGIN-v3 generator.
+    """
+
+    def __init__(
+        self,
+        source_channels: int,
+        num_boundaries: int,
+        *,
+        grid_size: int = 10,
+        relation_dim: int = 64,
+        head_dim: int = 16,
+        delta_cap: float = 2.0,
+    ) -> None:
+        super().__init__()
+        if min(source_channels, num_boundaries, grid_size, relation_dim, head_dim) < 1:
+            raise ValueError("relation dimensions must be positive")
+        if not math.isfinite(delta_cap) or delta_cap <= 0.0:
+            raise ValueError("relation delta_cap must be finite and positive")
+        self.source_channels = int(source_channels)
+        self.num_boundaries = int(num_boundaries)
+        self.grid_size = int(grid_size)
+        self.relation_dim = int(relation_dim)
+        self.head_dim = int(head_dim)
+        self.delta_cap = float(delta_cap)
+
+        self.token_projection = nn.Linear(self.source_channels, self.relation_dim)
+        self.token_norm = nn.LayerNorm(self.relation_dim)
+        self.query_projection = nn.Linear(
+            self.relation_dim, self.num_boundaries * self.head_dim
+        )
+        self.key_projection = nn.Linear(
+            self.relation_dim, self.num_boundaries * self.head_dim
+        )
+        displacement = 2 * self.grid_size - 1
+        self.relative_bias = nn.Parameter(
+            torch.zeros(self.num_boundaries, displacement, displacement)
+        )
+        # This is the sole pair-output parameter. Zero is both a strict forward
+        # identity and a point with a non-zero first derivative through tanh.
+        self.trilinear_weight = nn.Parameter(
+            torch.zeros(self.num_boundaries, self.head_dim)
+        )
+
+        coordinate = torch.arange(self.grid_size)
+        yy, xx = torch.meshgrid(coordinate, coordinate, indexing="ij")
+        flat_y = yy.reshape(-1)
+        flat_x = xx.reshape(-1)
+        self.register_buffer(
+            "relative_y_index",
+            flat_y[:, None] - flat_y[None, :] + self.grid_size - 1,
+            persistent=False,
+        )
+        self.register_buffer(
+            "relative_x_index",
+            flat_x[:, None] - flat_x[None, :] + self.grid_size - 1,
+            persistent=False,
+        )
+        self.register_buffer(
+            "self_edge_mask",
+            torch.eye(self.grid_size * self.grid_size, dtype=torch.bool),
+            persistent=False,
+        )
+
+    def _pool_regions(
+        self,
+        features: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int]]:
+        if features.ndim != 4 or features.shape[1] != self.source_channels:
+            raise ValueError(
+                "relation source features must have shape "
+                f"(N,{self.source_channels},H,W)"
+            )
+        if valid_mask.shape != features.shape[:1] + features.shape[-2:]:
+            raise ValueError("relation source valid-mask shape mismatch")
+        if valid_mask.dtype != torch.bool:
+            valid_mask = valid_mask.bool()
+        batch, channels, height, width = features.shape
+        grid = self.grid_size
+        if height % grid or width % grid:
+            raise ValueError(
+                "relation source lattice dimensions must be divisible by "
+                f"grid_size={grid}; got {(height, width)}"
+            )
+        block_height = height // grid
+        block_width = width // grid
+        mask = valid_mask[:, None].to(features.dtype)
+        weighted = (features * mask).reshape(
+            batch, channels, grid, block_height, grid, block_width
+        ).sum(dim=(3, 5))
+        counts = mask.reshape(
+            batch, 1, grid, block_height, grid, block_width
+        ).sum(dim=(3, 5))
+        pooled = weighted / counts.clamp_min(1.0)
+        minimum_count = 0.5 * float(block_height * block_width)
+        region_valid = counts[:, 0] >= minimum_count
+        pooled = torch.where(
+            region_valid[:, None], pooled, torch.zeros_like(pooled)
+        )
+        pooled = pooled.permute(0, 2, 3, 1).reshape(
+            batch, grid * grid, channels
+        )
+        return pooled, region_valid.reshape(batch, -1), (block_height, block_width)
+
+    def forward(
+        self,
+        encoded: OriginEncoderScale,
+    ) -> OriginRelationEvidence:
+        features = encoded.features.float()
+        _require_finite(features, "relation source features")
+        pooled, region_valid, block_size = self._pool_regions(
+            features, encoded.valid_mask
+        )
+        _require_finite(pooled, "pooled relation region features")
+        tokens = F.gelu(self.token_norm(self.token_projection(pooled)))
+        _require_finite(tokens, "relation region tokens")
+        batch, regions, _ = tokens.shape
+        queries = self.query_projection(tokens).reshape(
+            batch, regions, self.num_boundaries, self.head_dim
+        ).permute(0, 2, 1, 3)
+        keys = self.key_projection(tokens).reshape(
+            batch, regions, self.num_boundaries, self.head_dim
+        ).permute(0, 2, 1, 3)
+        _require_finite(queries, "relation pair queries")
+        _require_finite(keys, "relation pair keys")
+
+        inverse_sqrt = 1.0 / math.sqrt(float(self.head_dim))
+        affinity = torch.einsum("nbih,nbjh->nbij", queries, keys) * inverse_sqrt
+        _require_finite(affinity, "relation content affinities")
+        relative = self.relative_bias[
+            :, self.relative_y_index, self.relative_x_index
+        ]
+        _require_finite(relative, "relation relative-position biases")
+        affinity = affinity + relative[None]
+        _require_finite(affinity, "raw relation pair affinities")
+        pair_gates = affinity.sigmoid()
+        _require_finite(pair_gates, "relation pair gates")
+        trilinear = torch.einsum(
+            "nbih,bh,nbjh->nbij", queries, self.trilinear_weight, keys
+        ) * inverse_sqrt
+        _require_finite(trilinear, "raw relation trilinear messages")
+
+        edge_valid = (
+            region_valid[:, :, None]
+            & region_valid[:, None, :]
+            & ~self.self_edge_mask[None]
+        )
+        pair_gates = torch.where(
+            edge_valid[:, None], pair_gates, torch.zeros_like(pair_gates)
+        )
+        edge_messages = torch.where(
+            edge_valid[:, None],
+            pair_gates * trilinear.tanh(),
+            torch.zeros_like(trilinear),
+        )
+        _require_finite(pair_gates, "masked relation pair gates")
+        _require_finite(edge_messages, "masked relation edge messages")
+        target_incremental, incremental, cumulative = aggregate_ordinal_pair_messages(
+            edge_messages,
+            edge_valid,
+            region_valid,
+            delta_cap=self.delta_cap,
+        )
+
+        metadata = encoded.metadata
+        block_height, block_width = block_size
+        region_receptive_field = int(
+            metadata.receptive_field
+            + (max(block_height, block_width) - 1) * metadata.output_stride
+        )
+        if block_height != block_width:
+            raise ValueError("relation endpoint blocks must be square")
+        region_stride = int(metadata.output_stride * block_height)
+        first_center = metadata.center_offset + 0.5 * (
+            block_height - 1
+        ) * metadata.output_stride
+        axis = first_center + torch.arange(
+            self.grid_size, device=features.device, dtype=features.dtype
+        ) * region_stride
+        center_y, center_x = torch.meshgrid(axis, axis, indexing="ij")
+        centers = torch.stack((center_y, center_x), dim=-1).reshape(regions, 2)
+        _require_finite(target_incremental, "relation target log-odds output")
+        _require_finite(incremental, "relation incremental log-odds output")
+        _require_finite(cumulative, "relation cumulative log-odds output")
+        _require_finite(centers, "relation endpoint centers")
+        return OriginRelationEvidence(
+            source_scale=metadata.name,
+            grid_size=(self.grid_size, self.grid_size),
+            block_size=block_size,
+            region_valid_mask=region_valid,
+            edge_valid_mask=edge_valid,
+            pair_gates=pair_gates,
+            edge_messages=edge_messages,
+            target_incremental_log_odds=target_incremental,
+            incremental_log_odds=incremental,
+            cumulative_log_odds=cumulative,
+            region_centers_yx=centers,
+            source_receptive_field=int(metadata.receptive_field),
+            region_receptive_field=region_receptive_field,
+            region_output_stride=region_stride,
+            delta_cap=self.delta_cap,
+        )
+
+
 @dataclass
 class OriginScaleEvidence:
     """Replayable evidence ledger for one spatial scale."""
@@ -480,6 +855,17 @@ class OriginOutput:
     atom_mass_cap: float
     rate_roundoff_margin: float
     encoder_output: Optional[OriginEncoderOutput] = None
+    # ``base_total_rates`` is the conserved v3 ledger before any relational
+    # correction.  Keeping it alongside the final rates makes both local-cell
+    # and pair-edge interventions exact replays of the prediction circuit.
+    base_total_rates: Optional[torch.Tensor] = None
+    relation_evidence: Optional[OriginRelationEvidence] = None
+
+    @property
+    def pre_relation_rates(self) -> torch.Tensor:
+        """Conserved v3 rate ledger used as input to the relation merge."""
+
+        return self.total_rates if self.base_total_rates is None else self.base_total_rates
 
     @property
     def local_rate_maps(self) -> Dict[str, torch.Tensor]:
@@ -548,6 +934,8 @@ def _origin_output_from_decoded(
     atom_mass_cap: float,
     rate_roundoff_margin: float,
     encoder_output: Optional[OriginEncoderOutput],
+    base_total_rates: Optional[torch.Tensor] = None,
+    relation_evidence: Optional[OriginRelationEvidence] = None,
 ) -> OriginOutput:
     return OriginOutput(
         scale_evidence=scale_evidence,
@@ -570,6 +958,10 @@ def _origin_output_from_decoded(
         atom_mass_cap=atom_mass_cap,
         rate_roundoff_margin=rate_roundoff_margin,
         encoder_output=encoder_output,
+        base_total_rates=(
+            decoded.total_rates if base_total_rates is None else base_total_rates
+        ),
+        relation_evidence=relation_evidence,
     )
 
 
@@ -628,6 +1020,12 @@ class ConservedOrdinalGenerator(nn.Module):
         boundary_scale_cap: float = 2.0,
         rate_roundoff_margin: float = 1.0,
         dropout: float = 0.0,
+        relation_enabled: bool = False,
+        relation_source_scale: str = "s8",
+        relation_grid_size: int = 10,
+        relation_dim: int = 64,
+        relation_head_dim: int = 16,
+        relation_delta_cap: float = 2.0,
     ) -> None:
         super().__init__()
         if num_classes < 2:
@@ -673,6 +1071,12 @@ class ConservedOrdinalGenerator(nn.Module):
         unknown = set(selected) - set(available)
         if unknown:
             raise ValueError(f"unknown evidence scales: {sorted(unknown)}")
+        relation_source_scale = str(relation_source_scale)
+        if relation_enabled and relation_source_scale not in available:
+            raise ValueError(
+                "relation_source_scale must be exposed by the encoder; "
+                f"got {relation_source_scale!r}, available={sorted(available)}"
+            )
 
         self.num_classes = int(num_classes)
         self.num_boundaries = self.num_classes - 1
@@ -682,6 +1086,12 @@ class ConservedOrdinalGenerator(nn.Module):
         self.prior_rate_cap = float(prior_rate_cap)
         self.boundary_scale_cap = float(boundary_scale_cap)
         self.rate_roundoff_margin = float(rate_roundoff_margin)
+        self.relation_enabled = bool(relation_enabled)
+        self.relation_source_scale = relation_source_scale
+        self.relation_grid_size = int(relation_grid_size)
+        self.relation_dim = int(relation_dim)
+        self.relation_head_dim = int(relation_head_dim)
+        self.relation_delta_cap = float(relation_delta_cap)
         self.atom_mass_cap = (
             (
                 self.total_rate_cap
@@ -705,6 +1115,20 @@ class ConservedOrdinalGenerator(nn.Module):
                 for name in selected
             }
         )
+        self.relation_field: Optional[OrdinalPairInteractionField]
+        if self.relation_enabled:
+            self.relation_field = OrdinalPairInteractionField(
+                available[self.relation_source_scale],
+                self.num_boundaries,
+                grid_size=self.relation_grid_size,
+                relation_dim=self.relation_dim,
+                head_dim=self.relation_head_dim,
+                delta_cap=self.relation_delta_cap,
+            )
+        else:
+            # Assigning None instead of an inert module preserves the exact v3
+            # parameter/state-dict surface when relations are disabled.
+            self.relation_field = None
 
         self.scale_simplex_logits = nn.Parameter(
             torch.zeros(len(selected), self.num_boundaries)
@@ -830,7 +1254,7 @@ class ConservedOrdinalGenerator(nn.Module):
         # leaves the decoder on one continuous FP64 path.
         prior = self.prior_rates.to(device=first.device, dtype=_DECODER_DTYPE)
         prior = prior.unsqueeze(0).expand(first.shape[0], -1)
-        total = sum_local_rate_maps(
+        base_total = sum_local_rate_maps(
             {name: item.local_rate_map for name, item in scale_evidence.items()},
             prior,
         )
@@ -838,12 +1262,30 @@ class ConservedOrdinalGenerator(nn.Module):
         # conserved geometry imply in exact arithmetic:
         #   total <= prior_cap + reference_count * scale_cap * atom_mass_cap
         #         = total_rate_cap - rate_roundoff_margin.
-        maximum_total = float(total.detach().amax().item())
+        maximum_total = float(base_total.detach().amax().item())
         if maximum_total > self.total_rate_cap:
             raise FloatingPointError(
                 "ORIGIN bounded generator violated its architectural rate cap "
                 f"{self.total_rate_cap:g}: {maximum_total:g}"
             )
+        relation_evidence: Optional[OriginRelationEvidence] = None
+        total = base_total
+        if self.relation_field is not None:
+            if self.relation_source_scale not in encoder_output.scales:
+                raise ValueError(
+                    "encoder output is missing relation source scale "
+                    f"{self.relation_source_scale!r}"
+                )
+            # The relation trace and bounded merge are part of the structural
+            # decoder, so they run outside AMP just like the local atom heads.
+            source = encoder_output.scales[self.relation_source_scale]
+            with torch.autocast(device_type=source.features.device.type, enabled=False):
+                relation_evidence = self.relation_field(source)
+                total = bounded_rate_log_odds_merge(
+                    base_total,
+                    relation_evidence.cumulative_log_odds,
+                    total_rate_cap=self.total_rate_cap,
+                )
         decoded = decode_pure_birth_rates(total, force_fp64=force_decoder_fp64)
         return _origin_output_from_decoded(
             decoded,
@@ -858,6 +1300,8 @@ class ConservedOrdinalGenerator(nn.Module):
             atom_mass_cap=self.atom_mass_cap,
             rate_roundoff_margin=self.rate_roundoff_margin,
             encoder_output=encoder_output if retain_encoder_output else None,
+            base_total_rates=base_total,
+            relation_evidence=relation_evidence,
         )
 
 
@@ -964,10 +1408,17 @@ def replay_without(
         replayed[name] = replace(evidence, local_rate_map=kept)
 
     # Sum survivors rather than renormalizing or re-running any evidence head.
-    replay_rates = sum_local_rate_maps(
+    replay_base_rates = sum_local_rate_maps(
         {name: item.local_rate_map for name, item in replayed.items()},
         output.prior_rates,
     )
+    replay_rates = replay_base_rates
+    if output.relation_evidence is not None:
+        replay_rates = bounded_rate_log_odds_merge(
+            replay_base_rates,
+            output.relation_evidence.cumulative_log_odds,
+            total_rate_cap=output.total_rate_cap,
+        )
     decoded = decode_pure_birth_rates(replay_rates, force_fp64=force_decoder_fp64)
     replay_output = _origin_output_from_decoded(
         decoded,
@@ -982,12 +1433,162 @@ def replay_without(
         atom_mass_cap=output.atom_mass_cap,
         rate_roundoff_margin=output.rate_roundoff_margin,
         encoder_output=output.encoder_output,
+        base_total_rates=replay_base_rates,
+        relation_evidence=output.relation_evidence,
     )
     return OriginInterventionOutput(
         baseline=output,
         output=replay_output,
         removal_masks=canonical,
         removed_rates=removed_rates,
+    )
+
+
+@dataclass
+class OriginRelationInterventionOutput:
+    """Exact deletion and replay of stored cross-region pair messages."""
+
+    baseline: OriginOutput
+    output: OriginOutput
+    removal_mask: torch.Tensor
+    removed_edge_messages: torch.Tensor
+
+    @property
+    def delta_expected_grade(self) -> torch.Tensor:
+        return self.baseline.expected_grade - self.output.expected_grade
+
+    @property
+    def delta_cumulative_log_odds(self) -> torch.Tensor:
+        baseline = self.baseline.relation_evidence
+        replayed = self.output.relation_evidence
+        if baseline is None or replayed is None:  # pragma: no cover - invariant
+            raise RuntimeError("relation intervention is missing its stored trace")
+        return baseline.cumulative_log_odds - replayed.cumulative_log_odds
+
+    @property
+    def class_probs(self) -> torch.Tensor:
+        return self.output.class_probs
+
+    @property
+    def predicted_grade(self) -> torch.Tensor:
+        return self.output.predicted_grade
+
+
+def _canonical_relation_removal_mask(
+    removal: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Broadcast an unambiguous relation mask to ``(N,K-1,M,M)``.
+
+    Two-dimensional masks apply to every sample and boundary.  A
+    three-dimensional mask is *only* sample-specific ``(N,M,M)``.  Callers
+    selecting boundaries must supply an explicit four-dimensional mask such
+    as ``(1,K-1,M,M)`` or ``(N,K-1,M,M)``.
+    """
+
+    removal = torch.as_tensor(removal, device=target.device)
+    if target.ndim != 4 or target.shape[-1] != target.shape[-2]:
+        raise ValueError("relation target must have shape (N,K-1,M,M)")
+    batch, boundaries, regions, _ = target.shape
+    if tuple(removal.shape[-2:]) != (regions, regions):
+        raise ValueError(
+            "relation removal endpoint dimensions must match the stored "
+            f"lattice {(regions, regions)}; got {tuple(removal.shape[-2:])}"
+        )
+    if removal.ndim == 2:
+        removal = removal[None, None]
+    elif removal.ndim == 3:
+        if removal.shape[0] != batch:
+            raise ValueError(
+                "three-dimensional relation masks are sample-specific and "
+                f"must have shape (N,M,M) with N={batch}; boundary-specific "
+                "masks must be explicitly four-dimensional"
+            )
+        removal = removal[:, None]
+    elif removal.ndim != 4:
+        raise ValueError(
+            "relation removal mask must have shape (M,M), (N,M,M), "
+            "(1,K-1,M,M), or (N,K-1,M,M)"
+        )
+    if removal.shape[0] not in (1, batch) or removal.shape[1] not in (1, boundaries):
+        raise ValueError(
+            "relation removal batch/boundary dimensions are not broadcastable "
+            f"to {(batch, boundaries)}; got {tuple(removal.shape[:2])}"
+        )
+    return removal.bool().expand(batch, boundaries, regions, regions)
+
+
+def replay_without_relations(
+    output: OriginOutput,
+    edge_removal_mask: torch.Tensor,
+    *,
+    force_decoder_fp64: bool = True,
+) -> OriginRelationInterventionOutput:
+    """Delete stored pair messages and replay the bounded ordinal generator.
+
+    No feature map, attention gate, or encoder activation is recomputed.  The
+    fixed v3 local ledger is merged with the cumulative field compiled from
+    the surviving stored edge messages, so the reported counterfactual is an
+    exact intervention in the prediction path rather than a visualization.
+    """
+
+    relation = output.relation_evidence
+    if relation is None:
+        raise ValueError("output does not contain relational evidence")
+    if output.base_total_rates is None:
+        raise ValueError("relation-enabled output is missing its base rate ledger")
+    canonical = _canonical_relation_removal_mask(
+        edge_removal_mask, relation.edge_messages
+    )
+    canonical = canonical & relation.edge_valid_mask[:, None]
+    removed = torch.where(
+        canonical, relation.edge_messages, torch.zeros_like(relation.edge_messages)
+    )
+    kept = torch.where(
+        canonical, torch.zeros_like(relation.edge_messages), relation.edge_messages
+    )
+    target_incremental, incremental, cumulative = aggregate_ordinal_pair_messages(
+        kept,
+        relation.edge_valid_mask,
+        relation.region_valid_mask,
+        delta_cap=relation.delta_cap,
+    )
+    replay_relation = replace(
+        relation,
+        edge_messages=kept,
+        target_incremental_log_odds=target_incremental,
+        incremental_log_odds=incremental,
+        cumulative_log_odds=cumulative,
+    )
+    replay_rates = bounded_rate_log_odds_merge(
+        output.base_total_rates,
+        cumulative,
+        total_rate_cap=output.total_rate_cap,
+    )
+    decoded = decode_pure_birth_rates(
+        replay_rates, force_fp64=force_decoder_fp64
+    )
+    replay_output = _origin_output_from_decoded(
+        decoded,
+        scale_evidence=output.scale_evidence,
+        prior_rates=output.prior_rates,
+        atom_mode=output.atom_mode,
+        scale_simplex=output.scale_simplex,
+        boundary_scales=output.boundary_scales,
+        total_rate_cap=output.total_rate_cap,
+        prior_rate_cap=output.prior_rate_cap,
+        boundary_scale_cap=output.boundary_scale_cap,
+        atom_mass_cap=output.atom_mass_cap,
+        rate_roundoff_margin=output.rate_roundoff_margin,
+        encoder_output=output.encoder_output,
+        base_total_rates=output.base_total_rates,
+        relation_evidence=replay_relation,
+    )
+    return OriginRelationInterventionOutput(
+        baseline=output,
+        output=replay_output,
+        removal_mask=canonical,
+        removed_edge_messages=removed,
     )
 
 
@@ -1086,6 +1687,12 @@ class OriginModel(nn.Module):
         evidence_dropout: float = 0.0,
         mask_valid_fraction: float = 0.5,
         grad_checkpoint: bool = False,
+        relation_enabled: bool = False,
+        relation_source_scale: str = "s8",
+        relation_grid_size: int = 10,
+        relation_dim: int = 64,
+        relation_head_dim: int = 16,
+        relation_delta_cap: float = 2.0,
         encoder: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
@@ -1127,6 +1734,12 @@ class OriginModel(nn.Module):
             boundary_scale_cap=boundary_scale_cap,
             rate_roundoff_margin=rate_roundoff_margin,
             dropout=evidence_dropout,
+            relation_enabled=relation_enabled,
+            relation_source_scale=relation_source_scale,
+            relation_grid_size=relation_grid_size,
+            relation_dim=relation_dim,
+            relation_head_dim=relation_head_dim,
+            relation_delta_cap=relation_delta_cap,
         )
 
     @property
@@ -1163,6 +1776,25 @@ class OriginModel(nn.Module):
             if name in receptive_fields
         ]
         is_srff = self.encoder_name == "convnext_tiny_srff"
+        relation_field = self.generator.relation_field
+        relation_contract: Optional[Dict[str, object]] = None
+        if relation_field is not None:
+            relation_contract = {
+                "kind": "cumulative_ordinal_pair_rate_log_odds_v1",
+                "source_scale": self.generator.relation_source_scale,
+                "grid_size": relation_field.grid_size,
+                "num_regions": relation_field.grid_size ** 2,
+                "relation_dim": relation_field.relation_dim,
+                "head_dim": relation_field.head_dim,
+                "delta_cap": relation_field.delta_cap,
+                "merge": "C*sigmoid(log(lambda)-log(C-lambda)+D)",
+                "incremental_compilation": "geometry_normalized_signed_pair_messages",
+                "ordinal_compilation": "reverse_cumulative_incremental_field",
+                "pair_normalization": "no_feature_dependent_global_denominator",
+                "zero_initialization": "exact_v3_function_identity",
+                "relation_replay": "stored_pair_message_deletion_without_reencoding",
+                "no_classifier_bypass": True,
+            }
         return {
             "name": "ORIGIN",
             "encoder": self.encoder_name,
@@ -1200,6 +1832,13 @@ class OriginModel(nn.Module):
             "local_rate_layout": "NHW(K-1)",
             "no_classifier_bypass": True,
             "intervention": "stored_local_rate_subtraction_without_renormalization",
+            "relation_enabled": relation_field is not None,
+            "relation_contract": relation_contract,
+            "relation_intervention": (
+                "stored_pair_message_deletion_then_exact_bounded_rate_replay"
+                if relation_field is not None
+                else None
+            ),
         }
 
     def forward(
@@ -1245,6 +1884,19 @@ class OriginModel(nn.Module):
             force_decoder_fp64=force_decoder_fp64,
         )
 
+    def replay_without_relations(
+        self,
+        output: OriginOutput,
+        edge_removal_mask: torch.Tensor,
+        *,
+        force_decoder_fp64: bool = True,
+    ) -> OriginRelationInterventionOutput:
+        return replay_without_relations(
+            output,
+            edge_removal_mask,
+            force_decoder_fp64=force_decoder_fp64,
+        )
+
 
 def build_origin_model(**kwargs) -> OriginModel:
     """Stable construction hook for training and evaluation entry points."""
@@ -1253,13 +1905,18 @@ def build_origin_model(**kwargs) -> OriginModel:
 
 
 __all__ = [
+    "aggregate_ordinal_pair_messages",
+    "bounded_rate_log_odds_merge",
     "ChannelLayerNorm2d",
     "ConservedOrdinalGenerator",
     "OriginDecodedDistribution",
     "OriginInterventionOutput",
     "OriginModel",
     "OriginOutput",
+    "OriginRelationEvidence",
+    "OriginRelationInterventionOutput",
     "OriginScaleEvidence",
+    "OrdinalPairInteractionField",
     "PointwiseSeverityAtomHead",
     "TopKOriginInterventionReport",
     "build_origin_model",
@@ -1267,6 +1924,7 @@ __all__ = [
     "fit_pure_birth_rates",
     "pure_birth_generator",
     "replay_without",
+    "replay_without_relations",
     "reverse_cumulative_atoms",
     "sum_local_rate_maps",
     "topk_rate_intervention",

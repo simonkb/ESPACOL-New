@@ -69,6 +69,28 @@ class OriginConfig:
     force_decoder_fp64: bool = True
     decision_rule: str = "class_map"
 
+    # ORIGIN-v6 relational transition ledger.  The relation field modifies
+    # the *image-level adjacent-transition rates* through a bounded log-odds
+    # residual; it is not a feature-attention or auxiliary-classifier path.
+    # Keeping this disabled by default preserves the audited ORIGIN-v3 model.
+    relation_enabled: bool = False
+    relation_source_scale: str = "s8"
+    relation_grid_size: int = 10
+    relation_dim: int = 64
+    relation_head_dim: int = 16
+    relation_delta_cap: float = 2.0
+
+    # A v6 development run is initialized from an immutable v3 checkpoint.
+    # The path is invocation provenance; the SHA-256 is the content identity.
+    # Training enforces that both are supplied for a fresh relational run.
+    warm_start_checkpoint: Optional[str] = None
+    warm_start_sha256: Optional[str] = None
+    # Numerical comparison tolerance for the hash-bound v3 multi-metric
+    # checkpoint floor.  This absorbs serialization/evaluation roundoff only;
+    # it is not a permitted empirical regression margin.
+    warm_start_metric_floor_tolerance: float = 1e-6
+    relation_only_epochs: int = 0
+
     # Proper ordinal objective and optional evidence budget regularizer.
     rps_weight: float = 0.25
     evidence_budget_weight: float = 0.0
@@ -119,6 +141,9 @@ class OriginConfig:
         self.class_weighting = self.class_weighting.lower()
         self.decision_rule = self.decision_rule.lower()
         self.atom_mode = self.atom_mode.lower()
+        self.relation_source_scale = str(self.relation_source_scale).lower()
+        if not self.relation_source_scale.startswith("s"):
+            self.relation_source_scale = f"s{self.relation_source_scale}"
         self.evidence_scales = tuple(
             str(value).lower()
             if str(value).lower().startswith("s")
@@ -250,6 +275,40 @@ class OriginConfig:
             raise ValueError("ORIGIN's structural decoder must run in FP64")
         if self.decision_rule not in {"posterior_median", "class_map", "rounded_expected"}:
             raise ValueError(f"unsupported decision_rule: {self.decision_rule!r}")
+        if self.relation_grid_size < 2:
+            raise ValueError("relation_grid_size must be at least 2")
+        if self.relation_dim <= 0 or self.relation_head_dim <= 0:
+            raise ValueError("relation dimensions must be positive")
+        if self.relation_head_dim > self.relation_dim:
+            raise ValueError("relation_head_dim must not exceed relation_dim")
+        if not math.isfinite(self.relation_delta_cap) or self.relation_delta_cap <= 0.0:
+            raise ValueError("relation_delta_cap must be finite and positive")
+        if self.relation_enabled and self.relation_source_scale not in self.evidence_scales:
+            raise ValueError(
+                "relation_source_scale must be one of the active evidence_scales"
+            )
+        if (self.warm_start_checkpoint is None) != (self.warm_start_sha256 is None):
+            raise ValueError(
+                "warm_start_checkpoint and warm_start_sha256 must be supplied together"
+            )
+        if self.warm_start_sha256 is not None:
+            checksum = self.warm_start_sha256.lower()
+            if len(checksum) != 64 or any(character not in "0123456789abcdef" for character in checksum):
+                raise ValueError("warm_start_sha256 must be a 64-character hexadecimal SHA-256")
+            self.warm_start_sha256 = checksum
+        if (
+            not math.isfinite(self.warm_start_metric_floor_tolerance)
+            or self.warm_start_metric_floor_tolerance < 0.0
+        ):
+            raise ValueError(
+                "warm_start_metric_floor_tolerance must be finite and non-negative"
+            )
+        if self.relation_only_epochs < 0:
+            raise ValueError("relation_only_epochs must be non-negative")
+        if self.relation_only_epochs > 0 and not self.relation_enabled:
+            raise ValueError("relation_only_epochs requires relation_enabled=True")
+        if self.relation_only_epochs > self.epochs:
+            raise ValueError("relation_only_epochs must not exceed epochs")
         if self.checkpoint_selection not in {"acc_then_qwk", "acc_qwk_score"}:
             raise ValueError(
                 f"unsupported checkpoint_selection: {self.checkpoint_selection!r}"

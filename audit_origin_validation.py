@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only, full-inner-validation structural audit for ORIGIN-v3.
+"""Read-only, full-inner-validation structural audit for ORIGIN.
 
 The audit encodes only the inner-validation images and never updates model
 parameters. All deletion interventions then replay the stored local rate
@@ -36,7 +36,11 @@ from Datasets.origin_data import (
     split_origin_items,
     split_paths_are_disjoint,
 )
-from models.origin import build_origin_model
+from models.origin import (
+    aggregate_ordinal_pair_messages,
+    bounded_rate_log_odds_merge,
+    build_origin_model,
+)
 from train_origin import split_signature
 from training.origin_trainer import (
     _architecture_record,
@@ -75,8 +79,13 @@ def _verify_provenance(
 ) -> str:
     """Fail closed if code, model, config, or complete split identity changed."""
 
-    if state.get("schema") != "origin-checkpoint-v3":
-        raise ValueError("full validation audit requires an ORIGIN-v3 checkpoint")
+    expected_schema = (
+        "origin-checkpoint-v6" if cfg.relation_enabled else "origin-checkpoint-v3"
+    )
+    if state.get("schema") != expected_schema:
+        raise ValueError(
+            f"full validation audit requires checkpoint schema {expected_schema!r}"
+        )
     if manifest.get("schema") != "origin-split-v2":
         raise ValueError("full validation audit requires an origin-split-v2 manifest")
     if manifest.get("evaluation_scope") != "inner_validation_only":
@@ -165,6 +174,39 @@ def _effect_summary(records: Sequence[Mapping[str, Any]], quantiles: Sequence[fl
         "mean_expected_grade_delta": float(np.mean(expected)),
         "expected_grade_delta_quantiles": _quantiles(expected, quantiles),
         "mean_removed_boundary_rates": removed.mean(axis=0).tolist(),
+        "mean_cumulative_probability_delta": cumulative.mean(axis=0).tolist(),
+    }
+
+
+def _relation_effect_summary(
+    records: Sequence[Mapping[str, Any]],
+    quantiles: Sequence[float],
+) -> dict[str, Any]:
+    if not records:
+        return {"n": 0}
+    expected = [float(item["expected_grade_delta"]) for item in records]
+    grade_delta = [
+        int(item["baseline_prediction"]) - int(item["replayed_prediction"])
+        for item in records
+    ]
+    cumulative = np.asarray(
+        [item["cumulative_probability_delta"] for item in records],
+        dtype=np.float64,
+    )
+    return {
+        "n": len(records),
+        "prediction_change_count": sum(value != 0 for value in grade_delta),
+        "prediction_change_rate": sum(value != 0 for value in grade_delta) / len(records),
+        "mean_prediction_grade_delta": float(np.mean(grade_delta)),
+        "mean_expected_grade_delta": float(np.mean(expected)),
+        "mean_absolute_expected_grade_delta": float(np.mean(np.abs(expected))),
+        "expected_grade_delta_quantiles": _quantiles(expected, quantiles),
+        "mean_removed_edge_message_l1": float(
+            np.mean([item["removed_edge_message_l1"] for item in records])
+        ),
+        "mean_removed_edge_message_signed_sum": float(
+            np.mean([item["removed_edge_message_signed_sum"] for item in records])
+        ),
         "mean_cumulative_probability_delta": cumulative.mean(axis=0).tolist(),
     }
 
@@ -275,17 +317,26 @@ def _replay_records(
     removed = getattr(intervention, "removed_rates")
     baseline_rates = _field(baseline, "total_rates")
     replayed_rates = _field(replayed, "total_rates")
+    baseline_source_rates = getattr(baseline, "base_total_rates", baseline_rates)
+    replayed_source_rates = getattr(replayed, "base_total_rates", replayed_rates)
     _assert_distribution(baseline)
     _assert_distribution(replayed)
     if not bool(torch.isfinite(removed).all()) or bool((removed < 0).any()):
         raise FloatingPointError("invalid removed ORIGIN rates")
-    error = float((baseline_rates - removed - replayed_rates).abs().max().cpu())
+    error = float(
+        (baseline_source_rates - removed - replayed_source_rates)
+        .abs()
+        .max()
+        .cpu()
+    )
     local_maps = _field(baseline, "local_rate_maps")
     ledger_dtype = next(iter(local_maps.values())).dtype
     rate_scale = max(
         1.0,
         float(baseline_rates.abs().max().cpu()),
         float(replayed_rates.abs().max().cpu()),
+        float(baseline_source_rates.abs().max().cpu()),
+        float(replayed_source_rates.abs().max().cpu()),
     )
     tolerance = max(2e-5, 16.0 * torch.finfo(ledger_dtype).eps * rate_scale)
     if not math.isfinite(error) or error > tolerance:
@@ -326,6 +377,105 @@ def _replay_records(
             }
         )
     return records, error
+
+
+def _relation_replay_records(
+    model: torch.nn.Module,
+    baseline: object,
+    removals: torch.Tensor,
+    labels: torch.Tensor,
+    sample_ids: torch.Tensor,
+    decision_rule: str,
+) -> tuple[list[dict[str, Any]], float, float, float, float]:
+    """Delete stored pair messages and audit exact same-circuit replay."""
+
+    replay = getattr(model, "replay_without_relations", None)
+    if not callable(replay):
+        raise TypeError("relation-enabled ORIGIN must expose replay_without_relations")
+    intervention = replay(baseline, removals, force_decoder_fp64=True)
+    replayed = getattr(intervention, "output", intervention)
+    _assert_distribution(baseline)
+    _assert_distribution(replayed)
+    base_source = _field(baseline, "base_total_rates")
+    replay_source = _field(replayed, "base_total_rates")
+    source_error = float((base_source - replay_source).abs().max().cpu())
+    if source_error != 0.0:
+        raise AssertionError("relation deletion changed the conserved unary ledger")
+    baseline_relation = _field(baseline, "relation_evidence")
+    replayed_relation = _field(replayed, "relation_evidence")
+    canonical = intervention.removal_mask.bool()
+    removed = intervention.removed_edge_messages
+    original_messages = baseline_relation.edge_messages
+    partition_error = float(
+        (original_messages - (replayed_relation.edge_messages + removed))
+        .abs()
+        .max()
+        .cpu()
+    )
+    if partition_error != 0.0:
+        raise AssertionError("relation replay did not exactly partition edge messages")
+    if not torch.equal(
+        removed,
+        torch.where(canonical, original_messages, torch.zeros_like(original_messages)),
+    ):
+        raise AssertionError("relation intervention removal mask is not replayable")
+    _, recomputed_incremental, recomputed_cumulative = aggregate_ordinal_pair_messages(
+        replayed_relation.edge_messages,
+        replayed_relation.edge_valid_mask,
+        replayed_relation.region_valid_mask,
+        delta_cap=replayed_relation.delta_cap,
+    )
+    reaggregation_error = max(
+        float(
+            (recomputed_incremental - replayed_relation.incremental_log_odds)
+            .abs()
+            .max()
+            .cpu()
+        ),
+        float(
+            (recomputed_cumulative - replayed_relation.cumulative_log_odds)
+            .abs()
+            .max()
+            .cpu()
+        ),
+    )
+    recomputed_rates = bounded_rate_log_odds_merge(
+        replay_source,
+        recomputed_cumulative,
+        total_rate_cap=float(getattr(replayed, "total_rate_cap")),
+    )
+    merge_error = float(
+        (recomputed_rates - _field(replayed, "total_rates")).abs().max().cpu()
+    )
+    if max(reaggregation_error, merge_error) > 2e-10:
+        raise AssertionError("relation replay does not reproduce its aggregation and merge")
+
+    base_prediction = _decision(baseline, decision_rule).detach().cpu()
+    new_prediction = _decision(replayed, decision_rule).detach().cpu()
+    base_expected = _field(baseline, "expected_grade").detach().cpu()
+    new_expected = _field(replayed, "expected_grade").detach().cpu()
+    base_cumulative = _field(baseline, "cumulative_probs").detach().cpu()
+    new_cumulative = _field(replayed, "cumulative_probs").detach().cpu()
+    expected_delta = base_expected - new_expected
+    cumulative_delta = base_cumulative - new_cumulative
+    if float((expected_delta - cumulative_delta.sum(-1)).abs().max()) > 2e-10:
+        raise AssertionError("relation deletion expected-grade identity failed")
+    removed_cpu = removed.detach().cpu()
+    records = []
+    for row in range(len(labels)):
+        records.append(
+            {
+                "sample_id": int(sample_ids[row]),
+                "label": int(labels[row]),
+                "baseline_prediction": int(base_prediction[row]),
+                "replayed_prediction": int(new_prediction[row]),
+                "expected_grade_delta": float(expected_delta[row]),
+                "removed_edge_message_l1": float(removed_cpu[row].abs().sum()),
+                "removed_edge_message_signed_sum": float(removed_cpu[row].sum()),
+                "cumulative_probability_delta": cumulative_delta[row].tolist(),
+            }
+        )
+    return records, source_error, partition_error, reaggregation_error, merge_error
 
 
 def _topk_masks(
@@ -394,6 +544,7 @@ def audit_origin_validation(
     expected_all: list[torch.Tensor] = []
     sample_ids_all: list[torch.Tensor] = []
     rates_all: list[torch.Tensor] = []
+    base_rates_all: list[torch.Tensor] = []
     prior_rates_all: list[torch.Tensor] = []
     local_boundary0_all: list[torch.Tensor] = []
     prior_only_grade0_probabilities: list[torch.Tensor] = []
@@ -415,6 +566,18 @@ def audit_origin_validation(
     grade0_log_identity_error = 0.0
     boundary0_fp64_reconstruction_error = 0.0
     boundary0_fp32_reduction_difference = 0.0
+    relation_presence: bool | None = None
+    relation_cumulative_all: list[torch.Tensor] = []
+    relation_incremental_all: list[torch.Tensor] = []
+    relation_edge_abs_sums: list[torch.Tensor] = []
+    relation_valid_edge_counts: list[torch.Tensor] = []
+    relation_all_edge_effects: list[dict[str, Any]] = []
+    relation_top_edge_effects: list[dict[str, Any]] = []
+    relation_replay_source_error = 0.0
+    relation_replay_partition_error = 0.0
+    relation_reaggregation_error = 0.0
+    relation_merge_error = 0.0
+    relation_all_removed_to_base_error = 0.0
 
     with torch.inference_mode():
         for batch in validation_loader:
@@ -446,6 +609,9 @@ def audit_origin_validation(
             elif list(rate_maps) != scale_names:
                 raise ValueError("evidence scale ordering changed between batches")
             total_rates = _field(output, "total_rates")
+            base_total_rates = getattr(output, "base_total_rates", total_rates)
+            if not torch.is_tensor(base_total_rates):
+                raise TypeError("base_total_rates must be a tensor")
             prior_rates = _field(output, "prior_rates")
             num_boundaries = total_rates.shape[1]
             for scale, rates in rate_maps.items():
@@ -476,12 +642,15 @@ def audit_origin_validation(
                 [rate_maps[name].sum(dim=(1, 2))[:, 0] for name in scale_names],
                 dim=1,
             ).sum(1)
-            conserved_local_boundary0 = (
+            conserved_unary_boundary0 = (
+                base_total_rates[:, 0] - prior_rates[:, 0].to(base_total_rates.dtype)
+            )
+            effective_local_boundary0 = (
                 total_rates[:, 0] - prior_rates[:, 0].to(total_rates.dtype)
             )
             fp64_reconstruction_error = float((
-                conserved_local_boundary0
-                - summed_local_boundary0.to(total_rates.dtype)
+                conserved_unary_boundary0
+                - summed_local_boundary0.to(base_total_rates.dtype)
             ).abs().max())
             fp64_identity_tolerance = max(
                 2e-10,
@@ -495,8 +664,8 @@ def audit_origin_validation(
             if fp64_reconstruction_error > fp64_identity_tolerance:
                 raise AssertionError("FP64 boundary-0 ledger conservation failed")
             fp32_reduction_difference = float((
-                conserved_local_boundary0
-                - fp32_summed_local_boundary0.to(total_rates.dtype)
+                conserved_unary_boundary0
+                - fp32_summed_local_boundary0.to(base_total_rates.dtype)
             ).abs().max())
             boundary0_fp32_reduction_difference = max(
                 boundary0_fp32_reduction_difference, fp32_reduction_difference
@@ -528,6 +697,154 @@ def audit_origin_validation(
                 scale_sums[scale] = scale_sums.get(
                     scale, torch.zeros(num_boundaries, dtype=torch.float64)
                 ) + detached_scale[index].double()
+
+            relation = getattr(output, "relation_evidence", None)
+            has_relation = relation is not None
+            if relation_presence is None:
+                relation_presence = has_relation
+            elif relation_presence != has_relation:
+                raise AssertionError("relation evidence presence changed between batches")
+            if relation is not None:
+                if relation.edge_messages.shape[:2] != (len(labels), num_boundaries):
+                    raise ValueError("relation edge-message boundary shape is invalid")
+                if relation.edge_valid_mask.shape != (
+                    len(labels),
+                    relation.edge_messages.shape[-2],
+                    relation.edge_messages.shape[-1],
+                ):
+                    raise ValueError("relation edge-valid mask shape is invalid")
+                if not bool(torch.isfinite(relation.edge_messages).all()):
+                    raise FloatingPointError("relation edge messages are non-finite")
+                invalid_messages = relation.edge_messages.masked_select(
+                    ~relation.edge_valid_mask[:, None]
+                )
+                if invalid_messages.numel() and bool((invalid_messages != 0).any()):
+                    raise AssertionError("invalid relation edges carry a message")
+                relation_cumulative_all.append(
+                    relation.cumulative_log_odds.detach().cpu()
+                )
+                relation_incremental_all.append(
+                    relation.incremental_log_odds.detach().cpu()
+                )
+                relation_edge_abs_sums.append(
+                    relation.edge_messages.detach().abs().sum(dim=(1, 2, 3)).cpu()
+                )
+                relation_valid_edge_counts.append(
+                    relation.edge_valid_mask.detach().sum(dim=(1, 2)).cpu()
+                )
+
+                (
+                    all_edge_records,
+                    source_error,
+                    partition_error,
+                    reaggregation_error,
+                    merge_error,
+                ) = (
+                    _relation_replay_records(
+                        model,
+                        output,
+                        relation.edge_valid_mask,
+                        labels_cpu,
+                        sample_ids,
+                        decision_rule,
+                    )
+                )
+                relation_all_edge_effects.extend(all_edge_records)
+                relation_replay_source_error = max(
+                    relation_replay_source_error, source_error
+                )
+                relation_replay_partition_error = max(
+                    relation_replay_partition_error, partition_error
+                )
+                relation_reaggregation_error = max(
+                    relation_reaggregation_error, reaggregation_error
+                )
+                relation_merge_error = max(relation_merge_error, merge_error)
+                all_removed = model.replay_without_relations(
+                    output,
+                    relation.edge_valid_mask,
+                    force_decoder_fp64=True,
+                ).output
+                relation_all_removed_to_base_error = max(
+                    relation_all_removed_to_base_error,
+                    float(
+                        (
+                            _field(all_removed, "total_rates")
+                            - base_total_rates
+                        )
+                        .abs()
+                        .max()
+                        .cpu()
+                    ),
+                )
+
+                ranked = relation.edge_messages.abs().masked_fill(
+                    ~relation.edge_valid_mask[:, None], -torch.inf
+                ).flatten(1)
+                if bool((torch.isfinite(ranked).sum(1) == 0).any()):
+                    raise AssertionError("sample has no valid regional relation edge")
+                selected = ranked.argmax(1)
+                edge_mask = torch.zeros_like(
+                    relation.edge_messages, dtype=torch.bool
+                ).flatten(1)
+                edge_mask.scatter_(1, selected[:, None], True)
+                edge_mask = edge_mask.reshape_as(relation.edge_messages)
+                (
+                    top_records,
+                    source_error,
+                    partition_error,
+                    reaggregation_error,
+                    merge_error,
+                ) = (
+                    _relation_replay_records(
+                        model,
+                        output,
+                        edge_mask,
+                        labels_cpu,
+                        sample_ids,
+                        decision_rule,
+                    )
+                )
+                relation_replay_source_error = max(
+                    relation_replay_source_error, source_error
+                )
+                relation_replay_partition_error = max(
+                    relation_replay_partition_error, partition_error
+                )
+                relation_reaggregation_error = max(
+                    relation_reaggregation_error, reaggregation_error
+                )
+                relation_merge_error = max(relation_merge_error, merge_error)
+                regions = relation.edge_messages.shape[-1]
+                centers = relation.region_centers_yx.detach().cpu()
+                flat_message = relation.edge_messages.detach().cpu().flatten(1)
+                for row, record in enumerate(top_records):
+                    flat_index = int(selected[row])
+                    boundary = flat_index // (regions * regions)
+                    endpoints = flat_index % (regions * regions)
+                    target = endpoints // regions
+                    source = endpoints % regions
+                    record.update(
+                        {
+                            "selection": "largest_absolute_stored_pair_message",
+                            "boundary": boundary,
+                            "target_region": target,
+                            "source_region": source,
+                            "target_center_yx": centers[target].tolist(),
+                            "source_center_yx": centers[source].tolist(),
+                            "signed_pair_message": float(flat_message[row, flat_index]),
+                            "region_receptive_field_pixels": int(
+                                relation.region_receptive_field
+                            ),
+                            "region_output_stride_pixels": int(
+                                relation.region_output_stride
+                            ),
+                        }
+                    )
+                    index = int(record["sample_id"])
+                    if validation_items is not None and 0 <= index < len(validation_items):
+                        record["image_id"] = Path(validation_items[index][0]).name
+                    relation_top_edge_effects.append(record)
 
             # Highest all-boundary single-cell certificate for every sample.
             score_parts = []
@@ -661,6 +978,18 @@ def audit_origin_validation(
             prior_only = model.replay_without(
                 output, all_local_removals, force_decoder_fp64=True
             ).output
+            relation_trace = getattr(prior_only, "relation_evidence", None)
+            if relation_trace is not None:
+                replay_relations = getattr(model, "replay_without_relations", None)
+                if not callable(replay_relations):
+                    raise TypeError(
+                        "relation-enabled ORIGIN must expose replay_without_relations"
+                    )
+                prior_only = replay_relations(
+                    prior_only,
+                    relation_trace.edge_valid_mask,
+                    force_decoder_fp64=True,
+                ).output
             prior_only_p0 = _field(prior_only, "class_probs")[:, 0].double()
             full_log_p0 = _field(output, "log_class_probs")[:, 0].double()
             prior_only_log_p0 = _field(prior_only, "log_class_probs")[:, 0].double()
@@ -691,7 +1020,7 @@ def audit_origin_validation(
                 float((
                     full_log_p0
                     - prior_only_log_p0
-                    + conserved_local_boundary0.double()
+                    + effective_local_boundary0.double()
                 ).abs().max().cpu()),
             )
             grade0_log_identity_error = max(
@@ -729,6 +1058,7 @@ def audit_origin_validation(
                     }
                     prior_value = float(prior_rates[row, boundary].cpu())
                     local_value = sum(scale_decomposition.values())
+                    base_rate_value = float(base_total_rates[row, boundary].cpu())
                     argmax[boundary] = {
                         "rate": float(value),
                         "sample_id": index,
@@ -749,8 +1079,10 @@ def audit_origin_validation(
                         "prior_boundary_rate": prior_value,
                         "summed_local_boundary_rate": local_value,
                         "rate_reconstruction_error": abs(
-                            float(value) - prior_value - local_value
+                            base_rate_value - prior_value - local_value
                         ),
+                        "base_pre_relation_rate": base_rate_value,
+                        "relation_rate_delta": float(value) - base_rate_value,
                         "rate_cap_fraction": float(
                             value / float(getattr(output, "total_rate_cap", 64.0))
                         ),
@@ -763,8 +1095,9 @@ def audit_origin_validation(
             expected_all.append(expected_cpu)
             sample_ids_all.append(sample_ids.cpu())
             rates_all.append(total_cpu)
+            base_rates_all.append(base_total_rates.detach().cpu())
             prior_rates_all.append(prior_rates.detach().cpu())
-            local_boundary0_all.append(conserved_local_boundary0.detach().cpu())
+            local_boundary0_all.append(effective_local_boundary0.detach().cpu())
 
     if scale_names is None:
         raise ValueError("validation loader is empty")
@@ -777,6 +1110,7 @@ def audit_origin_validation(
     expected = torch.cat(expected_all)
     sample_ids = torch.cat(sample_ids_all)
     total_rates = torch.cat(rates_all).double()
+    base_total_rates = torch.cat(base_rates_all).double()
     prior_rates = torch.cat(prior_rates_all).double()
     local_boundary0 = torch.cat(local_boundary0_all).double()
     prior_only_p0 = torch.cat(prior_only_grade0_probabilities).double()
@@ -891,10 +1225,17 @@ def audit_origin_validation(
         }
 
     grade0_boundary0 = {
-        "identity": "total_boundary0_rate = prior_boundary0_rate + summed_local_boundary0_evidence",
+        "identity": (
+            "base_pre_relation_boundary0_rate = prior_boundary0_rate + "
+            "summed_unary_local_boundary0_evidence"
+            if relation_presence
+            else "total_boundary0_rate = prior_boundary0_rate + "
+            "summed_local_boundary0_evidence"
+        ),
         "prior_only_identity": "P(Y=0 | all local rates deleted) = exp(-prior_boundary0_rate)",
         "local_factorization_identity": (
-            "P_full(Y=0) / P_prior_only(Y=0) = exp(-summed_local_boundary0_evidence)"
+            "P_full(Y=0) / P_prior_only(Y=0) = "
+            "exp(-(final_boundary0_rate-prior_boundary0_rate))"
         ),
         "max_prior_only_identity_error": prior_only_identity_error,
         "max_log_space_local_factorization_identity_error": (
@@ -960,8 +1301,78 @@ def audit_origin_validation(
         },
     }
 
+    relation_diagnostics: dict[str, Any] | None = None
+    relation_certificates: list[dict[str, Any]] = []
+    if relation_presence:
+        relation_cumulative = torch.cat(relation_cumulative_all).double()
+        relation_incremental = torch.cat(relation_incremental_all).double()
+        relation_edge_l1 = torch.cat(relation_edge_abs_sums).double()
+        relation_edge_counts = torch.cat(relation_valid_edge_counts).long()
+        if relation_all_removed_to_base_error > 2e-10:
+            raise AssertionError(
+                "removing every regional relation did not recover the v3 base rates"
+            )
+        for grade in range(num_classes):
+            members = [
+                item
+                for item in relation_top_edge_effects
+                if int(item["label"]) == grade
+            ]
+            members.sort(
+                key=lambda item: hashlib.sha256(
+                    f"{split_signature}:relation:{grade}:{item['sample_id']}".encode()
+                ).hexdigest()
+            )
+            relation_certificates.extend(members[:certificates_per_grade])
+        relation_diagnostics = {
+            "contract": "stored_pair_messages_to_cumulative_transition_rate_log_odds",
+            "cumulative_log_odds_bound": float(
+                getattr(
+                    getattr(getattr(model, "generator", None), "relation_field", None),
+                    "delta_cap",
+                    0.0,
+                )
+            ),
+            "cumulative_log_odds_quantiles_by_boundary": {
+                str(boundary): _quantiles(
+                    relation_cumulative[:, boundary].tolist(), quantiles
+                )
+                for boundary in range(num_boundaries)
+            },
+            "incremental_log_odds_quantiles_by_atom": {
+                str(boundary): _quantiles(
+                    relation_incremental[:, boundary].tolist(), quantiles
+                )
+                for boundary in range(num_boundaries)
+            },
+            "edge_message_l1_per_image_quantiles": _quantiles(
+                relation_edge_l1.tolist(), quantiles
+            ),
+            "valid_directed_edge_count_quantiles": _quantiles(
+                relation_edge_counts.tolist(), quantiles
+            ),
+            "all_edge_deletion_effects": _relation_effect_summary(
+                relation_all_edge_effects, quantiles
+            ),
+            "largest_absolute_edge_deletion_effects": _relation_effect_summary(
+                relation_top_edge_effects, quantiles
+            ),
+            "max_exact_source_ledger_invariance_error": relation_replay_source_error,
+            "max_exact_edge_partition_error": relation_replay_partition_error,
+            "max_exact_relation_reaggregation_error": relation_reaggregation_error,
+            "max_exact_relation_merge_error": relation_merge_error,
+            "max_all_edges_removed_to_base_rate_error": (
+                relation_all_removed_to_base_error
+            ),
+            "grade_stratified_relation_certificates": relation_certificates,
+        }
+
     return {
-        "schema": "origin-full-validation-audit-v2",
+        "schema": (
+            "origin-full-validation-audit-v6"
+            if relation_presence
+            else "origin-full-validation-audit-v2"
+        ),
         "scope": "inner_validation_only",
         "n": len(labels),
         "decision_rule": decision_rule,
@@ -1043,7 +1454,12 @@ def audit_origin_validation(
             "certificate sampling is independent_of_intervention_effect_size"
         ),
         "max_exact_total_rate_replay_error": replay_error,
-        "interpretation_scope": "exact_stored_ledger_deletion_not_causal_pixel_masking",
+        "relation_interaction_diagnostics": relation_diagnostics,
+        "interpretation_scope": (
+            "exact_stored_unary_and_pair_ledger_deletion_not_causal_pixel_masking"
+            if relation_presence
+            else "exact_stored_ledger_deletion_not_causal_pixel_masking"
+        ),
         "validation_sample_ids": sample_ids.tolist(),
     }
 
@@ -1128,8 +1544,8 @@ def main() -> None:
         completed_result = json.load(stream)
     checkpoint_hash_before = _sha256_file(checkpoint_path)
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if state.get("schema") != "origin-checkpoint-v3":
-        raise ValueError("full validation audit requires an ORIGIN-v3 checkpoint")
+    if state.get("schema") not in {"origin-checkpoint-v3", "origin-checkpoint-v6"}:
+        raise ValueError("full validation audit requires an ORIGIN checkpoint")
     config_values = dict(state["config"])
     allowed = {field.name for field in fields(OriginConfig)}
     cfg = OriginConfig(**{key: value for key, value in config_values.items() if key in allowed})
@@ -1200,6 +1616,12 @@ def main() -> None:
         evidence_dropout=cfg.evidence_dropout,
         mask_valid_fraction=cfg.mask_valid_fraction,
         grad_checkpoint=False,
+        relation_enabled=cfg.relation_enabled,
+        relation_source_scale=cfg.relation_source_scale,
+        relation_grid_size=cfg.relation_grid_size,
+        relation_dim=cfg.relation_dim,
+        relation_head_dim=cfg.relation_head_dim,
+        relation_delta_cap=cfg.relation_delta_cap,
     )
     signature = _verify_provenance(
         state,
@@ -1218,6 +1640,48 @@ def main() -> None:
     implementation_signature = str(state["implementation_signature"])
     checkpoint_config_signature = str(state["config_signature"])
     checkpoint_metrics = dict(state.get("metrics", {}))
+    warm_start_provenance = state.get("warm_start_provenance")
+    warm_start_metric_safety_floor = state.get("warm_start_metric_safety_floor")
+    selected_metric_safety_floor_evaluation = state.get(
+        "candidate_metric_safety_floor_evaluation"
+    )
+    selected_training_phase = state.get("training_phase")
+    if cfg.relation_enabled:
+        if not isinstance(warm_start_provenance, Mapping):
+            raise ValueError("v6 checkpoint omits hash-bound v3 provenance")
+        if not isinstance(warm_start_metric_safety_floor, Mapping):
+            raise ValueError("v6 checkpoint omits its v3 multi-metric safety floor")
+        if not isinstance(selected_metric_safety_floor_evaluation, Mapping):
+            raise ValueError("v6 checkpoint omits selected safety-floor eligibility")
+        if not bool(
+            selected_metric_safety_floor_evaluation.get("checkpoint_eligible", False)
+        ):
+            raise ValueError("selected v6 checkpoint was not safety-floor eligible")
+        expected_phase = (
+            "hash_bound_v3_floor"
+            if checkpoint_epoch == 0
+            else (
+                "relation_only"
+                if checkpoint_epoch <= cfg.relation_only_epochs
+                else "joint"
+            )
+        )
+        if selected_training_phase != expected_phase:
+            raise ValueError(
+                "selected v6 checkpoint training phase is inconsistent with its epoch"
+            )
+        if completed_result.get("warm_start_metric_safety_floor") != dict(
+            warm_start_metric_safety_floor
+        ):
+            raise ValueError(
+                "completed result safety-floor thresholds differ from checkpoint"
+            )
+        if completed_result.get(
+            "selected_checkpoint_metric_safety_floor_evaluation"
+        ) != dict(selected_metric_safety_floor_evaluation):
+            raise ValueError(
+                "completed result selected safety-floor evaluation differs from checkpoint"
+            )
     del state
     gc.collect()
     device = torch.device("cuda")
@@ -1240,6 +1704,12 @@ def main() -> None:
             "architecture_signature": architecture_signature,
             "implementation_signature": implementation_signature,
             "checkpoint_config_signature": checkpoint_config_signature,
+            "warm_start_provenance": warm_start_provenance,
+            "warm_start_metric_safety_floor": warm_start_metric_safety_floor,
+            "selected_checkpoint_metric_safety_floor_evaluation": (
+                selected_metric_safety_floor_evaluation
+            ),
+            "selected_checkpoint_training_phase": selected_training_phase,
             "audit_implementation_sha256": _sha256_file(Path(__file__).resolve()),
             "audit_settings": {
                 "batch_size": args.batch_size,

@@ -344,6 +344,38 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("posterior_median", "class_map", "rounded_expected"),
         default="class_map",
     )
+    relation = parser.add_argument_group("ORIGIN-v6 relational transition ledger")
+    relation.add_argument("--relation_enabled", action="store_true")
+    relation.add_argument("--relation_source_scale", default="s8")
+    relation.add_argument("--relation_grid_size", type=int, default=10)
+    relation.add_argument("--relation_dim", type=int, default=64)
+    relation.add_argument("--relation_head_dim", type=int, default=16)
+    relation.add_argument("--relation_delta_cap", type=float, default=2.0)
+    relation.add_argument(
+        "--warm_start_checkpoint",
+        default=None,
+        help="immutable ORIGIN-v3 checkpoint used to initialize a v6 run",
+    )
+    relation.add_argument(
+        "--warm_start_sha256",
+        default=None,
+        help="required expected SHA-256 of --warm_start_checkpoint",
+    )
+    relation.add_argument(
+        "--warm_start_metric_floor_tolerance",
+        type=float,
+        default=1e-6,
+        help=(
+            "absolute numerical tolerance for the v3 QWK/balanced-accuracy/"
+            "macro-F1/MAE checkpoint safety floor"
+        ),
+    )
+    relation.add_argument(
+        "--relation_only_epochs",
+        type=int,
+        default=0,
+        help="train only the zero-initialized relation field for these first epochs",
+    )
 
     loss = parser.add_argument_group("loss")
     loss.add_argument("--rps_weight", type=float, default=0.25)
@@ -467,6 +499,16 @@ def main() -> None:
         evidence_dropout=args.evidence_dropout,
         force_decoder_fp64=True,
         decision_rule=args.decision_rule,
+        relation_enabled=args.relation_enabled,
+        relation_source_scale=args.relation_source_scale,
+        relation_grid_size=args.relation_grid_size,
+        relation_dim=args.relation_dim,
+        relation_head_dim=args.relation_head_dim,
+        relation_delta_cap=args.relation_delta_cap,
+        warm_start_checkpoint=args.warm_start_checkpoint,
+        warm_start_sha256=args.warm_start_sha256,
+        warm_start_metric_floor_tolerance=args.warm_start_metric_floor_tolerance,
+        relation_only_epochs=args.relation_only_epochs,
         rps_weight=args.rps_weight,
         evidence_budget_weight=args.evidence_budget_weight,
         evidence_budget_delay_epochs=args.evidence_budget_delay_epochs,
@@ -506,6 +548,13 @@ def main() -> None:
             "class weighting changes the likelihood target; add "
             "--allow_weighted_likelihood to acknowledge this explicitly"
         )
+    if cfg.relation_enabled and not cfg.resume and cfg.warm_start_checkpoint is None:
+        raise ValueError(
+            "a fresh ORIGIN-v6 relational run requires --warm_start_checkpoint "
+            "and --warm_start_sha256; random initialization is not the controlled protocol"
+        )
+    if not cfg.relation_enabled and cfg.warm_start_checkpoint is not None:
+        raise ValueError("--warm_start_checkpoint requires --relation_enabled")
 
     log = setup_logging(cfg.run_dir)
     set_seed(cfg.seed)
@@ -595,7 +644,11 @@ def main() -> None:
             encoder_name=cfg.encoder,
             # A resume immediately restores the complete encoder state, so it
             # must not depend on an external torchvision weight download/cache.
-            pretrained=cfg.pretrained and not cfg.resume,
+            pretrained=(
+                cfg.pretrained
+                and not cfg.resume
+                and cfg.warm_start_checkpoint is None
+            ),
             evidence_scales=cfg.evidence_scales,
             projection_dim=cfg.projection_dim,
             reference_count=cfg.reference_count,
@@ -611,6 +664,12 @@ def main() -> None:
             evidence_dropout=cfg.evidence_dropout,
             mask_valid_fraction=cfg.mask_valid_fraction,
             grad_checkpoint=cfg.grad_checkpoint,
+            relation_enabled=cfg.relation_enabled,
+            relation_source_scale=cfg.relation_source_scale,
+            relation_grid_size=cfg.relation_grid_size,
+            relation_dim=cfg.relation_dim,
+            relation_head_dim=cfg.relation_head_dim,
+            relation_delta_cap=cfg.relation_delta_cap,
         )
         trainer = OriginTrainer(
             model,
