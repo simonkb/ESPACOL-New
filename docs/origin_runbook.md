@@ -336,6 +336,9 @@ strict v3 state migration is an exact function identity at epoch 0. The
 source file SHA-256, internal checkpoint schema, architecture/configuration
 signatures, fold, split signature, state shapes, and state-key partition are
 validated. Only `generator.relation_field.*` may be absent from the v3 source.
+The bounded-v3 checkpoints predate the later explicit dependency-policy field;
+their native four-scale contract is accepted only under the registered bounded-v3
+implementation signature and the exact historical architecture metadata shape.
 Epoch 0 is evaluated and remains eligible as the best checkpoint, so this
 pilot has a hash-bound, verified-content baseline floor. SHA-256 binds the
 experiment to exact checkpoint bytes; it does not establish checkpoint

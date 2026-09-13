@@ -67,6 +67,37 @@ _RUNTIME_CONFIG_FIELDS = {
 }
 
 _RELATION_PARAMETER_PREFIX = "generator.relation_field."
+_LEGACY_BOUNDED_V3_IMPLEMENTATION_SIGNATURES = frozenset(
+    {
+        # ec1dd1c: the exact implementation used by both bounded-v3 fold-0
+        # checkpoints. Later audit/script-only commits retain this signature
+        # because those files are outside the training implementation manifest.
+        "0d9734495c4aeccb2a0038f2b9672f88c445a13b276d7d1073cae1cc0c86909b",
+    }
+)
+_LEGACY_BOUNDED_V3_DECLARED_KEYS = frozenset(
+    {
+        "name",
+        "encoder",
+        "num_classes",
+        "evidence_scales",
+        "atom_mode",
+        "reference_count",
+        "rate_parameterization",
+        "total_rate_cap",
+        "prior_rate_cap",
+        "boundary_scale_cap",
+        "atom_mass_cap",
+        "rate_roundoff_margin",
+        "decoder",
+        "available_decisions",
+        "model_default_decision",
+        "run_decision_owned_by_trainer_config",
+        "local_rate_layout",
+        "no_classifier_bypass",
+        "intervention",
+    }
+)
 _V3_WARMSTART_MODEL_FIELDS = (
     "dataset",
     "n_classes",
@@ -244,6 +275,12 @@ def load_origin_v3_relation_warm_start(
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if not isinstance(state, Mapping) or state.get("schema") != "origin-checkpoint-v3":
         raise ValueError("v6 warm start requires an origin-checkpoint-v3 source")
+    implementation_signature = str(state.get("implementation_signature", "")).lower()
+    if len(implementation_signature) != 64 or any(
+        character not in "0123456789abcdef"
+        for character in implementation_signature
+    ):
+        raise ValueError("ORIGIN-v3 source implementation signature is malformed")
     if int(state.get("fold", -1)) != int(fold):
         raise ValueError("ORIGIN-v3 warm-start fold mismatch")
     if split_signature is not None and state.get("split_signature") != split_signature:
@@ -254,6 +291,16 @@ def load_origin_v3_relation_warm_start(
         raise ValueError("ORIGIN-v3 warm-start checkpoint has no architecture record")
     if state.get("architecture_signature") != _canonical_sha256(architecture):
         raise ValueError("ORIGIN-v3 warm-start architecture signature is invalid")
+    required_outer_architecture = {
+        "no_classifier_bypass": True,
+        "posterior_path": "conserved_local_rates_to_pure_birth_matrix_exponential",
+    }
+    for name, expected in required_outer_architecture.items():
+        if architecture.get(name) != expected:
+            raise ValueError(
+                "warm-start source has an incompatible architecture record: "
+                f"{name}={architecture.get(name)!r}, expected {expected!r}"
+            )
     declared = architecture.get("declared")
     if not isinstance(declared, Mapping):
         raise ValueError("ORIGIN-v3 warm-start architecture declaration is missing")
@@ -262,7 +309,17 @@ def load_origin_v3_relation_warm_start(
         "encoder": "convnext_tiny",
         "evidence_scales": ["s4", "s8", "s16", "s32"],
         "atom_mode": "cumulative",
-        "evidence_dependency_policy": "native_convnext_stage_receptive_fields",
+        "rate_parameterization": "bounded_null_simplex_v1",
+        "decoder": "fp64_taylor24_scaled_squared_pure_birth_exponential",
+        "available_decisions": [
+            "posterior_median",
+            "class_map",
+            "rounded_expected",
+        ],
+        "model_default_decision": "class_map",
+        "run_decision_owned_by_trainer_config": True,
+        "local_rate_layout": "NHW(K-1)",
+        "intervention": "stored_local_rate_subtraction_without_renormalization",
         "no_classifier_bypass": True,
     }
     for name, expected in required_v3_declaration.items():
@@ -271,6 +328,44 @@ def load_origin_v3_relation_warm_start(
                 f"warm-start source is not the audited v3 baseline: {name}="
                 f"{declared.get(name)!r}, expected {expected!r}"
             )
+    # The bounded v3 checkpoints were produced before the later SRFF work
+    # introduced an explicit dependency-policy declaration.  Accept that
+    # historically exact metadata shape, but do not treat an arbitrarily
+    # deleted policy field from a newer checkpoint as legacy.  Encoder name,
+    # all four native scales, bounded rate parameterization, decoder identity,
+    # full config signatures, and the exact state-key subset remain mandatory.
+    dependency_policy = declared.get("evidence_dependency_policy")
+    if "evidence_dependency_policy" in declared:
+        if dependency_policy != "native_convnext_stage_receptive_fields":
+            raise ValueError(
+                "warm-start source is not the audited v3 baseline: "
+                f"evidence_dependency_policy={dependency_policy!r}, expected "
+                "'native_convnext_stage_receptive_fields'"
+            )
+        dependency_policy_provenance = "explicit_native_policy"
+    else:
+        observed_declared_keys = frozenset(str(name) for name in declared)
+        if observed_declared_keys != _LEGACY_BOUNDED_V3_DECLARED_KEYS:
+            missing_declared_keys = sorted(
+                _LEGACY_BOUNDED_V3_DECLARED_KEYS - observed_declared_keys
+            )
+            unexpected_declared_keys = sorted(
+                observed_declared_keys - _LEGACY_BOUNDED_V3_DECLARED_KEYS
+            )
+            raise ValueError(
+                "warm-start source omits evidence_dependency_policy but does not "
+                "match the exact historical bounded-v3 declared-key set: "
+                f"missing={missing_declared_keys}, unexpected={unexpected_declared_keys}"
+            )
+        if implementation_signature not in _LEGACY_BOUNDED_V3_IMPLEMENTATION_SIGNATURES:
+            raise ValueError(
+                "warm-start source omits evidence_dependency_policy but its "
+                "implementation signature is not a registered bounded-v3 legacy "
+                f"signature: {implementation_signature}"
+            )
+        dependency_policy_provenance = (
+            "legacy_v3_registered_implementation_and_exact_metadata_contract"
+        )
     # Current ORIGIN metadata records the disabled optional field explicitly as
     # ``relation_contract=None``.  Old v3 checkpoints may omit it entirely.
     # Either representation is a valid non-relational source; only a populated
@@ -341,11 +436,6 @@ def load_origin_v3_relation_warm_start(
     if sorted(incompatibility.missing_keys) != expected_missing or incompatibility.unexpected_keys:
         raise AssertionError("PyTorch state migration disagrees with the audited key partition")
 
-    implementation_signature = str(state.get("implementation_signature", ""))
-    if len(implementation_signature) != 64 or any(
-        character not in "0123456789abcdef" for character in implementation_signature.lower()
-    ):
-        raise ValueError("ORIGIN-v3 source implementation signature is malformed")
     return {
         "schema": "origin-v3-to-v6-verified-content-warm-start-v1",
         "source_checkpoint": str(checkpoint_path),
@@ -357,6 +447,7 @@ def load_origin_v3_relation_warm_start(
         "source_implementation_signature": implementation_signature,
         "source_architecture_signature": str(state["architecture_signature"]),
         "source_config_signature": str(state["config_signature"]),
+        "source_dependency_policy_provenance": dependency_policy_provenance,
         "source_metrics": dict(state.get("metrics", {})),
         "loaded_key_count": len(source_model_state),
         "initialized_relation_keys": expected_missing,

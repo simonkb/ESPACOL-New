@@ -216,6 +216,104 @@ def test_v3_to_v6_migration_accepts_only_the_exact_relation_subset(tmp_path) -> 
         assert torch.equal(target.state_dict()[name], value)
 
 
+def test_v3_to_v6_migration_accepts_the_real_legacy_v3_metadata_shape(
+    tmp_path,
+) -> None:
+    _, _, source_cfg, source_payload = _write_v3_checkpoint(tmp_path)
+    payload = copy.deepcopy(source_payload)
+    declared = payload["architecture"]["declared"]
+    for name in (
+        "encoder_spatial_contract",
+        "evidence_dependency_policy",
+        "srff_window_cells",
+        "sealed_source_masking",
+        "max_evidence_receptive_field",
+        "relation_enabled",
+        "relation_contract",
+        "relation_intervention",
+    ):
+        declared.pop(name, None)
+    payload["implementation_signature"] = (
+        "0d9734495c4aeccb2a0038f2b9672f88c445a13b276d7d1073cae1cc0c86909b"
+    )
+    payload["architecture_signature"] = trainer_module._canonical_sha256(
+        payload["architecture"]
+    )
+    checkpoint = tmp_path / "legacy_bounded_v3.pth"
+    torch.save(payload, checkpoint)
+    checksum = trainer_module._file_sha256(checkpoint)
+    cfg = _target_config(source_cfg, checkpoint, checksum, tmp_path / "target")
+
+    provenance = trainer_module.load_origin_v3_relation_warm_start(
+        _model(relation_enabled=True),
+        cfg,
+        fold=0,
+        split_signature="split-v1",
+    )
+
+    assert provenance is not None
+    assert provenance["source_dependency_policy_provenance"] == (
+        "legacy_v3_registered_implementation_and_exact_metadata_contract"
+    )
+
+
+def test_v3_to_v6_migration_rejects_ambiguous_missing_dependency_policy(
+    tmp_path,
+) -> None:
+    _, _, source_cfg, source_payload = _write_v3_checkpoint(tmp_path)
+    payload = copy.deepcopy(source_payload)
+    del payload["architecture"]["declared"]["evidence_dependency_policy"]
+    payload["architecture_signature"] = trainer_module._canonical_sha256(
+        payload["architecture"]
+    )
+    checkpoint = tmp_path / "ambiguous_policy_v3.pth"
+    torch.save(payload, checkpoint)
+    checksum = trainer_module._file_sha256(checkpoint)
+    cfg = _target_config(source_cfg, checkpoint, checksum, tmp_path / "target")
+
+    with pytest.raises(ValueError, match="exact historical bounded-v3 declared-key set"):
+        trainer_module.load_origin_v3_relation_warm_start(
+            _model(relation_enabled=True),
+            cfg,
+            fold=0,
+            split_signature="split-v1",
+        )
+
+
+def test_v3_to_v6_migration_rejects_unregistered_legacy_implementation(
+    tmp_path,
+) -> None:
+    _, _, source_cfg, source_payload = _write_v3_checkpoint(tmp_path)
+    payload = copy.deepcopy(source_payload)
+    declared = payload["architecture"]["declared"]
+    for name in (
+        "encoder_spatial_contract",
+        "evidence_dependency_policy",
+        "srff_window_cells",
+        "sealed_source_masking",
+        "max_evidence_receptive_field",
+        "relation_enabled",
+        "relation_contract",
+        "relation_intervention",
+    ):
+        declared.pop(name, None)
+    payload["architecture_signature"] = trainer_module._canonical_sha256(
+        payload["architecture"]
+    )
+    checkpoint = tmp_path / "unregistered_legacy_v3.pth"
+    torch.save(payload, checkpoint)
+    checksum = trainer_module._file_sha256(checkpoint)
+    cfg = _target_config(source_cfg, checkpoint, checksum, tmp_path / "target")
+
+    with pytest.raises(ValueError, match="not a registered bounded-v3 legacy"):
+        trainer_module.load_origin_v3_relation_warm_start(
+            _model(relation_enabled=True),
+            cfg,
+            fold=0,
+            split_signature="split-v1",
+        )
+
+
 def test_v3_to_v6_migration_rejects_bad_hash_fold_and_split(tmp_path) -> None:
     checkpoint, checksum, source_cfg, _ = _write_v3_checkpoint(tmp_path)
     cfg = _target_config(source_cfg, checkpoint, checksum, tmp_path / "target")
