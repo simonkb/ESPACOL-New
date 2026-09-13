@@ -79,8 +79,15 @@ class OriginConfig:
     relation_dim: int = 64
     relation_head_dim: int = 16
     relation_delta_cap: float = 2.0
+    # ``dense_v1`` is the historical ORIGIN-v6 field.  V7 keeps the same
+    # hash-bound v3 prediction path but replaces its diffuse aggregation with
+    # an endpoint-residualized, fixed-budget relation ledger.  Keeping the
+    # variant explicit makes checkpoints and controls impossible to confuse.
+    relation_variant: str = "dense_v1"
+    relation_edge_budget: int = 8
+    relation_permutation_seed: int = 617
 
-    # A v6 development run is initialized from an immutable v3 checkpoint.
+    # A relational development run is initialized from an immutable v3 checkpoint.
     # The path is invocation provenance; the SHA-256 is the content identity.
     # Training enforces that both are supplied for a fresh relational run.
     warm_start_checkpoint: Optional[str] = None
@@ -141,6 +148,7 @@ class OriginConfig:
         self.class_weighting = self.class_weighting.lower()
         self.decision_rule = self.decision_rule.lower()
         self.atom_mode = self.atom_mode.lower()
+        self.relation_variant = str(self.relation_variant).lower()
         self.relation_source_scale = str(self.relation_source_scale).lower()
         if not self.relation_source_scale.startswith("s"):
             self.relation_source_scale = f"s{self.relation_source_scale}"
@@ -283,6 +291,39 @@ class OriginConfig:
             raise ValueError("relation_head_dim must not exceed relation_dim")
         if not math.isfinite(self.relation_delta_cap) or self.relation_delta_cap <= 0.0:
             raise ValueError("relation_delta_cap must be finite and positive")
+        relation_variants = {
+            "dense_v1",
+            "identified_sparse_v1",
+            "additive_endpoint_control_v1",
+            "shuffled_pair_control_v1",
+        }
+        if self.relation_variant not in relation_variants:
+            raise ValueError(
+                f"unsupported relation_variant: {self.relation_variant!r}; "
+                f"choose from {sorted(relation_variants)}"
+            )
+        relation_regions = self.relation_grid_size * self.relation_grid_size
+        relation_edge_capacity = relation_regions * (relation_regions - 1)
+        if not 1 <= self.relation_edge_budget <= relation_edge_capacity:
+            raise ValueError(
+                "relation_edge_budget must lie in [1, R(R-1)] for "
+                f"R=relation_grid_size^2={relation_regions}"
+            )
+        if (
+            self.relation_variant != "dense_v1"
+            and self.relation_edge_budget >= relation_edge_capacity
+        ):
+            raise ValueError(
+                "a sparse relation_edge_budget must be strictly below "
+                "R(R-1) so that the identified residual cannot collapse "
+                "to its zero global sum"
+            )
+        if self.relation_permutation_seed < 0:
+            raise ValueError("relation_permutation_seed must be non-negative")
+        if not self.relation_enabled and self.relation_variant != "dense_v1":
+            raise ValueError(
+                "a non-default relation_variant requires relation_enabled=True"
+            )
         if self.relation_enabled and self.relation_source_scale not in self.evidence_scales:
             raise ValueError(
                 "relation_source_scale must be one of the active evidence_scales"

@@ -35,6 +35,14 @@ from .origin_encoder import (
 
 
 _ATOM_MODES = frozenset(("cumulative", "independent", "hybrid"))
+_RELATION_VARIANTS = frozenset(
+    (
+        "dense_v1",
+        "identified_sparse_v1",
+        "additive_endpoint_control_v1",
+        "shuffled_pair_control_v1",
+    )
+)
 _DECODER_DTYPE = torch.float64
 _EXP_TAYLOR_DEGREE = 24
 _EXP_SCALING_THETA = 0.5
@@ -572,6 +580,184 @@ def aggregate_ordinal_pair_messages(
     return target_incremental, incremental, cumulative
 
 
+def masked_offdiagonal_pair_anova(
+    pair_scores: torch.Tensor,
+    edge_valid_mask: torch.Tensor,
+    region_valid_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Split directed pair scores into interaction and endpoint main effects.
+
+    The valid graph is the complete directed graph on the valid regions with
+    its diagonal removed. For every sample and boundary this computes the
+    exact two-way additive projection
+
+    ``score[i,j] = interaction[i,j] + target_effect[i] + source_effect[j]``.
+
+    The interaction residual has zero row and column sums on the valid graph.
+    Thus an intercept, target-only term, source-only term, or their sum is
+    annihilated in real arithmetic. Samples with fewer than three valid
+    regions have no identifiable off-diagonal interaction degree of freedom
+    and fail closed to zero.
+    """
+
+    if pair_scores.ndim != 4:
+        raise ValueError("pair_scores must have shape (N,K-1,M,M)")
+    batch, _, targets, sources = pair_scores.shape
+    if targets != sources:
+        raise ValueError("pair_scores must use a square region-pair lattice")
+    if edge_valid_mask.shape != (batch, targets, sources):
+        raise ValueError("edge_valid_mask must have shape (N,M,M)")
+    if region_valid_mask.shape != (batch, targets):
+        raise ValueError("region_valid_mask must have shape (N,M)")
+    if edge_valid_mask.dtype != torch.bool:
+        edge_valid_mask = edge_valid_mask.bool()
+    if region_valid_mask.dtype != torch.bool:
+        region_valid_mask = region_valid_mask.bool()
+    _require_finite(pair_scores, "raw ordinal pair scores")
+
+    diagonal = torch.eye(targets, dtype=torch.bool, device=pair_scores.device)
+    expected_edges = (
+        region_valid_mask[:, :, None]
+        & region_valid_mask[:, None, :]
+        & ~diagonal[None]
+    )
+    if not torch.equal(edge_valid_mask, expected_edges):
+        raise ValueError(
+            "masked ANOVA requires the complete directed off-diagonal graph "
+            "on the declared valid regions"
+        )
+
+    edge_mask = edge_valid_mask[:, None]
+    masked = torch.where(edge_mask, pair_scores, torch.zeros_like(pair_scores))
+    valid_count = region_valid_mask.sum(dim=-1).to(pair_scores.dtype)
+    identifiable = valid_count >= 3.0
+
+    # Symmetric gauge: sum_i target_effect_i == sum_j source_effect_j.
+    # The residual is gauge invariant; this choice keeps the two reported
+    # endpoint components numerically balanced.
+    safe_count = valid_count.clamp_min(3.0)
+    row_sum = masked.sum(dim=-1)
+    column_sum = masked.sum(dim=-2)
+    total_sum = row_sum.sum(dim=-1)
+    endpoint_sum = total_sum / (2.0 * (safe_count[:, None] - 1.0))
+    determinant = safe_count * (safe_count - 2.0)
+    count_minus_one = (safe_count - 1.0)[:, None, None]
+    centered_row = row_sum - endpoint_sum[:, :, None]
+    centered_column = column_sum - endpoint_sum[:, :, None]
+    target_effect = (
+        count_minus_one * centered_row + centered_column
+    ) / determinant[:, None, None]
+    source_effect = (
+        centered_row + count_minus_one * centered_column
+    ) / determinant[:, None, None]
+    residual = masked - target_effect[:, :, :, None] - source_effect[:, :, None, :]
+    usable_edges = edge_mask & identifiable[:, None, None, None]
+    residual = torch.where(usable_edges, residual, torch.zeros_like(residual))
+    additive = torch.where(
+        usable_edges, masked - residual, torch.zeros_like(masked)
+    )
+    _require_finite(residual, "identified ordinal pair interactions")
+    _require_finite(additive, "additive endpoint pair component")
+    return residual, additive
+
+
+def _hard_stable_pair_budget(
+    scores: torch.Tensor,
+    edge_valid_mask: torch.Tensor,
+    *,
+    edge_budget: int,
+) -> torch.Tensor:
+    """Select a deterministic hard top-|score| budget per sample/boundary."""
+
+    if scores.ndim != 4 or scores.shape[-1] != scores.shape[-2]:
+        raise ValueError("scores must have shape (N,K-1,M,M)")
+    if edge_valid_mask.shape != scores.shape[:1] + scores.shape[-2:]:
+        raise ValueError("edge_valid_mask must have shape (N,M,M)")
+    if edge_budget < 1:
+        raise ValueError("edge_budget must be positive")
+    flat_scores = scores.detach().abs().flatten(start_dim=-2)
+    flat_valid = edge_valid_mask[:, None].expand_as(scores).flatten(start_dim=-2)
+    ranking = flat_scores.masked_fill(~flat_valid, -torch.inf)
+    # Stable sorting gives flattened edge index as the deterministic tie break.
+    order = torch.argsort(ranking, dim=-1, descending=True, stable=True)
+    chosen = order[..., : min(edge_budget, ranking.shape[-1])]
+    selected = torch.zeros_like(flat_valid)
+    selected.scatter_(-1, chosen, True)
+    selected &= flat_valid
+    return selected.reshape_as(scores)
+
+
+def aggregate_sparse_ordinal_pair_messages(
+    edge_messages: torch.Tensor,
+    selected_edge_mask: torch.Tensor,
+    edge_valid_mask: torch.Tensor,
+    region_valid_mask: torch.Tensor,
+    *,
+    delta_cap: float,
+    edge_budget: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compile a fixed sparse proof into literal ordinal log-odds entries.
+
+    The immutable denominator is the configured edge budget, not the number
+    of surviving edges. Each stored edge is therefore a literal additive
+    log-odds contribution and deletion never renormalizes the remaining proof.
+    Reverse cumulative compilation retains the ordinal prerequisite structure.
+    """
+
+    if edge_messages.ndim != 4:
+        raise ValueError("edge_messages must have shape (N,K-1,M,M)")
+    batch, boundaries, targets, sources = edge_messages.shape
+    if boundaries < 1 or targets != sources:
+        raise ValueError("edge_messages must have shape (N,K-1,M,M), K>=2")
+    if selected_edge_mask.shape != edge_messages.shape:
+        raise ValueError("selected_edge_mask must match edge_messages")
+    if edge_valid_mask.shape != (batch, targets, sources):
+        raise ValueError("edge_valid_mask must have shape (N,M,M)")
+    if region_valid_mask.shape != (batch, targets):
+        raise ValueError("region_valid_mask must have shape (N,M)")
+    if not math.isfinite(delta_cap) or delta_cap <= 0.0:
+        raise ValueError("delta_cap must be finite and positive")
+    if edge_budget < 1:
+        raise ValueError("edge_budget must be positive")
+    if selected_edge_mask.dtype != torch.bool:
+        selected_edge_mask = selected_edge_mask.bool()
+    if edge_valid_mask.dtype != torch.bool:
+        edge_valid_mask = edge_valid_mask.bool()
+    if bool((selected_edge_mask & ~edge_valid_mask[:, None]).any()):
+        raise ValueError("selected relation support contains invalid edges")
+    canonical = selected_edge_mask & edge_valid_mask[:, None]
+    _require_finite(edge_messages, "sparse ordinal pair messages")
+    tolerance = 2e-6
+    if bool((edge_messages.abs() > 1.0 + tolerance).any()):
+        raise ValueError("sparse ordinal pair messages must lie in [-1, 1]")
+    outside = torch.where(
+        canonical, torch.zeros_like(edge_messages), edge_messages
+    )
+    if bool(outside.ne(0).any()):
+        raise ValueError("non-selected or invalid pair messages must be exactly zero")
+    selected_counts = canonical.sum(dim=(-2, -1))
+    available_counts = edge_valid_mask.sum(dim=(-2, -1))[:, None]
+    expected_counts = torch.minimum(
+        available_counts,
+        torch.full_like(available_counts, edge_budget),
+    ).expand(-1, boundaries)
+    if not torch.equal(selected_counts, expected_counts):
+        raise ValueError("selected relation support does not match the fixed budget")
+
+    scale = float(delta_cap) / float(boundaries * edge_budget)
+    contributions = edge_messages.to(dtype=_DECODER_DTYPE) * scale
+    target_incremental = contributions.sum(dim=-1)
+    incremental = target_incremental.sum(dim=-1)
+    cumulative = reverse_cumulative_atoms(incremental, dim=1)
+    _require_finite(contributions, "sparse edge log-odds contributions")
+    _require_finite(target_incremental, "sparse target-local log-odds")
+    _require_finite(incremental, "sparse incremental relation log-odds")
+    _require_finite(cumulative, "sparse cumulative relation log-odds")
+    if bool((cumulative.abs() > float(delta_cap) + 2e-12).any()):
+        raise FloatingPointError("sparse cumulative relation field exceeded its bound")
+    return contributions, target_incremental, incremental, cumulative
+
+
 @dataclass
 class OriginRelationEvidence:
     """Stored, replayable trace of ORIGIN's explicit regional interactions."""
@@ -591,6 +777,25 @@ class OriginRelationEvidence:
     region_receptive_field: int
     region_output_stride: int
     delta_cap: float
+    variant: str = "dense_v1"
+    aggregation_kind: str = "geometry_normalized_tanh_v1"
+    raw_proposal_scores: Optional[torch.Tensor] = None
+    unidentified_proposal_scores: Optional[torch.Tensor] = None
+    pre_geometry_proposal_residuals: Optional[torch.Tensor] = None
+    pre_geometry_additive_proposal_scores: Optional[torch.Tensor] = None
+    projected_proposal_scores: Optional[torch.Tensor] = None
+    additive_proposal_scores: Optional[torch.Tensor] = None
+    raw_interaction_scores: Optional[torch.Tensor] = None
+    unidentified_interaction_scores: Optional[torch.Tensor] = None
+    pre_geometry_interaction_residuals: Optional[torch.Tensor] = None
+    pre_geometry_additive_endpoint_scores: Optional[torch.Tensor] = None
+    interaction_residuals: Optional[torch.Tensor] = None
+    additive_endpoint_scores: Optional[torch.Tensor] = None
+    geometry_modulation: Optional[torch.Tensor] = None
+    candidate_edge_mask: Optional[torch.Tensor] = None
+    selected_edge_mask: Optional[torch.Tensor] = None
+    edge_log_odds_contributions: Optional[torch.Tensor] = None
+    edge_budget: Optional[int] = None
 
     @property
     def num_regions(self) -> int:
@@ -604,11 +809,11 @@ class OrdinalPairInteractionField(nn.Module):
     blocks.  Their receptive-field-qualified supports in input pixels can
     overlap and are reported explicitly; the architecture therefore claims
     interactions between regional representations, not disjoint or pure
-    lesion synergy.  Every raw edge message depends only on its target and
-    source tokens plus their fixed relative displacement; there is no softmax
-    denominator involving other regions.  The trilinear output weights are
-    initialized to exactly zero, making this module an exact function-
-    preserving extension of a trained ORIGIN-v3 generator.
+    lesion synergy. ``dense_v1`` is the unchanged v6 field. The v7 variants
+    explicitly remove target/source main effects, select a fixed sparse proof,
+    and compile its entries as literal log-odds contributions. The trilinear
+    output weights are initialized to exactly zero, making every variant an
+    exact function-preserving extension of a trained ORIGIN-v3 generator.
     """
 
     def __init__(
@@ -620,18 +825,42 @@ class OrdinalPairInteractionField(nn.Module):
         relation_dim: int = 64,
         head_dim: int = 16,
         delta_cap: float = 2.0,
+        variant: str = "dense_v1",
+        edge_budget: int = 8,
+        permutation_seed: int = 617,
     ) -> None:
         super().__init__()
         if min(source_channels, num_boundaries, grid_size, relation_dim, head_dim) < 1:
             raise ValueError("relation dimensions must be positive")
         if not math.isfinite(delta_cap) or delta_cap <= 0.0:
             raise ValueError("relation delta_cap must be finite and positive")
+        variant = str(variant).lower()
+        if variant not in _RELATION_VARIANTS:
+            raise ValueError(
+                f"relation variant must be one of {sorted(_RELATION_VARIANTS)}"
+            )
+        max_edges = (grid_size * grid_size) * (grid_size * grid_size - 1)
+        if edge_budget < 1 or edge_budget > max_edges:
+            raise ValueError(
+                "relation edge_budget must lie between 1 and the number of "
+                f"directed non-self edges ({max_edges})"
+            )
+        if variant != "dense_v1" and edge_budget >= max_edges:
+            raise ValueError(
+                "a sparse relation edge_budget must be strictly smaller than "
+                f"the directed non-self edge capacity ({max_edges})"
+            )
+        if permutation_seed < 0:
+            raise ValueError("relation permutation_seed must be non-negative")
         self.source_channels = int(source_channels)
         self.num_boundaries = int(num_boundaries)
         self.grid_size = int(grid_size)
         self.relation_dim = int(relation_dim)
         self.head_dim = int(head_dim)
         self.delta_cap = float(delta_cap)
+        self.variant = variant
+        self.edge_budget = int(edge_budget)
+        self.permutation_seed = int(permutation_seed)
 
         self.token_projection = nn.Linear(self.source_channels, self.relation_dim)
         self.token_norm = nn.LayerNorm(self.relation_dim)
@@ -668,6 +897,17 @@ class OrdinalPairInteractionField(nn.Module):
         self.register_buffer(
             "self_edge_mask",
             torch.eye(self.grid_size * self.grid_size, dtype=torch.bool),
+            persistent=False,
+        )
+        permutation_generator = torch.Generator(device="cpu")
+        permutation_generator.manual_seed(self.permutation_seed)
+        permutation = torch.randperm(
+            self.grid_size * self.grid_size,
+            generator=permutation_generator,
+        )
+        self.register_buffer(
+            "source_permutation",
+            permutation,
             persistent=False,
         )
 
@@ -722,6 +962,13 @@ class OrdinalPairInteractionField(nn.Module):
             features, encoded.valid_mask
         )
         _require_finite(pooled, "pooled relation region features")
+        if self.variant == "shuffled_pair_control_v1":
+            # Permute the complete endpoint assignment relative to the fixed
+            # spatial lattice. Applying the same permutation to both endpoint
+            # roles preserves a complete off-diagonal graph and makes the
+            # control differ only in image-region/geometry correspondence.
+            pooled = pooled.index_select(1, self.source_permutation)
+            region_valid = region_valid.index_select(1, self.source_permutation)
         tokens = F.gelu(self.token_norm(self.token_projection(pooled)))
         _require_finite(tokens, "relation region tokens")
         batch, regions, _ = tokens.shape
@@ -734,14 +981,37 @@ class OrdinalPairInteractionField(nn.Module):
         _require_finite(queries, "relation pair queries")
         _require_finite(keys, "relation pair keys")
 
+        if self.variant != "dense_v1":
+            # Remove projection biases and every endpoint-global offset exactly
+            # before forming pair scores.  The first ANOVA projection below
+            # occurs before geometry, so all anchor cross-terms are discarded
+            # before a displacement-dependent multiplier is introduced.
+            endpoint_mask = region_valid[:, None, :, None]
+            first_valid = region_valid.to(dtype=torch.int64).argmax(dim=1)
+            anchor_index = first_valid[:, None, None, None].expand(
+                -1, self.num_boundaries, 1, self.head_dim
+            )
+            query_anchor = queries.gather(dim=2, index=anchor_index)
+            key_anchor = keys.gather(dim=2, index=anchor_index)
+            queries = torch.where(
+                endpoint_mask, queries - query_anchor, torch.zeros_like(queries)
+            )
+            keys = torch.where(
+                endpoint_mask, keys - key_anchor, torch.zeros_like(keys)
+            )
+            _require_finite(queries, "gauge-fixed relation pair queries")
+            _require_finite(keys, "gauge-fixed relation pair keys")
+
         inverse_sqrt = 1.0 / math.sqrt(float(self.head_dim))
-        affinity = torch.einsum("nbih,nbjh->nbij", queries, keys) * inverse_sqrt
-        _require_finite(affinity, "relation content affinities")
+        content_affinity = (
+            torch.einsum("nbih,nbjh->nbij", queries, keys) * inverse_sqrt
+        )
+        _require_finite(content_affinity, "relation content affinities")
         relative = self.relative_bias[
             :, self.relative_y_index, self.relative_x_index
         ]
         _require_finite(relative, "relation relative-position biases")
-        affinity = affinity + relative[None]
+        affinity = content_affinity + relative[None]
         _require_finite(affinity, "raw relation pair affinities")
         pair_gates = affinity.sigmoid()
         _require_finite(pair_gates, "relation pair gates")
@@ -755,22 +1025,144 @@ class OrdinalPairInteractionField(nn.Module):
             & region_valid[:, None, :]
             & ~self.self_edge_mask[None]
         )
-        pair_gates = torch.where(
-            edge_valid[:, None], pair_gates, torch.zeros_like(pair_gates)
-        )
-        edge_messages = torch.where(
-            edge_valid[:, None],
-            pair_gates * trilinear.tanh(),
-            torch.zeros_like(trilinear),
-        )
-        _require_finite(pair_gates, "masked relation pair gates")
-        _require_finite(edge_messages, "masked relation edge messages")
-        target_incremental, incremental, cumulative = aggregate_ordinal_pair_messages(
-            edge_messages,
-            edge_valid,
-            region_valid,
-            delta_cap=self.delta_cap,
-        )
+        if self.variant == "dense_v1":
+            # Preserve the original v6 path operation-for-operation.
+            pair_gates = torch.where(
+                edge_valid[:, None], pair_gates, torch.zeros_like(pair_gates)
+            )
+            edge_messages = torch.where(
+                edge_valid[:, None],
+                pair_gates * trilinear.tanh(),
+                torch.zeros_like(trilinear),
+            )
+            _require_finite(pair_gates, "masked relation pair gates")
+            _require_finite(edge_messages, "masked relation edge messages")
+            target_incremental, incremental, cumulative = (
+                aggregate_ordinal_pair_messages(
+                    edge_messages,
+                    edge_valid,
+                    region_valid,
+                    delta_cap=self.delta_cap,
+                )
+            )
+            raw_proposal_scores = None
+            unidentified_proposal_scores = None
+            pre_geometry_proposal_residuals = None
+            pre_geometry_additive_proposal_scores = None
+            projected_proposal_scores = None
+            additive_proposal_scores = None
+            raw_interaction_scores = None
+            unidentified_interaction_scores = None
+            pre_geometry_interaction_residuals = None
+            pre_geometry_additive_endpoint_scores = None
+            interaction_residuals = None
+            additive_endpoint_scores = None
+            evidence_geometry_modulation = None
+            selected_edge_mask = None
+            edge_log_odds_contributions = None
+            evidence_edge_budget = None
+            aggregation_kind = "geometry_normalized_tanh_v1"
+        else:
+            available_edge_count = edge_valid.sum(dim=(-2, -1))
+            if bool((available_edge_count <= self.edge_budget).any()):
+                raise ValueError(
+                    "an identified sparse relation proof requires strictly "
+                    "more valid candidate edges than its fixed edge budget"
+                )
+            # Identify the endpoint-independent pair component before allowing
+            # fixed displacement to modulate it.  Multiplication by geometry
+            # can reintroduce target/source main effects, so a second exact
+            # projection removes them.  This two-stage construction is
+            # invariant to global query/key offsets and maps a spatially
+            # constant endpoint field to exactly zero relation evidence.
+            unidentified_proposal_scores = torch.where(
+                edge_valid[:, None],
+                content_affinity,
+                torch.zeros_like(content_affinity),
+            )
+            unidentified_interaction_scores = torch.where(
+                edge_valid[:, None],
+                trilinear,
+                torch.zeros_like(trilinear),
+            )
+            (
+                pre_geometry_proposal_residuals,
+                pre_geometry_additive_proposal_scores,
+            ) = masked_offdiagonal_pair_anova(
+                unidentified_proposal_scores, edge_valid, region_valid
+            )
+            (
+                pre_geometry_interaction_residuals,
+                pre_geometry_additive_endpoint_scores,
+            ) = masked_offdiagonal_pair_anova(
+                unidentified_interaction_scores, edge_valid, region_valid
+            )
+            evidence_geometry_modulation = (
+                1.0 + relative[None].tanh()
+            ).expand(batch, -1, -1, -1)
+            if self.variant == "additive_endpoint_control_v1":
+                proposal_source = pre_geometry_additive_proposal_scores
+                interaction_source = pre_geometry_additive_endpoint_scores
+            else:
+                proposal_source = pre_geometry_proposal_residuals
+                interaction_source = pre_geometry_interaction_residuals
+            raw_proposal_scores = torch.where(
+                edge_valid[:, None],
+                proposal_source * evidence_geometry_modulation,
+                torch.zeros_like(content_affinity),
+            )
+            raw_interaction_scores = torch.where(
+                edge_valid[:, None],
+                interaction_source * evidence_geometry_modulation,
+                torch.zeros_like(trilinear),
+            )
+            projected_proposal_scores, additive_proposal_scores = (
+                masked_offdiagonal_pair_anova(
+                    raw_proposal_scores,
+                    edge_valid,
+                    region_valid,
+                )
+            )
+            interaction_residuals, additive_endpoint_scores = (
+                masked_offdiagonal_pair_anova(
+                    raw_interaction_scores,
+                    edge_valid,
+                    region_valid,
+                )
+            )
+            if self.variant == "additive_endpoint_control_v1":
+                proposal_for_selection = additive_proposal_scores
+                score_for_compilation = additive_endpoint_scores
+            else:
+                proposal_for_selection = projected_proposal_scores
+                score_for_compilation = interaction_residuals
+            selected_edge_mask = _hard_stable_pair_budget(
+                proposal_for_selection,
+                edge_valid,
+                edge_budget=self.edge_budget,
+            )
+            edge_messages = torch.where(
+                selected_edge_mask,
+                score_for_compilation.tanh(),
+                torch.zeros_like(score_for_compilation),
+            )
+            pair_gates = selected_edge_mask.to(dtype=edge_messages.dtype)
+            (
+                edge_log_odds_contributions,
+                target_incremental,
+                incremental,
+                cumulative,
+            ) = aggregate_sparse_ordinal_pair_messages(
+                edge_messages,
+                selected_edge_mask,
+                edge_valid,
+                region_valid,
+                delta_cap=self.delta_cap,
+                edge_budget=self.edge_budget,
+            )
+            _require_finite(edge_messages, "sparse relation edge messages")
+            evidence_edge_budget = self.edge_budget
+            aggregation_kind = "fixed_budget_linear_conserved_v1"
 
         metadata = encoded.metadata
         block_height, block_width = block_size
@@ -809,6 +1201,33 @@ class OrdinalPairInteractionField(nn.Module):
             region_receptive_field=region_receptive_field,
             region_output_stride=region_stride,
             delta_cap=self.delta_cap,
+            variant=self.variant,
+            aggregation_kind=aggregation_kind,
+            raw_proposal_scores=raw_proposal_scores,
+            unidentified_proposal_scores=unidentified_proposal_scores,
+            pre_geometry_proposal_residuals=pre_geometry_proposal_residuals,
+            pre_geometry_additive_proposal_scores=(
+                pre_geometry_additive_proposal_scores
+            ),
+            projected_proposal_scores=projected_proposal_scores,
+            additive_proposal_scores=additive_proposal_scores,
+            raw_interaction_scores=raw_interaction_scores,
+            unidentified_interaction_scores=unidentified_interaction_scores,
+            pre_geometry_interaction_residuals=(
+                pre_geometry_interaction_residuals
+            ),
+            pre_geometry_additive_endpoint_scores=(
+                pre_geometry_additive_endpoint_scores
+            ),
+            interaction_residuals=interaction_residuals,
+            additive_endpoint_scores=additive_endpoint_scores,
+            geometry_modulation=evidence_geometry_modulation,
+            candidate_edge_mask=(
+                edge_valid if self.variant != "dense_v1" else None
+            ),
+            selected_edge_mask=selected_edge_mask,
+            edge_log_odds_contributions=edge_log_odds_contributions,
+            edge_budget=evidence_edge_budget,
         )
 
 
@@ -1026,6 +1445,9 @@ class ConservedOrdinalGenerator(nn.Module):
         relation_dim: int = 64,
         relation_head_dim: int = 16,
         relation_delta_cap: float = 2.0,
+        relation_variant: str = "dense_v1",
+        relation_edge_budget: int = 8,
+        relation_permutation_seed: int = 617,
     ) -> None:
         super().__init__()
         if num_classes < 2:
@@ -1072,6 +1494,30 @@ class ConservedOrdinalGenerator(nn.Module):
         if unknown:
             raise ValueError(f"unknown evidence scales: {sorted(unknown)}")
         relation_source_scale = str(relation_source_scale)
+        relation_variant = str(relation_variant).lower()
+        if relation_variant not in _RELATION_VARIANTS:
+            raise ValueError(
+                f"relation variant must be one of {sorted(_RELATION_VARIANTS)}"
+            )
+        if relation_permutation_seed < 0:
+            raise ValueError("relation_permutation_seed must be non-negative")
+        if int(relation_grid_size) < 2:
+            raise ValueError("relation_grid_size must be at least 2")
+        relation_regions = int(relation_grid_size) ** 2
+        relation_edge_capacity = relation_regions * (relation_regions - 1)
+        if not 1 <= int(relation_edge_budget) <= relation_edge_capacity:
+            raise ValueError(
+                "relation_edge_budget must lie between 1 and the directed "
+                f"non-self edge capacity ({relation_edge_capacity})"
+            )
+        if (
+            relation_variant != "dense_v1"
+            and int(relation_edge_budget) >= relation_edge_capacity
+        ):
+            raise ValueError(
+                "a sparse relation_edge_budget must be strictly below the "
+                f"directed non-self edge capacity ({relation_edge_capacity})"
+            )
         if relation_enabled and relation_source_scale not in available:
             raise ValueError(
                 "relation_source_scale must be exposed by the encoder; "
@@ -1092,6 +1538,9 @@ class ConservedOrdinalGenerator(nn.Module):
         self.relation_dim = int(relation_dim)
         self.relation_head_dim = int(relation_head_dim)
         self.relation_delta_cap = float(relation_delta_cap)
+        self.relation_variant = relation_variant
+        self.relation_edge_budget = int(relation_edge_budget)
+        self.relation_permutation_seed = int(relation_permutation_seed)
         self.atom_mass_cap = (
             (
                 self.total_rate_cap
@@ -1124,6 +1573,9 @@ class ConservedOrdinalGenerator(nn.Module):
                 relation_dim=self.relation_dim,
                 head_dim=self.relation_head_dim,
                 delta_cap=self.relation_delta_cap,
+                variant=self.relation_variant,
+                edge_budget=self.relation_edge_budget,
+                permutation_seed=self.relation_permutation_seed,
             )
         else:
             # Assigning None instead of an inert module preserves the exact v3
@@ -1452,6 +1904,7 @@ class OriginRelationInterventionOutput:
     output: OriginOutput
     removal_mask: torch.Tensor
     removed_edge_messages: torch.Tensor
+    removed_edge_log_odds_contributions: Optional[torch.Tensor] = None
 
     @property
     def delta_expected_grade(self) -> torch.Tensor:
@@ -1541,21 +1994,61 @@ def replay_without_relations(
         edge_removal_mask, relation.edge_messages
     )
     canonical = canonical & relation.edge_valid_mask[:, None]
+    if relation.aggregation_kind == "fixed_budget_linear_conserved_v1":
+        if relation.selected_edge_mask is None:
+            raise ValueError("sparse relation trace is missing its selected support")
+        canonical = canonical & relation.selected_edge_mask
     removed = torch.where(
         canonical, relation.edge_messages, torch.zeros_like(relation.edge_messages)
     )
     kept = torch.where(
         canonical, torch.zeros_like(relation.edge_messages), relation.edge_messages
     )
-    target_incremental, incremental, cumulative = aggregate_ordinal_pair_messages(
-        kept,
-        relation.edge_valid_mask,
-        relation.region_valid_mask,
-        delta_cap=relation.delta_cap,
-    )
+    edge_log_odds_contributions: Optional[torch.Tensor]
+    removed_edge_log_odds_contributions: Optional[torch.Tensor]
+    if relation.aggregation_kind == "fixed_budget_linear_conserved_v1":
+        if relation.selected_edge_mask is None or relation.edge_budget is None:
+            raise ValueError("sparse relation trace is missing its fixed support")
+        (
+            edge_log_odds_contributions,
+            target_incremental,
+            incremental,
+            cumulative,
+        ) = aggregate_sparse_ordinal_pair_messages(
+            kept,
+            relation.selected_edge_mask,
+            relation.edge_valid_mask,
+            relation.region_valid_mask,
+            delta_cap=relation.delta_cap,
+            edge_budget=relation.edge_budget,
+        )
+        if relation.edge_log_odds_contributions is None:
+            raise ValueError("sparse relation trace is missing edge contributions")
+        removed_edge_log_odds_contributions = torch.where(
+            canonical,
+            relation.edge_log_odds_contributions,
+            torch.zeros_like(relation.edge_log_odds_contributions),
+        )
+    elif relation.aggregation_kind == "geometry_normalized_tanh_v1":
+        target_incremental, incremental, cumulative = (
+            aggregate_ordinal_pair_messages(
+                kept,
+                relation.edge_valid_mask,
+                relation.region_valid_mask,
+                delta_cap=relation.delta_cap,
+            )
+        )
+        edge_log_odds_contributions = None
+        removed_edge_log_odds_contributions = None
+    else:
+        raise ValueError(
+            "unknown relation aggregation kind "
+            f"{relation.aggregation_kind!r}"
+        )
     replay_relation = replace(
         relation,
         edge_messages=kept,
+        edge_log_odds_contributions=edge_log_odds_contributions,
         target_incremental_log_odds=target_incremental,
         incremental_log_odds=incremental,
         cumulative_log_odds=cumulative,
@@ -1589,6 +2082,9 @@ def replay_without_relations(
         output=replay_output,
         removal_mask=canonical,
         removed_edge_messages=removed,
+        removed_edge_log_odds_contributions=(
+            removed_edge_log_odds_contributions
+        ),
     )
 
 
@@ -1693,6 +2189,9 @@ class OriginModel(nn.Module):
         relation_dim: int = 64,
         relation_head_dim: int = 16,
         relation_delta_cap: float = 2.0,
+        relation_variant: str = "dense_v1",
+        relation_edge_budget: int = 8,
+        relation_permutation_seed: int = 617,
         encoder: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
@@ -1740,6 +2239,9 @@ class OriginModel(nn.Module):
             relation_dim=relation_dim,
             relation_head_dim=relation_head_dim,
             relation_delta_cap=relation_delta_cap,
+            relation_variant=relation_variant,
+            relation_edge_budget=relation_edge_budget,
+            relation_permutation_seed=relation_permutation_seed,
         )
 
     @property
@@ -1779,22 +2281,62 @@ class OriginModel(nn.Module):
         relation_field = self.generator.relation_field
         relation_contract: Optional[Dict[str, object]] = None
         if relation_field is not None:
-            relation_contract = {
-                "kind": "cumulative_ordinal_pair_rate_log_odds_v1",
-                "source_scale": self.generator.relation_source_scale,
-                "grid_size": relation_field.grid_size,
-                "num_regions": relation_field.grid_size ** 2,
-                "relation_dim": relation_field.relation_dim,
-                "head_dim": relation_field.head_dim,
-                "delta_cap": relation_field.delta_cap,
-                "merge": "C*sigmoid(log(lambda)-log(C-lambda)+D)",
-                "incremental_compilation": "geometry_normalized_signed_pair_messages",
-                "ordinal_compilation": "reverse_cumulative_incremental_field",
-                "pair_normalization": "no_feature_dependent_global_denominator",
-                "zero_initialization": "exact_v3_function_identity",
-                "relation_replay": "stored_pair_message_deletion_without_reencoding",
-                "no_classifier_bypass": True,
-            }
+            if relation_field.variant == "dense_v1":
+                # Keep the v6 declaration byte-for-byte stable.
+                relation_contract = {
+                    "kind": "cumulative_ordinal_pair_rate_log_odds_v1",
+                    "source_scale": self.generator.relation_source_scale,
+                    "grid_size": relation_field.grid_size,
+                    "num_regions": relation_field.grid_size ** 2,
+                    "relation_dim": relation_field.relation_dim,
+                    "head_dim": relation_field.head_dim,
+                    "delta_cap": relation_field.delta_cap,
+                    "merge": "C*sigmoid(log(lambda)-log(C-lambda)+D)",
+                    "incremental_compilation": "geometry_normalized_signed_pair_messages",
+                    "ordinal_compilation": "reverse_cumulative_incremental_field",
+                    "pair_normalization": "no_feature_dependent_global_denominator",
+                    "zero_initialization": "exact_v3_function_identity",
+                    "relation_replay": "stored_pair_message_deletion_without_reencoding",
+                    "no_classifier_bypass": True,
+                }
+            else:
+                relation_contract = {
+                    "kind": "identified_sparse_cumulative_ordinal_pair_log_odds_v1",
+                    "variant": relation_field.variant,
+                    "source_scale": self.generator.relation_source_scale,
+                    "grid_size": relation_field.grid_size,
+                    "num_regions": relation_field.grid_size ** 2,
+                    "relation_dim": relation_field.relation_dim,
+                    "head_dim": relation_field.head_dim,
+                    "delta_cap": relation_field.delta_cap,
+                    "edge_budget": relation_field.edge_budget,
+                    "permutation_seed": relation_field.permutation_seed,
+                    "merge": "C*sigmoid(log(lambda)-log(C-lambda)+D)",
+                    "pair_identification": (
+                        "pre_geometry_anova_then_geometry_then_post_geometry_anova"
+                    ),
+                    "endpoint_gauge": "global_query_key_offset_invariant",
+                    "constant_endpoint_field": "exact_zero_relation_evidence",
+                    "active_pair_component": (
+                        "post_geometry_endpoint_main_effect_control"
+                        if relation_field.variant == "additive_endpoint_control_v1"
+                        else "identified_interaction_residual"
+                    ),
+                    "selection": (
+                        "stable_hard_top_absolute_post_geometry_additive_proposal_per_boundary"
+                        if relation_field.variant == "additive_endpoint_control_v1"
+                        else "stable_hard_top_absolute_projected_proposal_per_boundary"
+                    ),
+                    "incremental_compilation": (
+                        "fixed_budget_linear_stored_edge_log_odds"
+                    ),
+                    "ordinal_compilation": "reverse_cumulative_incremental_field",
+                    "zero_initialization": "exact_v3_function_identity",
+                    "relation_replay": (
+                        "stored_edge_log_odds_deletion_without_reselection_or_renormalization"
+                    ),
+                    "no_classifier_bypass": True,
+                }
         return {
             "name": "ORIGIN",
             "encoder": self.encoder_name,
@@ -1906,6 +2448,7 @@ def build_origin_model(**kwargs) -> OriginModel:
 
 __all__ = [
     "aggregate_ordinal_pair_messages",
+    "aggregate_sparse_ordinal_pair_messages",
     "bounded_rate_log_odds_merge",
     "ChannelLayerNorm2d",
     "ConservedOrdinalGenerator",
@@ -1922,6 +2465,7 @@ __all__ = [
     "build_origin_model",
     "decode_pure_birth_rates",
     "fit_pure_birth_rates",
+    "masked_offdiagonal_pair_anova",
     "pure_birth_generator",
     "replay_without",
     "replay_without_relations",

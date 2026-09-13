@@ -414,6 +414,88 @@ edges, and all pair edges for a selected region, alongside deletion of that
 region's unary cells. Single-edge certificates alone do not establish regional
 necessity, synergy, or causal pixel effects.
 
+## ORIGIN-v7: identified sparse ordinal relation proofs
+
+V6 confirmed that a learned relation field can change the v3 prediction, but
+its validation audit rejected the field as an interpretable pair proof. Removing
+all pair terms changed only 13 of 3,162 EyePACS predictions (mean absolute
+expected-grade change 0.0103), while deleting the nominally strongest single
+edge changed none. Averaging thousands of directed pairs allowed endpoint or
+image-wide evidence to act as a diffuse correction rather than an identifiable
+interaction.
+
+V7 changes only that relation compiler. For each ordinal boundary it first
+projects the complete valid directed off-diagonal pair matrix onto the exact
+two-way interaction residual, removing the intercept and all target-only and
+source-only main effects. Query and key endpoints are first anchored to remove
+global offsets exactly. The pair matrix is projected once before positional
+modulation and again afterward, so anchor cross-terms cannot become geometric
+evidence; the result is invariant to global endpoint offsets and a spatially
+constant endpoint field emits exactly zero relation evidence. A deterministic
+hard top-8 rule then selects the largest absolute projected proposal scores.
+If `r_ijk` is the selected bounded interaction for boundary `k`, its literal
+stored log-odds contribution is
+
+```text
+c_ijk = [2 / ((K-1) * 8)] * 1[(i,j) selected for k] * tanh(r_ijk).
+```
+
+The contributions sum without feature-dependent normalization, compile
+reverse-cumulatively across ordinal prerequisites, and enter the same bounded
+rate-log-odds merge and pure-birth decoder as v3/v6. Deleting an edge removes
+that stored contribution with the support and denominator held fixed: no edge
+is reselected and no surviving edge is renormalized. Deleting every selected
+edge therefore recovers the hash-bound v3 predictor exactly. The target and the
+registered additive-endpoint and shuffled-pair controls have identical
+trainable parameter names and shapes.
+
+The initial experiment remains relation-only. Epoch 0 is the exact v3 model and
+is checkpoint-eligible. A learned candidate can replace it only by strictly
+improving accuracy while not worsening QWK, balanced accuracy, macro-F1, or MAE
+beyond `1e-6`. APTOS runs for 15 relation-only epochs; EyePACS runs for 25.
+Submit each dataset with its own checkpoint hash and independent preflight:
+
+```bash
+# APTOS
+export ORIGIN_V3_CHECKPOINT=runs/origin_aptos_f0_v3_bounded/fold0/best.pth
+export ORIGIN_V3_CHECKPOINT_SHA256=$(sha256sum "$ORIGIN_V3_CHECKPOINT" | awk '{print $1}')
+APTOS_PRE=$(sbatch --parsable scripts/submit_origin_v7_preflight.sh | cut -d';' -f1)
+APTOS_JOB=$(sbatch --parsable --dependency=afterok:${APTOS_PRE} scripts/submit_origin_v7_aptos_f0.sh | cut -d';' -f1)
+
+# EyePACS: change both variables before submitting this independent chain.
+export ORIGIN_V3_CHECKPOINT=runs/origin_dr_f0_v3_bounded/fold0/best.pth
+export ORIGIN_V3_CHECKPOINT_SHA256=$(sha256sum "$ORIGIN_V3_CHECKPOINT" | awk '{print $1}')
+DR_PRE=$(sbatch --parsable scripts/submit_origin_v7_preflight.sh | cut -d';' -f1)
+DR_JOB=$(sbatch --parsable --dependency=afterok:${DR_PRE} scripts/submit_origin_v7_dr_f0.sh | cut -d';' -f1)
+printf 'aptos_pre=%s aptos=%s dr_pre=%s dr=%s\n' "$APTOS_PRE" "$APTOS_JOB" "$DR_PRE" "$DR_JOB"
+```
+
+The shell environment is captured independently by each `sbatch`, so changing
+the exported checkpoint between the two chains does not alter already-submitted
+jobs. Do not reuse one preflight for both datasets. Fresh-run protection refuses
+to overwrite existing fold artifacts.
+
+Only after a target checkpoint passes the stored multi-metric floor, run the
+full validation audit. The default wrapper audits EyePACS; override all three
+variables together for APTOS:
+
+```bash
+sbatch scripts/submit_origin_v7_validation_audit.sh
+
+ORIGIN_V7_RUN_DIR=runs/origin_aptos_f0_v7_identified_sparse_k8 \
+ORIGIN_DATA_ROOT=Datasets/aptos2019-blindness-detection \
+ORIGIN_AUDIT_OUTPUT=runs/origin_aptos_f0_v7_identified_sparse_k8/fold0/audits/full_validation_audit_v7.json \
+sbatch scripts/submit_origin_v7_validation_audit.sh
+```
+
+The audit independently reconstructs the two-way projection, selected support,
+literal contribution ledger, ordinal compilation, and bounded merge. It also
+performs paired all-edge ablation, exact McNemar accounting, grade-stratified
+sign checks, and exhaustive leave-one-edge-out pivotality. Passing accuracy is
+not by itself an interaction claim: the identified target must outperform the
+parameter-matched additive-endpoint and shuffled-pair controls before the pair
+mechanism is credited for the gain.
+
 ## Historical failed runs
 
 The original September 8 v1 runs used the generic `torch.matrix_exp` backward

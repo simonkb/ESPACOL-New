@@ -36,7 +36,11 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Subset
 
 from losses.origin import OriginLoss
-from models.origin import aggregate_ordinal_pair_messages, bounded_rate_log_odds_merge
+from models.origin import (
+    aggregate_ordinal_pair_messages,
+    aggregate_sparse_ordinal_pair_messages,
+    bounded_rate_log_odds_merge,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -67,6 +71,13 @@ _RUNTIME_CONFIG_FIELDS = {
 }
 
 _RELATION_PARAMETER_PREFIX = "generator.relation_field."
+_V7_RELATION_VARIANTS = frozenset(
+    {
+        "identified_sparse_v1",
+        "additive_endpoint_control_v1",
+        "shuffled_pair_control_v1",
+    }
+)
 _LEGACY_BOUNDED_V3_IMPLEMENTATION_SIGNATURES = frozenset(
     {
         # ec1dd1c: the exact implementation used by both bounded-v3 fold-0
@@ -127,6 +138,19 @@ _V3_WARMSTART_MODEL_FIELDS = (
 
 _DECISION_RULES = ("posterior_median", "class_map", "rounded_expected")
 _SELECTION_POLICIES = ("acc_then_qwk", "acc_qwk_score")
+
+
+def _relation_protocol_version(cfg: object) -> str:
+    """Return the checkpoint protocol implied by an ORIGIN configuration."""
+
+    if not bool(_cfg_get(cfg, "relation_enabled", False)):
+        return "v3"
+    variant = str(_cfg_get(cfg, "relation_variant", "dense_v1")).lower()
+    if variant == "dense_v1":
+        return "v6"
+    if variant in _V7_RELATION_VARIANTS:
+        return "v7"
+    raise ValueError(f"unsupported relational ORIGIN protocol variant: {variant!r}")
 
 
 def _cfg_get(cfg: object, name: str, default: Any = None) -> Any:
@@ -244,9 +268,9 @@ def load_origin_v3_relation_warm_start(
     fold: int,
     split_signature: str | None,
 ) -> dict[str, Any] | None:
-    """Strictly migrate one immutable v3 checkpoint into a v6 relation model.
+    """Strictly migrate one immutable v3 checkpoint into a relation extension.
 
-    The source implementation hash cannot equal the current v6 source tree.
+    The source implementation hash cannot equal the current extension source tree.
     Instead, the checkpoint is bound to caller-supplied SHA-256 content
     identity, and its own architecture/configuration records are checked for
     internal consistency before a strict-subset state migration.  A hash alone
@@ -274,7 +298,9 @@ def load_origin_v3_relation_warm_start(
 
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if not isinstance(state, Mapping) or state.get("schema") != "origin-checkpoint-v3":
-        raise ValueError("v6 warm start requires an origin-checkpoint-v3 source")
+        raise ValueError(
+            "a relational warm start requires an origin-checkpoint-v3 source"
+        )
     implementation_signature = str(state.get("implementation_signature", "")).lower()
     if len(implementation_signature) != 64 or any(
         character not in "0123456789abcdef"
@@ -436,8 +462,19 @@ def load_origin_v3_relation_warm_start(
     if sorted(incompatibility.missing_keys) != expected_missing or incompatibility.unexpected_keys:
         raise AssertionError("PyTorch state migration disagrees with the audited key partition")
 
+    protocol_version = _relation_protocol_version(cfg)
+    if protocol_version not in {"v6", "v7"}:
+        raise ValueError("v3 relation warm start requires a relational target")
     return {
-        "schema": "origin-v3-to-v6-verified-content-warm-start-v1",
+        "schema": (
+            "origin-v3-to-v6-verified-content-warm-start-v1"
+            if protocol_version == "v6"
+            else "origin-v3-to-v7-verified-content-warm-start-v1"
+        ),
+        "target_protocol": protocol_version,
+        "target_relation_variant": str(
+            _cfg_get(cfg, "relation_variant", "dense_v1")
+        ),
         "source_checkpoint": str(checkpoint_path),
         "source_checkpoint_sha256": observed_sha256,
         "source_checkpoint_schema": str(state["schema"]),
@@ -779,6 +816,10 @@ class OriginTrainer:
         self.model.to(self.device)
         self.criterion.to(self.device)
         self.relation_enabled = bool(_cfg_get(cfg, "relation_enabled", False))
+        self.relation_protocol_version = _relation_protocol_version(cfg)
+        self.relation_variant = str(
+            _cfg_get(cfg, "relation_variant", "dense_v1")
+        ).lower()
         self.relation_only_epochs = int(_cfg_get(cfg, "relation_only_epochs", 0))
         if self.relation_only_epochs < 0:
             raise ValueError("relation_only_epochs must be non-negative")
@@ -812,9 +853,7 @@ class OriginTrainer:
         self.warm_start_metric_safety_floor = (
             self._build_warm_start_metric_safety_floor()
         )
-        self.checkpoint_schema = (
-            "origin-checkpoint-v6" if self.relation_enabled else "origin-checkpoint-v3"
-        )
+        self.checkpoint_schema = f"origin-checkpoint-{self.relation_protocol_version}"
         self.use_amp = bool(_cfg_get(cfg, "amp", True) and self.device.type == "cuda")
         self.amp_init_scale = float(_cfg_get(cfg, "amp_init_scale", 4096.0))
         self.amp_unfreeze_scale = float(_cfg_get(cfg, "amp_unfreeze_scale", 256.0))
@@ -924,7 +963,10 @@ class OriginTrainer:
             source[name] = value
         tolerance = self.warm_start_metric_floor_tolerance
         return {
-            "schema": "origin-v6-v3-multimetric-safety-floor-v1",
+            "schema": (
+                f"origin-{self.relation_protocol_version}-v3-"
+                "multimetric-safety-floor-v1"
+            ),
             "source_checkpoint_sha256": self.warm_start_provenance[
                 "source_checkpoint_sha256"
             ],
@@ -972,11 +1014,15 @@ class OriginTrainer:
         for name in ("acc", "qwk", "balanced_acc", "macro_f1", "mae"):
             if name not in metrics:
                 raise ValueError(
-                    f"v6 validation metrics omit safety-floor value {name!r}"
+                    "relational validation metrics omit safety-floor value "
+                    f"{name!r}"
                 )
             value = float(metrics[name])
             if not math.isfinite(value):
-                raise ValueError(f"v6 safety-floor candidate metric {name!r} is non-finite")
+                raise ValueError(
+                    "relational safety-floor candidate metric "
+                    f"{name!r} is non-finite"
+                )
             candidate[name] = value
         checks = {
             "accuracy_strict_improvement": (
@@ -993,7 +1039,10 @@ class OriginTrainer:
         }
         passes_metric_floor = all(checks.values())
         return {
-            "schema": "origin-v6-v3-multimetric-candidate-evaluation-v1",
+            "schema": (
+                f"origin-{self.relation_protocol_version}-v3-"
+                "multimetric-candidate-evaluation-v1"
+            ),
             "candidate_metrics": candidate,
             "checks": checks,
             "passes_metric_floor": passes_metric_floor,
@@ -1176,6 +1225,12 @@ class OriginTrainer:
         relation_edge_abs_sum = 0.0
         relation_edge_count = 0
         relation_edge_abs_max = 0.0
+        relation_selected_edge_sum = 0
+        relation_selected_edge_count = 0
+        relation_selected_edge_min: int | None = None
+        relation_selected_edge_max = 0
+        relation_anova_row_sum_abs_max = 0.0
+        relation_anova_column_sum_abs_max = 0.0
         skipped_steps = 0
         context = torch.enable_grad if train else torch.no_grad
         with context():
@@ -1193,7 +1248,8 @@ class OriginTrainer:
                     base_rates = getattr(output, "base_total_rates", None)
                     if not torch.is_tensor(base_rates):
                         raise AssertionError(
-                            "v6 warm-start baseline must expose base_total_rates"
+                            "relational warm-start baseline must expose "
+                            "base_total_rates"
                         )
                     no_op_error = float(
                         (base_rates.double() - _tensor_field(output, "total_rates").double())
@@ -1204,7 +1260,7 @@ class OriginTrainer:
                     )
                     if no_op_error > 2e-10:
                         raise AssertionError(
-                            "zero-initialized v6 relation field changed the v3 "
+                            "zero-initialized relation field changed the v3 "
                             f"transition ledger (max error {no_op_error:.3e})"
                         )
                 # Structural probabilities are already FP64. Keep the scoring
@@ -1298,8 +1354,83 @@ class OriginTrainer:
                     valid_edges = relation.edge_valid_mask[:, None].expand_as(
                         relation.edge_messages
                     )
-                    edge_values = relation.edge_messages.detach().abs().masked_select(
-                        valid_edges
+                    selected_edges = getattr(relation, "selected_edge_mask", None)
+                    if selected_edges is not None:
+                        if (
+                            not torch.is_tensor(selected_edges)
+                            or selected_edges.shape != relation.edge_messages.shape
+                        ):
+                            raise AssertionError(
+                                "selected relation-edge mask has an invalid shape"
+                            )
+                        selected_edges = selected_edges.bool()
+                        if bool((selected_edges & ~valid_edges).any()):
+                            raise AssertionError(
+                                "selected relation edges include an invalid endpoint"
+                            )
+                        selected_counts = selected_edges.flatten(2).sum(dim=-1)
+                        expected_counts = torch.minimum(
+                            valid_edges.flatten(2).sum(dim=-1),
+                            torch.full_like(
+                                selected_counts,
+                                int(getattr(relation, "edge_budget")),
+                            ),
+                        )
+                        if not torch.equal(selected_counts, expected_counts):
+                            raise AssertionError(
+                                "selected relation-edge support violates its fixed budget"
+                            )
+                        relation_selected_edge_sum += int(selected_counts.sum().cpu())
+                        relation_selected_edge_count += int(selected_counts.numel())
+                        batch_selected_min = int(selected_counts.min().cpu())
+                        relation_selected_edge_min = (
+                            batch_selected_min
+                            if relation_selected_edge_min is None
+                            else min(relation_selected_edge_min, batch_selected_min)
+                        )
+                        relation_selected_edge_max = max(
+                            relation_selected_edge_max,
+                            int(selected_counts.max().cpu()),
+                        )
+                        telemetry_mask = selected_edges
+                        interaction_residuals = getattr(
+                            relation, "interaction_residuals", None
+                        )
+                        if torch.is_tensor(interaction_residuals):
+                            masked_residuals = torch.where(
+                                valid_edges,
+                                interaction_residuals.detach(),
+                                torch.zeros_like(interaction_residuals),
+                            )
+                            relation_anova_row_sum_abs_max = max(
+                                relation_anova_row_sum_abs_max,
+                                float(
+                                    masked_residuals.sum(dim=-1).abs().max().cpu()
+                                ),
+                            )
+                            relation_anova_column_sum_abs_max = max(
+                                relation_anova_column_sum_abs_max,
+                                float(
+                                    masked_residuals.sum(dim=-2).abs().max().cpu()
+                                ),
+                            )
+                    else:
+                        if self.relation_protocol_version == "v7":
+                            raise AssertionError(
+                                "ORIGIN-v7 emitted no selected relation-edge mask"
+                            )
+                        telemetry_mask = valid_edges
+                    edge_contributions = getattr(
+                        relation, "edge_log_odds_contributions", None
+                    )
+                    if not torch.is_tensor(edge_contributions):
+                        edge_contributions = relation.edge_messages
+                    if edge_contributions.shape != relation.edge_messages.shape:
+                        raise AssertionError(
+                            "relation edge-contribution tensor has an invalid shape"
+                        )
+                    edge_values = edge_contributions.detach().abs().masked_select(
+                        telemetry_mask
                     )
                     if edge_values.numel():
                         relation_edge_abs_sum += float(edge_values.sum().cpu())
@@ -1374,6 +1505,42 @@ class OriginTrainer:
                     "max_abs_relation_edge_message": relation_edge_abs_max,
                 }
             )
+            if self.relation_protocol_version == "v7":
+                # V7's audited edge tensor is the literal log-odds contribution,
+                # not the pre-cap message.  Retain the legacy metric names above
+                # for checkpoint/tooling compatibility, but expose accurately
+                # named telemetry for reports and logs.
+                metrics.update(
+                    {
+                        "mean_abs_relation_edge_log_odds_contribution": (
+                            relation_edge_abs_sum / relation_edge_count
+                        ),
+                        "max_abs_relation_edge_log_odds_contribution": (
+                            relation_edge_abs_max
+                        ),
+                    }
+                )
+                if relation_selected_edge_count <= 0 or relation_selected_edge_min is None:
+                    raise AssertionError("ORIGIN-v7 selected-edge telemetry is empty")
+                metrics.update(
+                    {
+                        "mean_selected_relation_edges_per_boundary": (
+                            relation_selected_edge_sum / relation_selected_edge_count
+                        ),
+                        "min_selected_relation_edges_per_boundary": (
+                            relation_selected_edge_min
+                        ),
+                        "max_selected_relation_edges_per_boundary": (
+                            relation_selected_edge_max
+                        ),
+                        "max_abs_interaction_residual_row_sum": (
+                            relation_anova_row_sum_abs_max
+                        ),
+                        "max_abs_interaction_residual_column_sum": (
+                            relation_anova_column_sum_abs_max
+                        ),
+                    }
+                )
         for boundary in range(int(mean_rates.numel())):
             metrics[f"mean_total_rate_boundary_{boundary}"] = float(mean_rates[boundary])
             metrics[f"max_total_rate_boundary_{boundary}"] = float(total_rate_max[boundary])
@@ -1452,6 +1619,8 @@ class OriginTrainer:
         sampler = getattr(self.train_loader, "batch_sampler", None)
         return {
             "schema": self.checkpoint_schema,
+            "relation_protocol_version": self.relation_protocol_version,
+            "relation_variant": self.relation_variant,
             "epoch": int(epoch),
             "fold": self.fold,
             "split_signature": self.split_signature,
@@ -1537,6 +1706,10 @@ class OriginTrainer:
                 f"ORIGIN resume requires {self.checkpoint_schema!r}; "
                 "start a fresh architecture-specific run directory"
             )
+        if state.get("relation_protocol_version") != self.relation_protocol_version:
+            raise ValueError("ORIGIN resume relation protocol mismatch")
+        if state.get("relation_variant") != self.relation_variant:
+            raise ValueError("ORIGIN resume relation variant mismatch")
         checks = {
             "implementation_signature": self.implementation_signature,
             "architecture_signature": self.architecture_signature,
@@ -1829,8 +2002,24 @@ class OriginTrainer:
                     raise TypeError(
                         "relation-enabled ORIGIN must expose replay_without_relations"
                     )
-                ranked = relation.edge_messages.abs().masked_fill(
-                    ~relation.edge_valid_mask[:, None], -torch.inf
+                sparse_contributions = getattr(
+                    relation, "edge_log_odds_contributions", None
+                )
+                ranking_values = (
+                    sparse_contributions
+                    if torch.is_tensor(sparse_contributions)
+                    else relation.edge_messages
+                )
+                ranking_mask = relation.edge_valid_mask[:, None].expand_as(
+                    relation.edge_messages
+                )
+                selected_support = getattr(relation, "selected_edge_mask", None)
+                if selected_support is not None:
+                    if not torch.is_tensor(selected_support):
+                        raise TypeError("selected relation support must be a tensor")
+                    ranking_mask = ranking_mask & selected_support.bool()
+                ranked = ranking_values.abs().masked_fill(
+                    ~ranking_mask, -torch.inf
                 ).flatten(1)
                 if bool((torch.isfinite(ranked[:count]).sum(1) == 0).any()):
                     raise ValueError("validation sample has no valid relation edge")
@@ -1868,14 +2057,50 @@ class OriginTrainer:
                 relation_partition_error = float(
                     relation_partition_errors.max().cpu()
                 )
-                _, recomputed_incremental, recomputed_cumulative = (
-                    aggregate_ordinal_pair_messages(
+                if relation.aggregation_kind == "fixed_budget_linear_conserved_v1":
+                    if (
+                        replay_trace.selected_edge_mask is None
+                        or replay_trace.edge_budget is None
+                    ):
+                        raise AssertionError(
+                            "sparse relation replay lost its support contract"
+                        )
+                    (
+                        recomputed_contributions,
+                        _,
+                        recomputed_incremental,
+                        recomputed_cumulative,
+                    ) = aggregate_sparse_ordinal_pair_messages(
                         replay_trace.edge_messages,
+                        replay_trace.selected_edge_mask,
                         replay_trace.edge_valid_mask,
                         replay_trace.region_valid_mask,
                         delta_cap=replay_trace.delta_cap,
+                        edge_budget=replay_trace.edge_budget,
                     )
-                )
+                    if replay_trace.edge_log_odds_contributions is None:
+                        raise AssertionError(
+                            "sparse relation replay lost literal edge contributions"
+                        )
+                    contribution_error = float(
+                        (
+                            recomputed_contributions
+                            - replay_trace.edge_log_odds_contributions
+                        )
+                        .abs()
+                        .max()
+                        .cpu()
+                    )
+                else:
+                    _, recomputed_incremental, recomputed_cumulative = (
+                        aggregate_ordinal_pair_messages(
+                            replay_trace.edge_messages,
+                            replay_trace.edge_valid_mask,
+                            replay_trace.region_valid_mask,
+                            delta_cap=replay_trace.delta_cap,
+                        )
+                    )
+                    contribution_error = 0.0
                 relation_reaggregation_errors = torch.maximum(
                     (recomputed_incremental - replay_trace.incremental_log_odds)
                     .abs()
@@ -1886,6 +2111,9 @@ class OriginTrainer:
                 )
                 relation_reaggregation_error = float(
                     relation_reaggregation_errors.max().cpu()
+                )
+                relation_reaggregation_error = max(
+                    relation_reaggregation_error, contribution_error
                 )
                 recomputed_rates = bounded_rate_log_odds_merge(
                     _tensor_field(relation_replayed, "base_total_rates"),
@@ -1926,7 +2154,7 @@ class OriginTrainer:
                 replay_relation_predictions = self._predictions(
                     relation_replayed
                 ).detach().cpu()
-                flat_messages = relation.edge_messages.detach().cpu().flatten(1)
+                flat_messages = ranking_values.detach().cpu().flatten(1)
                 for sample in range(count):
                     flat_index = int(selected[sample])
                     boundary = flat_index // (regions * regions)
@@ -1937,7 +2165,11 @@ class OriginTrainer:
                         {
                             "sample_id": self._index_value(indices, sample),
                             "label": int(labels[sample].detach().cpu()),
-                            "selection": "largest_absolute_stored_pair_message",
+                            "selection": (
+                                "largest_absolute_stored_edge_log_odds_contribution"
+                                if torch.is_tensor(sparse_contributions)
+                                else "largest_absolute_stored_pair_message"
+                            ),
                             "boundary": boundary,
                             "target_region": target,
                             "source_region": source,
@@ -1951,6 +2183,16 @@ class OriginTrainer:
                             ),
                             "signed_pair_message": float(
                                 flat_messages[sample, flat_index]
+                            ),
+                            "relation_variant": str(
+                                getattr(relation, "variant", "dense_v1")
+                            ),
+                            "relation_aggregation_kind": str(
+                                getattr(
+                                    relation,
+                                    "aggregation_kind",
+                                    "geometry_normalized_tanh_v1",
+                                )
                             ),
                             "baseline_prediction": int(
                                 baseline_relation_predictions[sample]
@@ -1992,9 +2234,7 @@ class OriginTrainer:
                     )
         payload: dict[str, Any] = {
             "schema": (
-                "origin-exact-validation-certificates-v6"
-                if self.relation_enabled
-                else "origin-exact-validation-certificates-v3"
+                f"origin-exact-validation-certificates-{self.relation_protocol_version}"
             ),
             "scope": "inner_validation_only",
             "fold": self.fold,
@@ -2010,7 +2250,8 @@ class OriginTrainer:
             ),
             "exact_replay_max_abs_source_rate_error": replay_error,
             # Backward-compatible key: in v3 source and final rates coincide;
-            # in v6 this explicitly refers to the pre-relation source ledger.
+            # for relation extensions this explicitly refers to the
+            # pre-relation source ledger.
             "exact_replay_max_abs_total_rate_error": replay_error,
             "exact_replay_total_rate_tolerance": tolerance,
             "exact_relation_merge_max_abs_rate_error": relation_merge_error,
@@ -2076,8 +2317,8 @@ class OriginTrainer:
             logger.info("resumed ORIGIN fold=%d from epoch=%d", self.fold, completed)
         elif self.warm_start_provenance is not None:
             # The inherited v3 predictor is a prospective, eligible baseline:
-            # v6 cannot silently return a worse checkpoint merely because its
-            # newly added zero-initialized relation branch was optimized.
+            # A relation extension cannot silently return a worse checkpoint
+            # merely because its zero-initialized relation branch was optimized.
             baseline_metrics = self._run_epoch(
                 self.val_loader,
                 train=False,
@@ -2103,7 +2344,8 @@ class OriginTrainer:
                     atol=self.warm_start_metric_floor_tolerance,
                 ):
                     raise AssertionError(
-                        f"v6 epoch-0 validation {name} does not reproduce the "
+                        "relational epoch-0 validation "
+                        f"{name} does not reproduce the "
                         "hash-bound v3 checkpoint"
                     )
             best_key = validation_selection_key(
@@ -2113,7 +2355,10 @@ class OriginTrainer:
             )
             best_epoch = 0
             baseline_floor_evaluation = {
-                "schema": "origin-v6-v3-multimetric-candidate-evaluation-v1",
+                "schema": (
+                    f"origin-{self.relation_protocol_version}-v3-"
+                    "multimetric-candidate-evaluation-v1"
+                ),
                 "status": "hash_bound_v3_baseline_floor",
                 "candidate_metrics": {
                     name: float(baseline_metrics[name])
@@ -2240,20 +2485,51 @@ class OriginTrainer:
                 time.time() - started,
             )
             if self.relation_enabled:
+                edge_metric_label = (
+                    "edge_contribution"
+                    if self.relation_protocol_version == "v7"
+                    else "edge_message"
+                )
+                edge_mean_key = (
+                    "mean_abs_relation_edge_log_odds_contribution"
+                    if self.relation_protocol_version == "v7"
+                    else "mean_abs_relation_edge_message"
+                )
+                edge_max_key = (
+                    "max_abs_relation_edge_log_odds_contribution"
+                    if self.relation_protocol_version == "v7"
+                    else "max_abs_relation_edge_message"
+                )
                 logger.info(
-                    "ORIGIN relation epoch=%03d phase=%s "
+                    "ORIGIN relation epoch=%03d protocol=%s variant=%s phase=%s "
                     "|D|_mean=%.6f |D|_max=%.6f "
                     "|rate_delta|_mean=%.6f |rate_delta|_max=%.6f "
-                    "|edge_message|_mean=%.6f |edge_message|_max=%.6f",
+                    "|%s|_mean=%.6f |%s|_max=%.6f",
                     epoch,
+                    self.relation_protocol_version,
+                    self.relation_variant,
                     "relation_only" if self._relation_only_active(epoch) else "joint",
                     val_metrics["mean_abs_relation_log_odds"],
                     val_metrics["max_abs_relation_log_odds"],
                     val_metrics["mean_abs_relation_rate_delta"],
                     val_metrics["max_abs_relation_rate_delta"],
-                    val_metrics["mean_abs_relation_edge_message"],
-                    val_metrics["max_abs_relation_edge_message"],
+                    edge_metric_label,
+                    val_metrics[edge_mean_key],
+                    edge_metric_label,
+                    val_metrics[edge_max_key],
                 )
+                if self.relation_protocol_version == "v7":
+                    logger.info(
+                        "ORIGIN-v7 support epoch=%03d selected_mean=%.2f "
+                        "selected_min=%d selected_max=%d "
+                        "anova_row_error=%.3e anova_column_error=%.3e",
+                        epoch,
+                        val_metrics["mean_selected_relation_edges_per_boundary"],
+                        val_metrics["min_selected_relation_edges_per_boundary"],
+                        val_metrics["max_selected_relation_edges_per_boundary"],
+                        val_metrics["max_abs_interaction_residual_row_sum"],
+                        val_metrics["max_abs_interaction_residual_column_sum"],
+                    )
             if candidate_floor_evaluation is not None:
                 logger.info(
                     "ORIGIN v3 multi-metric safety floor epoch=%03d "
@@ -2290,6 +2566,8 @@ class OriginTrainer:
             ),
             "population_objective_proper": self.population_objective_proper,
             "checkpoint_schema": self.checkpoint_schema,
+            "relation_protocol_version": self.relation_protocol_version,
+            "relation_variant": self.relation_variant,
             "warm_start_provenance": self.warm_start_provenance,
             "warm_start_metric_safety_floor": self.warm_start_metric_safety_floor,
             "selected_checkpoint_metric_safety_floor_evaluation": best.get(

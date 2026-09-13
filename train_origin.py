@@ -344,7 +344,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("posterior_median", "class_map", "rounded_expected"),
         default="class_map",
     )
-    relation = parser.add_argument_group("ORIGIN-v6 relational transition ledger")
+    relation = parser.add_argument_group("ORIGIN-v6/v7 relational transition ledger")
     relation.add_argument("--relation_enabled", action="store_true")
     relation.add_argument("--relation_source_scale", default="s8")
     relation.add_argument("--relation_grid_size", type=int, default=10)
@@ -352,9 +352,37 @@ def build_parser() -> argparse.ArgumentParser:
     relation.add_argument("--relation_head_dim", type=int, default=16)
     relation.add_argument("--relation_delta_cap", type=float, default=2.0)
     relation.add_argument(
+        "--relation_variant",
+        choices=(
+            "dense_v1",
+            "identified_sparse_v1",
+            "additive_endpoint_control_v1",
+            "shuffled_pair_control_v1",
+        ),
+        default="dense_v1",
+        help=(
+            "dense_v1 reproduces the ORIGIN-v6 field; "
+            "identified_sparse_v1 uses the v7 endpoint-residualized "
+            "fixed-budget relation ledger; the remaining variants are "
+            "preregistered parameter-matched controls"
+        ),
+    )
+    relation.add_argument(
+        "--relation_edge_budget",
+        type=int,
+        default=8,
+        help="maximum selected directed relation edges per ordinal boundary",
+    )
+    relation.add_argument(
+        "--relation_permutation_seed",
+        type=int,
+        default=617,
+        help="registered fixed seed reserved for matched relation-pair controls",
+    )
+    relation.add_argument(
         "--warm_start_checkpoint",
         default=None,
-        help="immutable ORIGIN-v3 checkpoint used to initialize a v6 run",
+        help="immutable ORIGIN-v3 checkpoint used to initialize a relation extension",
     )
     relation.add_argument(
         "--warm_start_sha256",
@@ -505,6 +533,9 @@ def main() -> None:
         relation_dim=args.relation_dim,
         relation_head_dim=args.relation_head_dim,
         relation_delta_cap=args.relation_delta_cap,
+        relation_variant=args.relation_variant,
+        relation_edge_budget=args.relation_edge_budget,
+        relation_permutation_seed=args.relation_permutation_seed,
         warm_start_checkpoint=args.warm_start_checkpoint,
         warm_start_sha256=args.warm_start_sha256,
         warm_start_metric_floor_tolerance=args.warm_start_metric_floor_tolerance,
@@ -550,7 +581,7 @@ def main() -> None:
         )
     if cfg.relation_enabled and not cfg.resume and cfg.warm_start_checkpoint is None:
         raise ValueError(
-            "a fresh ORIGIN-v6 relational run requires --warm_start_checkpoint "
+            "a fresh relational ORIGIN run requires --warm_start_checkpoint "
             "and --warm_start_sha256; random initialization is not the controlled protocol"
         )
     if not cfg.relation_enabled and cfg.warm_start_checkpoint is not None:
@@ -670,6 +701,9 @@ def main() -> None:
             relation_dim=cfg.relation_dim,
             relation_head_dim=cfg.relation_head_dim,
             relation_delta_cap=cfg.relation_delta_cap,
+            relation_variant=cfg.relation_variant,
+            relation_edge_budget=cfg.relation_edge_budget,
+            relation_permutation_seed=cfg.relation_permutation_seed,
         )
         trainer = OriginTrainer(
             model,

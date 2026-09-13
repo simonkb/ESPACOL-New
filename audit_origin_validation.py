@@ -40,6 +40,7 @@ from models.origin import (
     aggregate_ordinal_pair_messages,
     bounded_rate_log_odds_merge,
     build_origin_model,
+    reverse_cumulative_atoms,
 )
 from train_origin import split_signature
 from training.origin_trainer import (
@@ -80,7 +81,13 @@ def _verify_provenance(
     """Fail closed if code, model, config, or complete split identity changed."""
 
     expected_schema = (
-        "origin-checkpoint-v6" if cfg.relation_enabled else "origin-checkpoint-v3"
+        (
+            "origin-checkpoint-v6"
+            if str(getattr(cfg, "relation_variant", "dense_v1")) == "dense_v1"
+            else "origin-checkpoint-v7"
+        )
+        if cfg.relation_enabled
+        else "origin-checkpoint-v3"
     )
     if state.get("schema") != expected_schema:
         raise ValueError(
@@ -193,7 +200,9 @@ def _relation_effect_summary(
         [item["cumulative_probability_delta"] for item in records],
         dtype=np.float64,
     )
-    return {
+    absolute_expected = [abs(value) for value in expected]
+    effect_tolerance = 1e-5
+    result = {
         "n": len(records),
         "prediction_change_count": sum(value != 0 for value in grade_delta),
         "prediction_change_rate": sum(value != 0 for value in grade_delta) / len(records),
@@ -201,6 +210,18 @@ def _relation_effect_summary(
         "mean_expected_grade_delta": float(np.mean(expected)),
         "mean_absolute_expected_grade_delta": float(np.mean(np.abs(expected))),
         "expected_grade_delta_quantiles": _quantiles(expected, quantiles),
+        "absolute_expected_grade_delta_quantiles": _quantiles(
+            absolute_expected, quantiles
+        ),
+        "positive_effect_count_above_1e-5": sum(
+            value > effect_tolerance for value in expected
+        ),
+        "negative_effect_count_below_minus_1e-5": sum(
+            value < -effect_tolerance for value in expected
+        ),
+        "near_zero_effect_count_at_1e-5": sum(
+            abs(value) <= effect_tolerance for value in expected
+        ),
         "mean_removed_edge_message_l1": float(
             np.mean([item["removed_edge_message_l1"] for item in records])
         ),
@@ -209,6 +230,659 @@ def _relation_effect_summary(
         ),
         "mean_cumulative_probability_delta": cumulative.mean(axis=0).tolist(),
     }
+    if all("removed_edge_log_odds_l1" in item for item in records):
+        result["mean_removed_edge_log_odds_l1"] = float(
+            np.mean([item["removed_edge_log_odds_l1"] for item in records])
+        )
+        result["mean_removed_edge_log_odds_signed_sum"] = float(
+            np.mean(
+                [item["removed_edge_log_odds_signed_sum"] for item in records]
+            )
+        )
+    return result
+
+
+def _masked_directed_anova_projection(
+    scores: torch.Tensor,
+    candidate_edge_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Independently project pair scores off endpoint-only main effects.
+
+    The candidate graph must be the complete directed graph without self edges
+    on each sample's valid regions.  The returned residual is orthogonal to an
+    intercept, every target indicator, and every source indicator.  This
+    audit implementation is intentionally separate from the model helper.
+    """
+
+    if scores.ndim != 4 or scores.shape[-1] != scores.shape[-2]:
+        raise ValueError("pair scores must have shape (N,B,M,M)")
+    batch, _, regions, _ = scores.shape
+    if candidate_edge_mask.shape != (batch, regions, regions):
+        raise ValueError("candidate edge mask must have shape (N,M,M)")
+    candidate = candidate_edge_mask.bool()
+    projected = torch.zeros_like(scores, dtype=torch.float64)
+    working = scores.to(dtype=torch.float64)
+    diagonal = torch.eye(regions, dtype=torch.bool, device=scores.device)
+
+    for row in range(batch):
+        region_valid = candidate[row].any(dim=-1) | candidate[row].any(dim=-2)
+        expected = (
+            region_valid[:, None]
+            & region_valid[None, :]
+            & ~diagonal
+        )
+        if not torch.equal(candidate[row], expected):
+            raise AssertionError(
+                "candidate relation graph is not complete directed off-diagonal"
+            )
+        indices = region_valid.nonzero(as_tuple=False).flatten()
+        count = int(indices.numel())
+        if count < 3:
+            # With fewer than three endpoints the directed graph contains no
+            # identifiable residual after target/source main effects.
+            continue
+        sub = working[row][:, indices][:, :, indices]
+        row_sum = sub.sum(dim=-1)
+        column_sum = sub.sum(dim=-2)
+        total = row_sum.sum(dim=-1, keepdim=True)
+        gauge = total / (2.0 * float(count - 1))
+        denominator = float(count * (count - 2))
+        target_main = (
+            float(count - 1) * (row_sum - gauge)
+            + (column_sum - gauge)
+        ) / denominator
+        source_main = (
+            (row_sum - gauge)
+            + float(count - 1) * (column_sum - gauge)
+        ) / denominator
+        residual = sub - target_main[..., :, None] - source_main[..., None, :]
+        residual = residual.masked_fill(
+            torch.eye(count, dtype=torch.bool, device=scores.device)[None], 0.0
+        )
+        for local_target, global_target in enumerate(indices.tolist()):
+            projected[row, :, global_target, indices] = residual[:, local_target]
+    return projected
+
+
+def _audit_sparse_relation_trace(relation: object) -> dict[str, Any]:
+    """Fail-closed structural audit of an identified sparse relation trace."""
+
+    variant = str(getattr(relation, "variant", "dense_v1"))
+    aggregation_kind = str(
+        getattr(relation, "aggregation_kind", "geometry_normalized_tanh_v1")
+    )
+    if aggregation_kind != "fixed_budget_linear_conserved_v1":
+        raise ValueError(
+            "sparse relation trace has an unknown aggregation contract: "
+            f"{aggregation_kind!r}"
+        )
+    candidate_value = getattr(relation, "candidate_edge_mask")
+    selected_value = getattr(relation, "selected_edge_mask")
+    edge_valid_value = getattr(relation, "edge_valid_mask")
+    if (
+        candidate_value.dtype != torch.bool
+        or selected_value.dtype != torch.bool
+        or edge_valid_value.dtype != torch.bool
+    ):
+        raise TypeError("sparse relation support masks must be boolean")
+    candidate = candidate_value
+    selected = selected_value
+    edge_valid = edge_valid_value
+    messages = getattr(relation, "edge_messages")
+    contributions = getattr(relation, "edge_log_odds_contributions")
+    budget = int(getattr(relation, "edge_budget"))
+    raw_proposal = getattr(relation, "raw_proposal_scores")
+    unidentified_proposal = getattr(relation, "unidentified_proposal_scores")
+    pre_geometry_proposal = getattr(
+        relation, "pre_geometry_proposal_residuals"
+    )
+    pre_geometry_additive_proposal = getattr(
+        relation, "pre_geometry_additive_proposal_scores"
+    )
+    projected_proposal = getattr(relation, "projected_proposal_scores")
+    additive_proposal = getattr(relation, "additive_proposal_scores")
+    raw_interaction = getattr(relation, "raw_interaction_scores")
+    unidentified_interaction = getattr(
+        relation, "unidentified_interaction_scores"
+    )
+    pre_geometry_interaction = getattr(
+        relation, "pre_geometry_interaction_residuals"
+    )
+    pre_geometry_additive_endpoints = getattr(
+        relation, "pre_geometry_additive_endpoint_scores"
+    )
+    interaction_residuals = getattr(relation, "interaction_residuals")
+    additive_endpoints = getattr(relation, "additive_endpoint_scores")
+    geometry_modulation = getattr(relation, "geometry_modulation")
+    region_valid = getattr(relation, "region_valid_mask").bool()
+
+    if budget < 1:
+        raise ValueError("sparse relation edge budget must be positive")
+    if candidate.shape != edge_valid.shape or not torch.equal(candidate, edge_valid):
+        raise AssertionError("candidate and valid relation masks differ")
+    expected_candidate = (
+        region_valid[:, :, None]
+        & region_valid[:, None, :]
+        & ~torch.eye(
+            region_valid.shape[1], dtype=torch.bool, device=region_valid.device
+        )[None]
+    )
+    if not torch.equal(candidate, expected_candidate):
+        raise AssertionError("candidate relation graph is not valid directed pairs")
+    expected_shape = messages.shape
+    for name, value in {
+        "selected edge mask": selected,
+        "edge log-odds contributions": contributions,
+        "raw proposal scores": raw_proposal,
+        "unidentified proposal scores": unidentified_proposal,
+        "pre-geometry proposal residuals": pre_geometry_proposal,
+        "pre-geometry additive proposal scores": (
+            pre_geometry_additive_proposal
+        ),
+        "projected proposal scores": projected_proposal,
+        "additive proposal scores": additive_proposal,
+        "raw interaction scores": raw_interaction,
+        "unidentified interaction scores": unidentified_interaction,
+        "pre-geometry interaction residuals": pre_geometry_interaction,
+        "pre-geometry additive endpoint scores": (
+            pre_geometry_additive_endpoints
+        ),
+        "interaction residuals": interaction_residuals,
+        "additive endpoint scores": additive_endpoints,
+        "geometry modulation": geometry_modulation,
+    }.items():
+        if value.shape != expected_shape:
+            raise ValueError(f"{name} shape differs from edge-message shape")
+    if bool((selected & ~candidate[:, None]).any()):
+        raise AssertionError("selected relation support leaves candidate graph")
+    for name, value in {
+        "messages": messages,
+        "contributions": contributions,
+        "raw proposal": raw_proposal,
+        "unidentified proposal": unidentified_proposal,
+        "pre-geometry proposal": pre_geometry_proposal,
+        "pre-geometry additive proposal": pre_geometry_additive_proposal,
+        "projected proposal": projected_proposal,
+        "additive proposal": additive_proposal,
+        "raw interaction": raw_interaction,
+        "unidentified interaction": unidentified_interaction,
+        "pre-geometry interaction": pre_geometry_interaction,
+        "pre-geometry additive endpoints": pre_geometry_additive_endpoints,
+        "interaction residuals": interaction_residuals,
+        "additive endpoints": additive_endpoints,
+        "geometry modulation": geometry_modulation,
+    }.items():
+        if not bool(torch.isfinite(value).all()):
+            raise FloatingPointError(f"sparse relation {name} are non-finite")
+    if bool((messages.masked_select(~selected) != 0).any()):
+        raise AssertionError("non-selected relation edges carry messages")
+    if bool((contributions.masked_select(~selected) != 0).any()):
+        raise AssertionError("non-selected relation edges carry contributions")
+
+    candidate_count = candidate.sum(dim=(1, 2))
+    selected_count = selected.sum(dim=(2, 3))
+    expected_count = torch.minimum(
+        candidate_count[:, None],
+        torch.full_like(selected_count, budget),
+    )
+    if not torch.equal(selected_count, expected_count):
+        raise AssertionError("sparse relation support violates its exact edge budget")
+
+    # Verify that the stored support is a valid top-q support.  This is
+    # independent of tie order: every selected score must be no smaller than
+    # every eligible unselected score.
+    proposal_for_selection = (
+        additive_proposal
+        if variant == "additive_endpoint_control_v1"
+        else projected_proposal
+    ).abs()
+    selected_floor = proposal_for_selection.masked_fill(~selected, torch.inf).amin(
+        dim=(2, 3)
+    )
+    unselected_candidates = candidate[:, None] & ~selected
+    unselected_ceiling = proposal_for_selection.masked_fill(
+        ~unselected_candidates, -torch.inf
+    ).amax(dim=(2, 3))
+    ranking_violation = (unselected_ceiling - selected_floor).clamp_min(0.0)
+    ranking_violation = torch.where(
+        torch.isfinite(ranking_violation), ranking_violation, torch.zeros_like(ranking_violation)
+    )
+    ranking_tolerance = 2e-6 * max(
+        1.0, float(proposal_for_selection.detach().abs().max().cpu())
+    )
+    if float(ranking_violation.max().cpu()) > ranking_tolerance:
+        raise AssertionError("selected relation support is not the declared top-q")
+
+    independent_pre_geometry_proposal = _masked_directed_anova_projection(
+        unidentified_proposal, candidate
+    )
+    independent_pre_geometry_interaction = _masked_directed_anova_projection(
+        unidentified_interaction, candidate
+    )
+    expected_pre_geometry_additive_proposal = (
+        unidentified_proposal - independent_pre_geometry_proposal
+    )
+    expected_pre_geometry_additive_interaction = (
+        unidentified_interaction - independent_pre_geometry_interaction
+    )
+    independent_proposal = _masked_directed_anova_projection(
+        raw_proposal, candidate
+    )
+    independent_interaction = _masked_directed_anova_projection(
+        raw_interaction, candidate
+    )
+    projection_scale = max(
+        1.0,
+        float(unidentified_proposal.detach().abs().max().cpu()),
+        float(unidentified_interaction.detach().abs().max().cpu()),
+        float(raw_proposal.detach().abs().max().cpu()),
+        float(raw_interaction.detach().abs().max().cpu()),
+    )
+    projection_tolerance = 5e-5 * projection_scale
+    pre_geometry_proposal_projection_error = float(
+        (
+            pre_geometry_proposal.double()
+            - independent_pre_geometry_proposal
+        )
+        .abs()
+        .max()
+        .cpu()
+    )
+    pre_geometry_interaction_projection_error = float(
+        (
+            pre_geometry_interaction.double()
+            - independent_pre_geometry_interaction
+        )
+        .abs()
+        .max()
+        .cpu()
+    )
+    pre_geometry_additive_proposal_error = float(
+        (
+            pre_geometry_additive_proposal.double()
+            - expected_pre_geometry_additive_proposal
+        )
+        .abs()
+        .max()
+        .cpu()
+    )
+    pre_geometry_additive_interaction_error = float(
+        (
+            pre_geometry_additive_endpoints.double()
+            - expected_pre_geometry_additive_interaction
+        )
+        .abs()
+        .max()
+        .cpu()
+    )
+    geometry_proposal_source = (
+        pre_geometry_additive_proposal
+        if variant == "additive_endpoint_control_v1"
+        else pre_geometry_proposal
+    )
+    geometry_interaction_source = (
+        pre_geometry_additive_endpoints
+        if variant == "additive_endpoint_control_v1"
+        else pre_geometry_interaction
+    )
+    geometry_proposal_error = float(
+        (
+            raw_proposal
+            - geometry_proposal_source * geometry_modulation
+        )
+        .abs()
+        .max()
+        .cpu()
+    )
+    geometry_interaction_error = float(
+        (
+            raw_interaction
+            - geometry_interaction_source * geometry_modulation
+        )
+        .abs()
+        .max()
+        .cpu()
+    )
+    proposal_projection_error = float(
+        (projected_proposal.double() - independent_proposal).abs().max().cpu()
+    )
+    interaction_projection_error = float(
+        (interaction_residuals.double() - independent_interaction).abs().max().cpu()
+    )
+    projection_diagnostics = (
+        pre_geometry_proposal_projection_error,
+        pre_geometry_interaction_projection_error,
+        pre_geometry_additive_proposal_error,
+        pre_geometry_additive_interaction_error,
+        geometry_proposal_error,
+        geometry_interaction_error,
+        proposal_projection_error,
+        interaction_projection_error,
+    )
+    if not all(math.isfinite(value) for value in projection_diagnostics):
+        raise FloatingPointError("sparse relation projection diagnostics are non-finite")
+    if max(projection_diagnostics) > projection_tolerance:
+        raise AssertionError("stored relation ANOVA projection does not replay")
+    proposal_partition_error = float(
+        (raw_proposal - (projected_proposal + additive_proposal)).abs().max().cpu()
+    )
+    interaction_partition_error = float(
+        (raw_interaction - (interaction_residuals + additive_endpoints)).abs().max().cpu()
+    )
+    if not all(
+        math.isfinite(value)
+        for value in (proposal_partition_error, interaction_partition_error)
+    ):
+        raise FloatingPointError("sparse relation partition diagnostics are non-finite")
+    if max(proposal_partition_error, interaction_partition_error) > projection_tolerance:
+        raise AssertionError("relation interaction/main-effect partition is invalid")
+
+    residual_mask = candidate[:, None]
+    residual_fields = (
+        pre_geometry_proposal,
+        pre_geometry_interaction,
+        projected_proposal,
+        interaction_residuals,
+    )
+    row_column_terms = []
+    for residual_field in residual_fields:
+        masked_field = residual_field.masked_fill(~residual_mask, 0.0)
+        row_column_terms.extend(
+            (masked_field.sum(dim=-1), masked_field.sum(dim=-2))
+        )
+    row_column_error = max(
+        float(value.abs().max().cpu()) for value in row_column_terms
+    )
+    sum_tolerance = max(
+        2e-6,
+        32.0
+        * torch.finfo(torch.float32).eps
+        * float(candidate.shape[-1])
+        * projection_scale,
+    )
+    if not math.isfinite(row_column_error):
+        raise FloatingPointError("sparse relation cancellation diagnostic is non-finite")
+    if row_column_error > sum_tolerance:
+        raise AssertionError("relation residual retains endpoint main effects")
+
+    active_scores = (
+        additive_endpoints
+        if variant == "additive_endpoint_control_v1"
+        else interaction_residuals
+    )
+    expected_messages = torch.where(
+        selected, active_scores.tanh(), torch.zeros_like(active_scores)
+    )
+    message_error = float((messages - expected_messages).abs().max().cpu())
+    boundaries = int(messages.shape[1])
+    expected_contributions = (
+        float(getattr(relation, "delta_cap"))
+        / float(boundaries * budget)
+        * expected_messages
+    )
+    contribution_error = float(
+        (contributions - expected_contributions).abs().max().cpu()
+    )
+    target = contributions.sum(dim=-1)
+    incremental = target.sum(dim=-1)
+    cumulative = reverse_cumulative_atoms(incremental, dim=1)
+    aggregation_error = max(
+        float(
+            (target - getattr(relation, "target_incremental_log_odds"))
+            .abs()
+            .max()
+            .cpu()
+        ),
+        float(
+            (incremental - getattr(relation, "incremental_log_odds"))
+            .abs()
+            .max()
+            .cpu()
+        ),
+        float(
+            (cumulative - getattr(relation, "cumulative_log_odds"))
+            .abs()
+            .max()
+            .cpu()
+        ),
+    )
+    if not all(
+        math.isfinite(value)
+        for value in (message_error, contribution_error, aggregation_error)
+    ):
+        raise FloatingPointError("sparse relation compilation diagnostics are non-finite")
+    numeric_tolerance = max(2e-6, projection_tolerance)
+    if max(message_error, contribution_error, aggregation_error) > numeric_tolerance:
+        raise AssertionError("sparse relation contribution compilation is invalid")
+    if bool((cumulative.abs() > float(getattr(relation, "delta_cap")) + 2e-6).any()):
+        raise AssertionError("sparse relation cumulative budget is exceeded")
+
+    nonzero_count = contributions.ne(0).sum(dim=(2, 3))
+    density = selected_count.double() / candidate_count.clamp_min(1)[:, None].double()
+    return {
+        "variant": variant,
+        "aggregation_kind": aggregation_kind,
+        "edge_budget": budget,
+        "candidate_count": candidate_count.detach().cpu(),
+        "selected_count": selected_count.detach().cpu(),
+        "nonzero_count": nonzero_count.detach().cpu(),
+        "selected_density": density.detach().cpu(),
+        "max_topq_ranking_violation": float(ranking_violation.max().cpu()),
+        "max_pre_geometry_proposal_projection_replay_error": (
+            pre_geometry_proposal_projection_error
+        ),
+        "max_pre_geometry_interaction_projection_replay_error": (
+            pre_geometry_interaction_projection_error
+        ),
+        "max_pre_geometry_additive_proposal_identity_error": (
+            pre_geometry_additive_proposal_error
+        ),
+        "max_pre_geometry_additive_interaction_identity_error": (
+            pre_geometry_additive_interaction_error
+        ),
+        "max_geometry_proposal_identity_error": geometry_proposal_error,
+        "max_geometry_interaction_identity_error": geometry_interaction_error,
+        "max_proposal_projection_replay_error": proposal_projection_error,
+        "max_interaction_projection_replay_error": interaction_projection_error,
+        "max_proposal_partition_error": proposal_partition_error,
+        "max_interaction_partition_error": interaction_partition_error,
+        "max_residual_row_or_column_sum": row_column_error,
+        "max_message_identity_error": message_error,
+        "max_edge_contribution_identity_error": contribution_error,
+        "max_sparse_aggregation_identity_error": aggregation_error,
+    }
+
+
+def _exact_two_sided_mcnemar_pvalue(helped: int, harmed: int) -> float:
+    """Exact two-sided binomial McNemar p-value without SciPy."""
+
+    discordant = int(helped) + int(harmed)
+    if discordant == 0:
+        return 1.0
+    tail = min(int(helped), int(harmed))
+    log_terms = [
+        math.lgamma(discordant + 1)
+        - math.lgamma(index + 1)
+        - math.lgamma(discordant - index + 1)
+        - discordant * math.log(2.0)
+        for index in range(tail + 1)
+    ]
+    maximum = max(log_terms)
+    probability = math.exp(maximum) * sum(
+        math.exp(value - maximum) for value in log_terms
+    )
+    return min(1.0, 2.0 * probability)
+
+
+def _relation_ablation_summary(
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Compare the full relation circuit with its exact no-relation replay."""
+
+    if not records:
+        return {"n": 0}
+    labels = torch.tensor([int(item["label"]) for item in records])
+    full_predictions = torch.tensor(
+        [int(item["baseline_prediction"]) for item in records]
+    )
+    replayed_predictions = torch.tensor(
+        [int(item["replayed_prediction"]) for item in records]
+    )
+    full_probabilities = torch.tensor(
+        [item["baseline_class_probs"] for item in records], dtype=torch.float64
+    )
+    replayed_probabilities = torch.tensor(
+        [item["replayed_class_probs"] for item in records], dtype=torch.float64
+    )
+    full_metrics = evaluate_origin_predictions(
+        full_probabilities, full_predictions, labels
+    )
+    replayed_metrics = evaluate_origin_predictions(
+        replayed_probabilities, replayed_predictions, labels
+    )
+    full_correct = full_predictions.eq(labels)
+    replayed_correct = replayed_predictions.eq(labels)
+    helped = int((full_correct & ~replayed_correct).sum())
+    harmed = int((~full_correct & replayed_correct).sum())
+    changed = full_predictions.ne(replayed_predictions)
+
+    by_grade: dict[str, Any] = {}
+    for grade in sorted(set(labels.tolist())):
+        members = labels.eq(grade)
+        by_grade[str(grade)] = {
+            "support": int(members.sum()),
+            "prediction_change_count": int((changed & members).sum()),
+            "full_relation_only_correct": int(
+                (full_correct & ~replayed_correct & members).sum()
+            ),
+            "no_relation_only_correct": int(
+                (~full_correct & replayed_correct & members).sum()
+            ),
+        }
+    metric_delta = {
+        name: float(full_metrics[name]) - float(replayed_metrics[name])
+        for name in ("acc", "qwk", "balanced_acc", "macro_f1", "mae", "ece")
+    }
+    return {
+        "n": len(records),
+        "full_relation_metrics": full_metrics,
+        "no_relation_metrics": replayed_metrics,
+        "full_minus_no_relation": metric_delta,
+        "prediction_change_count": int(changed.sum()),
+        "prediction_change_rate": float(changed.double().mean()),
+        "full_relation_only_correct": helped,
+        "no_relation_only_correct": harmed,
+        "net_correct": helped - harmed,
+        "exact_two_sided_mcnemar_pvalue_descriptive": (
+            _exact_two_sided_mcnemar_pvalue(helped, harmed)
+        ),
+        "by_true_grade": by_grade,
+    }
+
+
+def _most_pivotal_sparse_edge_records(
+    model: torch.nn.Module,
+    output: object,
+    relation: object,
+    labels: torch.Tensor,
+    sample_ids: torch.Tensor,
+    decision_rule: str,
+    collective_records: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], tuple[float, float, float, float]]:
+    """Exhaustively choose each sample's strongest actual active-edge effect."""
+
+    selected_mask = relation.selected_edge_mask.bool()
+    contributions = relation.edge_log_odds_contributions
+    flat_selected = selected_mask.flatten(1)
+    flat_contributions = contributions.flatten(1)
+    counts = flat_selected.sum(dim=1)
+    if bool((counts <= 0).any()):
+        raise AssertionError("sparse relation sample has no selected edge")
+    # Contribution magnitude fixes only enumeration order.  Selection of the
+    # final certificate below uses exact leave-one-edge-out expected-grade
+    # effects, not this internal score.
+    ranked = flat_contributions.abs().masked_fill(~flat_selected, -torch.inf)
+    order = ranked.argsort(dim=1, descending=True)
+    per_sample: list[list[tuple[dict[str, Any], int]]] = [
+        [] for _ in range(len(labels))
+    ]
+    maxima = [0.0, 0.0, 0.0, 0.0]
+    for rank in range(int(counts.max().item())):
+        present = counts > rank
+        flat_index = order[:, rank]
+        removal = torch.zeros_like(selected_mask).flatten(1)
+        removal.scatter_(1, flat_index[:, None], present[:, None])
+        removal = removal.reshape_as(selected_mask)
+        records, *errors = _relation_replay_records(
+            model,
+            output,
+            removal,
+            labels,
+            sample_ids,
+            decision_rule,
+        )
+        maxima = [max(old, new) for old, new in zip(maxima, errors)]
+        for row, record in enumerate(records):
+            if bool(present[row]):
+                per_sample[row].append((record, int(flat_index[row])))
+
+    regions = int(contributions.shape[-1])
+    centers = relation.region_centers_yx.detach().cpu()
+    result: list[dict[str, Any]] = []
+    for row, candidates in enumerate(per_sample):
+        candidates.sort(
+            key=lambda item: abs(float(item[0]["expected_grade_delta"])),
+            reverse=True,
+        )
+        record, flat_index = candidates[0]
+        absolute_effects = [
+            abs(float(item[0]["expected_grade_delta"])) for item in candidates
+        ]
+        effect_l1 = float(sum(absolute_effects))
+        top4 = float(sum(sorted(absolute_effects, reverse=True)[:4]))
+        boundary = flat_index // (regions * regions)
+        endpoints = flat_index % (regions * regions)
+        target = endpoints // regions
+        source = endpoints % regions
+        collective = abs(float(collective_records[row]["expected_grade_delta"]))
+        record.update(
+            {
+                "selection": "most_pivotal_selected_pair_by_exact_leave_one_edge_replay",
+                "boundary": int(boundary),
+                "target_region": int(target),
+                "source_region": int(source),
+                "target_center_yx": centers[target].tolist(),
+                "source_center_yx": centers[source].tolist(),
+                "signed_pair_message": float(
+                    relation.edge_messages.detach().cpu().flatten(1)[row, flat_index]
+                ),
+                "signed_edge_log_odds_contribution": float(
+                    flat_contributions.detach().cpu()[row, flat_index]
+                ),
+                "selected_edge_count": int(counts[row]),
+                "sum_absolute_individual_edge_effects": effect_l1,
+                "top_edge_effect_share_of_individual_l1": (
+                    abs(float(record["expected_grade_delta"])) / effect_l1
+                    if effect_l1 > 0.0
+                    else 0.0
+                ),
+                "top4_edge_effect_share_of_individual_l1": (
+                    top4 / effect_l1 if effect_l1 > 0.0 else 0.0
+                ),
+                "absolute_collective_relation_effect": collective,
+                "collective_to_individual_l1_ratio": (
+                    collective / effect_l1 if effect_l1 > 0.0 else 0.0
+                ),
+                "region_receptive_field_pixels": int(
+                    relation.region_receptive_field
+                ),
+                "region_output_stride_pixels": int(
+                    relation.region_output_stride
+                ),
+            }
+        )
+        result.append(record)
+    return result, tuple(maxima)  # type: ignore[return-value]
 
 
 def _rf_metadata(scale_metadata: Any, spatial: Sequence[int]) -> dict[str, Any]:
@@ -406,6 +1080,51 @@ def _relation_replay_records(
     canonical = intervention.removal_mask.bool()
     removed = intervention.removed_edge_messages
     original_messages = baseline_relation.edge_messages
+    requested = torch.as_tensor(removals, device=original_messages.device)
+    batch, boundaries, regions, _ = original_messages.shape
+    if requested.ndim == 2:
+        requested = requested[None, None]
+    elif requested.ndim == 3:
+        if requested.shape[0] != batch:
+            raise AssertionError("relation audit received an ambiguous removal mask")
+        requested = requested[:, None]
+    elif requested.ndim != 4:
+        raise AssertionError("relation audit received an invalid removal-mask rank")
+    try:
+        expected_canonical = requested.bool().expand(
+            batch, boundaries, regions, regions
+        )
+    except RuntimeError as error:
+        raise AssertionError(
+            "relation audit removal mask is not broadcastable to the edge ledger"
+        ) from error
+    expected_canonical = (
+        expected_canonical & baseline_relation.edge_valid_mask[:, None]
+    )
+    baseline_selected = getattr(baseline_relation, "selected_edge_mask", None)
+    if baseline_selected is not None:
+        expected_canonical = expected_canonical & baseline_selected.bool()
+    if not torch.equal(canonical, expected_canonical):
+        raise AssertionError(
+            "relation intervention changed or ignored the requested deletion mask"
+        )
+    for support_name in (
+        "region_valid_mask",
+        "edge_valid_mask",
+        "candidate_edge_mask",
+        "selected_edge_mask",
+    ):
+        baseline_support = getattr(baseline_relation, support_name, None)
+        replayed_support = getattr(replayed_relation, support_name, None)
+        if baseline_support is None or replayed_support is None:
+            if baseline_support is not replayed_support:
+                raise AssertionError(
+                    f"relation replay changed optional support {support_name}"
+                )
+        elif not torch.equal(baseline_support, replayed_support):
+            raise AssertionError(
+                f"relation replay reselected or changed support {support_name}"
+            )
     partition_error = float(
         (original_messages - (replayed_relation.edge_messages + removed))
         .abs()
@@ -419,12 +1138,67 @@ def _relation_replay_records(
         torch.where(canonical, original_messages, torch.zeros_like(original_messages)),
     ):
         raise AssertionError("relation intervention removal mask is not replayable")
-    _, recomputed_incremental, recomputed_cumulative = aggregate_ordinal_pair_messages(
-        replayed_relation.edge_messages,
-        replayed_relation.edge_valid_mask,
-        replayed_relation.region_valid_mask,
-        delta_cap=replayed_relation.delta_cap,
+    aggregation_kind = str(
+        getattr(
+            replayed_relation,
+            "aggregation_kind",
+            "geometry_normalized_tanh_v1",
+        )
     )
+    removed_contributions: torch.Tensor | None = None
+    if aggregation_kind == "fixed_budget_linear_conserved_v1":
+        original_contributions = baseline_relation.edge_log_odds_contributions
+        replayed_contributions = replayed_relation.edge_log_odds_contributions
+        reported_removed_contributions = getattr(
+            intervention, "removed_edge_log_odds_contributions", None
+        )
+        if reported_removed_contributions is None:
+            raise AssertionError(
+                "sparse relation replay omitted removed edge contributions"
+            )
+        removed_contributions = reported_removed_contributions
+        contribution_partition_error = float(
+            (
+                original_contributions
+                - (replayed_contributions + removed_contributions)
+            )
+            .abs()
+            .max()
+            .cpu()
+        )
+        if contribution_partition_error != 0.0:
+            raise AssertionError(
+                "relation replay did not exactly partition edge contributions"
+            )
+        if bool((removed_contributions.masked_select(~canonical) != 0).any()):
+            raise AssertionError(
+                "relation replay changed non-removed edge contributions"
+            )
+        if not torch.equal(
+            removed_contributions,
+            torch.where(
+                canonical,
+                original_contributions,
+                torch.zeros_like(original_contributions),
+            ),
+        ):
+            raise AssertionError(
+                "relation contribution removal mask is not replayable"
+            )
+        recomputed_target = replayed_contributions.sum(dim=-1)
+        recomputed_incremental = recomputed_target.sum(dim=-1)
+        recomputed_cumulative = reverse_cumulative_atoms(
+            recomputed_incremental, dim=1
+        )
+    else:
+        _, recomputed_incremental, recomputed_cumulative = (
+            aggregate_ordinal_pair_messages(
+                replayed_relation.edge_messages,
+                replayed_relation.edge_valid_mask,
+                replayed_relation.region_valid_mask,
+                delta_cap=replayed_relation.delta_cap,
+            )
+        )
     reaggregation_error = max(
         float(
             (recomputed_incremental - replayed_relation.incremental_log_odds)
@@ -456,11 +1230,16 @@ def _relation_replay_records(
     new_expected = _field(replayed, "expected_grade").detach().cpu()
     base_cumulative = _field(baseline, "cumulative_probs").detach().cpu()
     new_cumulative = _field(replayed, "cumulative_probs").detach().cpu()
+    base_probabilities = _field(baseline, "class_probs").detach().cpu()
+    new_probabilities = _field(replayed, "class_probs").detach().cpu()
     expected_delta = base_expected - new_expected
     cumulative_delta = base_cumulative - new_cumulative
     if float((expected_delta - cumulative_delta.sum(-1)).abs().max()) > 2e-10:
         raise AssertionError("relation deletion expected-grade identity failed")
     removed_cpu = removed.detach().cpu()
+    removed_contributions_cpu = (
+        None if removed_contributions is None else removed_contributions.detach().cpu()
+    )
     records = []
     for row in range(len(labels)):
         records.append(
@@ -469,12 +1248,27 @@ def _relation_replay_records(
                 "label": int(labels[row]),
                 "baseline_prediction": int(base_prediction[row]),
                 "replayed_prediction": int(new_prediction[row]),
+                "baseline_expected_grade": float(base_expected[row]),
+                "replayed_expected_grade": float(new_expected[row]),
                 "expected_grade_delta": float(expected_delta[row]),
                 "removed_edge_message_l1": float(removed_cpu[row].abs().sum()),
                 "removed_edge_message_signed_sum": float(removed_cpu[row].sum()),
                 "cumulative_probability_delta": cumulative_delta[row].tolist(),
+                "baseline_class_probs": base_probabilities[row].tolist(),
+                "replayed_class_probs": new_probabilities[row].tolist(),
             }
         )
+        if removed_contributions_cpu is not None:
+            records[-1].update(
+                {
+                    "removed_edge_log_odds_l1": float(
+                        removed_contributions_cpu[row].abs().sum()
+                    ),
+                    "removed_edge_log_odds_signed_sum": float(
+                        removed_contributions_cpu[row].sum()
+                    ),
+                }
+            )
     return records, source_error, partition_error, reaggregation_error, merge_error
 
 
@@ -567,10 +1361,18 @@ def audit_origin_validation(
     boundary0_fp64_reconstruction_error = 0.0
     boundary0_fp32_reduction_difference = 0.0
     relation_presence: bool | None = None
+    relation_variant: str | None = None
+    relation_aggregation_kind: str | None = None
     relation_cumulative_all: list[torch.Tensor] = []
     relation_incremental_all: list[torch.Tensor] = []
     relation_edge_abs_sums: list[torch.Tensor] = []
     relation_valid_edge_counts: list[torch.Tensor] = []
+    sparse_candidate_counts: list[torch.Tensor] = []
+    sparse_selected_counts: list[torch.Tensor] = []
+    sparse_nonzero_counts: list[torch.Tensor] = []
+    sparse_selected_densities: list[torch.Tensor] = []
+    sparse_trace_maxima: dict[str, float] = defaultdict(float)
+    sparse_edge_budget: int | None = None
     relation_all_edge_effects: list[dict[str, Any]] = []
     relation_top_edge_effects: list[dict[str, Any]] = []
     relation_replay_source_error = 0.0
@@ -705,6 +1507,24 @@ def audit_origin_validation(
             elif relation_presence != has_relation:
                 raise AssertionError("relation evidence presence changed between batches")
             if relation is not None:
+                batch_variant = str(getattr(relation, "variant", "dense_v1"))
+                batch_aggregation = str(
+                    getattr(
+                        relation,
+                        "aggregation_kind",
+                        "geometry_normalized_tanh_v1",
+                    )
+                )
+                if relation_variant is None:
+                    relation_variant = batch_variant
+                    relation_aggregation_kind = batch_aggregation
+                elif (
+                    relation_variant != batch_variant
+                    or relation_aggregation_kind != batch_aggregation
+                ):
+                    raise AssertionError(
+                        "relation variant or aggregation contract changed between batches"
+                    )
                 if relation.edge_messages.shape[:2] != (len(labels), num_boundaries):
                     raise ValueError("relation edge-message boundary shape is invalid")
                 if relation.edge_valid_mask.shape != (
@@ -732,6 +1552,29 @@ def audit_origin_validation(
                 relation_valid_edge_counts.append(
                     relation.edge_valid_mask.detach().sum(dim=(1, 2)).cpu()
                 )
+                sparse_relation = (
+                    batch_aggregation == "fixed_budget_linear_conserved_v1"
+                )
+                if sparse_relation:
+                    sparse_trace = _audit_sparse_relation_trace(relation)
+                    batch_budget = int(sparse_trace["edge_budget"])
+                    if sparse_edge_budget is None:
+                        sparse_edge_budget = batch_budget
+                    elif sparse_edge_budget != batch_budget:
+                        raise AssertionError(
+                            "sparse relation edge budget changed between batches"
+                        )
+                    sparse_candidate_counts.append(sparse_trace["candidate_count"])
+                    sparse_selected_counts.append(sparse_trace["selected_count"])
+                    sparse_nonzero_counts.append(sparse_trace["nonzero_count"])
+                    sparse_selected_densities.append(
+                        sparse_trace["selected_density"]
+                    )
+                    for name, value in sparse_trace.items():
+                        if name.startswith("max_"):
+                            sparse_trace_maxima[name] = max(
+                                sparse_trace_maxima[name], float(value)
+                            )
 
                 (
                     all_edge_records,
@@ -743,7 +1586,11 @@ def audit_origin_validation(
                     _relation_replay_records(
                         model,
                         output,
-                        relation.edge_valid_mask,
+                        (
+                            relation.selected_edge_mask
+                            if sparse_relation
+                            else relation.edge_valid_mask
+                        ),
                         labels_cpu,
                         sample_ids,
                         decision_rule,
@@ -762,7 +1609,11 @@ def audit_origin_validation(
                 relation_merge_error = max(relation_merge_error, merge_error)
                 all_removed = model.replay_without_relations(
                     output,
-                    relation.edge_valid_mask,
+                    (
+                        relation.selected_edge_mask
+                        if sparse_relation
+                        else relation.edge_valid_mask
+                    ),
                     force_decoder_fp64=True,
                 ).output
                 relation_all_removed_to_base_error = max(
@@ -778,25 +1629,60 @@ def audit_origin_validation(
                     ),
                 )
 
-                ranked = relation.edge_messages.abs().masked_fill(
-                    ~relation.edge_valid_mask[:, None], -torch.inf
-                ).flatten(1)
-                if bool((torch.isfinite(ranked).sum(1) == 0).any()):
-                    raise AssertionError("sample has no valid regional relation edge")
-                selected = ranked.argmax(1)
-                edge_mask = torch.zeros_like(
-                    relation.edge_messages, dtype=torch.bool
-                ).flatten(1)
-                edge_mask.scatter_(1, selected[:, None], True)
-                edge_mask = edge_mask.reshape_as(relation.edge_messages)
-                (
-                    top_records,
-                    source_error,
-                    partition_error,
-                    reaggregation_error,
-                    merge_error,
-                ) = (
-                    _relation_replay_records(
+                if sparse_relation:
+                    top_records, errors = _most_pivotal_sparse_edge_records(
+                        model,
+                        output,
+                        relation,
+                        labels_cpu,
+                        sample_ids,
+                        decision_rule,
+                        all_edge_records,
+                    )
+                    source_error, partition_error, reaggregation_error, merge_error = (
+                        errors
+                    )
+                    relation_replay_source_error = max(
+                        relation_replay_source_error, source_error
+                    )
+                    relation_replay_partition_error = max(
+                        relation_replay_partition_error, partition_error
+                    )
+                    relation_reaggregation_error = max(
+                        relation_reaggregation_error, reaggregation_error
+                    )
+                    relation_merge_error = max(relation_merge_error, merge_error)
+                    for record in top_records:
+                        index = int(record["sample_id"])
+                        if (
+                            validation_items is not None
+                            and 0 <= index < len(validation_items)
+                        ):
+                            record["image_id"] = Path(
+                                validation_items[index][0]
+                            ).name
+                        relation_top_edge_effects.append(record)
+                else:
+                    ranked = relation.edge_messages.abs().masked_fill(
+                        ~relation.edge_valid_mask[:, None], -torch.inf
+                    ).flatten(1)
+                    if bool((torch.isfinite(ranked).sum(1) == 0).any()):
+                        raise AssertionError(
+                            "sample has no valid regional relation edge"
+                        )
+                    selected = ranked.argmax(1)
+                    edge_mask = torch.zeros_like(
+                        relation.edge_messages, dtype=torch.bool
+                    ).flatten(1)
+                    edge_mask.scatter_(1, selected[:, None], True)
+                    edge_mask = edge_mask.reshape_as(relation.edge_messages)
+                    (
+                        top_records,
+                        source_error,
+                        partition_error,
+                        reaggregation_error,
+                        merge_error,
+                    ) = _relation_replay_records(
                         model,
                         output,
                         edge_mask,
@@ -804,47 +1690,55 @@ def audit_origin_validation(
                         sample_ids,
                         decision_rule,
                     )
-                )
-                relation_replay_source_error = max(
-                    relation_replay_source_error, source_error
-                )
-                relation_replay_partition_error = max(
-                    relation_replay_partition_error, partition_error
-                )
-                relation_reaggregation_error = max(
-                    relation_reaggregation_error, reaggregation_error
-                )
-                relation_merge_error = max(relation_merge_error, merge_error)
-                regions = relation.edge_messages.shape[-1]
-                centers = relation.region_centers_yx.detach().cpu()
-                flat_message = relation.edge_messages.detach().cpu().flatten(1)
-                for row, record in enumerate(top_records):
-                    flat_index = int(selected[row])
-                    boundary = flat_index // (regions * regions)
-                    endpoints = flat_index % (regions * regions)
-                    target = endpoints // regions
-                    source = endpoints % regions
-                    record.update(
-                        {
-                            "selection": "largest_absolute_stored_pair_message",
-                            "boundary": boundary,
-                            "target_region": target,
-                            "source_region": source,
-                            "target_center_yx": centers[target].tolist(),
-                            "source_center_yx": centers[source].tolist(),
-                            "signed_pair_message": float(flat_message[row, flat_index]),
-                            "region_receptive_field_pixels": int(
-                                relation.region_receptive_field
-                            ),
-                            "region_output_stride_pixels": int(
-                                relation.region_output_stride
-                            ),
-                        }
+                    relation_replay_source_error = max(
+                        relation_replay_source_error, source_error
                     )
-                    index = int(record["sample_id"])
-                    if validation_items is not None and 0 <= index < len(validation_items):
-                        record["image_id"] = Path(validation_items[index][0]).name
-                    relation_top_edge_effects.append(record)
+                    relation_replay_partition_error = max(
+                        relation_replay_partition_error, partition_error
+                    )
+                    relation_reaggregation_error = max(
+                        relation_reaggregation_error, reaggregation_error
+                    )
+                    relation_merge_error = max(
+                        relation_merge_error, merge_error
+                    )
+                    regions = relation.edge_messages.shape[-1]
+                    centers = relation.region_centers_yx.detach().cpu()
+                    flat_message = relation.edge_messages.detach().cpu().flatten(1)
+                    for row, record in enumerate(top_records):
+                        flat_index = int(selected[row])
+                        boundary = flat_index // (regions * regions)
+                        endpoints = flat_index % (regions * regions)
+                        target = endpoints // regions
+                        source = endpoints % regions
+                        record.update(
+                            {
+                                "selection": "largest_absolute_stored_pair_message",
+                                "boundary": boundary,
+                                "target_region": target,
+                                "source_region": source,
+                                "target_center_yx": centers[target].tolist(),
+                                "source_center_yx": centers[source].tolist(),
+                                "signed_pair_message": float(
+                                    flat_message[row, flat_index]
+                                ),
+                                "region_receptive_field_pixels": int(
+                                    relation.region_receptive_field
+                                ),
+                                "region_output_stride_pixels": int(
+                                    relation.region_output_stride
+                                ),
+                            }
+                        )
+                        index = int(record["sample_id"])
+                        if (
+                            validation_items is not None
+                            and 0 <= index < len(validation_items)
+                        ):
+                            record["image_id"] = Path(
+                                validation_items[index][0]
+                            ).name
+                        relation_top_edge_effects.append(record)
 
             # Highest all-boundary single-cell certificate for every sample.
             score_parts = []
@@ -1324,8 +2218,16 @@ def audit_origin_validation(
                 ).hexdigest()
             )
             relation_certificates.extend(members[:certificates_per_grade])
+        all_edge_summary = _relation_effect_summary(
+            relation_all_edge_effects, quantiles
+        )
+        top_edge_summary = _relation_effect_summary(
+            relation_top_edge_effects, quantiles
+        )
         relation_diagnostics = {
             "contract": "stored_pair_messages_to_cumulative_transition_rate_log_odds",
+            "variant": relation_variant,
+            "aggregation_kind": relation_aggregation_kind,
             "cumulative_log_odds_bound": float(
                 getattr(
                     getattr(getattr(model, "generator", None), "relation_field", None),
@@ -1351,11 +2253,15 @@ def audit_origin_validation(
             "valid_directed_edge_count_quantiles": _quantiles(
                 relation_edge_counts.tolist(), quantiles
             ),
-            "all_edge_deletion_effects": _relation_effect_summary(
-                relation_all_edge_effects, quantiles
-            ),
-            "largest_absolute_edge_deletion_effects": _relation_effect_summary(
-                relation_top_edge_effects, quantiles
+            "all_edge_deletion_effects": all_edge_summary,
+            (
+                "most_pivotal_selected_edge_deletion_effects"
+                if relation_aggregation_kind
+                == "fixed_budget_linear_conserved_v1"
+                else "largest_absolute_edge_deletion_effects"
+            ): top_edge_summary,
+            "full_vs_no_relation_ablation": _relation_ablation_summary(
+                relation_all_edge_effects
             ),
             "max_exact_source_ledger_invariance_error": relation_replay_source_error,
             "max_exact_edge_partition_error": relation_replay_partition_error,
@@ -1366,12 +2272,91 @@ def audit_origin_validation(
             ),
             "grade_stratified_relation_certificates": relation_certificates,
         }
+        if relation_aggregation_kind == "fixed_budget_linear_conserved_v1":
+            candidate_counts = torch.cat(sparse_candidate_counts).double()
+            selected_counts = torch.cat(sparse_selected_counts).double()
+            nonzero_counts = torch.cat(sparse_nonzero_counts).double()
+            selected_densities = torch.cat(sparse_selected_densities).double()
+            relation_diagnostics["sparse_support_and_identifiability"] = {
+                "edge_budget_per_boundary": sparse_edge_budget,
+                "candidate_edge_count_quantiles": _quantiles(
+                    candidate_counts.tolist(), quantiles
+                ),
+                "selected_edge_count_quantiles_by_boundary": {
+                    str(boundary): _quantiles(
+                        selected_counts[:, boundary].tolist(), quantiles
+                    )
+                    for boundary in range(num_boundaries)
+                },
+                "nonzero_edge_count_quantiles_by_boundary": {
+                    str(boundary): _quantiles(
+                        nonzero_counts[:, boundary].tolist(), quantiles
+                    )
+                    for boundary in range(num_boundaries)
+                },
+                "selected_candidate_density_quantiles_by_boundary": {
+                    str(boundary): _quantiles(
+                        selected_densities[:, boundary].tolist(), quantiles
+                    )
+                    for boundary in range(num_boundaries)
+                },
+                **dict(sparse_trace_maxima),
+            }
+            pivotal_absolute = np.asarray(
+                [
+                    abs(float(item["expected_grade_delta"]))
+                    for item in relation_top_edge_effects
+                ],
+                dtype=np.float64,
+            )
+            positive_fraction = float(
+                all_edge_summary["positive_effect_count_above_1e-5"]
+                / max(1, all_edge_summary["n"])
+            )
+            negative_fraction = float(
+                all_edge_summary["negative_effect_count_below_minus_1e-5"]
+                / max(1, all_edge_summary["n"])
+            )
+            strength_checks = {
+                "at_least_one_top_edge_changes_a_prediction": bool(
+                    top_edge_summary["prediction_change_count"] > 0
+                ),
+                "median_top_edge_absolute_expected_grade_effect_at_least_1e-3": bool(
+                    float(np.quantile(pivotal_absolute, 0.5)) >= 1e-3
+                ),
+                "q90_top_edge_absolute_expected_grade_effect_at_least_1e-2": bool(
+                    float(np.quantile(pivotal_absolute, 0.9)) >= 1e-2
+                ),
+                "at_least_5pct_collective_positive_effects": bool(
+                    positive_fraction >= 0.05
+                ),
+                "at_least_5pct_collective_negative_effects": bool(
+                    negative_fraction >= 0.05
+                ),
+            }
+            relation_diagnostics["individual_certificate_strength_gate"] = {
+                "scope": "pre_registered_engineering_gate_not_a_mathematical_guarantee",
+                "positive_collective_effect_fraction_above_1e-5": positive_fraction,
+                "negative_collective_effect_fraction_below_minus_1e-5": negative_fraction,
+                "median_top_edge_absolute_expected_grade_effect": float(
+                    np.quantile(pivotal_absolute, 0.5)
+                ),
+                "q90_top_edge_absolute_expected_grade_effect": float(
+                    np.quantile(pivotal_absolute, 0.9)
+                ),
+                "checks": strength_checks,
+                "passed": all(strength_checks.values()),
+            }
 
     return {
         "schema": (
-            "origin-full-validation-audit-v6"
-            if relation_presence
-            else "origin-full-validation-audit-v2"
+            "origin-full-validation-audit-v7"
+            if relation_aggregation_kind == "fixed_budget_linear_conserved_v1"
+            else (
+                "origin-full-validation-audit-v6"
+                if relation_presence
+                else "origin-full-validation-audit-v2"
+            )
         ),
         "scope": "inner_validation_only",
         "n": len(labels),
@@ -1544,7 +2529,11 @@ def main() -> None:
         completed_result = json.load(stream)
     checkpoint_hash_before = _sha256_file(checkpoint_path)
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if state.get("schema") not in {"origin-checkpoint-v3", "origin-checkpoint-v6"}:
+    if state.get("schema") not in {
+        "origin-checkpoint-v3",
+        "origin-checkpoint-v6",
+        "origin-checkpoint-v7",
+    }:
         raise ValueError("full validation audit requires an ORIGIN checkpoint")
     config_values = dict(state["config"])
     allowed = {field.name for field in fields(OriginConfig)}
@@ -1622,6 +2611,9 @@ def main() -> None:
         relation_dim=cfg.relation_dim,
         relation_head_dim=cfg.relation_head_dim,
         relation_delta_cap=cfg.relation_delta_cap,
+        relation_variant=cfg.relation_variant,
+        relation_edge_budget=cfg.relation_edge_budget,
+        relation_permutation_seed=cfg.relation_permutation_seed,
     )
     signature = _verify_provenance(
         state,
