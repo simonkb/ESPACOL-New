@@ -40,6 +40,7 @@ from models.origin import (
     aggregate_ordinal_pair_messages,
     aggregate_sparse_ordinal_pair_messages,
     bounded_rate_log_odds_merge,
+    reverse_cumulative_atoms,
 )
 
 
@@ -76,6 +77,13 @@ _V7_RELATION_VARIANTS = frozenset(
         "identified_sparse_v1",
         "additive_endpoint_control_v1",
         "shuffled_pair_control_v1",
+    }
+)
+_V8_RELATION_VARIANTS = frozenset(
+    {
+        "identified_conserved_witness_v1",
+        "additive_conserved_witness_control_v1",
+        "shuffled_conserved_witness_control_v1",
     }
 )
 _LEGACY_BOUNDED_V3_IMPLEMENTATION_SIGNATURES = frozenset(
@@ -150,6 +158,8 @@ def _relation_protocol_version(cfg: object) -> str:
         return "v6"
     if variant in _V7_RELATION_VARIANTS:
         return "v7"
+    if variant in _V8_RELATION_VARIANTS:
+        return "v8"
     raise ValueError(f"unsupported relational ORIGIN protocol variant: {variant!r}")
 
 
@@ -463,13 +473,11 @@ def load_origin_v3_relation_warm_start(
         raise AssertionError("PyTorch state migration disagrees with the audited key partition")
 
     protocol_version = _relation_protocol_version(cfg)
-    if protocol_version not in {"v6", "v7"}:
+    if protocol_version not in {"v6", "v7", "v8"}:
         raise ValueError("v3 relation warm start requires a relational target")
     return {
         "schema": (
-            "origin-v3-to-v6-verified-content-warm-start-v1"
-            if protocol_version == "v6"
-            else "origin-v3-to-v7-verified-content-warm-start-v1"
+            f"origin-v3-to-{protocol_version}-verified-content-warm-start-v1"
         ),
         "target_protocol": protocol_version,
         "target_relation_variant": str(
@@ -914,6 +922,13 @@ class OriginTrainer:
         )
 
         self.best_path = self.run_dir / "best.pth"
+        # Relational warm starts have two deliberately different notions of
+        # "best": ``best.pth`` is the deployable checkpoint that must clear
+        # the hash-bound v3 multi-metric floor, while ``best_learned.pth`` is
+        # the best epoch learned by the new architecture under the ordinary
+        # prospective selector.  Keeping both prevents the safety floor from
+        # hiding whether a treatment actually learned anything.
+        self.best_learned_path = self.run_dir / "best_learned.pth"
         self.last_path = self.run_dir / "last.pth"
         self.history_path = self.run_dir / "history.csv"
         self.certificate_path = self.run_dir / "validation_certificates.json"
@@ -1231,6 +1246,16 @@ class OriginTrainer:
         relation_selected_edge_max = 0
         relation_anova_row_sum_abs_max = 0.0
         relation_anova_column_sum_abs_max = 0.0
+        relation_effective_witness_sum = 0.0
+        relation_effective_witness_count = 0
+        relation_effective_witness_min = math.inf
+        relation_effective_witness_max = 0.0
+        relation_top1_allocation_sum = 0.0
+        relation_top1_allocation_count = 0
+        relation_top1_allocation_max = 0.0
+        relation_capacity_utilization_sum = 0.0
+        relation_capacity_utilization_count = 0
+        relation_capacity_utilization_max = 0.0
         skipped_steps = 0
         context = torch.enable_grad if train else torch.no_grad
         with context():
@@ -1369,17 +1394,25 @@ class OriginTrainer:
                                 "selected relation edges include an invalid endpoint"
                             )
                         selected_counts = selected_edges.flatten(2).sum(dim=-1)
-                        expected_counts = torch.minimum(
+                        edge_budget = int(getattr(relation, "edge_budget"))
+                        maximum_counts = torch.minimum(
                             valid_edges.flatten(2).sum(dim=-1),
-                            torch.full_like(
-                                selected_counts,
-                                int(getattr(relation, "edge_budget")),
-                            ),
+                            torch.full_like(selected_counts, edge_budget),
                         )
-                        if not torch.equal(selected_counts, expected_counts):
-                            raise AssertionError(
-                                "selected relation-edge support violates its fixed budget"
-                            )
+                        if self.relation_protocol_version == "v7":
+                            if not torch.equal(selected_counts, maximum_counts):
+                                raise AssertionError(
+                                    "selected relation-edge support violates its "
+                                    "fixed budget"
+                                )
+                        elif self.relation_protocol_version == "v8":
+                            if bool(
+                                ((selected_counts < 1) | (selected_counts > maximum_counts)).any()
+                            ):
+                                raise AssertionError(
+                                    "ORIGIN-v8 adaptive witness support must contain "
+                                    "between one edge and its shortlist cap"
+                                )
                         relation_selected_edge_sum += int(selected_counts.sum().cpu())
                         relation_selected_edge_count += int(selected_counts.numel())
                         batch_selected_min = int(selected_counts.min().cpu())
@@ -1392,6 +1425,106 @@ class OriginTrainer:
                             relation_selected_edge_max,
                             int(selected_counts.max().cpu()),
                         )
+                        if self.relation_protocol_version == "v8":
+                            allocation = getattr(relation, "witness_allocation", None)
+                            effective = getattr(
+                                relation, "effective_witness_count", None
+                            )
+                            allocated_capacity = getattr(
+                                relation, "per_boundary_allocated_capacity", None
+                            )
+                            l1_usage = getattr(
+                                relation, "per_boundary_l1_usage", None
+                            )
+                            if not all(
+                                torch.is_tensor(value)
+                                for value in (
+                                    allocation,
+                                    effective,
+                                    allocated_capacity,
+                                    l1_usage,
+                                )
+                            ):
+                                raise AssertionError(
+                                    "ORIGIN-v8 omitted conserved-witness telemetry"
+                                )
+                            if allocation.shape != relation.edge_messages.shape:
+                                raise AssertionError(
+                                    "ORIGIN-v8 witness allocation has an invalid shape"
+                                )
+                            allocation = allocation.detach()
+                            outside_allocation = allocation.masked_select(
+                                ~selected_edges
+                            )
+                            if bool((outside_allocation != 0).any()):
+                                raise AssertionError(
+                                    "ORIGIN-v8 allocation is nonzero outside its "
+                                    "active witness support"
+                                )
+                            allocation_sums = allocation.flatten(2).sum(dim=-1)
+                            if not torch.allclose(
+                                allocation_sums,
+                                torch.ones_like(allocation_sums),
+                                rtol=0.0,
+                                atol=2e-6,
+                            ):
+                                raise AssertionError(
+                                    "ORIGIN-v8 witness allocation does not conserve "
+                                    "one unit per sample and boundary"
+                                )
+                            effective_values = effective.detach().float()
+                            top1_values = allocation.flatten(2).amax(dim=-1).float()
+                            capacity_values = allocated_capacity.detach().float()
+                            usage_values = l1_usage.detach().float()
+                            utilization = torch.where(
+                                capacity_values > 0,
+                                usage_values / capacity_values,
+                                torch.zeros_like(usage_values),
+                            )
+                            if bool(
+                                (~torch.isfinite(effective_values)).any()
+                                or (~torch.isfinite(top1_values)).any()
+                                or (~torch.isfinite(utilization)).any()
+                                or (utilization < 0).any()
+                                or (utilization > 1.0 + 2e-6).any()
+                            ):
+                                raise AssertionError(
+                                    "ORIGIN-v8 conserved-witness telemetry is invalid"
+                                )
+                            relation_effective_witness_sum += float(
+                                effective_values.sum().cpu()
+                            )
+                            relation_effective_witness_count += int(
+                                effective_values.numel()
+                            )
+                            relation_effective_witness_min = min(
+                                relation_effective_witness_min,
+                                float(effective_values.min().cpu()),
+                            )
+                            relation_effective_witness_max = max(
+                                relation_effective_witness_max,
+                                float(effective_values.max().cpu()),
+                            )
+                            relation_top1_allocation_sum += float(
+                                top1_values.sum().cpu()
+                            )
+                            relation_top1_allocation_count += int(
+                                top1_values.numel()
+                            )
+                            relation_top1_allocation_max = max(
+                                relation_top1_allocation_max,
+                                float(top1_values.max().cpu()),
+                            )
+                            relation_capacity_utilization_sum += float(
+                                utilization.sum().cpu()
+                            )
+                            relation_capacity_utilization_count += int(
+                                utilization.numel()
+                            )
+                            relation_capacity_utilization_max = max(
+                                relation_capacity_utilization_max,
+                                float(utilization.max().cpu()),
+                            )
                         telemetry_mask = selected_edges
                         interaction_residuals = getattr(
                             relation, "interaction_residuals", None
@@ -1415,9 +1548,10 @@ class OriginTrainer:
                                 ),
                             )
                     else:
-                        if self.relation_protocol_version == "v7":
+                        if self.relation_protocol_version in {"v7", "v8"}:
                             raise AssertionError(
-                                "ORIGIN-v7 emitted no selected relation-edge mask"
+                                f"ORIGIN-{self.relation_protocol_version} emitted "
+                                "no selected relation-edge mask"
                             )
                         telemetry_mask = valid_edges
                     edge_contributions = getattr(
@@ -1505,11 +1639,10 @@ class OriginTrainer:
                     "max_abs_relation_edge_message": relation_edge_abs_max,
                 }
             )
-            if self.relation_protocol_version == "v7":
-                # V7's audited edge tensor is the literal log-odds contribution,
-                # not the pre-cap message.  Retain the legacy metric names above
-                # for checkpoint/tooling compatibility, but expose accurately
-                # named telemetry for reports and logs.
+            if self.relation_protocol_version in {"v7", "v8"}:
+                # Sparse protocols audit the literal edge log-odds
+                # contribution rather than the pre-cap message. Retain the
+                # legacy names for checkpoint/tooling compatibility as well.
                 metrics.update(
                     {
                         "mean_abs_relation_edge_log_odds_contribution": (
@@ -1521,7 +1654,10 @@ class OriginTrainer:
                     }
                 )
                 if relation_selected_edge_count <= 0 or relation_selected_edge_min is None:
-                    raise AssertionError("ORIGIN-v7 selected-edge telemetry is empty")
+                    raise AssertionError(
+                        f"ORIGIN-{self.relation_protocol_version} selected-edge "
+                        "telemetry is empty"
+                    )
                 metrics.update(
                     {
                         "mean_selected_relation_edges_per_boundary": (
@@ -1541,6 +1677,43 @@ class OriginTrainer:
                         ),
                     }
                 )
+                if self.relation_protocol_version == "v8":
+                    if min(
+                        relation_effective_witness_count,
+                        relation_top1_allocation_count,
+                        relation_capacity_utilization_count,
+                    ) <= 0 or not math.isfinite(relation_effective_witness_min):
+                        raise AssertionError(
+                            "ORIGIN-v8 conserved-witness telemetry is empty"
+                        )
+                    metrics.update(
+                        {
+                            "mean_relation_effective_witness_count": (
+                                relation_effective_witness_sum
+                                / relation_effective_witness_count
+                            ),
+                            "min_relation_effective_witness_count": (
+                                relation_effective_witness_min
+                            ),
+                            "max_relation_effective_witness_count": (
+                                relation_effective_witness_max
+                            ),
+                            "mean_relation_top1_allocation": (
+                                relation_top1_allocation_sum
+                                / relation_top1_allocation_count
+                            ),
+                            "max_relation_top1_allocation": (
+                                relation_top1_allocation_max
+                            ),
+                            "mean_relation_capacity_utilization": (
+                                relation_capacity_utilization_sum
+                                / relation_capacity_utilization_count
+                            ),
+                            "max_relation_capacity_utilization": (
+                                relation_capacity_utilization_max
+                            ),
+                        }
+                    )
         for boundary in range(int(mean_rates.numel())):
             metrics[f"mean_total_rate_boundary_{boundary}"] = float(mean_rates[boundary])
             metrics[f"max_total_rate_boundary_{boundary}"] = float(total_rate_max[boundary])
@@ -1615,7 +1788,23 @@ class OriginTrainer:
         best_epoch: int,
         bad_epochs: int,
         candidate_floor_evaluation: Mapping[str, Any] | None = None,
+        best_learned_key: tuple[float, float, float] | None = None,
+        best_learned_epoch: int | None = None,
+        learned_bad_epochs: int = 0,
+        checkpoint_role: str | None = None,
+        deployable_best_checkpoint_sha256: str | None = None,
+        best_learned_checkpoint_sha256: str | None = None,
+        checkpoint_transaction: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        valid_roles = {
+            None,
+            "hash_bound_v3_floor",
+            "deployable_selected",
+            "best_learned",
+            "resume_state",
+        }
+        if checkpoint_role not in valid_roles:
+            raise ValueError(f"unsupported ORIGIN checkpoint role: {checkpoint_role!r}")
         sampler = getattr(self.train_loader, "batch_sampler", None)
         return {
             "schema": self.checkpoint_schema,
@@ -1641,6 +1830,30 @@ class OriginTrainer:
             "best_selection_key": tuple(float(value) for value in best_key),
             "best_epoch": int(best_epoch),
             "early_stopping_bad_epochs": int(bad_epochs),
+            "best_learned_selection_key": (
+                None
+                if best_learned_key is None
+                else tuple(float(value) for value in best_learned_key)
+            ),
+            "best_learned_epoch": (
+                None if best_learned_epoch is None else int(best_learned_epoch)
+            ),
+            "learned_early_stopping_bad_epochs": int(learned_bad_epochs),
+            "early_stopping_track": (
+                "learned_epoch_selector"
+                if self.warm_start_provenance is not None
+                else "deployable_checkpoint_selector"
+            ),
+            "checkpoint_role": checkpoint_role,
+            "deployable_best_checkpoint_sha256": (
+                deployable_best_checkpoint_sha256
+            ),
+            "best_learned_checkpoint_sha256": best_learned_checkpoint_sha256,
+            "checkpoint_transaction": (
+                None
+                if checkpoint_transaction is None
+                else dict(checkpoint_transaction)
+            ),
             "amp_total_skipped_steps": int(self.amp_total_skipped_steps),
             "train_batch_sampler_epoch": getattr(sampler, "_epoch", None),
             "rng_state": {
@@ -1681,8 +1894,17 @@ class OriginTrainer:
         best_epoch: int,
         bad_epochs: int,
         candidate_floor_evaluation: Mapping[str, Any] | None = None,
-    ) -> None:
+        best_learned_key: tuple[float, float, float] | None = None,
+        best_learned_epoch: int | None = None,
+        learned_bad_epochs: int = 0,
+        checkpoint_role: str | None = None,
+        deployable_best_checkpoint_sha256: str | None = None,
+        best_learned_checkpoint_sha256: str | None = None,
+        checkpoint_transaction: Mapping[str, Any] | None = None,
+        defer_commit: bool = False,
+    ) -> Path:
         temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        prepared = False
         try:
             torch.save(
                 self._checkpoint_payload(
@@ -1692,15 +1914,109 @@ class OriginTrainer:
                     best_epoch,
                     bad_epochs,
                     candidate_floor_evaluation,
+                    best_learned_key,
+                    best_learned_epoch,
+                    learned_bad_epochs,
+                    checkpoint_role,
+                    deployable_best_checkpoint_sha256,
+                    best_learned_checkpoint_sha256,
+                    checkpoint_transaction,
                 ),
                 temporary,
             )
+            if defer_commit:
+                prepared = True
+                return temporary
             os.replace(temporary, path)
+            return path
         finally:
-            if temporary.exists():
+            if not prepared and temporary.exists():
                 temporary.unlink()
 
-    def _validate_resume(self, state: Mapping[str, Any]) -> None:
+    def _recover_checkpoint_transaction(self, state: Mapping[str, Any]) -> None:
+        """Finish sidecar replacements prepared before ``last.pth`` committed.
+
+        A best-checkpoint update spans more than one file.  Improved sidecars
+        are therefore serialized first, ``last.pth`` is atomically replaced
+        with their intended hashes, and only then are the prepared sidecars
+        renamed into place.  If the process dies between those operations,
+        this method completes the recorded renames before resume validation.
+        """
+
+        transaction = state.get("checkpoint_transaction")
+        if transaction is None:
+            return
+        if not isinstance(transaction, Mapping) or transaction.get("schema") != (
+            "origin-checkpoint-sidecar-transaction-v1"
+        ):
+            raise ValueError("ORIGIN resume checkpoint transaction is malformed")
+        if int(transaction.get("epoch", -1)) != int(state.get("epoch", -2)):
+            raise ValueError("ORIGIN resume checkpoint transaction epoch mismatch")
+        entries = transaction.get("prepared_sidecars")
+        if not isinstance(entries, Mapping) or not entries:
+            raise ValueError("ORIGIN resume checkpoint transaction has no sidecars")
+
+        targets = {
+            "deployable_selected": (
+                self.best_path,
+                "deployable_best_checkpoint_sha256",
+            ),
+            "best_learned": (
+                self.best_learned_path,
+                "best_learned_checkpoint_sha256",
+            ),
+        }
+        unknown = set(entries) - set(targets)
+        if unknown:
+            raise ValueError(
+                "ORIGIN resume checkpoint transaction has unknown sidecar roles: "
+                f"{sorted(unknown)}"
+            )
+        for role, record in entries.items():
+            if not isinstance(record, Mapping):
+                raise ValueError(
+                    f"ORIGIN resume transaction record for {role!r} is malformed"
+                )
+            target, hash_field = targets[role]
+            expected_hash = state.get(hash_field)
+            if record.get("target_name") != target.name or record.get(
+                "sha256"
+            ) != expected_hash:
+                raise ValueError(
+                    f"ORIGIN resume transaction metadata for {role!r} is inconsistent"
+                )
+            temporary_name = record.get("temporary_name")
+            if (
+                not isinstance(temporary_name, str)
+                or Path(temporary_name).name != temporary_name
+                or not temporary_name.startswith(f".{target.name}.")
+                or not temporary_name.endswith(".tmp")
+            ):
+                raise ValueError(
+                    f"ORIGIN resume transaction temporary path for {role!r} is invalid"
+                )
+            if target.is_file() and self._file_sha256(target) == expected_hash:
+                continue
+            temporary = self.run_dir / temporary_name
+            if not temporary.is_file():
+                raise FileNotFoundError(
+                    "ORIGIN resume cannot complete prepared sidecar transaction: "
+                    f"{temporary} is missing"
+                )
+            observed_hash = self._file_sha256(temporary)
+            if observed_hash != expected_hash:
+                raise ValueError(
+                    f"ORIGIN resume prepared {role} SHA-256 mismatch: "
+                    f"expected {expected_hash}, observed {observed_hash}"
+                )
+            os.replace(temporary, target)
+
+    def _validate_resume(
+        self,
+        state: Mapping[str, Any],
+        *,
+        recover_transaction: bool = False,
+    ) -> None:
         if state.get("schema") != self.checkpoint_schema:
             raise ValueError(
                 f"ORIGIN resume requires {self.checkpoint_schema!r}; "
@@ -1735,6 +2051,85 @@ class OriginTrainer:
             current_warm_start.pop("source_checkpoint", None)
         if saved_warm_start != current_warm_start:
             raise ValueError("ORIGIN resume warm-start provenance mismatch")
+
+        checkpoint_role = state.get("checkpoint_role")
+        if checkpoint_role not in (None, "resume_state"):
+            raise ValueError(
+                "ORIGIN resume requires a resume_state checkpoint, got "
+                f"{checkpoint_role!r}"
+            )
+        if checkpoint_role is None:
+            if self.warm_start_provenance is None:
+                # Compatibility for direct/legacy non-relational payloads.
+                return
+            raise ValueError(
+                "relational ORIGIN resume checkpoint predates the explicit "
+                "dual-checkpoint protocol; start a new run directory"
+            )
+        completed_epoch = int(state.get("epoch", -1))
+        dual_checkpoint = self.warm_start_provenance is not None
+        if dual_checkpoint:
+            if state.get("early_stopping_track") != "learned_epoch_selector":
+                raise ValueError("ORIGIN resume early-stopping track mismatch")
+            learned_key = state.get("best_learned_selection_key")
+            learned_epoch = state.get("best_learned_epoch")
+            if completed_epoch == 0:
+                if learned_key is not None or learned_epoch is not None:
+                    raise ValueError(
+                        "epoch-0 relational resume state cannot contain a learned best"
+                    )
+            elif (
+                not isinstance(learned_key, (tuple, list))
+                or len(learned_key) != 3
+                or learned_epoch is None
+            ):
+                raise ValueError(
+                    "relational ORIGIN resume checkpoint omits learned-best state"
+                )
+        elif state.get("early_stopping_track") != "deployable_checkpoint_selector":
+            raise ValueError("ORIGIN resume early-stopping track mismatch")
+
+        # Recovery is intentionally delayed until the checkpoint's schema,
+        # implementation, architecture, configuration, split, provenance,
+        # role, and stopping policy have all been authenticated above.
+        if recover_transaction:
+            self._recover_checkpoint_transaction(state)
+
+        bound_files = [
+            (
+                self.best_path,
+                "deployable_best_checkpoint_sha256",
+                "deployable best",
+            )
+        ]
+        if dual_checkpoint and completed_epoch > 0:
+            bound_files.append(
+                (
+                    self.best_learned_path,
+                    "best_learned_checkpoint_sha256",
+                    "learned best",
+                )
+            )
+        for path, hash_field, label in bound_files:
+            expected_hash = state.get(hash_field)
+            if (
+                not isinstance(expected_hash, str)
+                or len(expected_hash) != 64
+                or any(character not in "0123456789abcdef" for character in expected_hash)
+            ):
+                raise ValueError(
+                    f"relational ORIGIN resume omits a valid {label} SHA-256"
+                )
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"relational ORIGIN resume requires its {label} checkpoint: {path}"
+                )
+            observed_hash = self._file_sha256(path)
+            if observed_hash != expected_hash:
+                raise ValueError(
+                    f"relational ORIGIN resume {label} SHA-256 mismatch: "
+                    f"expected {expected_hash}, observed {observed_hash}"
+                )
 
     @staticmethod
     def _restore_rng(state: Mapping[str, Any]) -> None:
@@ -2091,6 +2486,50 @@ class OriginTrainer:
                         .max()
                         .cpu()
                     )
+                elif (
+                    relation.aggregation_kind
+                    == "conserved_sparse_witness_allocation_v1"
+                ):
+                    replayed_contributions = getattr(
+                        replay_trace, "edge_log_odds_contributions", None
+                    )
+                    removed_contributions = getattr(
+                        relation_intervention,
+                        "removed_edge_log_odds_contributions",
+                        None,
+                    )
+                    original_contributions = getattr(
+                        relation, "edge_log_odds_contributions", None
+                    )
+                    if not all(
+                        torch.is_tensor(value)
+                        for value in (
+                            replayed_contributions,
+                            removed_contributions,
+                            original_contributions,
+                        )
+                    ):
+                        raise AssertionError(
+                            "conserved-witness replay lost its literal edge ledger"
+                        )
+                    contribution_partition_errors = (
+                        original_contributions
+                        - (replayed_contributions + removed_contributions)
+                    ).abs().flatten(1).amax(dim=1)
+                    relation_partition_errors = torch.maximum(
+                        relation_partition_errors,
+                        contribution_partition_errors,
+                    )
+                    relation_partition_error = float(
+                        relation_partition_errors.max().cpu()
+                    )
+                    recomputed_target = replayed_contributions.sum(dim=-1)
+                    recomputed_incremental = recomputed_target.sum(dim=-1)
+                    recomputed_cumulative = reverse_cumulative_atoms(
+                        recomputed_incremental,
+                        dim=1,
+                    )
+                    contribution_error = 0.0
                 else:
                     _, recomputed_incremental, recomputed_cumulative = (
                         aggregate_ordinal_pair_messages(
@@ -2287,6 +2726,10 @@ class OriginTrainer:
         best_key = (-math.inf, -math.inf, -math.inf)
         best_epoch = 0
         bad_epochs = 0
+        dual_checkpoint = self.warm_start_provenance is not None
+        best_learned_key: tuple[float, float, float] | None = None
+        best_learned_epoch: int | None = None
+        learned_bad_epochs = 0
         start_epoch = 1
         if resume and not self.last_path.exists():
             raise FileNotFoundError(
@@ -2295,7 +2738,12 @@ class OriginTrainer:
         if not resume:
             existing = [
                 path
-                for path in (self.best_path, self.last_path, self.history_path)
+                for path in (
+                    self.best_path,
+                    self.best_learned_path,
+                    self.last_path,
+                    self.history_path,
+                )
                 if path.exists()
             ]
             if existing:
@@ -2306,12 +2754,21 @@ class OriginTrainer:
                 )
         if resume:
             state = torch.load(self.last_path, map_location=self.device, weights_only=False)
-            self._validate_resume(state)
+            self._validate_resume(state, recover_transaction=True)
             self._restore_training_state(state)
             best_key = tuple(float(value) for value in state["best_selection_key"])
             best_epoch = int(state["best_epoch"])
             bad_epochs = int(state.get("early_stopping_bad_epochs", 0))
             completed = int(state["epoch"])
+            if dual_checkpoint and completed > 0:
+                best_learned_key = tuple(
+                    float(value)
+                    for value in state["best_learned_selection_key"]
+                )
+                best_learned_epoch = int(state["best_learned_epoch"])
+                learned_bad_epochs = int(
+                    state.get("learned_early_stopping_bad_epochs", 0)
+                )
             self._reconcile_history(completed)
             start_epoch = completed + 1
             logger.info("resumed ORIGIN fold=%d from epoch=%d", self.fold, completed)
@@ -2371,7 +2828,7 @@ class OriginTrainer:
                 "passes_normal_checkpoint_selector": True,
                 "checkpoint_eligible": True,
             }
-            self._save_checkpoint(
+            prepared_baseline = self._save_checkpoint(
                 self.best_path,
                 epoch=0,
                 metrics=baseline_metrics,
@@ -2379,7 +2836,41 @@ class OriginTrainer:
                 best_epoch=0,
                 bad_epochs=0,
                 candidate_floor_evaluation=baseline_floor_evaluation,
+                best_learned_key=None,
+                best_learned_epoch=None,
+                learned_bad_epochs=0,
+                checkpoint_role="hash_bound_v3_floor",
+                defer_commit=True,
             )
+            baseline_hash = self._file_sha256(prepared_baseline)
+            baseline_transaction = {
+                "schema": "origin-checkpoint-sidecar-transaction-v1",
+                "epoch": 0,
+                "prepared_sidecars": {
+                    "deployable_selected": {
+                        "target_name": self.best_path.name,
+                        "temporary_name": prepared_baseline.name,
+                        "sha256": baseline_hash,
+                    }
+                },
+            }
+            self._save_checkpoint(
+                self.last_path,
+                epoch=0,
+                metrics=baseline_metrics,
+                best_key=best_key,
+                best_epoch=0,
+                bad_epochs=0,
+                candidate_floor_evaluation=baseline_floor_evaluation,
+                best_learned_key=None,
+                best_learned_epoch=None,
+                learned_bad_epochs=0,
+                checkpoint_role="resume_state",
+                deployable_best_checkpoint_sha256=baseline_hash,
+                best_learned_checkpoint_sha256=None,
+                checkpoint_transaction=baseline_transaction,
+            )
+            os.replace(prepared_baseline, self.best_path)
             logger.info(
                 "hash-bound ORIGIN-v3 warm start is eligible at epoch=000: "
                 "val_loss=%.5f val_acc=%.2f val_qwk=%.4f val_mae=%.4f "
@@ -2405,6 +2896,17 @@ class OriginTrainer:
                 policy=self.selection_policy,
                 qwk_weight=self.selection_qwk_weight,
             )
+            learned_improved = False
+            if dual_checkpoint:
+                learned_improved = (
+                    best_learned_key is None or key > best_learned_key
+                )
+                if learned_improved:
+                    best_learned_key = key
+                    best_learned_epoch = epoch
+                    learned_bad_epochs = 0
+                else:
+                    learned_bad_epochs += 1
             selector_improved = key > best_key
             candidate_floor_evaluation = (
                 self._warm_start_candidate_floor_evaluation(
@@ -2428,6 +2930,9 @@ class OriginTrainer:
             if candidate_floor_evaluation is not None:
                 history_row.update(
                     {
+                        "learned_selector_improved": bool(learned_improved),
+                        "best_learned_epoch": best_learned_epoch,
+                        "learned_early_stopping_bad_epochs": learned_bad_epochs,
                         "warm_start_floor_selector_improved": bool(
                             candidate_floor_evaluation[
                                 "passes_normal_checkpoint_selector"
@@ -2448,8 +2953,30 @@ class OriginTrainer:
                     }
                 )
             self._append_history(history_row)
+            prepared_sidecars: dict[str, tuple[Path, Path]] = {}
+            if learned_improved:
+                if best_learned_key is None or best_learned_epoch is None:
+                    raise AssertionError("learned-best state was not updated")
+                prepared = self._save_checkpoint(
+                    self.best_learned_path,
+                    epoch=epoch,
+                    metrics=val_metrics,
+                    best_key=best_key,
+                    best_epoch=best_epoch,
+                    bad_epochs=bad_epochs,
+                    candidate_floor_evaluation=candidate_floor_evaluation,
+                    best_learned_key=best_learned_key,
+                    best_learned_epoch=best_learned_epoch,
+                    learned_bad_epochs=learned_bad_epochs,
+                    checkpoint_role="best_learned",
+                    defer_commit=True,
+                )
+                prepared_sidecars["best_learned"] = (
+                    prepared,
+                    self.best_learned_path,
+                )
             if improved:
-                self._save_checkpoint(
+                prepared = self._save_checkpoint(
                     self.best_path,
                     epoch=epoch,
                     metrics=val_metrics,
@@ -2457,7 +2984,57 @@ class OriginTrainer:
                     best_epoch=best_epoch,
                     bad_epochs=bad_epochs,
                     candidate_floor_evaluation=candidate_floor_evaluation,
+                    best_learned_key=best_learned_key,
+                    best_learned_epoch=best_learned_epoch,
+                    learned_bad_epochs=learned_bad_epochs,
+                    checkpoint_role="deployable_selected",
+                    defer_commit=True,
                 )
+                prepared_sidecars["deployable_selected"] = (
+                    prepared,
+                    self.best_path,
+                )
+            deployable_best_hash = (
+                self._file_sha256(
+                    prepared_sidecars["deployable_selected"][0]
+                    if "deployable_selected" in prepared_sidecars
+                    else self.best_path
+                )
+                if (
+                    "deployable_selected" in prepared_sidecars
+                    or self.best_path.is_file()
+                )
+                else None
+            )
+            learned_best_hash = (
+                self._file_sha256(
+                    prepared_sidecars["best_learned"][0]
+                    if "best_learned" in prepared_sidecars
+                    else self.best_learned_path
+                )
+                if dual_checkpoint
+                and (
+                    "best_learned" in prepared_sidecars
+                    or self.best_learned_path.is_file()
+                )
+                else None
+            )
+            checkpoint_transaction = (
+                {
+                    "schema": "origin-checkpoint-sidecar-transaction-v1",
+                    "epoch": epoch,
+                    "prepared_sidecars": {
+                        role: {
+                            "target_name": target.name,
+                            "temporary_name": temporary.name,
+                            "sha256": self._file_sha256(temporary),
+                        }
+                        for role, (temporary, target) in prepared_sidecars.items()
+                    },
+                }
+                if prepared_sidecars
+                else None
+            )
             self._save_checkpoint(
                 self.last_path,
                 epoch=epoch,
@@ -2466,7 +3043,16 @@ class OriginTrainer:
                 best_epoch=best_epoch,
                 bad_epochs=bad_epochs,
                 candidate_floor_evaluation=candidate_floor_evaluation,
+                best_learned_key=best_learned_key,
+                best_learned_epoch=best_learned_epoch,
+                learned_bad_epochs=learned_bad_epochs,
+                checkpoint_role="resume_state",
+                deployable_best_checkpoint_sha256=deployable_best_hash,
+                best_learned_checkpoint_sha256=learned_best_hash,
+                checkpoint_transaction=checkpoint_transaction,
             )
+            for temporary, target in prepared_sidecars.values():
+                os.replace(temporary, target)
             logger.info(
                 "ORIGIN epoch=%03d train_loss=%.5f val_loss=%.5f val_acc=%.2f "
                 "val_qwk=%.4f val_mae=%.4f bal_acc=%.2f macro_f1=%.4f "
@@ -2487,17 +3073,17 @@ class OriginTrainer:
             if self.relation_enabled:
                 edge_metric_label = (
                     "edge_contribution"
-                    if self.relation_protocol_version == "v7"
+                    if self.relation_protocol_version in {"v7", "v8"}
                     else "edge_message"
                 )
                 edge_mean_key = (
                     "mean_abs_relation_edge_log_odds_contribution"
-                    if self.relation_protocol_version == "v7"
+                    if self.relation_protocol_version in {"v7", "v8"}
                     else "mean_abs_relation_edge_message"
                 )
                 edge_max_key = (
                     "max_abs_relation_edge_log_odds_contribution"
-                    if self.relation_protocol_version == "v7"
+                    if self.relation_protocol_version in {"v7", "v8"}
                     else "max_abs_relation_edge_message"
                 )
                 logger.info(
@@ -2518,17 +3104,33 @@ class OriginTrainer:
                     edge_metric_label,
                     val_metrics[edge_max_key],
                 )
-                if self.relation_protocol_version == "v7":
+                if self.relation_protocol_version in {"v7", "v8"}:
                     logger.info(
-                        "ORIGIN-v7 support epoch=%03d selected_mean=%.2f "
+                        "ORIGIN-%s support epoch=%03d selected_mean=%.2f "
                         "selected_min=%d selected_max=%d "
                         "anova_row_error=%.3e anova_column_error=%.3e",
+                        self.relation_protocol_version,
                         epoch,
                         val_metrics["mean_selected_relation_edges_per_boundary"],
                         val_metrics["min_selected_relation_edges_per_boundary"],
                         val_metrics["max_selected_relation_edges_per_boundary"],
                         val_metrics["max_abs_interaction_residual_row_sum"],
                         val_metrics["max_abs_interaction_residual_column_sum"],
+                    )
+                if self.relation_protocol_version == "v8":
+                    logger.info(
+                        "ORIGIN-v8 witness epoch=%03d effective_mean=%.3f "
+                        "effective_min=%.3f effective_max=%.3f "
+                        "top1_mean=%.4f top1_max=%.4f "
+                        "capacity_util_mean=%.4f capacity_util_max=%.4f",
+                        epoch,
+                        val_metrics["mean_relation_effective_witness_count"],
+                        val_metrics["min_relation_effective_witness_count"],
+                        val_metrics["max_relation_effective_witness_count"],
+                        val_metrics["mean_relation_top1_allocation"],
+                        val_metrics["max_relation_top1_allocation"],
+                        val_metrics["mean_relation_capacity_utilization"],
+                        val_metrics["max_relation_capacity_utilization"],
                     )
             if candidate_floor_evaluation is not None:
                 logger.info(
@@ -2544,8 +3146,19 @@ class OriginTrainer:
                     candidate_floor_evaluation["checks"],
                     self.warm_start_metric_safety_floor["requirements"],
                 )
-            if bad_epochs >= self.early_stopping_patience:
-                logger.info("ORIGIN early stopping at epoch %d", epoch)
+            stopping_bad_epochs = (
+                learned_bad_epochs if dual_checkpoint else bad_epochs
+            )
+            if stopping_bad_epochs >= self.early_stopping_patience:
+                logger.info(
+                    "ORIGIN early stopping at epoch %d on %s",
+                    epoch,
+                    (
+                        "learned-epoch selector"
+                        if dual_checkpoint
+                        else "deployable checkpoint selector"
+                    ),
+                )
                 break
 
         if not self.best_path.exists():
@@ -2553,6 +3166,26 @@ class OriginTrainer:
         best = self._restore_best()
         best_validation = dict(best["metrics"])
         certificates = self._write_validation_certificates(int(best["epoch"]))
+        deployable_best_hash = self._file_sha256(self.best_path)
+        best_learned: Mapping[str, Any] | None = None
+        best_learned_validation: dict[str, Any] | None = None
+        best_learned_hash: str | None = None
+        if dual_checkpoint:
+            if not self.best_learned_path.is_file():
+                raise RuntimeError(
+                    "relational ORIGIN training produced no best learned checkpoint"
+                )
+            best_learned = torch.load(
+                self.best_learned_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+            if best_learned.get("checkpoint_role") != "best_learned":
+                raise ValueError(
+                    "best_learned.pth does not declare the best_learned role"
+                )
+            best_learned_validation = dict(best_learned["metrics"])
+            best_learned_hash = self._file_sha256(self.best_learned_path)
         result: dict[str, Any] = {
             "best_epoch": int(best["epoch"]),
             "best_validation": best_validation,
@@ -2581,7 +3214,38 @@ class OriginTrainer:
             "best_checkpoint_is_hash_bound_v3_floor": bool(
                 self.warm_start_provenance is not None and int(best["epoch"]) == 0
             ),
+            "selected_checkpoint_role": best.get("checkpoint_role"),
+            "best_checkpoint_sha256": deployable_best_hash,
+            "deployable_best_checkpoint_sha256": deployable_best_hash,
         }
+        if best_learned is not None and best_learned_validation is not None:
+            learned_floor_evaluation = best_learned.get(
+                "candidate_metric_safety_floor_evaluation"
+            )
+            result.update(
+                {
+                    "best_learned_epoch": int(best_learned["epoch"]),
+                    "best_learned_validation": best_learned_validation,
+                    "best_learned_validation_metrics": best_learned_validation,
+                    "best_learned_checkpoint_sha256": best_learned_hash,
+                    "best_learned_checkpoint_role": best_learned.get(
+                        "checkpoint_role"
+                    ),
+                    "best_learned_training_phase": str(
+                        best_learned.get("training_phase", "unknown")
+                    ),
+                    "best_learned_selection_key": best_learned.get(
+                        "best_learned_selection_key"
+                    ),
+                    "best_learned_metric_safety_floor_evaluation": (
+                        learned_floor_evaluation
+                    ),
+                    "best_learned_passes_v3_safety_floor": bool(
+                        isinstance(learned_floor_evaluation, Mapping)
+                        and learned_floor_evaluation.get("passes_metric_floor", False)
+                    ),
+                }
+            )
         result.update(
             {
                 f"best_val_{key}": value

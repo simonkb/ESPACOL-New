@@ -86,6 +86,9 @@ class OriginConfig:
     relation_variant: str = "dense_v1"
     relation_edge_budget: int = 8
     relation_permutation_seed: int = 617
+    # V8 allocates the unchanged relation capacity over an adaptive entmax
+    # witness support capped by ``relation_edge_budget``.
+    relation_allocation_temperature: float = 1.0
 
     # A relational development run is initialized from an immutable v3 checkpoint.
     # The path is invocation provenance; the SHA-256 is the content identity.
@@ -296,6 +299,9 @@ class OriginConfig:
             "identified_sparse_v1",
             "additive_endpoint_control_v1",
             "shuffled_pair_control_v1",
+            "identified_conserved_witness_v1",
+            "additive_conserved_witness_control_v1",
+            "shuffled_conserved_witness_control_v1",
         }
         if self.relation_variant not in relation_variants:
             raise ValueError(
@@ -320,6 +326,13 @@ class OriginConfig:
             )
         if self.relation_permutation_seed < 0:
             raise ValueError("relation_permutation_seed must be non-negative")
+        if (
+            not math.isfinite(self.relation_allocation_temperature)
+            or self.relation_allocation_temperature <= 0.0
+        ):
+            raise ValueError(
+                "relation_allocation_temperature must be finite and positive"
+            )
         if not self.relation_enabled and self.relation_variant != "dense_v1":
             raise ValueError(
                 "a non-default relation_variant requires relation_enabled=True"

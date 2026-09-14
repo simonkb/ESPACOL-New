@@ -53,6 +53,19 @@ from training.origin_trainer import (
 
 
 _DECISIONS = ("class_map", "posterior_median", "rounded_expected")
+_V7_SPARSE_AGGREGATION = "fixed_budget_linear_conserved_v1"
+_V8_WITNESS_AGGREGATION = "conserved_sparse_witness_allocation_v1"
+_V8_RELATION_VARIANTS = {
+    "identified_conserved_witness_v1",
+    "additive_conserved_witness_control_v1",
+    "shuffled_conserved_witness_control_v1",
+}
+_V8_CHECKPOINT_ROLES = {
+    "hash_bound_v3_floor",
+    "deployable_selected",
+    "best_learned",
+    "resume_state",
+}
 
 
 def _acquire_nonblocking_lock(path: Path, *, shared: bool) -> Any:
@@ -80,11 +93,16 @@ def _verify_provenance(
 ) -> str:
     """Fail closed if code, model, config, or complete split identity changed."""
 
+    relation_variant = str(getattr(cfg, "relation_variant", "dense_v1"))
     expected_schema = (
         (
             "origin-checkpoint-v6"
-            if str(getattr(cfg, "relation_variant", "dense_v1")) == "dense_v1"
-            else "origin-checkpoint-v7"
+            if relation_variant == "dense_v1"
+            else (
+                "origin-checkpoint-v8"
+                if relation_variant in _V8_RELATION_VARIANTS
+                else "origin-checkpoint-v7"
+            )
         )
         if cfg.relation_enabled
         else "origin-checkpoint-v3"
@@ -93,6 +111,11 @@ def _verify_provenance(
         raise ValueError(
             f"full validation audit requires checkpoint schema {expected_schema!r}"
         )
+    if expected_schema == "origin-checkpoint-v8":
+        if state.get("relation_protocol_version") != "v8":
+            raise ValueError("v8 checkpoint omits its relation protocol identity")
+        if state.get("relation_variant") != relation_variant:
+            raise ValueError("v8 checkpoint relation variant differs from configuration")
     if manifest.get("schema") != "origin-split-v2":
         raise ValueError("full validation audit requires an origin-split-v2 manifest")
     if manifest.get("evaluation_scope") != "inner_validation_only":
@@ -311,7 +334,7 @@ def _audit_sparse_relation_trace(relation: object) -> dict[str, Any]:
     aggregation_kind = str(
         getattr(relation, "aggregation_kind", "geometry_normalized_tanh_v1")
     )
-    if aggregation_kind != "fixed_budget_linear_conserved_v1":
+    if aggregation_kind != _V7_SPARSE_AGGREGATION:
         raise ValueError(
             "sparse relation trace has an unknown aggregation contract: "
             f"{aggregation_kind!r}"
@@ -690,6 +713,381 @@ def _audit_sparse_relation_trace(relation: object) -> dict[str, Any]:
         "max_message_identity_error": message_error,
         "max_edge_contribution_identity_error": contribution_error,
         "max_sparse_aggregation_identity_error": aggregation_error,
+    }
+
+
+def _entmax15_reference(
+    logits: torch.Tensor,
+    support_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Independent FP64 alpha=1.5 entmax reference on a masked support.
+
+    This intentionally does not call the model implementation.  The loop is
+    acceptable in the offline audit and makes the allocation contract
+    independently replayable, including when shortlist sizes vary by sample.
+    """
+
+    if logits.shape != support_mask.shape or logits.ndim != 4:
+        raise ValueError("masked entmax inputs must have matching (N,B,M,M) shapes")
+    if support_mask.dtype != torch.bool:
+        raise TypeError("masked entmax support must be boolean")
+    result = torch.zeros_like(logits, dtype=torch.float64)
+    working = logits.to(dtype=torch.float64)
+    for sample in range(logits.shape[0]):
+        for boundary in range(logits.shape[1]):
+            support = support_mask[sample, boundary]
+            values = working[sample, boundary][support]
+            if values.numel() == 0:
+                raise AssertionError("entmax shortlist is empty")
+
+            # Peters et al.'s exact alpha=1.5 threshold algorithm.  Scaling by
+            # 1/2 is part of the entmax15 transform, not a temperature choice.
+            values = values / 2.0
+            values = values - values.max()
+            sorted_values = values.sort(descending=True).values
+            rho = torch.arange(
+                1,
+                sorted_values.numel() + 1,
+                device=values.device,
+                dtype=torch.float64,
+            )
+            mean = sorted_values.cumsum(0) / rho
+            mean_sq = sorted_values.square().cumsum(0) / rho
+            variance_sum = rho * (mean_sq - mean.square())
+            delta = (1.0 - variance_sum) / rho
+            taus = mean - delta.clamp_min(0.0).sqrt()
+            threshold_candidates = taus <= sorted_values
+            support_size = int(threshold_candidates.sum().item())
+            if support_size < 1:
+                raise AssertionError("entmax threshold has empty support")
+            threshold = taus[support_size - 1]
+            probabilities = (values - threshold).clamp_min(0.0).square()
+            normalizer = probabilities.sum()
+            if not bool(torch.isfinite(normalizer)) or float(normalizer) <= 0.0:
+                raise FloatingPointError("entmax reference has invalid normalization")
+            probabilities = probabilities / normalizer
+            result[sample, boundary][support] = probabilities
+    return result
+
+
+def _expanded_relation_strength(
+    strength: torch.Tensor,
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    """Validate and broadcast a shared per-boundary V8 output gate."""
+
+    batch, boundaries, regions, _ = reference.shape
+    value = torch.as_tensor(strength, device=reference.device, dtype=reference.dtype)
+    if value.shape == (boundaries,):
+        value = value.reshape(1, boundaries, 1, 1)
+    elif value.shape in {(1, boundaries), (batch, boundaries)}:
+        value = value.reshape(value.shape[0], boundaries, 1, 1)
+    elif value.shape not in {
+        (1, boundaries, 1, 1),
+        (batch, boundaries, 1, 1),
+    }:
+        raise ValueError(
+            "relation strength must be shared per boundary, with shape (B,), "
+            "(1,B), (N,B), (1,B,1,1), or (N,B,1,1)"
+        )
+    return value.expand(batch, boundaries, regions, regions)
+
+
+def _audit_conserved_witness_relation_trace(
+    relation: object,
+) -> dict[str, Any]:
+    """Fail-closed audit of a V8 conserved minimal-witness trace."""
+
+    variant = str(getattr(relation, "variant", ""))
+    aggregation_kind = str(getattr(relation, "aggregation_kind", ""))
+    if variant not in _V8_RELATION_VARIANTS:
+        raise ValueError(f"unknown V8 relation variant: {variant!r}")
+    if aggregation_kind != _V8_WITNESS_AGGREGATION:
+        raise ValueError(
+            "V8 relation trace has an unknown aggregation contract: "
+            f"{aggregation_kind!r}"
+        )
+
+    candidate = getattr(relation, "candidate_edge_mask")
+    edge_valid = getattr(relation, "edge_valid_mask")
+    shortlist = getattr(relation, "shortlist_edge_mask")
+    active = getattr(relation, "active_witness_mask", None)
+    selected_alias = getattr(relation, "selected_edge_mask", None)
+    if active is None:
+        if selected_alias is None:
+            raise AttributeError("V8 relation trace omits its active witness support")
+        active = selected_alias
+    elif selected_alias is not None and not torch.equal(active, selected_alias):
+        raise AssertionError("selected-edge alias differs from active witness support")
+    for name, value in {
+        "candidate edge mask": candidate,
+        "edge-valid mask": edge_valid,
+        "shortlist edge mask": shortlist,
+        "active witness mask": active,
+    }.items():
+        if value.dtype != torch.bool:
+            raise TypeError(f"{name} must be boolean")
+
+    scores = getattr(relation, "identified_pair_scores")
+    allocation = getattr(relation, "witness_allocation")
+    messages = getattr(relation, "edge_messages")
+    pair_gates = getattr(relation, "pair_gates")
+    contributions = getattr(relation, "edge_log_odds_contributions")
+    region_valid = getattr(relation, "region_valid_mask").bool()
+    budget = int(getattr(relation, "edge_budget"))
+    temperature = float(getattr(relation, "allocation_temperature"))
+    delta_cap = float(getattr(relation, "delta_cap"))
+    if budget < 1:
+        raise ValueError("V8 maximum witness count must be positive")
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("V8 allocation temperature must be finite and positive")
+    if not math.isfinite(delta_cap) or delta_cap <= 0.0:
+        raise ValueError("V8 relation delta cap must be finite and positive")
+    if candidate.shape != edge_valid.shape or not torch.equal(candidate, edge_valid):
+        raise AssertionError("candidate and valid relation masks differ")
+    expected_candidate = (
+        region_valid[:, :, None]
+        & region_valid[:, None, :]
+        & ~torch.eye(
+            region_valid.shape[1], dtype=torch.bool, device=region_valid.device
+        )[None]
+    )
+    if not torch.equal(candidate, expected_candidate):
+        raise AssertionError("candidate relation graph is not valid directed pairs")
+    expected_shape = scores.shape
+    if scores.ndim != 4 or scores.shape[-1] != scores.shape[-2]:
+        raise ValueError("identified pair scores must have shape (N,B,M,M)")
+    for name, value in {
+        "shortlist edge mask": shortlist,
+        "active witness mask": active,
+        "witness allocation": allocation,
+        "edge messages": messages,
+        "pair gates": pair_gates,
+        "edge log-odds contributions": contributions,
+    }.items():
+        if value.shape != expected_shape:
+            raise ValueError(f"{name} shape differs from identified pair scores")
+    if scores.shape[0] != candidate.shape[0] or scores.shape[-2:] != candidate.shape[-2:]:
+        raise ValueError("V8 score and candidate graph shapes differ")
+    if bool((shortlist & ~candidate[:, None]).any()):
+        raise AssertionError("V8 shortlist leaves the candidate graph")
+    if bool((active & ~shortlist).any()):
+        raise AssertionError("active witnesses leave the V8 shortlist")
+    for name, value in {
+        "identified pair scores": scores,
+        "witness allocation": allocation,
+        "edge messages": messages,
+        "pair gates": pair_gates,
+        "edge log-odds contributions": contributions,
+    }.items():
+        if not bool(torch.isfinite(value).all()):
+            raise FloatingPointError(f"V8 {name} are non-finite")
+    if bool((allocation < 0).any()):
+        raise AssertionError("V8 witness allocation contains negative mass")
+    if bool((scores.masked_select(~candidate[:, None]) != 0).any()):
+        raise AssertionError("invalid V8 relation edges carry identified scores")
+    if bool((allocation.masked_select(~active) != 0).any()):
+        raise AssertionError("inactive V8 witnesses carry allocation mass")
+    if bool((allocation.masked_select(active) <= 0).any()):
+        raise AssertionError("active V8 witnesses must carry positive allocation mass")
+    if bool((contributions.masked_select(~active) != 0).any()):
+        raise AssertionError("inactive V8 witnesses carry log-odds contributions")
+    if not torch.equal(pair_gates, allocation):
+        raise AssertionError("V8 pair gates do not expose the witness allocation")
+
+    candidate_count = candidate.sum(dim=(1, 2))
+    shortlist_count = shortlist.sum(dim=(2, 3))
+    active_count = active.sum(dim=(2, 3))
+    expected_shortlist_count = torch.minimum(
+        candidate_count[:, None], torch.full_like(shortlist_count, budget)
+    )
+    if not torch.equal(shortlist_count, expected_shortlist_count):
+        raise AssertionError("V8 shortlist violates its maximum-witness budget")
+    if bool((active_count < 1).any()) or bool((active_count > shortlist_count).any()):
+        raise AssertionError("V8 active witness count is outside [1, shortlist size]")
+
+    # Ties may choose either stable edge, so audit the top-q set by its score
+    # floor/ceiling rather than reproducing a device-specific tie order.
+    magnitude = scores.abs()
+    shortlist_floor = magnitude.masked_fill(~shortlist, torch.inf).amin(dim=(2, 3))
+    unshortlisted = candidate[:, None] & ~shortlist
+    unshortlisted_ceiling = magnitude.masked_fill(
+        ~unshortlisted, -torch.inf
+    ).amax(dim=(2, 3))
+    ranking_violation = (unshortlisted_ceiling - shortlist_floor).clamp_min(0.0)
+    ranking_violation = torch.where(
+        torch.isfinite(ranking_violation),
+        ranking_violation,
+        torch.zeros_like(ranking_violation),
+    )
+    score_scale = max(1.0, float(scores.detach().abs().max().cpu()))
+    numeric_tolerance = max(2e-6, 5e-6 * score_scale)
+    if float(ranking_violation.max().cpu()) > numeric_tolerance:
+        raise AssertionError("V8 shortlist is not a top-q identified-score support")
+
+    allocation_sum = allocation.double().sum(dim=(2, 3))
+    allocation_sum_error = float((allocation_sum - 1.0).abs().max().cpu())
+    if allocation_sum_error > 2e-6:
+        raise AssertionError("V8 witness allocation does not conserve unit capacity")
+    reference_allocation = _entmax15_reference(
+        magnitude.double() / temperature, shortlist
+    )
+    allocation_replay_error = float(
+        (allocation.double() - reference_allocation).abs().max().cpu()
+    )
+    if allocation_replay_error > max(5e-6, numeric_tolerance):
+        raise AssertionError("V8 entmax witness allocation does not replay")
+    expected_active = allocation > 0
+    if not torch.equal(active, expected_active):
+        raise AssertionError("V8 active support is not the positive entmax support")
+
+    effective = 1.0 / allocation.double().square().sum(dim=(2, 3))
+    reported_effective = getattr(relation, "effective_witness_count")
+    if reported_effective.shape != effective.shape:
+        raise ValueError("V8 effective witness count has invalid shape")
+    if not bool(torch.isfinite(reported_effective).all()):
+        raise FloatingPointError("V8 effective witness counts are non-finite")
+    effective_error = float(
+        (reported_effective.double() - effective).abs().max().cpu()
+    )
+    if effective_error > 5e-6:
+        raise AssertionError("V8 effective witness count does not replay")
+
+    # The target and shuffled controls remain identified contrasts.  The
+    # additive control intentionally preserves endpoint main effects.
+    projection_error = 0.0
+    row_column_error = 0.0
+    if variant != "additive_conserved_witness_control_v1":
+        independently_projected = _masked_directed_anova_projection(
+            scores, candidate
+        )
+        projection_error = float(
+            (scores.double() - independently_projected).abs().max().cpu()
+        )
+        masked_scores = scores.masked_fill(~candidate[:, None], 0.0)
+        row_column_error = max(
+            float(masked_scores.sum(-1).abs().max().cpu()),
+            float(masked_scores.sum(-2).abs().max().cpu()),
+        )
+        projection_tolerance = max(
+            2e-6,
+            32.0
+            * torch.finfo(torch.float32).eps
+            * float(candidate.shape[-1])
+            * score_scale,
+        )
+        if max(projection_error, row_column_error) > projection_tolerance:
+            raise AssertionError("V8 identified score field retains endpoint main effects")
+
+    expanded_strength = _expanded_relation_strength(
+        getattr(relation, "relation_strength"), scores
+    )
+    if not bool(torch.isfinite(expanded_strength).all()):
+        raise FloatingPointError("V8 relation strength is non-finite")
+    if bool((expanded_strength.abs() > 1.0 + 2e-6).any()):
+        raise AssertionError("V8 relation strength leaves its [-1,1] gate range")
+    boundaries = int(scores.shape[1])
+    scale = delta_cap / float(boundaries)
+    expected_messages = torch.where(
+        active,
+        expanded_strength * scores.tanh(),
+        torch.zeros_like(scores),
+    )
+    message_error = float((messages - expected_messages).abs().max().cpu())
+    expected_contributions = (
+        scale * expected_messages.double() * allocation.double()
+    ).double()
+    contribution_error = float(
+        (contributions.double() - expected_contributions).abs().max().cpu()
+    )
+    target = contributions.double().sum(dim=-1)
+    incremental = target.sum(dim=-1)
+    cumulative = reverse_cumulative_atoms(incremental, dim=1)
+    aggregation_error = max(
+        float(
+            (target - getattr(relation, "target_incremental_log_odds").double())
+            .abs()
+            .max()
+            .cpu()
+        ),
+        float(
+            (incremental - getattr(relation, "incremental_log_odds").double())
+            .abs()
+            .max()
+            .cpu()
+        ),
+        float(
+            (cumulative - getattr(relation, "cumulative_log_odds").double())
+            .abs()
+            .max()
+            .cpu()
+        ),
+    )
+    if max(message_error, contribution_error, aggregation_error) > max(
+        5e-6, numeric_tolerance
+    ):
+        raise AssertionError("V8 conserved witness contribution compilation is invalid")
+    per_boundary_l1 = contributions.double().abs().sum(dim=(2, 3))
+    per_boundary_capacity = (
+        scale * expanded_strength[:, :, 0, 0].double().abs()
+    )
+    reported_capacity = getattr(relation, "per_boundary_allocated_capacity")
+    reported_l1 = getattr(relation, "per_boundary_l1_usage")
+    if reported_capacity.shape != per_boundary_capacity.shape:
+        raise ValueError("V8 allocated-capacity trace has invalid shape")
+    if reported_l1.shape != per_boundary_l1.shape:
+        raise ValueError("V8 L1-usage trace has invalid shape")
+    if not bool(torch.isfinite(reported_capacity).all()) or not bool(
+        torch.isfinite(reported_l1).all()
+    ):
+        raise FloatingPointError("V8 capacity-use traces are non-finite")
+    capacity_identity_error = float(
+        (reported_capacity.double() - per_boundary_capacity).abs().max().cpu()
+    )
+    l1_identity_error = float(
+        (reported_l1.double() - per_boundary_l1).abs().max().cpu()
+    )
+    if max(capacity_identity_error, l1_identity_error) > 5e-6:
+        raise AssertionError("V8 reported capacity use does not replay")
+    budget_violation = float(
+        (per_boundary_l1 - per_boundary_capacity).clamp_min(0.0).max().cpu()
+    )
+    cumulative_violation = float(
+        (cumulative.abs() - delta_cap).clamp_min(0.0).max().cpu()
+    )
+    if max(budget_violation, cumulative_violation) > 5e-6:
+        raise AssertionError("V8 conserved relation budget is exceeded")
+
+    nonzero_count = contributions.ne(0).sum(dim=(2, 3))
+    density = active_count.double() / candidate_count.clamp_min(1)[:, None].double()
+    top_mass = allocation.double().flatten(2).amax(dim=-1)
+    return {
+        "variant": variant,
+        "aggregation_kind": aggregation_kind,
+        "edge_budget": budget,
+        "allocation_temperature": temperature,
+        "candidate_count": candidate_count.detach().cpu(),
+        "shortlist_count": shortlist_count.detach().cpu(),
+        "selected_count": active_count.detach().cpu(),
+        "nonzero_count": nonzero_count.detach().cpu(),
+        "selected_density": density.detach().cpu(),
+        "effective_witness_count": effective.detach().cpu(),
+        "top_witness_allocation": top_mass.detach().cpu(),
+        "per_boundary_allocated_capacity": per_boundary_capacity.detach().cpu(),
+        "per_boundary_l1_usage": per_boundary_l1.detach().cpu(),
+        "max_topq_ranking_violation": float(ranking_violation.max().cpu()),
+        "max_allocation_sum_error": allocation_sum_error,
+        "max_entmax_allocation_replay_error": allocation_replay_error,
+        "max_effective_witness_count_identity_error": effective_error,
+        "max_identified_projection_replay_error": projection_error,
+        "max_identified_residual_row_or_column_sum": row_column_error,
+        "max_message_identity_error": message_error,
+        "max_edge_contribution_identity_error": contribution_error,
+        "max_sparse_aggregation_identity_error": aggregation_error,
+        "max_allocated_capacity_identity_error": capacity_identity_error,
+        "max_l1_usage_identity_error": l1_identity_error,
+        "max_per_boundary_budget_violation": budget_violation,
+        "max_cumulative_budget_violation": cumulative_violation,
     }
 
 
@@ -1112,6 +1510,8 @@ def _relation_replay_records(
         "region_valid_mask",
         "edge_valid_mask",
         "candidate_edge_mask",
+        "shortlist_edge_mask",
+        "active_witness_mask",
         "selected_edge_mask",
     ):
         baseline_support = getattr(baseline_relation, support_name, None)
@@ -1124,6 +1524,31 @@ def _relation_replay_records(
         elif not torch.equal(baseline_support, replayed_support):
             raise AssertionError(
                 f"relation replay reselected or changed support {support_name}"
+            )
+    for fixed_name in (
+        "identified_pair_scores",
+        "witness_allocation",
+        "pair_gates",
+        "effective_witness_count",
+        "relation_strength",
+        "allocation_temperature",
+        "per_boundary_allocated_capacity",
+    ):
+        baseline_value = getattr(baseline_relation, fixed_name, None)
+        replayed_value = getattr(replayed_relation, fixed_name, None)
+        if baseline_value is None or replayed_value is None:
+            if baseline_value is not replayed_value:
+                raise AssertionError(
+                    f"relation replay changed optional trace field {fixed_name}"
+                )
+        elif torch.is_tensor(baseline_value):
+            if not torch.equal(baseline_value, replayed_value):
+                raise AssertionError(
+                    f"relation replay reallocated or changed trace field {fixed_name}"
+                )
+        elif baseline_value != replayed_value:
+            raise AssertionError(
+                f"relation replay changed optional trace field {fixed_name}"
             )
     partition_error = float(
         (original_messages - (replayed_relation.edge_messages + removed))
@@ -1146,7 +1571,10 @@ def _relation_replay_records(
         )
     )
     removed_contributions: torch.Tensor | None = None
-    if aggregation_kind == "fixed_budget_linear_conserved_v1":
+    if aggregation_kind in {
+        _V7_SPARSE_AGGREGATION,
+        _V8_WITNESS_AGGREGATION,
+    }:
         original_contributions = baseline_relation.edge_log_odds_contributions
         replayed_contributions = replayed_relation.edge_log_odds_contributions
         reported_removed_contributions = getattr(
@@ -1170,6 +1598,7 @@ def _relation_replay_records(
             raise AssertionError(
                 "relation replay did not exactly partition edge contributions"
             )
+        partition_error = max(partition_error, contribution_partition_error)
         if bool((removed_contributions.masked_select(~canonical) != 0).any()):
             raise AssertionError(
                 "relation replay changed non-removed edge contributions"
@@ -1190,6 +1619,13 @@ def _relation_replay_records(
         recomputed_cumulative = reverse_cumulative_atoms(
             recomputed_incremental, dim=1
         )
+        if aggregation_kind == _V8_WITNESS_AGGREGATION:
+            replayed_l1 = getattr(replayed_relation, "per_boundary_l1_usage", None)
+            if replayed_l1 is None:
+                raise AssertionError("V8 relation replay omitted its realized L1 use")
+            expected_l1 = replayed_contributions.abs().sum(dim=(2, 3))
+            if not torch.equal(replayed_l1, expected_l1):
+                raise AssertionError("V8 relation replay reports stale capacity use")
     else:
         _, recomputed_incremental, recomputed_cumulative = (
             aggregate_ordinal_pair_messages(
@@ -1371,6 +1807,11 @@ def audit_origin_validation(
     sparse_selected_counts: list[torch.Tensor] = []
     sparse_nonzero_counts: list[torch.Tensor] = []
     sparse_selected_densities: list[torch.Tensor] = []
+    sparse_shortlist_counts: list[torch.Tensor] = []
+    sparse_effective_witness_counts: list[torch.Tensor] = []
+    sparse_top_witness_allocations: list[torch.Tensor] = []
+    sparse_allocated_capacities: list[torch.Tensor] = []
+    sparse_l1_usages: list[torch.Tensor] = []
     sparse_trace_maxima: dict[str, float] = defaultdict(float)
     sparse_edge_budget: int | None = None
     relation_all_edge_effects: list[dict[str, Any]] = []
@@ -1552,11 +1993,16 @@ def audit_origin_validation(
                 relation_valid_edge_counts.append(
                     relation.edge_valid_mask.detach().sum(dim=(1, 2)).cpu()
                 )
-                sparse_relation = (
-                    batch_aggregation == "fixed_budget_linear_conserved_v1"
-                )
+                sparse_relation = batch_aggregation in {
+                    _V7_SPARSE_AGGREGATION,
+                    _V8_WITNESS_AGGREGATION,
+                }
                 if sparse_relation:
-                    sparse_trace = _audit_sparse_relation_trace(relation)
+                    sparse_trace = (
+                        _audit_conserved_witness_relation_trace(relation)
+                        if batch_aggregation == _V8_WITNESS_AGGREGATION
+                        else _audit_sparse_relation_trace(relation)
+                    )
                     batch_budget = int(sparse_trace["edge_budget"])
                     if sparse_edge_budget is None:
                         sparse_edge_budget = batch_budget
@@ -1570,6 +2016,22 @@ def audit_origin_validation(
                     sparse_selected_densities.append(
                         sparse_trace["selected_density"]
                     )
+                    if batch_aggregation == _V8_WITNESS_AGGREGATION:
+                        sparse_shortlist_counts.append(
+                            sparse_trace["shortlist_count"]
+                        )
+                        sparse_effective_witness_counts.append(
+                            sparse_trace["effective_witness_count"]
+                        )
+                        sparse_top_witness_allocations.append(
+                            sparse_trace["top_witness_allocation"]
+                        )
+                        sparse_allocated_capacities.append(
+                            sparse_trace["per_boundary_allocated_capacity"]
+                        )
+                        sparse_l1_usages.append(
+                            sparse_trace["per_boundary_l1_usage"]
+                        )
                     for name, value in sparse_trace.items():
                         if name.startswith("max_"):
                             sparse_trace_maxima[name] = max(
@@ -2225,7 +2687,11 @@ def audit_origin_validation(
             relation_top_edge_effects, quantiles
         )
         relation_diagnostics = {
-            "contract": "stored_pair_messages_to_cumulative_transition_rate_log_odds",
+            "contract": (
+                "stored_edge_log_odds_contributions_to_cumulative_transition_rate_log_odds"
+                if relation_aggregation_kind == _V8_WITNESS_AGGREGATION
+                else "stored_pair_messages_to_cumulative_transition_rate_log_odds"
+            ),
             "variant": relation_variant,
             "aggregation_kind": relation_aggregation_kind,
             "cumulative_log_odds_bound": float(
@@ -2257,7 +2723,7 @@ def audit_origin_validation(
             (
                 "most_pivotal_selected_edge_deletion_effects"
                 if relation_aggregation_kind
-                == "fixed_budget_linear_conserved_v1"
+                in {_V7_SPARSE_AGGREGATION, _V8_WITNESS_AGGREGATION}
                 else "largest_absolute_edge_deletion_effects"
             ): top_edge_summary,
             "full_vs_no_relation_ablation": _relation_ablation_summary(
@@ -2272,7 +2738,10 @@ def audit_origin_validation(
             ),
             "grade_stratified_relation_certificates": relation_certificates,
         }
-        if relation_aggregation_kind == "fixed_budget_linear_conserved_v1":
+        if relation_aggregation_kind in {
+            _V7_SPARSE_AGGREGATION,
+            _V8_WITNESS_AGGREGATION,
+        }:
             candidate_counts = torch.cat(sparse_candidate_counts).double()
             selected_counts = torch.cat(sparse_selected_counts).double()
             nonzero_counts = torch.cat(sparse_nonzero_counts).double()
@@ -2302,6 +2771,66 @@ def audit_origin_validation(
                 },
                 **dict(sparse_trace_maxima),
             }
+            if relation_aggregation_kind == _V8_WITNESS_AGGREGATION:
+                shortlist_counts = torch.cat(sparse_shortlist_counts).double()
+                effective_counts = torch.cat(
+                    sparse_effective_witness_counts
+                ).double()
+                top_allocations = torch.cat(
+                    sparse_top_witness_allocations
+                ).double()
+                allocated_capacities = torch.cat(
+                    sparse_allocated_capacities
+                ).double()
+                l1_usages = torch.cat(sparse_l1_usages).double()
+                capacity_fraction = torch.where(
+                    allocated_capacities > 0,
+                    l1_usages / allocated_capacities,
+                    torch.zeros_like(l1_usages),
+                )
+                relation_diagnostics["conserved_witness_allocation"] = {
+                    "semantics": (
+                        "unit allocation conserves available per-boundary capacity; "
+                        "realized L1 use may be lower because the signed score and "
+                        "relation-strength gates are bounded"
+                    ),
+                    "shortlist_count_quantiles_by_boundary": {
+                        str(boundary): _quantiles(
+                            shortlist_counts[:, boundary].tolist(), quantiles
+                        )
+                        for boundary in range(num_boundaries)
+                    },
+                    "effective_witness_count_quantiles_by_boundary": {
+                        str(boundary): _quantiles(
+                            effective_counts[:, boundary].tolist(), quantiles
+                        )
+                        for boundary in range(num_boundaries)
+                    },
+                    "top_witness_allocation_quantiles_by_boundary": {
+                        str(boundary): _quantiles(
+                            top_allocations[:, boundary].tolist(), quantiles
+                        )
+                        for boundary in range(num_boundaries)
+                    },
+                    "allocated_capacity_quantiles_by_boundary": {
+                        str(boundary): _quantiles(
+                            allocated_capacities[:, boundary].tolist(), quantiles
+                        )
+                        for boundary in range(num_boundaries)
+                    },
+                    "realized_l1_usage_quantiles_by_boundary": {
+                        str(boundary): _quantiles(
+                            l1_usages[:, boundary].tolist(), quantiles
+                        )
+                        for boundary in range(num_boundaries)
+                    },
+                    "realized_to_allocated_capacity_fraction_quantiles_by_boundary": {
+                        str(boundary): _quantiles(
+                            capacity_fraction[:, boundary].tolist(), quantiles
+                        )
+                        for boundary in range(num_boundaries)
+                    },
+                }
             pivotal_absolute = np.asarray(
                 [
                     abs(float(item["expected_grade_delta"]))
@@ -2350,12 +2879,16 @@ def audit_origin_validation(
 
     return {
         "schema": (
-            "origin-full-validation-audit-v7"
-            if relation_aggregation_kind == "fixed_budget_linear_conserved_v1"
+            "origin-full-validation-audit-v8"
+            if relation_aggregation_kind == _V8_WITNESS_AGGREGATION
             else (
-                "origin-full-validation-audit-v6"
-                if relation_presence
-                else "origin-full-validation-audit-v2"
+                "origin-full-validation-audit-v7"
+                if relation_aggregation_kind == _V7_SPARSE_AGGREGATION
+                else (
+                    "origin-full-validation-audit-v6"
+                    if relation_presence
+                    else "origin-full-validation-audit-v2"
+                )
             )
         ),
         "scope": "inner_validation_only",
@@ -2485,6 +3018,90 @@ def _assert_metric_reproduction(
             raise AssertionError(f"validation metric {key} does not reproduce {source}")
 
 
+def _checkpoint_role_result_contract(
+    state: Mapping[str, Any],
+    completed_result: Mapping[str, Any],
+    *,
+    checkpoint_sha256: str | None = None,
+) -> tuple[str, int, Mapping[str, Any]]:
+    """Resolve the selected-result record for legacy and role-tagged checkpoints.
+
+    V8 deliberately writes both a deployable safety-floor-selected checkpoint
+    and a best learned checkpoint.  Treating either one as the other can hide
+    a failed learned relation behind the epoch-0 V3 floor, so the production
+    audit requires an explicit role and binds it to a distinct result record.
+    """
+
+    schema = str(state.get("schema", ""))
+    if schema != "origin-checkpoint-v8":
+        metrics = completed_result.get(
+            "best_validation", completed_result.get("best_validation_metrics", {})
+        )
+        if not isinstance(metrics, Mapping):
+            raise ValueError("completed result has invalid best-validation metrics")
+        return "legacy_selected", int(completed_result.get("best_epoch", -1)), metrics
+
+    role = str(state.get("checkpoint_role", ""))
+    if role not in _V8_CHECKPOINT_ROLES:
+        raise ValueError(f"v8 checkpoint has an unknown checkpoint role: {role!r}")
+    if role == "resume_state":
+        raise ValueError("full validation audit refuses a resume-state checkpoint")
+
+    checkpoint_epoch = int(state.get("epoch", -1))
+    phase = str(state.get("training_phase", ""))
+    if role == "hash_bound_v3_floor":
+        if checkpoint_epoch != 0 or phase != "hash_bound_v3_floor":
+            raise ValueError("v8 floor checkpoint role is inconsistent with epoch/phase")
+        if not bool(
+            completed_result.get("best_checkpoint_is_hash_bound_v3_floor", False)
+        ):
+            raise ValueError("v8 result does not select the declared V3 floor")
+        epoch = int(completed_result.get("best_epoch", -1))
+        metrics = completed_result.get(
+            "best_validation", completed_result.get("best_validation_metrics", {})
+        )
+    elif role == "deployable_selected":
+        if checkpoint_epoch < 1 or phase == "hash_bound_v3_floor":
+            raise ValueError("deployable V8 checkpoint is not a learned candidate")
+        if bool(completed_result.get("best_checkpoint_is_hash_bound_v3_floor", False)):
+            raise ValueError("deployable V8 role conflicts with a selected floor result")
+        epoch = int(completed_result.get("best_epoch", -1))
+        metrics = completed_result.get(
+            "best_validation", completed_result.get("best_validation_metrics", {})
+        )
+    else:  # best_learned
+        if checkpoint_epoch < 1 or phase == "hash_bound_v3_floor":
+            raise ValueError("best-learned V8 checkpoint is not a learned candidate")
+        if "best_learned_epoch" not in completed_result:
+            raise ValueError("v8 result omits best_learned_epoch")
+        epoch = int(completed_result["best_learned_epoch"])
+        metrics = completed_result.get(
+            "best_learned_validation",
+            completed_result.get("best_learned_validation_metrics", {}),
+        )
+    if not isinstance(metrics, Mapping) or not metrics:
+        raise ValueError(f"v8 result omits metrics for checkpoint role {role!r}")
+    if epoch != checkpoint_epoch:
+        raise ValueError(
+            f"v8 checkpoint epoch differs from its {role!r} result record"
+        )
+    if checkpoint_sha256 is not None:
+        if role == "best_learned":
+            result_role = completed_result.get("best_learned_checkpoint_role")
+            result_hash = completed_result.get("best_learned_checkpoint_sha256")
+        else:
+            result_role = completed_result.get("selected_checkpoint_role")
+            result_hash = completed_result.get(
+                "deployable_best_checkpoint_sha256",
+                completed_result.get("best_checkpoint_sha256"),
+            )
+        if result_role != role:
+            raise ValueError("v8 result checkpoint role differs from checkpoint")
+        if result_hash != checkpoint_sha256:
+            raise ValueError("v8 result checkpoint hash differs from audited artifact")
+    return role, epoch, metrics
+
+
 def _parse_ints(value: str) -> tuple[int, ...]:
     result = tuple(int(part.strip()) for part in value.split(",") if part.strip())
     if not result or min(result) < 1:
@@ -2533,6 +3150,7 @@ def main() -> None:
         "origin-checkpoint-v3",
         "origin-checkpoint-v6",
         "origin-checkpoint-v7",
+        "origin-checkpoint-v8",
     }:
         raise ValueError("full validation audit requires an ORIGIN checkpoint")
     config_values = dict(state["config"])
@@ -2549,8 +3167,15 @@ def main() -> None:
         manifest = json.load(stream)
     if manifest.get("schema") != "origin-split-v2":
         raise ValueError("full validation audit requires an origin-split-v2 manifest")
-    if int(completed_result.get("best_epoch", -1)) != int(state.get("epoch", -2)):
-        raise ValueError("best checkpoint epoch differs from completed result")
+    checkpoint_role, result_checkpoint_epoch, result_metrics = (
+        _checkpoint_role_result_contract(
+            state,
+            completed_result,
+            checkpoint_sha256=checkpoint_hash_before,
+        )
+    )
+    if result_checkpoint_epoch != int(state.get("epoch", -2)):
+        raise ValueError("checkpoint epoch differs from its completed-result record")
     if int(completed_result.get("fold", -1)) != fold:
         raise ValueError("completed result fold differs from checkpoint")
     if bool(completed_result.get("test_evaluated", False)):
@@ -2613,6 +3238,7 @@ def main() -> None:
         relation_delta_cap=cfg.relation_delta_cap,
         relation_variant=cfg.relation_variant,
         relation_edge_budget=cfg.relation_edge_budget,
+        relation_allocation_temperature=cfg.relation_allocation_temperature,
         relation_permutation_seed=cfg.relation_permutation_seed,
     )
     signature = _verify_provenance(
@@ -2640,15 +3266,15 @@ def main() -> None:
     selected_training_phase = state.get("training_phase")
     if cfg.relation_enabled:
         if not isinstance(warm_start_provenance, Mapping):
-            raise ValueError("v6 checkpoint omits hash-bound v3 provenance")
+            raise ValueError("relation checkpoint omits hash-bound v3 provenance")
         if not isinstance(warm_start_metric_safety_floor, Mapping):
-            raise ValueError("v6 checkpoint omits its v3 multi-metric safety floor")
+            raise ValueError("relation checkpoint omits its v3 multi-metric safety floor")
         if not isinstance(selected_metric_safety_floor_evaluation, Mapping):
-            raise ValueError("v6 checkpoint omits selected safety-floor eligibility")
-        if not bool(
+            raise ValueError("relation checkpoint omits candidate safety-floor evaluation")
+        if checkpoint_role != "best_learned" and not bool(
             selected_metric_safety_floor_evaluation.get("checkpoint_eligible", False)
         ):
-            raise ValueError("selected v6 checkpoint was not safety-floor eligible")
+            raise ValueError("deployable relation checkpoint was not safety-floor eligible")
         expected_phase = (
             "hash_bound_v3_floor"
             if checkpoint_epoch == 0
@@ -2660,7 +3286,7 @@ def main() -> None:
         )
         if selected_training_phase != expected_phase:
             raise ValueError(
-                "selected v6 checkpoint training phase is inconsistent with its epoch"
+                "relation checkpoint training phase is inconsistent with its epoch"
             )
         if completed_result.get("warm_start_metric_safety_floor") != dict(
             warm_start_metric_safety_floor
@@ -2668,11 +3294,16 @@ def main() -> None:
             raise ValueError(
                 "completed result safety-floor thresholds differ from checkpoint"
             )
-        if completed_result.get(
-            "selected_checkpoint_metric_safety_floor_evaluation"
-        ) != dict(selected_metric_safety_floor_evaluation):
+        result_safety_evaluation = (
+            completed_result.get("best_learned_metric_safety_floor_evaluation")
+            if checkpoint_role == "best_learned"
+            else completed_result.get(
+                "selected_checkpoint_metric_safety_floor_evaluation"
+            )
+        )
+        if result_safety_evaluation != dict(selected_metric_safety_floor_evaluation):
             raise ValueError(
-                "completed result selected safety-floor evaluation differs from checkpoint"
+                "completed result role-specific safety-floor evaluation differs from checkpoint"
             )
     del state
     gc.collect()
@@ -2692,6 +3323,7 @@ def main() -> None:
         {
             "fold": fold,
             "checkpoint_epoch": checkpoint_epoch,
+            "checkpoint_role": checkpoint_role,
             "checkpoint_sha256": checkpoint_hash_before,
             "architecture_signature": architecture_signature,
             "implementation_signature": implementation_signature,
@@ -2713,11 +3345,10 @@ def main() -> None:
             },
         }
     )
-    result_metrics = completed_result.get(
-        "best_validation", completed_result.get("best_validation_metrics", {})
-    )
     _assert_metric_reproduction(payload["metrics"], checkpoint_metrics, source="checkpoint")
-    _assert_metric_reproduction(payload["metrics"], result_metrics, source="completed result")
+    _assert_metric_reproduction(
+        payload["metrics"], result_metrics, source=f"completed result ({checkpoint_role})"
+    )
     checkpoint_hash_after = _sha256_file(checkpoint_path)
     if checkpoint_hash_after != checkpoint_hash_before:
         raise AssertionError("checkpoint changed while read-only audit was running")

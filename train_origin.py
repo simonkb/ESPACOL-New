@@ -182,6 +182,7 @@ def split_signature(*named_splits) -> str:
 
 _PROTECTED_FOLD_ARTIFACTS = (
     "best.pth",
+    "best_learned.pth",
     "last.pth",
     "history.csv",
     "result.json",
@@ -358,6 +359,9 @@ def build_parser() -> argparse.ArgumentParser:
             "identified_sparse_v1",
             "additive_endpoint_control_v1",
             "shuffled_pair_control_v1",
+            "identified_conserved_witness_v1",
+            "additive_conserved_witness_control_v1",
+            "shuffled_conserved_witness_control_v1",
         ),
         default="dense_v1",
         help=(
@@ -378,6 +382,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=617,
         help="registered fixed seed reserved for matched relation-pair controls",
+    )
+    relation.add_argument(
+        "--relation_allocation_temperature",
+        type=float,
+        default=1.0,
+        help=(
+            "temperature of the V8 capped-entmax witness allocator; the "
+            "configured edge budget is its maximum support size"
+        ),
     )
     relation.add_argument(
         "--warm_start_checkpoint",
@@ -536,6 +549,7 @@ def main() -> None:
         relation_variant=args.relation_variant,
         relation_edge_budget=args.relation_edge_budget,
         relation_permutation_seed=args.relation_permutation_seed,
+        relation_allocation_temperature=args.relation_allocation_temperature,
         warm_start_checkpoint=args.warm_start_checkpoint,
         warm_start_sha256=args.warm_start_sha256,
         warm_start_metric_floor_tolerance=args.warm_start_metric_floor_tolerance,
@@ -704,6 +718,7 @@ def main() -> None:
             relation_variant=cfg.relation_variant,
             relation_edge_budget=cfg.relation_edge_budget,
             relation_permutation_seed=cfg.relation_permutation_seed,
+            relation_allocation_temperature=cfg.relation_allocation_temperature,
         )
         trainer = OriginTrainer(
             model,

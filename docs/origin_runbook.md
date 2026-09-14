@@ -496,6 +496,87 @@ not by itself an interaction claim: the identified target must outperform the
 parameter-matched additive-endpoint and shuffled-pair controls before the pair
 mechanism is credited for the gain.
 
+## ORIGIN-v8: conserved minimal-witness allocation
+
+V7 established exact replay, but its fixed uniform compiler diluted every
+selected edge by the full top-8 denominator. On EyePACS the strongest stored
+edge was consequently too weak to change a prediction, and V7's detached
+proposal score was not the score whose value entered the ordinal ledger. V8
+repairs those two specific defects without increasing the relation cap or
+changing the hash-bound v3 predictor.
+
+For sample `n`, ordinal boundary `b`, and directed regional edge `e=(i,j)`, let
+`R_nbe` be the masked two-way endpoint contrast after the registered
+pre-geometry and post-geometry ANOVA projections. A deterministic top-8
+operation on `|R|` defines only a maximum candidate support `S_nb`. On that
+support, entmax-1.5 allocates one conserved unit of capacity:
+
+```text
+pi_nb = entmax_1.5(|R_nb| / tau),  support(pi_nb) subseteq S_nb,
+sum_e pi_nbe = 1,  |support(pi_nb)| <= 8.
+```
+
+The same `R_nbe` controls selection, allocation, and the signed edge-wise
+value; there is no separate proposal/value network. A single zero-start scalar
+`a_b=tanh(gamma_b)` controls the global strength and orientation of boundary
+`b` but cannot independently rank or value its edges. With the unchanged total
+relation cap `Delta=2`, the literal stored contribution is
+
+```text
+c_nbe = [Delta / (K-1)] * a_b * pi_nbe * tanh(R_nbe).
+```
+
+Thus one decisive witness may receive nearly the entire boundary allocation,
+while diffuse evidence remains distributed when the data require it. The
+per-boundary L1 use is bounded by `Delta/(K-1)` and the reverse-cumulative
+ordinal field remains bounded by `Delta`. At initialization `a_b=0`, so V8 is
+exactly the immutable v3 function. An intervention deletes stored `c_nbe`
+entries and recompiles the generator with the original shortlist, allocation,
+scores, and gate held fixed. It never reranks or reallocates surviving
+witnesses; deleting every contribution recovers v3 exactly.
+
+The interpretation is deliberately scoped. A V8 edge is an identified
+regional-representation contrast inside the model's rate ledger. It is not a
+claim of biological synergy, a globally minimum proof, or a pixel-level causal
+effect. Those stronger claims require separate evidence.
+
+### Registered matched-control gate
+
+The first V8 experiment is APTOS fold 0, inner validation only. It trains for
+exactly 15 relation-only epochs from one SHA-256-bound v3 checkpoint. The
+three array members differ only in the registered relation variant:
+
+1. identified conserved witnesses (the proposed mechanism);
+2. additive endpoint component with the same allocator and capacity; and
+3. a fixed endpoint-to-geometry permutation with the same content-pair set.
+
+Every run writes two checkpoints. `best.pth` is deployable only if a learned
+epoch clears the complete v3 safety floor; `best_learned.pth` is the best
+learned epoch even when it fails that floor. Controls are compared using only
+`best_learned.pth`, preventing the common error of comparing three identical
+epoch-0 fallbacks. The target advances only if its learned checkpoint clears
+the v3 safety floor, passes the independently audited individual-witness
+strength gate, and has strictly higher validation accuracy than both matched
+controls. This is a development gate, not a statistical or cross-validation
+claim.
+
+After pulling the exact implementation commit on the cluster, launch the
+preflight, matched training array, structural-audit array, and comparison as
+one dependency chain:
+
+```bash
+cd /dpc/kuin0170/ESPACOL-New
+git switch severity-foundation-model
+git pull --ff-only
+export ORIGIN_V3_CHECKPOINT=runs/origin_aptos_f0_v3_bounded/fold0/best.pth
+bash scripts/launch_origin_v8_matched_aptos_f0.sh
+```
+
+Do not start EyePACS or full cross-validation until the generated matched
+comparison passes. If the target does not beat both controls, reject this
+relation mechanism rather than tuning the control definitions after observing
+their results.
+
 ## Historical failed runs
 
 The original September 8 v1 runs used the generic `torch.matrix_exp` backward

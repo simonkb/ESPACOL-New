@@ -193,6 +193,22 @@ def _target_config(
     )
 
 
+@pytest.mark.parametrize(
+    "variant",
+    (
+        "identified_conserved_witness_v1",
+        "additive_conserved_witness_control_v1",
+        "shuffled_conserved_witness_control_v1",
+    ),
+)
+def test_conserved_witness_variants_use_the_v8_protocol(tmp_path, variant) -> None:
+    cfg = replace(
+        _config(tmp_path / variant, relation_enabled=True),
+        relation_variant=variant,
+    )
+    assert trainer_module._relation_protocol_version(cfg) == "v8"
+
+
 def test_v3_to_v6_migration_accepts_only_the_exact_relation_subset(tmp_path) -> None:
     checkpoint, checksum, source_cfg, payload = _write_v3_checkpoint(tmp_path)
     target = _model(relation_enabled=True)
@@ -454,9 +470,22 @@ def test_higher_accuracy_candidate_with_worse_qwk_cannot_replace_epoch_zero_floo
     )
     result = trainer.fit()
     saved = torch.load(trainer.best_path, map_location="cpu", weights_only=False)
+    learned = torch.load(
+        trainer.best_learned_path,
+        map_location="cpu",
+        weights_only=False,
+    )
     last = torch.load(trainer.last_path, map_location="cpu", weights_only=False)
     assert saved["epoch"] == 0
+    assert saved["checkpoint_role"] == "hash_bound_v3_floor"
+    assert learned["epoch"] == 1
+    assert learned["checkpoint_role"] == "best_learned"
+    assert learned["metrics"] == worse
     assert result["best_epoch"] == 0
+    assert result["best_learned_epoch"] == 1
+    assert result["best_learned_validation"] == worse
+    assert result["best_learned_checkpoint_role"] == "best_learned"
+    assert result["best_learned_passes_v3_safety_floor"] is False
     assert result["epoch0_warm_start_eligible"] is True
     assert result["best_checkpoint_is_hash_bound_v3_floor"] is True
     assert result["selected_checkpoint_training_phase"] == "hash_bound_v3_floor"
@@ -468,12 +497,205 @@ def test_higher_accuracy_candidate_with_worse_qwk_cannot_replace_epoch_zero_floo
     assert candidate["checks"]["qwk_non_regression"] is False
     assert candidate["passes_metric_floor"] is False
     assert candidate["checkpoint_eligible"] is False
+    assert last["checkpoint_role"] == "resume_state"
+    assert last["early_stopping_track"] == "learned_epoch_selector"
+    assert tuple(last["best_learned_selection_key"]) == tuple(
+        learned["best_learned_selection_key"]
+    )
+    assert last["best_learned_epoch"] == 1
+    assert last["learned_early_stopping_bad_epochs"] == 0
+    assert last["deployable_best_checkpoint_sha256"] == trainer_module._file_sha256(
+        trainer.best_path
+    )
+    assert last["best_learned_checkpoint_sha256"] == trainer_module._file_sha256(
+        trainer.best_learned_path
+    )
+    trainer._validate_resume(last)
     with trainer.history_path.open(newline="") as stream:
         history = list(csv.DictReader(stream))
     assert len(history) == 1
     assert history[0]["warm_start_floor_selector_improved"] == "True"
     assert history[0]["warm_start_floor_qwk_non_regression"] == "False"
     assert history[0]["warm_start_floor_checkpoint_eligible"] == "False"
+    assert history[0]["learned_selector_improved"] == "True"
+    assert history[0]["best_learned_epoch"] == "1"
+
+    # ``last.pth`` is the write-ahead manifest for a multi-file checkpoint
+    # update.  Recreate the narrow crash window in which the manifest is
+    # durable but the prepared learned sidecar has not yet been renamed.
+    transaction = last["checkpoint_transaction"]
+    learned_record = transaction["prepared_sidecars"]["best_learned"]
+    prepared_learned = trainer.run_dir / learned_record["temporary_name"]
+    prepared_learned.write_bytes(trainer.best_learned_path.read_bytes())
+    trainer.best_learned_path.write_bytes(b"interrupted-old-sidecar")
+    trainer._validate_resume(last, recover_transaction=True)
+    assert not prepared_learned.exists()
+    assert last["best_learned_checkpoint_sha256"] == trainer_module._file_sha256(
+        trainer.best_learned_path
+    )
+
+    trainer.best_learned_path.write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="learned best SHA-256 mismatch"):
+        trainer._validate_resume(last)
+
+
+def test_warm_start_early_stopping_tracks_learned_epochs_not_the_v3_floor(
+    tmp_path,
+) -> None:
+    checkpoint, checksum, source_cfg, source_payload = _write_v3_checkpoint(tmp_path)
+    cfg = replace(
+        _target_config(
+            source_cfg,
+            checkpoint,
+            checksum,
+            tmp_path / "learned_stopping_target",
+        ),
+        epochs=3,
+        relation_only_epochs=3,
+        early_stopping_patience=1,
+    )
+    loader = _loader()
+    trainer = OriginTrainer(
+        _model(relation_enabled=True),
+        loader,
+        loader,
+        None,
+        cfg,
+        tmp_path / "learned_stopping_target",
+        fold=0,
+        split_signature="split-v1",
+        device="cpu",
+    )
+    source_metrics = copy.deepcopy(source_payload["metrics"])
+    validation_epochs: list[int] = []
+
+    def metrics_for_epoch(epoch: int) -> dict[str, Any]:
+        metrics = copy.deepcopy(source_metrics)
+        metrics["acc"] = float(source_metrics["acc"]) - (4.0 - epoch)
+        metrics["loss"] = float(source_metrics["loss"]) + (4.0 - epoch)
+        for name in (
+            "mean_abs_relation_log_odds",
+            "max_abs_relation_log_odds",
+            "mean_abs_relation_rate_delta",
+            "max_abs_relation_rate_delta",
+            "mean_abs_relation_edge_message",
+            "max_abs_relation_edge_message",
+        ):
+            metrics[name] = 0.0
+        return metrics
+
+    def fake_run_epoch(loader_arg, *, train: bool, epoch: int):
+        del loader_arg
+        if not train and epoch == 0:
+            return copy.deepcopy(source_metrics)
+        if not train:
+            validation_epochs.append(epoch)
+        return metrics_for_epoch(epoch)
+
+    trainer._run_epoch = fake_run_epoch  # type: ignore[method-assign]
+    trainer._write_validation_certificates = (  # type: ignore[method-assign]
+        lambda checkpoint_epoch: {
+            "content_checksum_sha256": "f" * 64,
+            "checkpoint_epoch": checkpoint_epoch,
+        }
+    )
+
+    result = trainer.fit()
+    deployable = torch.load(
+        trainer.best_path, map_location="cpu", weights_only=False
+    )
+    learned = torch.load(
+        trainer.best_learned_path, map_location="cpu", weights_only=False
+    )
+    last = torch.load(trainer.last_path, map_location="cpu", weights_only=False)
+    assert validation_epochs == [1, 2, 3]
+    assert deployable["epoch"] == 0
+    assert learned["epoch"] == 3
+    assert result["best_epoch"] == 0
+    assert result["best_learned_epoch"] == 3
+    assert last["early_stopping_bad_epochs"] == 3
+    assert last["learned_early_stopping_bad_epochs"] == 0
+
+
+def test_epoch_zero_floor_is_a_resumable_write_ahead_checkpoint(tmp_path) -> None:
+    checkpoint, checksum, source_cfg, source_payload = _write_v3_checkpoint(tmp_path)
+    run_dir = tmp_path / "epoch0_resume_target"
+    cfg = _target_config(source_cfg, checkpoint, checksum, run_dir)
+    loader = _loader()
+    interrupted = OriginTrainer(
+        _model(relation_enabled=True),
+        loader,
+        loader,
+        None,
+        cfg,
+        run_dir,
+        fold=0,
+        split_signature="split-v1",
+        device="cpu",
+    )
+    source_metrics = copy.deepcopy(source_payload["metrics"])
+
+    def interrupt_after_epoch_zero(loader_arg, *, train: bool, epoch: int):
+        del loader_arg
+        if not train and epoch == 0:
+            return copy.deepcopy(source_metrics)
+        raise RuntimeError("simulated preemption before epoch one")
+
+    interrupted._run_epoch = interrupt_after_epoch_zero  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="simulated preemption"):
+        interrupted.fit()
+
+    assert interrupted.best_path.is_file()
+    assert interrupted.last_path.is_file()
+    assert not interrupted.best_learned_path.exists()
+    epoch_zero = torch.load(
+        interrupted.last_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert epoch_zero["epoch"] == 0
+    assert epoch_zero["checkpoint_role"] == "resume_state"
+    assert epoch_zero["best_learned_epoch"] is None
+    interrupted._validate_resume(epoch_zero, recover_transaction=True)
+
+    resumed = OriginTrainer(
+        _model(relation_enabled=True),
+        loader,
+        loader,
+        None,
+        replace(cfg, resume=True),
+        run_dir,
+        fold=0,
+        split_signature="split-v1",
+        device="cpu",
+    )
+    learned_metrics = copy.deepcopy(source_metrics)
+    learned_metrics["loss"] = float(source_metrics["loss"]) + 0.1
+    for name in (
+        "mean_abs_relation_log_odds",
+        "max_abs_relation_log_odds",
+        "mean_abs_relation_rate_delta",
+        "max_abs_relation_rate_delta",
+        "mean_abs_relation_edge_message",
+        "max_abs_relation_edge_message",
+    ):
+        learned_metrics[name] = 0.0
+
+    def finish_epoch_one(loader_arg, *, train: bool, epoch: int):
+        del loader_arg, train
+        assert epoch == 1
+        return copy.deepcopy(learned_metrics)
+
+    resumed._run_epoch = finish_epoch_one  # type: ignore[method-assign]
+    resumed._write_validation_certificates = (  # type: ignore[method-assign]
+        lambda checkpoint_epoch: {
+            "content_checksum_sha256": "f" * 64,
+            "checkpoint_epoch": checkpoint_epoch,
+        }
+    )
+    result = resumed.fit()
+    assert result["best_epoch"] == 0
+    assert result["best_learned_epoch"] == 1
 
 
 def test_v6_certificate_emits_exact_relation_edge_replay(tmp_path) -> None:

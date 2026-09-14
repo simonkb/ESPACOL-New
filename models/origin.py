@@ -41,6 +41,16 @@ _RELATION_VARIANTS = frozenset(
         "identified_sparse_v1",
         "additive_endpoint_control_v1",
         "shuffled_pair_control_v1",
+        "identified_conserved_witness_v1",
+        "additive_conserved_witness_control_v1",
+        "shuffled_conserved_witness_control_v1",
+    )
+)
+_V8_RELATION_VARIANTS = frozenset(
+    (
+        "identified_conserved_witness_v1",
+        "additive_conserved_witness_control_v1",
+        "shuffled_conserved_witness_control_v1",
     )
 )
 _DECODER_DTYPE = torch.float64
@@ -687,6 +697,190 @@ def _hard_stable_pair_budget(
     return selected.reshape_as(scores)
 
 
+def _entmax15(scores: torch.Tensor, *, dim: int = -1) -> torch.Tensor:
+    """Compute :math:`\alpha=1.5` entmax with exact sparse support.
+
+    This is the closed-form threshold algorithm.  Inputs must be finite; the
+    caller is responsible for masking unavailable entries before invoking it.
+    The implementation stays in the input dtype and is differentiable away
+    from the usual sorting/support knots.
+    """
+
+    if not torch.is_floating_point(scores):
+        raise TypeError("entmax15 scores must be floating point")
+    _require_finite(scores, "entmax15 scores")
+    if scores.shape[dim] < 1:
+        raise ValueError("entmax15 requires a non-empty normalization axis")
+
+    # For alpha=1.5, p_i = [max(x_i / 2 - tau, 0)]^2 and tau is
+    # available from the sorted prefix moments.
+    scaled = scores / 2.0
+    scaled = scaled - scaled.amax(dim=dim, keepdim=True)
+    ordered, _ = torch.sort(scaled, dim=dim, descending=True, stable=True)
+    cumulative = ordered.cumsum(dim)
+    cumulative_sq = ordered.square().cumsum(dim)
+    axis_size = ordered.shape[dim]
+    view = [1] * ordered.ndim
+    view[dim] = axis_size
+    rho = torch.arange(
+        1,
+        axis_size + 1,
+        dtype=ordered.dtype,
+        device=ordered.device,
+    ).reshape(view)
+    mean = cumulative / rho
+    mean_sq = cumulative_sq / rho
+    variance_sum = rho * (mean_sq - mean.square())
+    delta = (1.0 - variance_sum) / rho
+    taus = mean - delta.clamp_min(0.0).sqrt()
+    support = taus <= ordered
+    support_size = support.sum(dim=dim, keepdim=True).clamp_min(1)
+    threshold = taus.gather(dim, support_size - 1)
+    probabilities = (scaled - threshold).clamp_min(0.0).square()
+    # The formula sums to one analytically.  A final division absorbs only
+    # floating-point roundoff and is part of the stored forward computation.
+    return probabilities / probabilities.sum(dim=dim, keepdim=True).clamp_min(
+        torch.finfo(probabilities.dtype).tiny
+    )
+
+
+def capped_entmax_witness_allocation(
+    identified_scores: torch.Tensor,
+    edge_valid_mask: torch.Tensor,
+    *,
+    max_witnesses: int,
+    temperature: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate a unit budget to at most ``max_witnesses`` pair witnesses.
+
+    A deterministic top-|score| shortlist caps compute and support size.  The
+    *same* identified score then drives entmax allocation and the edge-wise
+    witness value used by the compiler; a single boundary-level zero-start
+    scalar controls only the correction's global strength/orientation.
+    Entries outside the shortlist are exactly zero.  No part of the returned
+    allocation is detached.
+    """
+
+    if identified_scores.ndim != 4 or identified_scores.shape[-1] != identified_scores.shape[-2]:
+        raise ValueError("identified_scores must have shape (N,K-1,M,M)")
+    if edge_valid_mask.shape != identified_scores.shape[:1] + identified_scores.shape[-2:]:
+        raise ValueError("edge_valid_mask must have shape (N,M,M)")
+    if max_witnesses < 1:
+        raise ValueError("max_witnesses must be positive")
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("allocation temperature must be finite and positive")
+    _require_finite(identified_scores, "identified witness scores")
+    valid = edge_valid_mask.bool()
+    available = valid.sum(dim=(-2, -1))
+    if bool((available < 1).any()):
+        raise ValueError("each sample requires at least one valid relation edge")
+
+    shortlist = _hard_stable_pair_budget(
+        identified_scores,
+        valid,
+        edge_budget=max_witnesses,
+    )
+    flat_shortlist = shortlist.flatten(start_dim=-2)
+    flat_scores = identified_scores.abs().flatten(start_dim=-2) / float(temperature)
+    # A finite sentinel avoids inf-inf arithmetic in the closed-form entmax
+    # threshold while remaining far below the centered shortlisted scores.
+    sentinel = torch.full_like(flat_scores, -1.0e4)
+    masked_scores = torch.where(flat_shortlist, flat_scores, sentinel)
+    allocation = _entmax15(masked_scores, dim=-1)
+    allocation = torch.where(
+        flat_shortlist,
+        allocation,
+        torch.zeros_like(allocation),
+    )
+    allocation = allocation / allocation.sum(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(allocation.dtype).tiny
+    )
+    allocation = allocation.reshape_as(identified_scores)
+    active = shortlist & allocation.gt(0.0)
+    _require_finite(allocation, "sparse witness allocation")
+    if bool((allocation < 0.0).any()):
+        raise FloatingPointError("sparse witness allocation became negative")
+    return shortlist, allocation, active
+
+
+def compile_conserved_witness_ledger(
+    identified_scores: torch.Tensor,
+    witness_allocation: torch.Tensor,
+    active_witness_mask: torch.Tensor,
+    edge_valid_mask: torch.Tensor,
+    relation_strength: torch.Tensor,
+    *,
+    delta_cap: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compile sparse witness allocations into literal ordinal log-odds.
+
+    The simplex conserves *allocated capacity*.  The realized L1 correction
+    is bounded (rather than forced to equal that capacity) by the signed score
+    and the zero-start relation-strength gate.  Stored contributions are the
+    intervention unit, so deletion never reallocates the remaining budget.
+    """
+
+    if identified_scores.ndim != 4:
+        raise ValueError("identified_scores must have shape (N,K-1,M,M)")
+    batch, boundaries, targets, sources = identified_scores.shape
+    if boundaries < 1 or targets != sources:
+        raise ValueError("identified_scores must have shape (N,K-1,M,M), K>=2")
+    if witness_allocation.shape != identified_scores.shape:
+        raise ValueError("witness_allocation must match identified_scores")
+    if active_witness_mask.shape != identified_scores.shape:
+        raise ValueError("active_witness_mask must match identified_scores")
+    if edge_valid_mask.shape != (batch, targets, sources):
+        raise ValueError("edge_valid_mask must have shape (N,M,M)")
+    if relation_strength.shape not in {(boundaries,), (1, boundaries, 1, 1)}:
+        raise ValueError("relation_strength must have shape (K-1,)")
+    if not math.isfinite(delta_cap) or delta_cap <= 0.0:
+        raise ValueError("delta_cap must be finite and positive")
+
+    valid = edge_valid_mask.bool()[:, None]
+    active = active_witness_mask.bool()
+    if bool((active & ~valid).any()):
+        raise ValueError("active witness support contains invalid edges")
+    _require_finite(identified_scores, "identified witness scores")
+    _require_finite(witness_allocation, "witness allocation")
+    _require_finite(relation_strength, "relation strength")
+    if bool((witness_allocation < 0.0).any()):
+        raise ValueError("witness allocation must be non-negative")
+    outside = torch.where(active, torch.zeros_like(witness_allocation), witness_allocation)
+    if bool(outside.ne(0.0).any()):
+        raise ValueError("allocation must be exactly zero outside active witnesses")
+    sums = witness_allocation.sum(dim=(-2, -1))
+    if not torch.allclose(sums, torch.ones_like(sums), atol=2e-6, rtol=2e-6):
+        raise ValueError("witness allocation must sum to one per sample and boundary")
+    if bool((relation_strength.abs() > 1.0 + 2e-6).any()):
+        raise ValueError("relation_strength must lie in [-1, 1]")
+
+    strength = relation_strength.reshape(1, boundaries, 1, 1)
+    scale = float(delta_cap) / float(boundaries)
+    signed_scores = torch.where(
+        active,
+        identified_scores.tanh(),
+        torch.zeros_like(identified_scores),
+    )
+    contributions = (
+        signed_scores.to(dtype=_DECODER_DTYPE)
+        * strength.to(dtype=_DECODER_DTYPE)
+        * witness_allocation.to(dtype=_DECODER_DTYPE)
+        * scale
+    )
+    target_incremental = contributions.sum(dim=-1)
+    incremental = target_incremental.sum(dim=-1)
+    cumulative = reverse_cumulative_atoms(incremental, dim=1)
+    _require_finite(contributions, "witness edge log-odds contributions")
+    _require_finite(cumulative, "witness cumulative relation log-odds")
+    per_boundary_l1 = contributions.abs().sum(dim=(-2, -1))
+    bound = scale * relation_strength.abs().reshape(1, boundaries)
+    if bool((per_boundary_l1 > bound.to(per_boundary_l1.dtype) + 2e-12).any()):
+        raise FloatingPointError("witness ledger exceeded its per-boundary capacity")
+    if bool((cumulative.abs() > float(delta_cap) + 2e-12).any()):
+        raise FloatingPointError("witness cumulative relation field exceeded its bound")
+    return contributions, target_incremental, incremental, cumulative
+
+
 def aggregate_sparse_ordinal_pair_messages(
     edge_messages: torch.Tensor,
     selected_edge_mask: torch.Tensor,
@@ -796,6 +990,15 @@ class OriginRelationEvidence:
     selected_edge_mask: Optional[torch.Tensor] = None
     edge_log_odds_contributions: Optional[torch.Tensor] = None
     edge_budget: Optional[int] = None
+    identified_pair_scores: Optional[torch.Tensor] = None
+    shortlist_edge_mask: Optional[torch.Tensor] = None
+    witness_allocation: Optional[torch.Tensor] = None
+    active_witness_mask: Optional[torch.Tensor] = None
+    relation_strength: Optional[torch.Tensor] = None
+    allocation_temperature: Optional[float] = None
+    effective_witness_count: Optional[torch.Tensor] = None
+    per_boundary_allocated_capacity: Optional[torch.Tensor] = None
+    per_boundary_l1_usage: Optional[torch.Tensor] = None
 
     @property
     def num_regions(self) -> int:
@@ -811,9 +1014,11 @@ class OrdinalPairInteractionField(nn.Module):
     interactions between regional representations, not disjoint or pure
     lesion synergy. ``dense_v1`` is the unchanged v6 field. The v7 variants
     explicitly remove target/source main effects, select a fixed sparse proof,
-    and compile its entries as literal log-odds contributions. The trilinear
-    output weights are initialized to exactly zero, making every variant an
-    exact function-preserving extension of a trained ORIGIN-v3 generator.
+    and compile its entries as literal log-odds contributions. V8 uses one
+    identified score for shortlist, sparse allocation, sign, and magnitude,
+    then assigns the conserved capacity with entmax.  A separate zero-start
+    relation-strength gate makes every variant an exact function-preserving
+    extension of a trained ORIGIN-v3 generator.
     """
 
     def __init__(
@@ -828,6 +1033,7 @@ class OrdinalPairInteractionField(nn.Module):
         variant: str = "dense_v1",
         edge_budget: int = 8,
         permutation_seed: int = 617,
+        allocation_temperature: float = 1.0,
     ) -> None:
         super().__init__()
         if min(source_channels, num_boundaries, grid_size, relation_dim, head_dim) < 1:
@@ -852,6 +1058,10 @@ class OrdinalPairInteractionField(nn.Module):
             )
         if permutation_seed < 0:
             raise ValueError("relation permutation_seed must be non-negative")
+        if not math.isfinite(allocation_temperature) or allocation_temperature <= 0.0:
+            raise ValueError(
+                "relation allocation_temperature must be finite and positive"
+            )
         self.source_channels = int(source_channels)
         self.num_boundaries = int(num_boundaries)
         self.grid_size = int(grid_size)
@@ -861,6 +1071,7 @@ class OrdinalPairInteractionField(nn.Module):
         self.variant = variant
         self.edge_budget = int(edge_budget)
         self.permutation_seed = int(permutation_seed)
+        self.allocation_temperature = float(allocation_temperature)
 
         self.token_projection = nn.Linear(self.source_channels, self.relation_dim)
         self.token_norm = nn.LayerNorm(self.relation_dim)
@@ -874,11 +1085,23 @@ class OrdinalPairInteractionField(nn.Module):
         self.relative_bias = nn.Parameter(
             torch.zeros(self.num_boundaries, displacement, displacement)
         )
-        # This is the sole pair-output parameter. Zero is both a strict forward
-        # identity and a point with a non-zero first derivative through tanh.
+        # V6/V7 retain their exact historical initialization. V8 uses this as
+        # the single identified pair score and places the no-op initialization
+        # in ``raw_relation_strength`` so selection and value cannot diverge.
         self.trilinear_weight = nn.Parameter(
-            torch.zeros(self.num_boundaries, self.head_dim)
+            (
+                torch.ones(self.num_boundaries, self.head_dim)
+                if self.variant in _V8_RELATION_VARIANTS
+                else torch.zeros(self.num_boundaries, self.head_dim)
+            )
         )
+        self.raw_relation_strength: Optional[nn.Parameter]
+        if self.variant in _V8_RELATION_VARIANTS:
+            self.raw_relation_strength = nn.Parameter(
+                torch.zeros(self.num_boundaries)
+            )
+        else:
+            self.register_parameter("raw_relation_strength", None)
 
         coordinate = torch.arange(self.grid_size)
         yy, xx = torch.meshgrid(coordinate, coordinate, indexing="ij")
@@ -962,7 +1185,10 @@ class OrdinalPairInteractionField(nn.Module):
             features, encoded.valid_mask
         )
         _require_finite(pooled, "pooled relation region features")
-        if self.variant == "shuffled_pair_control_v1":
+        if self.variant in {
+            "shuffled_pair_control_v1",
+            "shuffled_conserved_witness_control_v1",
+        }:
             # Permute the complete endpoint assignment relative to the fixed
             # spatial lattice. Applying the same permutation to both endpoint
             # roles preserves a complete off-diagonal graph and makes the
@@ -1061,7 +1287,127 @@ class OrdinalPairInteractionField(nn.Module):
             selected_edge_mask = None
             edge_log_odds_contributions = None
             evidence_edge_budget = None
+            identified_pair_scores = None
+            shortlist_edge_mask = None
+            witness_allocation = None
+            active_witness_mask = None
+            relation_strength = None
+            effective_witness_count = None
+            per_boundary_allocated_capacity = None
+            per_boundary_l1_usage = None
             aggregation_kind = "geometry_normalized_tanh_v1"
+        elif self.variant in _V8_RELATION_VARIANTS:
+            available_edge_count = edge_valid.sum(dim=(-2, -1))
+            if bool((available_edge_count <= self.edge_budget).any()):
+                raise ValueError(
+                    "a conserved sparse witness proof requires strictly more "
+                    "valid candidate edges than its shortlist cap"
+                )
+            if self.raw_relation_strength is None:
+                raise AssertionError("V8 relation field is missing its output gate")
+
+            # One and only one edge score drives support, allocation, and the
+            # signed edge-wise value. A boundary-level scalar supplies the
+            # exact zero-start strength/orientation but cannot rank or value
+            # edges independently. The two projections make the score an
+            # endpoint-main-effect contrast before and after fixed spatial
+            # geometry is introduced.
+            unidentified_interaction_scores = torch.where(
+                edge_valid[:, None],
+                trilinear,
+                torch.zeros_like(trilinear),
+            )
+            (
+                pre_geometry_interaction_residuals,
+                pre_geometry_additive_endpoint_scores,
+            ) = masked_offdiagonal_pair_anova(
+                unidentified_interaction_scores,
+                edge_valid,
+                region_valid,
+            )
+            evidence_geometry_modulation = (
+                1.0 + relative[None].tanh()
+            ).expand(batch, -1, -1, -1)
+            if self.variant == "additive_conserved_witness_control_v1":
+                score_source = pre_geometry_additive_endpoint_scores
+            else:
+                score_source = pre_geometry_interaction_residuals
+            raw_interaction_scores = torch.where(
+                edge_valid[:, None],
+                score_source * evidence_geometry_modulation,
+                torch.zeros_like(trilinear),
+            )
+            interaction_residuals, additive_endpoint_scores = (
+                masked_offdiagonal_pair_anova(
+                    raw_interaction_scores,
+                    edge_valid,
+                    region_valid,
+                )
+            )
+            identified_pair_scores = (
+                additive_endpoint_scores
+                if self.variant == "additive_conserved_witness_control_v1"
+                else interaction_residuals
+            )
+            (
+                shortlist_edge_mask,
+                witness_allocation,
+                active_witness_mask,
+            ) = capped_entmax_witness_allocation(
+                identified_pair_scores,
+                edge_valid,
+                max_witnesses=self.edge_budget,
+                temperature=self.allocation_temperature,
+            )
+            relation_strength = self.raw_relation_strength.tanh()
+            (
+                edge_log_odds_contributions,
+                target_incremental,
+                incremental,
+                cumulative,
+            ) = compile_conserved_witness_ledger(
+                identified_pair_scores,
+                witness_allocation,
+                active_witness_mask,
+                edge_valid,
+                relation_strength,
+                delta_cap=self.delta_cap,
+            )
+            edge_messages = torch.where(
+                active_witness_mask,
+                relation_strength.reshape(1, self.num_boundaries, 1, 1)
+                * identified_pair_scores.tanh(),
+                torch.zeros_like(identified_pair_scores),
+            )
+            pair_gates = witness_allocation
+            selected_edge_mask = active_witness_mask
+            evidence_edge_budget = self.edge_budget
+            effective_witness_count = witness_allocation.square().sum(
+                dim=(-2, -1)
+            ).clamp_min(torch.finfo(witness_allocation.dtype).tiny).reciprocal()
+            capacity_scale = float(self.delta_cap) / float(self.num_boundaries)
+            per_boundary_allocated_capacity = (
+                relation_strength.abs().reshape(1, self.num_boundaries)
+                .expand(batch, -1)
+                * capacity_scale
+            )
+            per_boundary_l1_usage = edge_log_odds_contributions.abs().sum(
+                dim=(-2, -1)
+            )
+
+            # Legacy proposal fields intentionally alias the one-score path so
+            # downstream diagnostics cannot accidentally revive V7's split
+            # selector/value semantics.
+            raw_proposal_scores = raw_interaction_scores
+            unidentified_proposal_scores = unidentified_interaction_scores
+            pre_geometry_proposal_residuals = pre_geometry_interaction_residuals
+            pre_geometry_additive_proposal_scores = (
+                pre_geometry_additive_endpoint_scores
+            )
+            projected_proposal_scores = interaction_residuals
+            additive_proposal_scores = additive_endpoint_scores
+            _require_finite(edge_messages, "conserved witness edge messages")
+            aggregation_kind = "conserved_sparse_witness_allocation_v1"
         else:
             available_edge_count = edge_valid.sum(dim=(-2, -1))
             if bool((available_edge_count <= self.edge_budget).any()):
@@ -1162,6 +1508,14 @@ class OrdinalPairInteractionField(nn.Module):
             )
             _require_finite(edge_messages, "sparse relation edge messages")
             evidence_edge_budget = self.edge_budget
+            identified_pair_scores = None
+            shortlist_edge_mask = None
+            witness_allocation = None
+            active_witness_mask = None
+            relation_strength = None
+            effective_witness_count = None
+            per_boundary_allocated_capacity = None
+            per_boundary_l1_usage = None
             aggregation_kind = "fixed_budget_linear_conserved_v1"
 
         metadata = encoded.metadata
@@ -1228,6 +1582,19 @@ class OrdinalPairInteractionField(nn.Module):
             selected_edge_mask=selected_edge_mask,
             edge_log_odds_contributions=edge_log_odds_contributions,
             edge_budget=evidence_edge_budget,
+            identified_pair_scores=identified_pair_scores,
+            shortlist_edge_mask=shortlist_edge_mask,
+            witness_allocation=witness_allocation,
+            active_witness_mask=active_witness_mask,
+            relation_strength=relation_strength,
+            allocation_temperature=(
+                self.allocation_temperature
+                if self.variant in _V8_RELATION_VARIANTS
+                else None
+            ),
+            effective_witness_count=effective_witness_count,
+            per_boundary_allocated_capacity=per_boundary_allocated_capacity,
+            per_boundary_l1_usage=per_boundary_l1_usage,
         )
 
 
@@ -1448,6 +1815,7 @@ class ConservedOrdinalGenerator(nn.Module):
         relation_variant: str = "dense_v1",
         relation_edge_budget: int = 8,
         relation_permutation_seed: int = 617,
+        relation_allocation_temperature: float = 1.0,
     ) -> None:
         super().__init__()
         if num_classes < 2:
@@ -1501,6 +1869,13 @@ class ConservedOrdinalGenerator(nn.Module):
             )
         if relation_permutation_seed < 0:
             raise ValueError("relation_permutation_seed must be non-negative")
+        if (
+            not math.isfinite(relation_allocation_temperature)
+            or relation_allocation_temperature <= 0.0
+        ):
+            raise ValueError(
+                "relation_allocation_temperature must be finite and positive"
+            )
         if int(relation_grid_size) < 2:
             raise ValueError("relation_grid_size must be at least 2")
         relation_regions = int(relation_grid_size) ** 2
@@ -1541,6 +1916,9 @@ class ConservedOrdinalGenerator(nn.Module):
         self.relation_variant = relation_variant
         self.relation_edge_budget = int(relation_edge_budget)
         self.relation_permutation_seed = int(relation_permutation_seed)
+        self.relation_allocation_temperature = float(
+            relation_allocation_temperature
+        )
         self.atom_mass_cap = (
             (
                 self.total_rate_cap
@@ -1576,6 +1954,7 @@ class ConservedOrdinalGenerator(nn.Module):
                 variant=self.relation_variant,
                 edge_budget=self.relation_edge_budget,
                 permutation_seed=self.relation_permutation_seed,
+                allocation_temperature=self.relation_allocation_temperature,
             )
         else:
             # Assigning None instead of an inert module preserves the exact v3
@@ -1994,7 +2373,10 @@ def replay_without_relations(
         edge_removal_mask, relation.edge_messages
     )
     canonical = canonical & relation.edge_valid_mask[:, None]
-    if relation.aggregation_kind == "fixed_budget_linear_conserved_v1":
+    if relation.aggregation_kind in {
+        "fixed_budget_linear_conserved_v1",
+        "conserved_sparse_witness_allocation_v1",
+    }:
         if relation.selected_edge_mask is None:
             raise ValueError("sparse relation trace is missing its selected support")
         canonical = canonical & relation.selected_edge_mask
@@ -2006,6 +2388,7 @@ def replay_without_relations(
     )
     edge_log_odds_contributions: Optional[torch.Tensor]
     removed_edge_log_odds_contributions: Optional[torch.Tensor]
+    replayed_per_boundary_l1_usage = relation.per_boundary_l1_usage
     if relation.aggregation_kind == "fixed_budget_linear_conserved_v1":
         if relation.selected_edge_mask is None or relation.edge_budget is None:
             raise ValueError("sparse relation trace is missing its fixed support")
@@ -2029,6 +2412,28 @@ def replay_without_relations(
             relation.edge_log_odds_contributions,
             torch.zeros_like(relation.edge_log_odds_contributions),
         )
+    elif relation.aggregation_kind == "conserved_sparse_witness_allocation_v1":
+        if relation.edge_log_odds_contributions is None:
+            raise ValueError("witness trace is missing stored edge contributions")
+        # The intervention is literal ledger deletion.  Crucially, neither the
+        # shortlist nor entmax allocation is recomputed or renormalized.
+        edge_log_odds_contributions = torch.where(
+            canonical,
+            torch.zeros_like(relation.edge_log_odds_contributions),
+            relation.edge_log_odds_contributions,
+        )
+        removed_edge_log_odds_contributions = torch.where(
+            canonical,
+            relation.edge_log_odds_contributions,
+            torch.zeros_like(relation.edge_log_odds_contributions),
+        )
+        target_incremental = edge_log_odds_contributions.sum(dim=-1)
+        incremental = target_incremental.sum(dim=-1)
+        cumulative = reverse_cumulative_atoms(incremental, dim=1)
+        replayed_per_boundary_l1_usage = edge_log_odds_contributions.abs().sum(
+            dim=(-2, -1)
+        )
+        _require_finite(cumulative, "replayed witness cumulative log-odds")
     elif relation.aggregation_kind == "geometry_normalized_tanh_v1":
         target_incremental, incremental, cumulative = (
             aggregate_ordinal_pair_messages(
@@ -2052,6 +2457,7 @@ def replay_without_relations(
         target_incremental_log_odds=target_incremental,
         incremental_log_odds=incremental,
         cumulative_log_odds=cumulative,
+        per_boundary_l1_usage=replayed_per_boundary_l1_usage,
     )
     replay_rates = bounded_rate_log_odds_merge(
         output.base_total_rates,
@@ -2192,6 +2598,7 @@ class OriginModel(nn.Module):
         relation_variant: str = "dense_v1",
         relation_edge_budget: int = 8,
         relation_permutation_seed: int = 617,
+        relation_allocation_temperature: float = 1.0,
         encoder: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
@@ -2242,6 +2649,7 @@ class OriginModel(nn.Module):
             relation_variant=relation_variant,
             relation_edge_budget=relation_edge_budget,
             relation_permutation_seed=relation_permutation_seed,
+            relation_allocation_temperature=relation_allocation_temperature,
         )
 
     @property
@@ -2297,6 +2705,59 @@ class OriginModel(nn.Module):
                     "pair_normalization": "no_feature_dependent_global_denominator",
                     "zero_initialization": "exact_v3_function_identity",
                     "relation_replay": "stored_pair_message_deletion_without_reencoding",
+                    "no_classifier_bypass": True,
+                }
+            elif relation_field.variant in _V8_RELATION_VARIANTS:
+                relation_contract = {
+                    "kind": "identified_conserved_sparse_witness_ordinal_log_odds_v1",
+                    "variant": relation_field.variant,
+                    "source_scale": self.generator.relation_source_scale,
+                    "grid_size": relation_field.grid_size,
+                    "num_regions": relation_field.grid_size ** 2,
+                    "relation_dim": relation_field.relation_dim,
+                    "head_dim": relation_field.head_dim,
+                    "delta_cap": relation_field.delta_cap,
+                    "max_witnesses": relation_field.edge_budget,
+                    "allocation": "capped_entmax15_unit_simplex",
+                    "allocation_temperature": relation_field.allocation_temperature,
+                    "permutation_seed": relation_field.permutation_seed,
+                    "merge": "C*sigmoid(log(lambda)-log(C-lambda)+D)",
+                    "pair_identification": (
+                        "pre_geometry_anova_then_geometry_then_post_geometry_anova"
+                    ),
+                    "pair_semantics": (
+                        "masked_two_way_endpoint_contrast_not_biological_synergy"
+                    ),
+                    "endpoint_gauge": "global_query_key_offset_invariant",
+                    "single_score_contract": (
+                        "same_identified_score_drives_shortlist_allocation_and_edgewise_value"
+                    ),
+                    "global_strength_orientation": (
+                        "one_zero_start_scalar_per_ordinal_boundary"
+                    ),
+                    "active_pair_component": (
+                        "post_geometry_endpoint_main_effect_control"
+                        if relation_field.variant
+                        == "additive_conserved_witness_control_v1"
+                        else "identified_interaction_residual"
+                    ),
+                    "spatial_null_semantics": (
+                        "fixed_endpoint_to_geometry_correspondence_permutation"
+                        if relation_field.variant
+                        == "shuffled_conserved_witness_control_v1"
+                        else None
+                    ),
+                    "incremental_compilation": (
+                        "conserved_sparse_stored_witness_log_odds"
+                    ),
+                    "ordinal_compilation": "reverse_cumulative_incremental_field",
+                    "zero_initialization": "zero_strength_exact_v3_function_identity",
+                    "relation_replay": (
+                        "stored_contribution_deletion_without_reselection_or_reallocation"
+                    ),
+                    "deletion_semantics": (
+                        "exact_internal_stored_contribution_intervention_not_pixel_causality"
+                    ),
                     "no_classifier_bypass": True,
                 }
             else:
