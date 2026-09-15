@@ -925,9 +925,11 @@ def _audit_conserved_witness_relation_trace(
     if float(ranking_violation.max().cpu()) > numeric_tolerance:
         raise AssertionError("V8 shortlist is not a top-q identified-score support")
 
-    allocation_sum = allocation.double().sum(dim=(2, 3))
+    if allocation.dtype != torch.float64:
+        raise TypeError("V8 stored witness allocation must be FP64")
+    allocation_sum = allocation.sum(dim=(2, 3))
     allocation_sum_error = float((allocation_sum - 1.0).abs().max().cpu())
-    if allocation_sum_error > 2e-6:
+    if allocation_sum_error > 2e-12:
         raise AssertionError("V8 witness allocation does not conserve unit capacity")
     reference_allocation = _entmax15_reference(
         magnitude.double() / temperature, shortlist
@@ -995,8 +997,15 @@ def _audit_conserved_witness_relation_trace(
     )
     message_error = float((messages - expected_messages).abs().max().cpu())
     expected_contributions = (
-        scale * expected_messages.double() * allocation.double()
-    ).double()
+        scale
+        * expanded_strength.double()
+        * allocation
+        * torch.where(
+            active,
+            scores.tanh().double(),
+            torch.zeros_like(scores.double()),
+        )
+    )
     contribution_error = float(
         (contributions.double() - expected_contributions).abs().max().cpu()
     )
@@ -1055,7 +1064,7 @@ def _audit_conserved_witness_relation_trace(
     cumulative_violation = float(
         (cumulative.abs() - delta_cap).clamp_min(0.0).max().cpu()
     )
-    if max(budget_violation, cumulative_violation) > 5e-6:
+    if max(budget_violation, cumulative_violation) > 2e-12:
         raise AssertionError("V8 conserved relation budget is exceeded")
 
     nonzero_count = contributions.ne(0).sum(dim=(2, 3))

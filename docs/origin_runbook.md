@@ -516,6 +516,11 @@ pi_nb = entmax_1.5(|R_nb| / tau),  support(pi_nb) subseteq S_nb,
 sum_e pi_nbe = 1,  |support(pi_nb)| <= 8.
 ```
 
+The sparse entmax calculation is performed in FP32 and its fixed-support
+allocation is then canonically re-normalized and stored in FP64. Consequently,
+the literal intervention ledger respects the unit budget at decoder precision
+rather than relying on a relaxed mixed-precision tolerance.
+
 The same `R_nbe` controls selection, allocation, and the signed edge-wise
 value; there is no separate proposal/value network. A single zero-start scalar
 `a_b=tanh(gamma_b)` controls the global strength and orientation of boundary

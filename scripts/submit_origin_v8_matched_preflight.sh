@@ -201,6 +201,7 @@ for variant, (_, model) in arms.items():
         "max_witnesses": 8,
         "allocation": "capped_entmax15_unit_simplex",
         "allocation_temperature": 1.0,
+        "allocation_ledger_dtype": "float64",
         "single_score_contract": (
             "same_identified_score_drives_shortlist_allocation_and_edgewise_value"
         ),

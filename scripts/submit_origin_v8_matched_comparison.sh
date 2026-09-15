@@ -31,10 +31,10 @@ cd "${REPO_ROOT}"
 }
 
 RUN_ROOT="${ORIGIN_V8_RUN_ROOT:-runs}"
-TARGET="${ORIGIN_V8_TARGET_RUN:-${RUN_ROOT}/origin_aptos_f0_v8_cmwa_target}"
-ADDITIVE="${ORIGIN_V8_ADDITIVE_RUN:-${RUN_ROOT}/origin_aptos_f0_v8_cmwa_endpoint_control}"
-SHUFFLED="${ORIGIN_V8_SHUFFLED_RUN:-${RUN_ROOT}/origin_aptos_f0_v8_cmwa_shuffled_control}"
-OUTPUT="${ORIGIN_V8_COMPARISON_OUTPUT:-${RUN_ROOT}/origin_aptos_f0_v8_cmwa_matched_comparison.json}"
+TARGET="${ORIGIN_V8_TARGET_RUN:-${RUN_ROOT}/origin_aptos_f0_v8_cmwa_r1_target}"
+ADDITIVE="${ORIGIN_V8_ADDITIVE_RUN:-${RUN_ROOT}/origin_aptos_f0_v8_cmwa_r1_endpoint_control}"
+SHUFFLED="${ORIGIN_V8_SHUFFLED_RUN:-${RUN_ROOT}/origin_aptos_f0_v8_cmwa_r1_shuffled_control}"
+OUTPUT="${ORIGIN_V8_COMPARISON_OUTPUT:-${RUN_ROOT}/origin_aptos_f0_v8_cmwa_r1_matched_comparison.json}"
 
 [[ ! -e "${OUTPUT}" ]] || {
   echo "Refusing to overwrite comparison: ${OUTPUT}" >&2

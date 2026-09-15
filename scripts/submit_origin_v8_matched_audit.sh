@@ -33,9 +33,9 @@ cd "${REPO_ROOT}"
 }
 
 RUN_NAMES=(
-  origin_aptos_f0_v8_cmwa_target
-  origin_aptos_f0_v8_cmwa_endpoint_control
-  origin_aptos_f0_v8_cmwa_shuffled_control
+  origin_aptos_f0_v8_cmwa_r1_target
+  origin_aptos_f0_v8_cmwa_r1_endpoint_control
+  origin_aptos_f0_v8_cmwa_r1_shuffled_control
 )
 TASK_ID="${SLURM_ARRAY_TASK_ID:-}"
 [[ "${TASK_ID}" =~ ^[0-2]$ ]] || {

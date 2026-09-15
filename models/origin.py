@@ -781,7 +781,14 @@ def capped_entmax_witness_allocation(
         edge_budget=max_witnesses,
     )
     flat_shortlist = shortlist.flatten(start_dim=-2)
-    flat_scores = identified_scores.abs().flatten(start_dim=-2) / float(temperature)
+    # Entmax reduces over every candidate edge (10,000 entries for the
+    # registered 10x10 regional grid).  Force that reduction to FP32 so AMP
+    # cannot overflow the masked prefix moments in FP16, then canonicalize the
+    # conserved simplex in the decoder dtype used by the literal ledger.
+    flat_scores = (
+        identified_scores.to(dtype=torch.float32).abs().flatten(start_dim=-2)
+        / float(temperature)
+    )
     # A finite sentinel avoids inf-inf arithmetic in the closed-form entmax
     # threshold while remaining far below the centered shortlisted scores.
     sentinel = torch.full_like(flat_scores, -1.0e4)
@@ -795,7 +802,11 @@ def capped_entmax_witness_allocation(
     allocation = allocation / allocation.sum(dim=-1, keepdim=True).clamp_min(
         torch.finfo(allocation.dtype).tiny
     )
-    allocation = allocation.reshape_as(identified_scores)
+    allocation = allocation.to(dtype=_DECODER_DTYPE)
+    allocation = allocation / allocation.sum(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(_DECODER_DTYPE).tiny
+    )
+    allocation = allocation.reshape(identified_scores.shape)
     active = shortlist & allocation.gt(0.0)
     _require_finite(allocation, "sparse witness allocation")
     if bool((allocation < 0.0).any()):
@@ -845,16 +856,22 @@ def compile_conserved_witness_ledger(
     _require_finite(relation_strength, "relation strength")
     if bool((witness_allocation < 0.0).any()):
         raise ValueError("witness allocation must be non-negative")
+    if witness_allocation.dtype != _DECODER_DTYPE:
+        raise TypeError(
+            "witness allocation must use the FP64 conserved-ledger dtype"
+        )
     outside = torch.where(active, torch.zeros_like(witness_allocation), witness_allocation)
     if bool(outside.ne(0.0).any()):
         raise ValueError("allocation must be exactly zero outside active witnesses")
     sums = witness_allocation.sum(dim=(-2, -1))
-    if not torch.allclose(sums, torch.ones_like(sums), atol=2e-6, rtol=2e-6):
+    if not torch.allclose(sums, torch.ones_like(sums), atol=2e-12, rtol=0.0):
         raise ValueError("witness allocation must sum to one per sample and boundary")
     if bool((relation_strength.abs() > 1.0 + 2e-6).any()):
         raise ValueError("relation_strength must lie in [-1, 1]")
 
-    strength = relation_strength.reshape(1, boundaries, 1, 1)
+    strength = relation_strength.reshape(1, boundaries, 1, 1).to(
+        dtype=_DECODER_DTYPE
+    )
     scale = float(delta_cap) / float(boundaries)
     signed_scores = torch.where(
         active,
@@ -862,10 +879,10 @@ def compile_conserved_witness_ledger(
         torch.zeros_like(identified_scores),
     )
     contributions = (
-        signed_scores.to(dtype=_DECODER_DTYPE)
-        * strength.to(dtype=_DECODER_DTYPE)
-        * witness_allocation.to(dtype=_DECODER_DTYPE)
-        * scale
+        scale
+        * strength
+        * witness_allocation
+        * signed_scores.to(dtype=_DECODER_DTYPE)
     )
     target_incremental = contributions.sum(dim=-1)
     incremental = target_incremental.sum(dim=-1)
@@ -873,8 +890,11 @@ def compile_conserved_witness_ledger(
     _require_finite(contributions, "witness edge log-odds contributions")
     _require_finite(cumulative, "witness cumulative relation log-odds")
     per_boundary_l1 = contributions.abs().sum(dim=(-2, -1))
-    bound = scale * relation_strength.abs().reshape(1, boundaries)
-    if bool((per_boundary_l1 > bound.to(per_boundary_l1.dtype) + 2e-12).any()):
+    # Form the bound in the same FP64 arithmetic as the ledger.  Computing
+    # ``scale * abs(strength)`` in FP32 and casting afterwards can round the
+    # bound downward by ~1e-8, falsely rejecting a valid unit-simplex ledger.
+    bound = scale * strength[:, :, 0, 0].abs()
+    if bool((per_boundary_l1 > bound + 2e-12).any()):
         raise FloatingPointError("witness ledger exceeded its per-boundary capacity")
     if bool((cumulative.abs() > float(delta_cap) + 2e-12).any()):
         raise FloatingPointError("witness cumulative relation field exceeded its bound")
@@ -1387,7 +1407,9 @@ class OrdinalPairInteractionField(nn.Module):
             ).clamp_min(torch.finfo(witness_allocation.dtype).tiny).reciprocal()
             capacity_scale = float(self.delta_cap) / float(self.num_boundaries)
             per_boundary_allocated_capacity = (
-                relation_strength.abs().reshape(1, self.num_boundaries)
+                relation_strength.to(dtype=_DECODER_DTYPE)
+                .abs()
+                .reshape(1, self.num_boundaries)
                 .expand(batch, -1)
                 * capacity_scale
             )
@@ -2720,6 +2742,7 @@ class OriginModel(nn.Module):
                     "max_witnesses": relation_field.edge_budget,
                     "allocation": "capped_entmax15_unit_simplex",
                     "allocation_temperature": relation_field.allocation_temperature,
+                    "allocation_ledger_dtype": "float64",
                     "permutation_seed": relation_field.permutation_seed,
                     "merge": "C*sigmoid(log(lambda)-log(C-lambda)+D)",
                     "pair_identification": (

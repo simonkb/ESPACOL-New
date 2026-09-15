@@ -41,9 +41,9 @@ VARIANTS=(
   shuffled_conserved_witness_control_v1
 )
 RUN_NAMES=(
-  origin_aptos_f0_v8_cmwa_target
-  origin_aptos_f0_v8_cmwa_endpoint_control
-  origin_aptos_f0_v8_cmwa_shuffled_control
+  origin_aptos_f0_v8_cmwa_r1_target
+  origin_aptos_f0_v8_cmwa_r1_endpoint_control
+  origin_aptos_f0_v8_cmwa_r1_shuffled_control
 )
 CONTROL_SEMANTICS=(
   identified_nonadditive_spatial_pair_witnesses

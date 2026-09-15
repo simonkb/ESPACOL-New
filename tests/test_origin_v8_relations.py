@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from models.origin import (
@@ -92,6 +93,7 @@ def test_capped_entmax_allocation_is_sparse_normalized_and_deterministic() -> No
         temperature=1.0,
     )
     shortlist, allocation, active = first
+    assert allocation.dtype == torch.float64
     assert all(torch.equal(left, right) for left, right in zip(first, second))
     assert torch.equal(shortlist.flatten(2).sum(-1), torch.full((1, 2), 3))
     assert torch.all(active.flatten(2).sum(-1).ge(1))
@@ -101,13 +103,15 @@ def test_capped_entmax_allocation_is_sparse_normalized_and_deterministic() -> No
     assert torch.count_nonzero(allocation.masked_select(~shortlist)) == 0
     torch.testing.assert_close(
         allocation.sum(dim=(-2, -1)),
-        torch.ones(1, 2),
+        torch.ones(1, 2, dtype=allocation.dtype),
         atol=1e-6,
         rtol=1e-6,
     )
     # The dominant edge receives the complete boundary budget, demonstrating
     # that V8 is not constrained to V7's uniform one-third allocation.
-    torch.testing.assert_close(allocation[0, 0, 0, 1], torch.tensor(1.0))
+    torch.testing.assert_close(
+        allocation[0, 0, 0, 1], torch.tensor(1.0, dtype=allocation.dtype)
+    )
     (allocation * scores).sum().backward()
     assert scores.grad is not None and torch.isfinite(scores.grad).all()
 
@@ -131,10 +135,10 @@ def test_conserved_compiler_is_literal_and_respects_ordinal_capacity() -> None:
         )
     )
     expected = (
-        allocation.double()
-        * scores.tanh().double()
+        (2.0 / 4.0)
         * strength.reshape(1, 4, 1, 1).double()
-        * (2.0 / 4.0)
+        * allocation
+        * scores.tanh().double()
     )
     torch.testing.assert_close(contributions, expected, atol=0.0, rtol=0.0)
     torch.testing.assert_close(target, contributions.sum(-1), atol=0.0, rtol=0.0)
@@ -148,6 +152,83 @@ def test_conserved_compiler_is_literal_and_respects_ordinal_capacity() -> None:
     l1 = contributions.abs().sum(dim=(-2, -1))
     assert torch.all(l1 <= strength.abs().double()[None] * 0.5 + 2e-12)
     assert torch.all(cumulative.abs() <= 2.0 + 2e-12)
+
+
+def test_fp32_simplex_roundoff_cannot_trigger_false_capacity_overflow() -> None:
+    """Regression for the three-arm cluster failure observed in V8."""
+
+    torch.manual_seed(0)
+    magnitude = 100.0 + 0.1 * torch.randn(8, 4, 64, 64)
+    sign = torch.where(torch.rand_like(magnitude) > 0.5, 1.0, -1.0)
+    scores = (magnitude * sign).float()
+    valid = ~torch.eye(64, dtype=torch.bool)[None].expand(8, -1, -1)
+    _, allocation, active = capped_entmax_witness_allocation(
+        scores,
+        valid,
+        max_witnesses=8,
+        temperature=1.0,
+    )
+    strength = torch.ones(4)
+    contributions, _, _, cumulative = compile_conserved_witness_ledger(
+        scores,
+        allocation,
+        active,
+        valid,
+        strength,
+        delta_cap=2.0,
+    )
+    capacity = strength.double().abs()[None] * 0.5
+    usage = contributions.abs().sum(dim=(-2, -1))
+    assert float((allocation.sum(dim=(-2, -1)) - 1.0).abs().max()) <= 2e-12
+    assert torch.all(usage <= capacity + 2e-12)
+    assert torch.all(cumulative.abs() <= 2.0 + 2e-12)
+
+
+def test_allocation_is_canonical_fp64_for_each_supported_input_dtype() -> None:
+    torch.manual_seed(818)
+    base_scores = torch.randn(2, 4, 6, 6)
+    valid = ~torch.eye(6, dtype=torch.bool)[None].expand(2, -1, -1)
+    for dtype in (torch.float16, torch.float32, torch.float64):
+        scores = base_scores.to(dtype=dtype)
+        _, allocation, active = capped_entmax_witness_allocation(
+            scores,
+            valid,
+            max_witnesses=5,
+            temperature=0.7,
+        )
+        assert allocation.dtype == torch.float64
+        assert float((allocation.sum((-2, -1)) - 1.0).abs().max()) <= 2e-12
+        contributions, _, _, _ = compile_conserved_witness_ledger(
+            scores,
+            allocation,
+            active,
+            valid,
+            torch.tensor([0.8, -0.5, 0.3, 1.0]),
+            delta_cap=2.0,
+        )
+        assert torch.isfinite(contributions).all()
+
+
+def test_compiler_rejects_noncanonical_fp64_simplex() -> None:
+    torch.manual_seed(819)
+    scores = torch.randn(1, 4, 5, 5)
+    valid = ~torch.eye(5, dtype=torch.bool)[None]
+    _, allocation, active = capped_entmax_witness_allocation(
+        scores,
+        valid,
+        max_witnesses=4,
+        temperature=1.0,
+    )
+    corrupted = allocation * (1.0 + 1e-8)
+    with pytest.raises(ValueError, match="sum to one"):
+        compile_conserved_witness_ledger(
+            scores,
+            corrupted,
+            active,
+            valid,
+            torch.ones(4),
+            delta_cap=2.0,
+        )
 
 
 def test_v8_zero_gate_is_exact_v3_and_opens_a_live_single_score_path() -> None:
@@ -210,10 +291,10 @@ def test_v8_one_identified_score_drives_all_forward_decisions() -> None:
     assert torch.equal(active, relation.active_witness_mask)
     torch.testing.assert_close(allocation, relation.witness_allocation)
     expected = (
-        relation.witness_allocation.double()
-        * relation.identified_pair_scores.tanh().double()
+        (relation.delta_cap / 4.0)
         * relation.relation_strength.reshape(1, 4, 1, 1).double()
-        * (relation.delta_cap / 4.0)
+        * relation.witness_allocation
+        * relation.identified_pair_scores.tanh().double()
     )
     torch.testing.assert_close(
         relation.edge_log_odds_contributions, expected, atol=0.0, rtol=0.0

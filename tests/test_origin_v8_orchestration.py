@@ -26,9 +26,9 @@ def test_v8_aptos_launcher_is_a_three_member_validation_only_array() -> None:
 def test_v8_orchestration_uses_fresh_distinct_run_names() -> None:
     text = (ROOT / "scripts" / "submit_origin_v8_matched_aptos_f0.sh").read_text()
     for name in (
-        "origin_aptos_f0_v8_cmwa_target",
-        "origin_aptos_f0_v8_cmwa_endpoint_control",
-        "origin_aptos_f0_v8_cmwa_shuffled_control",
+        "origin_aptos_f0_v8_cmwa_r1_target",
+        "origin_aptos_f0_v8_cmwa_r1_endpoint_control",
+        "origin_aptos_f0_v8_cmwa_r1_shuffled_control",
     ):
         assert text.count(name) == 1
     assert "best_learned.pth" in text

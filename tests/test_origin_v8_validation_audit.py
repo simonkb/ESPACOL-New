@@ -44,7 +44,7 @@ def _trace(
     temperature = 0.7
     allocation = _entmax15_reference(
         scores.double().abs() / temperature, shortlist
-    ).float()
+    )
     active = allocation > 0
     strength = torch.tensor([0.8, -0.6, 0.35, -0.2])[:boundaries]
     messages = torch.where(
