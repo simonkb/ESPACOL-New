@@ -684,10 +684,23 @@ class PathsContinuationRefiner(nn.Module):
                 valid_spectrum, local_phi, torch.zeros_like(local_phi)
             )
             baseline_mass = local_mass.sum(dim=(-2, -1))
-            safe_mass = baseline_mass.clamp_min(torch.finfo(_PATHS_DTYPE).tiny)
+            # A zero-evidence boundary has an exactly zero spectrum.  Do not
+            # divide that inactive branch by ``finfo(float64).tiny`` and mask
+            # it afterwards: the division backward contains ``tiny**2``,
+            # which underflows to zero and can create a hidden 0/0 NaN before
+            # ``where`` suppresses its value.  A unit denominator is the
+            # exact neutral extension on the zero-mass branch: both its value
+            # and gradient remain zero, while positive masses retain the
+            # defining mass normalization unchanged.
+            positive_mass = baseline_mass > 0.0
+            safe_mass = torch.where(
+                positive_mass,
+                baseline_mass,
+                torch.ones_like(baseline_mass),
+            )
             local_concentration = local_phi / safe_mass[:, :, None, None, None]
             local_concentration = torch.where(
-                (baseline_mass > 0.0)[:, :, None, None, None],
+                positive_mass[:, :, None, None, None],
                 local_concentration,
                 torch.zeros_like(local_concentration),
             )

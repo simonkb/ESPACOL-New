@@ -91,26 +91,111 @@ criterion = PathsLoss(
     risk_set_power=0.5,
     rps_weight=0.25,
 ).to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-scaler = GradScaler("cuda", enabled=True, init_scale=256.0, growth_interval=2000)
-images = torch.zeros(2, 3, 128, 128, device=device)
-valid = torch.ones(2, 1, 128, 128, dtype=torch.bool, device=device)
+optimizer = torch.optim.AdamW(
+    [
+        {"params": list(model.encoder.parameters()), "lr": 1e-5, "name": "encoder"},
+        {
+            "params": list(model.generator.parameters()),
+            "lr": 5e-5,
+            "name": "origin_v3_generator",
+        },
+        {
+            "params": list(model.paths_refiner.parameters()),
+            "lr": 5e-4,
+            "name": "paths_refiner",
+        },
+    ],
+    weight_decay=1e-5,
+)
+
+# A spatially constant, all-black tensor is a pathological ConvNeXt gradient
+# test: with random weights and the extreme grade-4 target it sends the same
+# reference-count-amplified signal into every stem location, producing a stem
+# bias gradient around 1e10 even in FP32.  Scaling that by 256 must overflow
+# FP16, although neither real fundus batches nor the staged PATHS warm start
+# have this degeneracy.  Use a fixed, non-constant signal and a fundus-shaped
+# valid mask so the canary exercises the actual mixed-precision path.
+generator = torch.Generator(device="cpu").manual_seed(1729)
+images = torch.rand(2, 3, 128, 128, generator=generator).to(device)
+axis = torch.linspace(-1.0, 1.0, 128, device=device)
+yy, xx = torch.meshgrid(axis, axis, indexing="ij")
+valid = ((xx.square() + yy.square()) <= 0.95**2)[None, None].expand(2, 1, -1, -1)
 labels = torch.tensor([0, 4], device=device)
+
+
+def assert_finite_gradients(stage: str) -> float:
+    offenders = []
+    finite_gradients = 0
+    maximum = 0.0
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None:
+            continue
+        if not bool(torch.isfinite(parameter.grad).all()):
+            offenders.append(name)
+            continue
+        finite_gradients += 1
+        maximum = max(maximum, float(parameter.grad.detach().abs().max()))
+    if offenders:
+        raise RuntimeError(
+            f"PATHS {stage} produced non-finite gradients in "
+            + ", ".join(offenders[:16])
+        )
+    if finite_gradients == 0 or maximum == 0.0:
+        raise RuntimeError(f"PATHS {stage} produced no nonzero finite gradient")
+    print(f"{stage}_max_unscaled_gradient", maximum)
+    return maximum
+
+
+def forward_loss(*, amp: bool):
+    with autocast(device_type="cuda", enabled=amp):
+        output = model(images, valid, force_decoder_fp64=True)
+    if not isinstance(output, PathsOutput):
+        raise RuntimeError("PATHS strength-one canary bypassed the refiner")
+    with autocast(device_type="cuda", enabled=False):
+        loss, diagnostics = criterion(output, labels, epoch=0)
+    if not bool(torch.isfinite(loss)):
+        raise RuntimeError("PATHS canary loss is non-finite")
+    return loss, diagnostics
+
+
+# First validate the complete differentiable computation in FP32/FP64.  This
+# distinguishes mathematical NaNs from mixed-precision range overflows.
+for parameter in model.parameters():
+    parameter.requires_grad_(True)
 optimizer.zero_grad(set_to_none=True)
-with autocast(device_type="cuda", enabled=True):
-    output = model(images, valid, force_decoder_fp64=True)
-if not isinstance(output, PathsOutput):
-    raise RuntimeError("PATHS strength-one canary bypassed the refiner")
-with autocast(device_type="cuda", enabled=False):
-    loss, diagnostics = criterion(output, labels, epoch=0)
-if not torch.isfinite(loss):
-    raise RuntimeError("PATHS canary loss is non-finite")
-scaler.scale(loss).backward()
-scaler.unscale_(optimizer)
-if not all(p.grad is None or bool(torch.isfinite(p.grad).all()) for p in model.parameters()):
-    raise RuntimeError("PATHS canary produced non-finite gradients")
-scaler.step(optimizer)
-scaler.update()
+fp32_loss, _ = forward_loss(amp=False)
+fp32_loss.backward()
+assert_finite_gradients("full_precision_backward")
+
+# Mirror epochs 1--3: the hash-bound V3 base is frozen and only the PATHS
+# focality law is adapted.  The trainer begins this phase with scale 4096.
+for name, parameter in model.named_parameters():
+    parameter.requires_grad_(name.startswith("paths_refiner."))
+optimizer.zero_grad(set_to_none=True)
+frozen_scaler = GradScaler(
+    "cuda", enabled=True, init_scale=4096.0, growth_interval=2000
+)
+frozen_loss, _ = forward_loss(amp=True)
+frozen_scaler.scale(frozen_loss).backward()
+frozen_scaler.unscale_(optimizer)
+assert_finite_gradients("correction_only_amp_backward")
+frozen_scaler.step(optimizer)
+frozen_scaler.update()
+
+# Mirror the first joint epoch: all groups become trainable and the trainer
+# deliberately resets the AMP scale to 256 before any joint update.
+for parameter in model.parameters():
+    parameter.requires_grad_(True)
+optimizer.zero_grad(set_to_none=True)
+joint_scaler = GradScaler(
+    "cuda", enabled=True, init_scale=256.0, growth_interval=2000
+)
+loss, diagnostics = forward_loss(amp=True)
+joint_scaler.scale(loss).backward()
+joint_scaler.unscale_(optimizer)
+assert_finite_gradients("joint_amp_backward")
+joint_scaler.step(optimizer)
+joint_scaler.update()
 print("gpu", torch.cuda.get_device_name(0))
 print("canary_loss", float(loss.detach()), diagnostics)
 print("boundary_weights", criterion.boundary_weights.detach().cpu().tolist())

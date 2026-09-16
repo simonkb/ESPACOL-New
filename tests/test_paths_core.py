@@ -204,12 +204,17 @@ def test_learned_path_backpropagates_to_probes_gain_and_base_atoms() -> None:
 
 def test_zero_atom_mass_has_zero_finite_spectrum_and_correction() -> None:
     base = _base_output()
+    zero_atoms = {
+        name: torch.zeros_like(evidence.compiled_atoms, requires_grad=True)
+        for name, evidence in base.scale_evidence.items()
+    }
     zero_scales = {
-        name: replace(evidence, compiled_atoms=torch.zeros_like(evidence.compiled_atoms))
+        name: replace(evidence, compiled_atoms=zero_atoms[name])
         for name, evidence in base.scale_evidence.items()
     }
     zero_base = replace(base, scale_evidence=zero_scales)
-    output = PathsContinuationRefiner(4, ("s4", "s8"))(zero_base)
+    refiner = PathsContinuationRefiner(4, ("s4", "s8"))
+    output = refiner(zero_base)
     assert isinstance(output, PathsOutput)
     assert torch.equal(output.boundary_correction, torch.zeros_like(output.boundary_correction))
     for evidence in output.spectrum_evidence.values():
@@ -219,6 +224,18 @@ def test_zero_atom_mass_has_zero_finite_spectrum_and_correction() -> None:
             torch.zeros_like(evidence.concentration_spectrum),
         )
         assert torch.isfinite(evidence.concentration_spectrum).all()
+
+    # The inactive branch must also be a mathematically safe extension in
+    # backward.  Masking a division by float64 tiny only after it is evaluated
+    # can leave a forward-finite graph whose denominator gradient is NaN.
+    output.boundary_correction.sum().backward()
+    for atoms in zero_atoms.values():
+        assert atoms.grad is not None
+        assert torch.isfinite(atoms.grad).all()
+        assert torch.equal(atoms.grad, torch.zeros_like(atoms.grad))
+    for parameter in refiner.parameters():
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
 
 
 def test_non_nested_cumulative_atoms_are_rejected() -> None:
