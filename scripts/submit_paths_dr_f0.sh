@@ -25,9 +25,12 @@ cd "${REPO_ROOT}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 for PATHS_FILE in \
-  configs/paths_config.py losses/paths.py models/paths.py \
-  training/paths_trainer.py training/origin_trainer.py \
-  models/origin.py train_paths.py; do
+  configs/paths_config.py configs/origin_config.py \
+  Datasets/origin_data.py Datasets/mosaic_data.py Datasets/dataloaders.py \
+  models/origin_encoder.py models/origin.py models/paths.py \
+  losses/origin.py losses/paths.py \
+  training/origin_trainer.py training/paths_trainer.py \
+  train_paths.py utils/spatial_mask.py; do
   [[ "$(git rev-parse "HEAD:${PATHS_FILE}")" == "$(git hash-object "${PATHS_FILE}")" ]] || {
     echo "Tracked implementation differs from HEAD: ${PATHS_FILE}" >&2
     exit 2

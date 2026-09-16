@@ -27,9 +27,12 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # switching. Compare the executed implementation bytes with the recorded HEAD
 # blobs; a scientific run must never mix PATHS with another branch's trainer.
 for PATHS_FILE in \
-  configs/paths_config.py losses/paths.py models/paths.py \
-  training/paths_trainer.py training/origin_trainer.py \
-  models/origin.py train_paths.py; do
+  configs/paths_config.py configs/origin_config.py \
+  Datasets/origin_data.py Datasets/mosaic_data.py Datasets/dataloaders.py \
+  models/origin_encoder.py models/origin.py models/paths.py \
+  losses/origin.py losses/paths.py \
+  training/origin_trainer.py training/paths_trainer.py \
+  train_paths.py utils/spatial_mask.py; do
   EXPECTED_BLOB="$(git rev-parse "HEAD:${PATHS_FILE}")"
   OBSERVED_BLOB="$(git hash-object "${PATHS_FILE}")"
   [[ "${EXPECTED_BLOB}" == "${OBSERVED_BLOB}" ]] || {
