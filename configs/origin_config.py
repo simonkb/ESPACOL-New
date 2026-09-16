@@ -69,6 +69,38 @@ class OriginConfig:
     force_decoder_fp64: bool = True
     decision_rule: str = "class_map"
 
+    # ORIGIN-v6 relational transition ledger.  The relation field modifies
+    # the *image-level adjacent-transition rates* through a bounded log-odds
+    # residual; it is not a feature-attention or auxiliary-classifier path.
+    # Keeping this disabled by default preserves the audited ORIGIN-v3 model.
+    relation_enabled: bool = False
+    relation_source_scale: str = "s8"
+    relation_grid_size: int = 10
+    relation_dim: int = 64
+    relation_head_dim: int = 16
+    relation_delta_cap: float = 2.0
+    # ``dense_v1`` is the historical ORIGIN-v6 field.  V7 keeps the same
+    # hash-bound v3 prediction path but replaces its diffuse aggregation with
+    # an endpoint-residualized, fixed-budget relation ledger.  Keeping the
+    # variant explicit makes checkpoints and controls impossible to confuse.
+    relation_variant: str = "dense_v1"
+    relation_edge_budget: int = 8
+    relation_permutation_seed: int = 617
+    # V8 allocates the unchanged relation capacity over an adaptive entmax
+    # witness support capped by ``relation_edge_budget``.
+    relation_allocation_temperature: float = 1.0
+
+    # A relational development run is initialized from an immutable v3 checkpoint.
+    # The path is invocation provenance; the SHA-256 is the content identity.
+    # Training enforces that both are supplied for a fresh relational run.
+    warm_start_checkpoint: Optional[str] = None
+    warm_start_sha256: Optional[str] = None
+    # Numerical comparison tolerance for the hash-bound v3 multi-metric
+    # checkpoint floor.  This absorbs serialization/evaluation roundoff only;
+    # it is not a permitted empirical regression margin.
+    warm_start_metric_floor_tolerance: float = 1e-6
+    relation_only_epochs: int = 0
+
     # Proper ordinal objective and optional evidence budget regularizer.
     rps_weight: float = 0.25
     evidence_budget_weight: float = 0.0
@@ -119,6 +151,10 @@ class OriginConfig:
         self.class_weighting = self.class_weighting.lower()
         self.decision_rule = self.decision_rule.lower()
         self.atom_mode = self.atom_mode.lower()
+        self.relation_variant = str(self.relation_variant).lower()
+        self.relation_source_scale = str(self.relation_source_scale).lower()
+        if not self.relation_source_scale.startswith("s"):
+            self.relation_source_scale = f"s{self.relation_source_scale}"
         self.evidence_scales = tuple(
             str(value).lower()
             if str(value).lower().startswith("s")
@@ -138,18 +174,31 @@ class OriginConfig:
             raise ValueError("img_size, batch_size, and epochs must be positive")
         if self.num_workers < 0:
             raise ValueError("num_workers must be non-negative")
-        if self.encoder != "convnext_tiny":
-            raise ValueError("the initial ORIGIN implementation supports convnext_tiny")
+        if self.encoder not in {"convnext_tiny", "convnext_tiny_srff"}:
+            raise ValueError(
+                "ORIGIN supports encoder='convnext_tiny' or "
+                "'convnext_tiny_srff'"
+            )
+        if self.encoder == "convnext_tiny_srff" and self.img_size % 128:
+            raise ValueError(
+                "convnext_tiny_srff requires img_size divisible by 128 so its "
+                "fixed 16x16 s8 windows exactly partition the image"
+            )
         if self.projection_dim <= 0:
             raise ValueError("projection_dim must be positive")
-        allowed_scales = {"s4", "s8", "s16", "s32"}
+        allowed_scales = (
+            {"s4", "s8", "s128"}
+            if self.encoder == "convnext_tiny_srff"
+            else {"s4", "s8", "s16", "s32"}
+        )
         if not self.evidence_scales or not set(self.evidence_scales).issubset(allowed_scales):
             raise ValueError(
-                "evidence_scales must be selected from s4,s8,s16,s32"
+                "evidence_scales are incompatible with encoder "
+                f"{self.encoder!r}; choose from {sorted(allowed_scales)}"
             )
         if len(set(self.evidence_scales)) != len(self.evidence_scales):
             raise ValueError("evidence_scales must not contain duplicates")
-        scale_stride = {"s4": 4, "s8": 8, "s16": 16, "s32": 32}
+        scale_stride = {"s4": 4, "s8": 8, "s16": 16, "s32": 32, "s128": 128}
         if tuple(sorted(self.evidence_scales, key=scale_stride.__getitem__)) != self.evidence_scales:
             raise ValueError("evidence_scales must be strictly increasing")
         if not math.isfinite(self.reference_count) or self.reference_count <= 0.0:
@@ -237,6 +286,83 @@ class OriginConfig:
             raise ValueError("ORIGIN's structural decoder must run in FP64")
         if self.decision_rule not in {"posterior_median", "class_map", "rounded_expected"}:
             raise ValueError(f"unsupported decision_rule: {self.decision_rule!r}")
+        if self.relation_grid_size < 2:
+            raise ValueError("relation_grid_size must be at least 2")
+        if self.relation_dim <= 0 or self.relation_head_dim <= 0:
+            raise ValueError("relation dimensions must be positive")
+        if self.relation_head_dim > self.relation_dim:
+            raise ValueError("relation_head_dim must not exceed relation_dim")
+        if not math.isfinite(self.relation_delta_cap) or self.relation_delta_cap <= 0.0:
+            raise ValueError("relation_delta_cap must be finite and positive")
+        relation_variants = {
+            "dense_v1",
+            "identified_sparse_v1",
+            "additive_endpoint_control_v1",
+            "shuffled_pair_control_v1",
+            "identified_conserved_witness_v1",
+            "additive_conserved_witness_control_v1",
+            "shuffled_conserved_witness_control_v1",
+        }
+        if self.relation_variant not in relation_variants:
+            raise ValueError(
+                f"unsupported relation_variant: {self.relation_variant!r}; "
+                f"choose from {sorted(relation_variants)}"
+            )
+        relation_regions = self.relation_grid_size * self.relation_grid_size
+        relation_edge_capacity = relation_regions * (relation_regions - 1)
+        if not 1 <= self.relation_edge_budget <= relation_edge_capacity:
+            raise ValueError(
+                "relation_edge_budget must lie in [1, R(R-1)] for "
+                f"R=relation_grid_size^2={relation_regions}"
+            )
+        if (
+            self.relation_variant != "dense_v1"
+            and self.relation_edge_budget >= relation_edge_capacity
+        ):
+            raise ValueError(
+                "a sparse relation_edge_budget must be strictly below "
+                "R(R-1) so that the identified residual cannot collapse "
+                "to its zero global sum"
+            )
+        if self.relation_permutation_seed < 0:
+            raise ValueError("relation_permutation_seed must be non-negative")
+        if (
+            not math.isfinite(self.relation_allocation_temperature)
+            or self.relation_allocation_temperature <= 0.0
+        ):
+            raise ValueError(
+                "relation_allocation_temperature must be finite and positive"
+            )
+        if not self.relation_enabled and self.relation_variant != "dense_v1":
+            raise ValueError(
+                "a non-default relation_variant requires relation_enabled=True"
+            )
+        if self.relation_enabled and self.relation_source_scale not in self.evidence_scales:
+            raise ValueError(
+                "relation_source_scale must be one of the active evidence_scales"
+            )
+        if (self.warm_start_checkpoint is None) != (self.warm_start_sha256 is None):
+            raise ValueError(
+                "warm_start_checkpoint and warm_start_sha256 must be supplied together"
+            )
+        if self.warm_start_sha256 is not None:
+            checksum = self.warm_start_sha256.lower()
+            if len(checksum) != 64 or any(character not in "0123456789abcdef" for character in checksum):
+                raise ValueError("warm_start_sha256 must be a 64-character hexadecimal SHA-256")
+            self.warm_start_sha256 = checksum
+        if (
+            not math.isfinite(self.warm_start_metric_floor_tolerance)
+            or self.warm_start_metric_floor_tolerance < 0.0
+        ):
+            raise ValueError(
+                "warm_start_metric_floor_tolerance must be finite and non-negative"
+            )
+        if self.relation_only_epochs < 0:
+            raise ValueError("relation_only_epochs must be non-negative")
+        if self.relation_only_epochs > 0 and not self.relation_enabled:
+            raise ValueError("relation_only_epochs requires relation_enabled=True")
+        if self.relation_only_epochs > self.epochs:
+            raise ValueError("relation_only_epochs must not exceed epochs")
         if self.checkpoint_selection not in {"acc_then_qwk", "acc_qwk_score"}:
             raise ValueError(
                 f"unsupported checkpoint_selection: {self.checkpoint_selection!r}"

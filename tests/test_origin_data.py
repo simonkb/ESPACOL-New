@@ -128,6 +128,20 @@ def test_split_manifest_guard_preserves_existing_run_provenance(tmp_path: Path) 
     assert (tmp_path / "split_manifest.json").read_text().find("original") >= 0
 
 
+def test_split_manifest_guard_protects_best_learned_checkpoint(tmp_path: Path) -> None:
+    manifest = {
+        "dataset": "aptos",
+        "fold": 0,
+        "signature": "original",
+        "counts": {"train": 1, "validation": 1, "locked_test": 1},
+        "histograms": {"train": [1], "validation": [1], "locked_test": [1]},
+    }
+    guard_and_write_split_manifest(tmp_path, manifest, resume=False)
+    (tmp_path / "best_learned.pth").write_bytes(b"learned-treatment")
+    with pytest.raises(FileExistsError, match="best_learned.pth"):
+        guard_and_write_split_manifest(tmp_path, manifest, resume=False)
+
+
 def test_generic_transform_returns_full_valid_mask() -> None:
     transform = OriginGenericTransform(size=32, augment=False)
     image, mask = transform(Image.new("RGB", (43, 21), (40, 50, 60)))

@@ -73,7 +73,7 @@ PY
 
 TRAIN_ARGS=(
   --dataset dr --data_root "${DATA_ROOT}" --run_dir "${RUN_DIR}" --folds 0 --seed 42
-  --image_size "${ORIGIN_IMAGE_SIZE:-640}" --encoder convnext_tiny
+  --image_size "${ORIGIN_IMAGE_SIZE:-640}" --encoder "${ORIGIN_ENCODER:-convnext_tiny}"
   --scales "${ORIGIN_SCALES:-s4,s8,s16,s32}"
   --projection_dim "${ORIGIN_PROJECTION_DIM:-128}"
   --reference_count "${ORIGIN_REFERENCE_COUNT:-4096}"
