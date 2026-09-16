@@ -23,6 +23,25 @@ REPO_ROOT="${ORIGIN_REPO_ROOT:-/dpc/kuin0170/ESPACOL-New}"
 cd "${REPO_ROOT}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+# Git index flags such as assume-unchanged can hide a stale file after branch
+# switching. Compare the executed implementation bytes with the recorded HEAD
+# blobs; a scientific run must never mix PATHS with another branch's trainer.
+for PATHS_FILE in \
+  configs/paths_config.py configs/origin_config.py \
+  Datasets/origin_data.py Datasets/mosaic_data.py Datasets/dataloaders.py \
+  models/origin_encoder.py models/origin.py models/paths.py \
+  losses/origin.py losses/paths.py \
+  training/origin_trainer.py training/paths_trainer.py \
+  train_paths.py utils/spatial_mask.py; do
+  EXPECTED_BLOB="$(git rev-parse "HEAD:${PATHS_FILE}")"
+  OBSERVED_BLOB="$(git hash-object "${PATHS_FILE}")"
+  [[ "${EXPECTED_BLOB}" == "${OBSERVED_BLOB}" ]] || {
+    echo "Tracked implementation differs from HEAD: ${PATHS_FILE}" >&2
+    echo "Clear any assume-unchanged/skip-worktree flag and restore this file." >&2
+    exit 2
+  }
+done
+
 echo "=== PATHS structural preflight ==="
 date --iso-8601=seconds
 git rev-parse HEAD
@@ -32,7 +51,7 @@ python --version
 if ! python -c 'import pytest' >/dev/null 2>&1; then
   echo "Missing pytest in conda environment ${ORIGIN_CONDA_ENV:-G}." >&2
   echo "Install once: python -m pip install -r requirements-dev.txt" >&2
-  exit 2
+  exit 3
 fi
 python -m pytest -q tests/test_paths*.py tests/test_origin_core.py tests/test_origin_loss.py
 
