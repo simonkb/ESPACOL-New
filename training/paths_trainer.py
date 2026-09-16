@@ -841,6 +841,7 @@ class PathsTrainer(OriginTrainer):
         self.architecture_signature = _canonical_sha256(self.architecture)
         self.critical_config = _critical_config(cfg)
         self.config_signature = _canonical_sha256(self.critical_config)
+        self.checkpoint_schema = "paths-checkpoint-v2"
         self.base_control_path = self.run_dir / "v3_strength_zero_control.json"
         self.best_learned_path = self.run_dir / "best_learned.pth"
 
@@ -937,15 +938,49 @@ class PathsTrainer(OriginTrainer):
         best_key: tuple[float, float, float],
         best_epoch: int,
         bad_epochs: int,
+        candidate_floor_evaluation: Mapping[str, Any] | None = None,
+        best_learned_key: tuple[float, float, float] | None = None,
+        best_learned_epoch: int | None = None,
+        learned_bad_epochs: int = 0,
+        checkpoint_role: str | None = None,
+        deployable_best_checkpoint_sha256: str | None = None,
+        best_learned_checkpoint_sha256: str | None = None,
+        checkpoint_transaction: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if candidate_floor_evaluation is not None:
+            raise ValueError("PATHS does not accept an inherited candidate metric floor")
+        if (
+            best_learned_key is not None
+            or best_learned_epoch is not None
+            or learned_bad_epochs != 0
+            or best_learned_checkpoint_sha256 is not None
+        ):
+            raise ValueError("PATHS uses one learned checkpoint-selection track")
         payload = super()._checkpoint_payload(
-            epoch, metrics, best_key, best_epoch, bad_epochs
+            epoch,
+            metrics,
+            best_key,
+            best_epoch,
+            bad_epochs,
+            candidate_floor_evaluation=candidate_floor_evaluation,
+            best_learned_key=best_learned_key,
+            best_learned_epoch=best_learned_epoch,
+            learned_bad_epochs=learned_bad_epochs,
+            checkpoint_role=checkpoint_role,
+            deployable_best_checkpoint_sha256=deployable_best_checkpoint_sha256,
+            best_learned_checkpoint_sha256=best_learned_checkpoint_sha256,
+            checkpoint_transaction=checkpoint_transaction,
         )
+        selected_role = payload.get("checkpoint_role")
+        if selected_role == "deployable_selected":
+            selected_role = "paths_selected_learned"
         payload.update(
             {
-                "schema": "paths-checkpoint-v2",
-                "checkpoint_role": "paths_selected_learned",
-                "warm_start_provenance": self.paths_warm_start_provenance,
+                "schema": self.checkpoint_schema,
+                "paths_protocol_version": "paths-v2",
+                "checkpoint_role": selected_role,
+                "warm_start_provenance": None,
+                "paths_warm_start_provenance": self.paths_warm_start_provenance,
                 "training_label_counts": list(self.training_label_counts),
                 "risk_set_boundary_weights": (
                     self.criterion.boundary_weights.detach().cpu().tolist()
@@ -953,66 +988,84 @@ class PathsTrainer(OriginTrainer):
                 "risk_set_weights_from_training_labels_only": True,
                 "correction_only_epochs": self.correction_only_epochs,
                 "optimizer_group_contract": self.optimizer_group_contract,
+                "training_phase": (
+                    "paths_correction_only"
+                    if 1 <= int(epoch) <= self.correction_only_epochs
+                    else "paths_joint"
+                ),
             }
         )
         return payload
 
-    def _save_checkpoint(
-        self,
-        path: Path,
-        *,
-        epoch: int,
-        metrics: Mapping[str, Any],
-        best_key: tuple[float, float, float],
-        best_epoch: int,
-        bad_epochs: int,
-    ) -> None:
-        super()._save_checkpoint(
-            path,
-            epoch=epoch,
-            metrics=metrics,
-            best_key=best_key,
-            best_epoch=best_epoch,
-            bad_epochs=bad_epochs,
+    def _materialize_best_learned_checkpoint(self) -> Mapping[str, Any]:
+        """Atomically mirror the committed selected PATHS checkpoint.
+
+        This is deliberately performed only after the parent's transactional
+        training loop returns. During ``_save_checkpoint`` the selected
+        sidecar may still be an uncommitted temporary file.
+        """
+
+        if not self.best_path.is_file():
+            raise FileNotFoundError(
+                f"selected PATHS checkpoint does not exist: {self.best_path}"
+            )
+        state = torch.load(self.best_path, map_location="cpu", weights_only=False)
+        if state.get("schema") != self.checkpoint_schema:
+            raise ValueError("selected PATHS checkpoint schema mismatch")
+        if state.get("checkpoint_role") != "paths_selected_learned":
+            raise ValueError(
+                "selected PATHS checkpoint does not declare its learned role"
+            )
+        learned_state = dict(state)
+        learned_state["checkpoint_role"] = "best_learned"
+        learned_state["best_learned_selection_key"] = state.get(
+            "best_selection_key"
         )
-        if path != self.best_path:
-            return
-        # Keep an explicit learned-candidate artifact. The V3 strength-zero
-        # control is metrics-only and is never silently installed here.
-        state = torch.load(path, map_location="cpu", weights_only=False)
-        state["checkpoint_role"] = "best_learned"
+        learned_state["best_learned_epoch"] = int(state["epoch"])
         temporary = self.best_learned_path.with_name(
             f".{self.best_learned_path.name}.{os.getpid()}.tmp"
         )
         try:
-            torch.save(state, temporary)
+            torch.save(learned_state, temporary)
             os.replace(temporary, self.best_learned_path)
         finally:
             if temporary.exists():
                 temporary.unlink()
+        return learned_state
 
-    def _validate_resume(self, state: Mapping[str, Any]) -> None:
-        if state.get("schema") != "paths-checkpoint-v2":
+    def _validate_resume(
+        self,
+        state: Mapping[str, Any],
+        *,
+        recover_transaction: bool = False,
+    ) -> None:
+        # Authenticate PATHS-owned fields before allowing the parent to act on
+        # a recorded filesystem transaction.
+        if state.get("schema") != self.checkpoint_schema:
             raise ValueError("PATHS resume requires a paths-checkpoint-v2 checkpoint")
-        for name, expected in {
-            "implementation_signature": self.implementation_signature,
-            "architecture_signature": self.architecture_signature,
-            "config_signature": self.config_signature,
-        }.items():
-            if state.get(name) != expected:
-                raise ValueError(f"PATHS resume {name} mismatch")
-        if int(state.get("fold", -1)) != self.fold:
-            raise ValueError("PATHS resume fold mismatch")
-        if self.split_signature is not None and state.get("split_signature") != self.split_signature:
-            raise ValueError("PATHS resume split signature mismatch")
-        if state.get("warm_start_provenance") != self.paths_warm_start_provenance:
+        if state.get("paths_protocol_version") != "paths-v2":
+            raise ValueError("PATHS resume protocol mismatch")
+        if state.get("warm_start_provenance") is not None:
+            raise ValueError("PATHS resume unexpectedly activates the ORIGIN relation hook")
+        if state.get("paths_warm_start_provenance") != self.paths_warm_start_provenance:
             raise ValueError("PATHS resume warm-start provenance mismatch")
         if state.get("training_label_counts") != self.training_label_counts:
             raise ValueError("PATHS resume training-label counts mismatch")
-        if state.get("selection_policy") != self.selection_policy:
-            raise ValueError("PATHS resume selection policy mismatch")
         if state.get("optimizer_group_contract") != self.optimizer_group_contract:
             raise ValueError("PATHS resume optimizer-group contract mismatch")
+        if state.get("candidate_metric_safety_floor_evaluation") is not None:
+            raise ValueError("PATHS resume contains an inherited candidate metric floor")
+        if state.get("best_learned_selection_key") is not None or state.get(
+            "best_learned_epoch"
+        ) is not None:
+            raise ValueError("PATHS resume contains an inherited learned checkpoint track")
+
+        # The parent owns generic identity/role checks, transaction recovery,
+        # and hash-binding of the committed selected checkpoint.
+        super()._validate_resume(
+            state,
+            recover_transaction=recover_transaction,
+        )
 
     def _evaluate_v3_control(self) -> dict[str, Any]:
         self.model.eval()
@@ -1531,6 +1584,7 @@ class PathsTrainer(OriginTrainer):
                 )
             self._evaluate_v3_control()
         result = super().fit(evaluate_test=evaluate_test)
+        best_learned = self._materialize_best_learned_checkpoint()
         if not self.best_learned_path.is_file():
             raise RuntimeError("PATHS training produced no best_learned.pth")
         result.update(
@@ -1548,6 +1602,11 @@ class PathsTrainer(OriginTrainer):
                 "best_learned_checkpoint_sha256": _file_sha256(
                     self.best_learned_path
                 ),
+                "best_learned_epoch": int(best_learned["epoch"]),
+                "best_learned_validation": dict(best_learned["metrics"]),
+                "best_learned_checkpoint_role": best_learned[
+                    "checkpoint_role"
+                ],
                 "v3_control_promoted_as_paths": False,
             }
         )

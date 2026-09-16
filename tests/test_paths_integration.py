@@ -251,6 +251,127 @@ def test_trainer_fixes_risk_weights_from_training_fold_labels_only(tmp_path) -> 
     assert all(parameter.requires_grad for parameter in trainer.model.parameters())
 
 
+def test_paths_checkpoint_transaction_and_resume_match_parent_protocol(tmp_path) -> None:
+    checkpoint = tmp_path / "source.pth"
+    checksum = _source_checkpoint(checkpoint)
+    train_labels = [0, 0, 1, 2, 2, 2, 3, 4]
+    train = DataLoader(_LabelDataset(train_labels), batch_size=2)
+    validation = DataLoader(_LabelDataset([0, 4, 4, 4, 4]), batch_size=2)
+
+    def build_trainer(*, resume: bool) -> PathsTrainer:
+        cfg = PathsConfig(
+            warm_start_checkpoint=str(checkpoint),
+            warm_start_sha256=checksum,
+            risk_set_alpha=0.5,
+            amp=False,
+            resume=resume,
+        )
+        model = PathsModel(
+            **_model_kwargs(),
+            paths_probe_z=cfg.pgf_probes,
+            paths_correction_cap=cfg.correction_cap,
+            paths_gain_init=cfg.correction_gain_init,
+            paths_strength=cfg.correction_strength,
+        )
+        return PathsTrainer(
+            model,
+            train,
+            validation,
+            None,
+            cfg,
+            tmp_path / "run",
+            fold=0,
+            split_signature="split-a",
+            device="cpu",
+        )
+
+    trainer = build_trainer(resume=False)
+    metrics = {"loss": 1.0, "acc": 80.0, "qwk": 0.8, "mae": 0.2}
+    best_key = (80.0, 0.8, -1.0)
+    prepared = trainer._save_checkpoint(
+        trainer.best_path,
+        epoch=1,
+        metrics=metrics,
+        best_key=best_key,
+        best_epoch=1,
+        bad_epochs=0,
+        candidate_floor_evaluation=None,
+        best_learned_key=None,
+        best_learned_epoch=None,
+        learned_bad_epochs=0,
+        checkpoint_role="deployable_selected",
+        defer_commit=True,
+    )
+    assert prepared.is_file()
+    assert not trainer.best_path.exists()
+    selected = torch.load(prepared, map_location="cpu", weights_only=False)
+    assert selected["schema"] == "paths-checkpoint-v2"
+    assert selected["checkpoint_role"] == "paths_selected_learned"
+    assert selected["warm_start_provenance"] is None
+    assert selected["paths_warm_start_provenance"] == (
+        trainer.paths_warm_start_provenance
+    )
+
+    prepared_hash = hashlib.sha256(prepared.read_bytes()).hexdigest()
+    transaction = {
+        "schema": "origin-checkpoint-sidecar-transaction-v1",
+        "epoch": 1,
+        "prepared_sidecars": {
+            "deployable_selected": {
+                "target_name": trainer.best_path.name,
+                "temporary_name": prepared.name,
+                "sha256": prepared_hash,
+            }
+        },
+    }
+    trainer._save_checkpoint(
+        trainer.last_path,
+        epoch=1,
+        metrics=metrics,
+        best_key=best_key,
+        best_epoch=1,
+        bad_epochs=0,
+        checkpoint_role="resume_state",
+        deployable_best_checkpoint_sha256=prepared_hash,
+        checkpoint_transaction=transaction,
+    )
+    last = torch.load(trainer.last_path, map_location="cpu", weights_only=False)
+    assert last["schema"] == "paths-checkpoint-v2"
+    assert last["checkpoint_role"] == "resume_state"
+    trainer._validate_resume(last, recover_transaction=True)
+    assert trainer.best_path.is_file()
+    assert not prepared.exists()
+    assert hashlib.sha256(trainer.best_path.read_bytes()).hexdigest() == prepared_hash
+
+    learned = trainer._materialize_best_learned_checkpoint()
+    assert learned["checkpoint_role"] == "best_learned"
+    assert learned["epoch"] == selected["epoch"]
+    assert learned["metrics"] == selected["metrics"]
+    stored_learned = torch.load(
+        trainer.best_learned_path, map_location="cpu", weights_only=False
+    )
+    assert stored_learned["checkpoint_role"] == "best_learned"
+    for name, value in selected["model_state"].items():
+        torch.testing.assert_close(stored_learned["model_state"][name], value)
+
+    resumed = build_trainer(resume=True)
+    resumed_last = torch.load(
+        resumed.last_path, map_location="cpu", weights_only=False
+    )
+    resumed._validate_resume(resumed_last, recover_transaction=True)
+    resumed._restore_training_state(resumed_last)
+
+    with pytest.raises(ValueError, match="candidate metric floor"):
+        trainer._checkpoint_payload(
+            1,
+            metrics,
+            best_key,
+            1,
+            0,
+            candidate_floor_evaluation={"passes_metric_floor": True},
+        )
+
+
 def _joint_output():
     torch.manual_seed(73)
     metadata = OriginScaleMetadata(
