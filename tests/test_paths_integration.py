@@ -212,6 +212,11 @@ def test_trainer_fixes_risk_weights_from_training_fold_labels_only(tmp_path) -> 
         split_signature="split-a",
         device="cpu",
     )
+    assert cfg.warm_start_checkpoint == str(checkpoint)
+    assert cfg.warm_start_sha256 == checksum
+    assert trainer.cfg is cfg
+    assert trainer.warm_start_provenance is None
+    assert trainer.paths_warm_start_provenance["source_checkpoint_sha256"] == checksum
     expected_counts = torch.bincount(torch.tensor(train_labels), minlength=5)
     assert trainer.training_label_counts == expected_counts.tolist()
     torch.testing.assert_close(
@@ -460,7 +465,9 @@ def test_certificate_v2_serializes_exact_final_predictor_and_geometry(tmp_path) 
     trainer.split_signature = "split-a"
     trainer.implementation_signature = "a" * 64
     trainer.architecture_signature = "b" * 64
-    trainer.warm_start_provenance = {"source_checkpoint_sha256": "c" * 64}
+    trainer.paths_warm_start_provenance = {
+        "source_checkpoint_sha256": "c" * 64
+    }
     trainer.certificate_path = tmp_path / "certificates.json"
     trainer.best_path = tmp_path / "best.pth"
     trainer.best_path.write_bytes(b"checkpoint")

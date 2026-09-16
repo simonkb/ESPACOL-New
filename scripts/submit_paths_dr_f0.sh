@@ -24,10 +24,20 @@ REPO_ROOT="${ORIGIN_REPO_ROOT:-/dpc/kuin0170/ESPACOL-New}"
 cd "${REPO_ROOT}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+for PATHS_FILE in \
+  configs/paths_config.py losses/paths.py models/paths.py \
+  training/paths_trainer.py training/origin_trainer.py \
+  models/origin.py train_paths.py; do
+  [[ "$(git rev-parse "HEAD:${PATHS_FILE}")" == "$(git hash-object "${PATHS_FILE}")" ]] || {
+    echo "Tracked implementation differs from HEAD: ${PATHS_FILE}" >&2
+    exit 2
+  }
+done
+
 APTOS_GATE="${PATHS_APTOS_GATE:-runs/paths_aptos_f0_v2/fold0/PROMOTED_TO_EYEPACS.json}"
 [[ -f "${APTOS_GATE}" ]] || {
   echo "PATHS EyePACS is blocked until the APTOS promotion gate exists: ${APTOS_GATE}" >&2
-  exit 2
+  exit 3
 }
 PATHS_GATE="${APTOS_GATE}" python - <<'PY'
 import json, os, pathlib

@@ -24,14 +24,24 @@ REPO_ROOT="${ORIGIN_REPO_ROOT:-/dpc/kuin0170/ESPACOL-New}"
 cd "${REPO_ROOT}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+for PATHS_FILE in \
+  configs/paths_config.py losses/paths.py models/paths.py \
+  training/paths_trainer.py training/origin_trainer.py \
+  models/origin.py train_paths.py; do
+  [[ "$(git rev-parse "HEAD:${PATHS_FILE}")" == "$(git hash-object "${PATHS_FILE}")" ]] || {
+    echo "Tracked implementation differs from HEAD: ${PATHS_FILE}" >&2
+    exit 2
+  }
+done
+
 RUN_DIR="${PATHS_APTOS_RUN_DIR:-runs/paths_aptos_f0_v2}"
 DATA_ROOT="${ORIGIN_APTOS_ROOT:-Datasets/aptos2019-blindness-detection}"
 SOURCE_CHECKPOINT="${PATHS_V3_APTOS_CHECKPOINT:-runs/origin_aptos_f0_v3_bounded/fold0/best.pth}"
 SOURCE_SHA="${PATHS_V3_APTOS_SHA256:-}"
-[[ -f "${SOURCE_CHECKPOINT}" ]] || { echo "Missing ${SOURCE_CHECKPOINT}" >&2; exit 2; }
+[[ -f "${SOURCE_CHECKPOINT}" ]] || { echo "Missing ${SOURCE_CHECKPOINT}" >&2; exit 3; }
 [[ "${SOURCE_SHA}" =~ ^[0-9a-fA-F]{64}$ ]] || {
   echo "Set PATHS_V3_APTOS_SHA256 to the audited V3 checkpoint SHA-256." >&2
-  exit 2
+  exit 3
 }
 
 FOLD_DIR="${RUN_DIR}/fold0"

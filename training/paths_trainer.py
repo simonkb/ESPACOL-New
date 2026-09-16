@@ -773,23 +773,44 @@ class PathsTrainer(OriginTrainer):
         split_signature: str | None = None,
         device: torch.device | str | None = None,
     ) -> None:
-        self.warm_start_provenance = load_audited_origin_v3_warm_start(
+        paths_warm_start_provenance = load_audited_origin_v3_warm_start(
             model,
             cfg,
             fold=fold,
             split_signature=split_signature,
         )
-        super().__init__(
-            model,
-            train_loader,
-            val_loader,
-            test_loader,
-            cfg,
-            run_dir,
-            fold=fold,
-            split_signature=split_signature,
-            device=device,
-        )
+        # PATHS owns and has already completed its strict V3 migration above.
+        # Later ORIGIN branches also inspect these generically named fields to
+        # trigger a relation-only migration from ``OriginTrainer.__init__``.
+        # Hide them only for the parent constructor so an inherited extension
+        # cannot load the same checkpoint a second time under the wrong state
+        # contract.  ``self.cfg`` retains this same object, so restoring in the
+        # finally block also restores the complete PATHS experiment identity.
+        warm_start_checkpoint = getattr(cfg, "warm_start_checkpoint", None)
+        warm_start_sha256 = getattr(cfg, "warm_start_sha256", None)
+        setattr(cfg, "warm_start_checkpoint", None)
+        setattr(cfg, "warm_start_sha256", None)
+        try:
+            super().__init__(
+                model,
+                train_loader,
+                val_loader,
+                test_loader,
+                cfg,
+                run_dir,
+                fold=fold,
+                split_signature=split_signature,
+                device=device,
+            )
+        finally:
+            setattr(cfg, "warm_start_checkpoint", warm_start_checkpoint)
+            setattr(cfg, "warm_start_sha256", warm_start_sha256)
+        # Keep the inherited extension hook disabled for its entire lifetime:
+        # newer OriginTrainer implementations use this same-named field to
+        # activate relation-specific checkpoint selection. PATHS owns a
+        # distinct provenance field and a distinct checkpoint contract.
+        self.warm_start_provenance = None
+        self.paths_warm_start_provenance = paths_warm_start_provenance
         self._install_paths_optimizer(cfg)
         labels = _labels_from_dataset(train_loader.dataset)
         if labels is None or len(labels) != len(train_loader.dataset):
@@ -924,7 +945,7 @@ class PathsTrainer(OriginTrainer):
             {
                 "schema": "paths-checkpoint-v2",
                 "checkpoint_role": "paths_selected_learned",
-                "warm_start_provenance": self.warm_start_provenance,
+                "warm_start_provenance": self.paths_warm_start_provenance,
                 "training_label_counts": list(self.training_label_counts),
                 "risk_set_boundary_weights": (
                     self.criterion.boundary_weights.detach().cpu().tolist()
@@ -984,7 +1005,7 @@ class PathsTrainer(OriginTrainer):
             raise ValueError("PATHS resume fold mismatch")
         if self.split_signature is not None and state.get("split_signature") != self.split_signature:
             raise ValueError("PATHS resume split signature mismatch")
-        if state.get("warm_start_provenance") != self.warm_start_provenance:
+        if state.get("warm_start_provenance") != self.paths_warm_start_provenance:
             raise ValueError("PATHS resume warm-start provenance mismatch")
         if state.get("training_label_counts") != self.training_label_counts:
             raise ValueError("PATHS resume training-label counts mismatch")
@@ -1014,7 +1035,7 @@ class PathsTrainer(OriginTrainer):
         metrics = evaluate_origin_predictions(
             torch.cat(probabilities), torch.cat(predictions), torch.cat(labels_all)
         )
-        source = self.warm_start_provenance["source_metrics"]
+        source = self.paths_warm_start_provenance["source_metrics"]
         tolerance = float(getattr(self.cfg, "warm_start_metric_tolerance", 1e-6))
         errors = {
             name: abs(float(metrics[name]) - float(source[name]))
@@ -1030,7 +1051,7 @@ class PathsTrainer(OriginTrainer):
             "scope": "inner_validation_only",
             "fold": self.fold,
             "split_signature": self.split_signature,
-            "source_checkpoint_sha256": self.warm_start_provenance[
+            "source_checkpoint_sha256": self.paths_warm_start_provenance[
                 "source_checkpoint_sha256"
             ],
             "metrics": metrics,
@@ -1460,7 +1481,7 @@ class PathsTrainer(OriginTrainer):
             "checkpoint_sha256": _file_sha256(self.best_path),
             "implementation_signature": self.implementation_signature,
             "architecture_signature": self.architecture_signature,
-            "warm_start_checkpoint_sha256": self.warm_start_provenance[
+            "warm_start_checkpoint_sha256": self.paths_warm_start_provenance[
                 "source_checkpoint_sha256"
             ],
             "decision_rule": self.decision_rule,
@@ -1515,7 +1536,7 @@ class PathsTrainer(OriginTrainer):
         result.update(
             {
                 "protocol": "paths-v2",
-                "warm_start_provenance": self.warm_start_provenance,
+                "warm_start_provenance": self.paths_warm_start_provenance,
                 "v3_strength_zero_control_path": str(self.base_control_path),
                 "training_label_counts": list(self.training_label_counts),
                 "risk_set_boundary_weights": (
