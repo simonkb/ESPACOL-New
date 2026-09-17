@@ -242,7 +242,31 @@ class PathsLoss(nn.Module):
         epoch: int | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor | bool]]:
         del epoch
-        logits = _field(output, "continuation_logits")
+        # The signed-transport treatment exposes its final continuation
+        # logits directly.  The matched risk-objective V3 control deliberately
+        # returns the untouched OriginOutput, so derive the same conditional
+        # logits from its normalized categorical law without changing the
+        # represented posterior.
+        if isinstance(output, Mapping):
+            has_logits = "continuation_logits" in output
+        else:
+            has_logits = hasattr(output, "continuation_logits")
+        if has_logits:
+            logits = _field(output, "continuation_logits")
+        else:
+            log_probs = _field(output, "log_class_probs")
+            if log_probs.ndim != 2 or log_probs.shape[1] != self.num_classes:
+                raise ValueError(
+                    "PATHS control log probabilities must have shape "
+                    f"(N, {self.num_classes})"
+                )
+            log_tails = torch.flip(
+                torch.logcumsumexp(
+                    torch.flip(log_probs[:, 1:].double(), dims=(-1,)), dim=-1
+                ),
+                dims=(-1,),
+            )
+            logits = log_tails - log_probs[:, :-1].double()
         cumulative = _field(output, "cumulative_probs")
         if logits.ndim != 2 or logits.shape != (
             logits.shape[0],

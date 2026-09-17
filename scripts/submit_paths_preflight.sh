@@ -32,7 +32,10 @@ for PATHS_FILE in \
   models/origin_encoder.py models/origin.py models/paths.py \
   losses/origin.py losses/paths.py \
   training/origin_trainer.py training/paths_trainer.py \
-  train_paths.py utils/spatial_mask.py; do
+  train_paths.py utils/spatial_mask.py \
+  scripts/submit_paths_preflight.sh scripts/submit_paths_aptos_f0.sh \
+  scripts/submit_paths_aptos_control_f0.sh scripts/submit_paths_aptos_gate.sh \
+  scripts/submit_paths_dr_f0.sh; do
   EXPECTED_BLOB="$(git rev-parse "HEAD:${PATHS_FILE}")"
   OBSERVED_BLOB="$(git hash-object "${PATHS_FILE}")"
   [[ "${EXPECTED_BLOB}" == "${OBSERVED_BLOB}" ]] || {
@@ -53,6 +56,12 @@ if ! python -c 'import pytest' >/dev/null 2>&1; then
   echo "Install once: python -m pip install -r requirements-dev.txt" >&2
   exit 3
 fi
+for PATHS_SCRIPT in \
+  scripts/submit_paths_preflight.sh scripts/submit_paths_aptos_f0.sh \
+  scripts/submit_paths_aptos_control_f0.sh scripts/submit_paths_aptos_gate.sh \
+  scripts/submit_paths_dr_f0.sh; do
+  bash -n "${PATHS_SCRIPT}"
+done
 python -m pytest -q tests/test_paths*.py tests/test_origin_core.py tests/test_origin_loss.py
 
 python - <<'PY'
@@ -81,8 +90,11 @@ model = build_paths_model(
     boundary_scale_cap=2.0,
     rate_roundoff_margin=1.0,
     paths_probe_z=(0.05, 0.20, 0.50, 0.80),
-    paths_correction_cap=3.0,
-    paths_gain_init=0.05,
+    paths_transport_gain_cap=1.0,
+    paths_transport_gain_init=0.05,
+    paths_transport_threshold_init=0.5,
+    paths_transport_slope_init=2.0,
+    paths_transport_slope_cap=8.0,
     paths_strength=1.0,
 ).to(device).train()
 criterion = PathsLoss(
@@ -96,7 +108,7 @@ optimizer = torch.optim.AdamW(
         {"params": list(model.encoder.parameters()), "lr": 1e-5, "name": "encoder"},
         {
             "params": list(model.generator.parameters()),
-            "lr": 5e-5,
+            "lr": 1e-5,
             "name": "origin_v3_generator",
         },
         {
@@ -167,39 +179,53 @@ fp32_loss, _ = forward_loss(amp=False)
 fp32_loss.backward()
 assert_finite_gradients("full_precision_backward")
 
-# Mirror epochs 1--3: the hash-bound V3 base is frozen and only the PATHS
-# focality law is adapted.  The trainer begins this phase with scale 4096.
+# Mirror the launched treatment exactly: encoder frozen, V3 generator and
+# signed-transport refiner trainable, with the conservative AMP scale used by
+# both APTOS jobs.
 for name, parameter in model.named_parameters():
-    parameter.requires_grad_(name.startswith("paths_refiner."))
+    parameter.requires_grad_(not name.startswith("encoder."))
 optimizer.zero_grad(set_to_none=True)
-frozen_scaler = GradScaler(
-    "cuda", enabled=True, init_scale=4096.0, growth_interval=2000
-)
-frozen_loss, _ = forward_loss(amp=True)
-frozen_scaler.scale(frozen_loss).backward()
-frozen_scaler.unscale_(optimizer)
-assert_finite_gradients("correction_only_amp_backward")
-frozen_scaler.step(optimizer)
-frozen_scaler.update()
-
-# Mirror the first joint epoch: all groups become trainable and the trainer
-# deliberately resets the AMP scale to 256 before any joint update.
-for parameter in model.parameters():
-    parameter.requires_grad_(True)
-optimizer.zero_grad(set_to_none=True)
-joint_scaler = GradScaler(
+treatment_scaler = GradScaler(
     "cuda", enabled=True, init_scale=256.0, growth_interval=2000
 )
-loss, diagnostics = forward_loss(amp=True)
-joint_scaler.scale(loss).backward()
-joint_scaler.unscale_(optimizer)
-assert_finite_gradients("joint_amp_backward")
-joint_scaler.step(optimizer)
-joint_scaler.update()
+treatment_loss, _ = forward_loss(amp=True)
+treatment_scaler.scale(treatment_loss).backward()
+treatment_scaler.unscale_(optimizer)
+assert_finite_gradients("treatment_generator_refiner_amp_backward")
+treatment_scaler.step(optimizer)
+treatment_scaler.update()
+
+# Mirror the matched control: the encoder and refiner are frozen, and the same
+# risk-set objective updates only the V3 generator through the untouched base
+# posterior.
+for name, parameter in model.named_parameters():
+    parameter.requires_grad_(name.startswith("generator."))
+optimizer.zero_grad(set_to_none=True)
+control_scaler = GradScaler(
+    "cuda", enabled=True, init_scale=256.0, growth_interval=2000
+)
+with autocast(device_type="cuda", enabled=True):
+    control_output = model(images, valid, force_decoder_fp64=True).base_output
+with autocast(device_type="cuda", enabled=False):
+    control_loss, control_diagnostics = criterion(control_output, labels, epoch=0)
+control_scaler.scale(control_loss).backward()
+control_scaler.unscale_(optimizer)
+assert_finite_gradients("risk_control_generator_amp_backward")
+control_scaler.step(optimizer)
+control_scaler.update()
 print("gpu", torch.cuda.get_device_name(0))
-print("canary_loss", float(loss.detach()), diagnostics)
+print("treatment_canary_loss", float(treatment_loss.detach()))
+print("control_canary_loss", float(control_loss.detach()), control_diagnostics)
 print("boundary_weights", criterion.boundary_weights.detach().cpu().tolist())
 print("architecture", model.architecture_metadata())
+with torch.no_grad():
+    checked = model(images, valid, force_decoder_fp64=True)
+matrix = checked.transport_matrix
+if not torch.allclose(
+    matrix.sum(dim=-1), torch.ones_like(matrix[..., 0]), atol=2e-12, rtol=0.0
+):
+    raise RuntimeError("PATHS transport matrix is not row stochastic")
+print("transport_flow_range", float(checked.net_boundary_flow.min()), float(checked.net_boundary_flow.max()))
 PY
 
 echo "PATHS structural preflight passed."

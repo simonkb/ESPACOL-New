@@ -52,7 +52,7 @@ def _parse_probes(value: str) -> tuple[float, ...]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="PATHS PGF continuation-spectrum severity training",
+        description="PATHS signed adjacent-transport severity training",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--dataset", choices=tuple(DATASET_DEFAULTS), default="aptos")
@@ -96,10 +96,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     paths = parser.add_argument_group("PATHS architecture")
+    paths.add_argument(
+        "--paths_variant",
+        choices=("signed_transport", "risk_objective_v3"),
+        default="signed_transport",
+    )
     paths.add_argument("--pgf_probes", type=_parse_probes, default=_parse_probes("0.05,0.20,0.50,0.80"))
-    paths.add_argument("--correction_cap", type=float, default=3.0)
-    paths.add_argument("--correction_gain_init", type=float, default=0.05)
-    paths.add_argument("--correction_strength", type=float, default=1.0)
+    paths.add_argument("--transport_gain_cap", type=float, default=1.0)
+    paths.add_argument("--transport_gain_init", type=float, default=0.05)
+    paths.add_argument("--transport_threshold_init", type=float, default=0.50)
+    paths.add_argument("--transport_slope_init", type=float, default=2.0)
+    paths.add_argument("--transport_slope_cap", type=float, default=8.0)
+    paths.add_argument("--transport_strength", type=float, default=1.0)
     paths.add_argument("--risk_set_alpha", type=float, default=0.5)
     paths.add_argument("--rps_weight", type=float, default=0.25)
 
@@ -166,7 +174,7 @@ def main() -> None:
     root = args.data_root or str(defaults["root"])
     n_folds = args.n_folds or int(defaults["n_folds"])
     epochs = args.epochs or int(defaults["epochs"])
-    run_dir = args.run_dir or f"runs/paths_{args.dataset}_v2"
+    run_dir = args.run_dir or f"runs/paths_{args.dataset}_v3_sapt"
     fundus = bool(defaults["fundus"]) or (
         args.dataset == "generic" and args.fundus_preprocessing
     )
@@ -215,10 +223,14 @@ def main() -> None:
         evidence_budget_weight=0.0,
         class_weighting="none",
         stratified_batches=False,
+        paths_variant=args.paths_variant,
         pgf_probes=args.pgf_probes,
-        correction_cap=args.correction_cap,
-        correction_gain_init=args.correction_gain_init,
-        correction_strength=args.correction_strength,
+        transport_gain_cap=args.transport_gain_cap,
+        transport_gain_init=args.transport_gain_init,
+        transport_threshold_init=args.transport_threshold_init,
+        transport_slope_init=args.transport_slope_init,
+        transport_slope_cap=args.transport_slope_cap,
+        transport_strength=args.transport_strength,
         correction_only_epochs=args.correction_only_epochs,
         paths_encoder_lr=args.paths_encoder_lr,
         paths_base_lr=args.paths_base_lr,
@@ -349,9 +361,12 @@ def main() -> None:
             mask_valid_fraction=cfg.mask_valid_fraction,
             grad_checkpoint=cfg.grad_checkpoint,
             paths_probe_z=cfg.pgf_probes,
-            paths_correction_cap=cfg.correction_cap,
-            paths_gain_init=cfg.correction_gain_init,
-            paths_strength=cfg.correction_strength,
+            paths_transport_gain_cap=cfg.transport_gain_cap,
+            paths_transport_gain_init=cfg.transport_gain_init,
+            paths_transport_threshold_init=cfg.transport_threshold_init,
+            paths_transport_slope_init=cfg.transport_slope_init,
+            paths_transport_slope_cap=cfg.transport_slope_cap,
+            paths_strength=cfg.transport_strength,
         )
         trainer = PathsTrainer(
             model,

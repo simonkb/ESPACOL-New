@@ -1,5 +1,6 @@
 #!/bin/bash
-# PATHS EyePACS pilot. This script refuses to run before the APTOS gate passes.
+# PATHS-v3 SAPT EyePACS pilot. This script refuses to run before the paired
+# APTOS treatment/control gate passes under the same implementation commit.
 #SBATCH --job-name=paths_dr0
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
@@ -23,6 +24,7 @@ set -u
 REPO_ROOT="${ORIGIN_REPO_ROOT:-/dpc/kuin0170/ESPACOL-New}"
 cd "${REPO_ROOT}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PATHS_RUN_GIT_COMMIT="$(git rev-parse HEAD)"
 
 for PATHS_FILE in \
   configs/paths_config.py configs/origin_config.py \
@@ -30,27 +32,40 @@ for PATHS_FILE in \
   models/origin_encoder.py models/origin.py models/paths.py \
   losses/origin.py losses/paths.py \
   training/origin_trainer.py training/paths_trainer.py \
-  train_paths.py utils/spatial_mask.py; do
+  train_paths.py utils/spatial_mask.py \
+  scripts/submit_paths_preflight.sh scripts/submit_paths_aptos_f0.sh \
+  scripts/submit_paths_aptos_control_f0.sh scripts/submit_paths_aptos_gate.sh \
+  scripts/submit_paths_dr_f0.sh; do
   [[ "$(git rev-parse "HEAD:${PATHS_FILE}")" == "$(git hash-object "${PATHS_FILE}")" ]] || {
     echo "Tracked implementation differs from HEAD: ${PATHS_FILE}" >&2
     exit 2
   }
 done
 
-APTOS_GATE="${PATHS_APTOS_GATE:-runs/paths_aptos_f0_v2/fold0/PROMOTED_TO_EYEPACS.json}"
+APTOS_GATE="${PATHS_APTOS_GATE:-runs/paths_aptos_f0_v3_sapt/fold0/PROMOTED_TO_EYEPACS.json}"
 [[ -f "${APTOS_GATE}" ]] || {
   echo "PATHS EyePACS is blocked until the APTOS promotion gate exists: ${APTOS_GATE}" >&2
   exit 3
 }
-PATHS_GATE="${APTOS_GATE}" python - <<'PY'
+PATHS_GATE="${APTOS_GATE}" PATHS_HEAD="$(git rev-parse HEAD)" python - <<'PY'
 import json, os, pathlib
+from configs.paths_config import PATHS_PROTOCOL_VERSION
+from training.paths_trainer import paths_implementation_signature
 gate = json.loads(pathlib.Path(os.environ["PATHS_GATE"]).read_text())
-if gate.get("passed") is not True or not all(gate.get("checks", {}).values()):
+valid = (
+    gate.get("schema") == "paths-v3-sapt-aptos-paired-gate-v1"
+    and gate.get("passed") is True
+    and all(gate.get("checks", {}).values())
+    and gate.get("git_commit") == os.environ["PATHS_HEAD"]
+    and gate.get("protocol") == PATHS_PROTOCOL_VERSION
+    and gate.get("implementation_signature") == paths_implementation_signature()
+)
+if not valid:
     raise SystemExit("APTOS promotion gate did not pass")
 print("aptos_gate", json.dumps(gate["checks"], sort_keys=True))
 PY
 
-RUN_DIR="${PATHS_DR_RUN_DIR:-runs/paths_dr_f0_v2}"
+RUN_DIR="${PATHS_DR_RUN_DIR:-runs/paths_dr_f0_v3_sapt}"
 DATA_ROOT="${ORIGIN_DR_ROOT:-Datasets/DR}"
 SOURCE_CHECKPOINT="${PATHS_V3_DR_CHECKPOINT:-runs/origin_dr_f0_v3_bounded/fold0/best.pth}"
 SOURCE_SHA="${PATHS_V3_DR_SHA256:-}"
@@ -72,11 +87,22 @@ elif [[ -e "${FOLD_DIR}/last.pth" || -e "${FOLD_DIR}/history.csv" ]]; then
   exit 6
 fi
 
-echo "=== PATHS EyePACS fold 0 / inner validation only ==="
+echo "=== PATHS-v3 SAPT EyePACS fold 0 / inner validation only ==="
 date --iso-8601=seconds
 git rev-parse HEAD
 git status --short
 python --version
+
+ORIGIN_DATA_ROOT="${DATA_ROOT}" python - <<'PY'
+import os
+from Datasets.origin_data import class_histogram, eyepacs_fold, load_eyepacs_items, split_paths_are_disjoint
+items = load_eyepacs_items(os.environ["ORIGIN_DATA_ROOT"])
+train, validation, test = eyepacs_fold(items, 0, n_folds=10, seed=42)
+assert len(items) == 35126 and (len(train), len(validation), len(test)) == (28446, 3162, 3518)
+assert class_histogram(train) == [20918, 1979, 4271, 702, 576]
+assert class_histogram(validation) == [2318, 216, 481, 83, 64]
+assert split_paths_are_disjoint(train, validation, test)
+PY
 
 ARGS=(
   --dataset dr --data_root "${DATA_ROOT}" --run_dir "${RUN_DIR}" --folds 0 --seed 42
@@ -85,14 +111,17 @@ ARGS=(
   --projection_dim 128 --reference_count 4096 --atom_rate_init 1e-6
   --prior_rate_init 1e-4 --boundary_scale_init 1.0 --total_rate_cap 64.0
   --prior_rate_cap 1.0 --boundary_scale_cap 2.0 --rate_roundoff_margin 1.0
-  --decision_rule class_map --pgf_probes 0.05,0.20,0.50,0.80
-  --correction_cap 3.0 --correction_gain_init 0.05 --correction_strength 1.0
-  --risk_set_alpha 0.5 --rps_weight 0.25 --batch_size 8 --epochs 75
-  --num_workers 8 --paths_encoder_lr 1e-5 --paths_base_lr 5e-5
+  --decision_rule class_map --paths_variant signed_transport
+  --pgf_probes 0.05,0.20,0.50,0.80
+  --transport_gain_cap 1.0 --transport_gain_init 0.05
+  --transport_threshold_init 0.5 --transport_slope_init 2.0
+  --transport_slope_cap 8.0 --transport_strength 1.0
+  --risk_set_alpha 0.5 --rps_weight 0.25 --batch_size 8 --epochs 25
+  --num_workers 8 --paths_encoder_lr 1e-5 --paths_base_lr 1e-5
   --paths_refiner_lr 5e-4 --weight_decay 1e-5
-  --correction_only_epochs 3 --freeze_encoder_epochs 3
-  --lr_factor 0.2 --lr_patience 5 --early_stopping_patience 15
-  --amp_unfreeze_scale 256 --skip_test
+  --correction_only_epochs 0 --freeze_encoder_epochs 25
+  --lr_factor 0.2 --lr_patience 4 --early_stopping_patience 8
+  --amp_init_scale 256 --amp_unfreeze_scale 256 --skip_test
 )
 if (( ${#RESUME_ARGS[@]} )); then ARGS+=("${RESUME_ARGS[@]}"); fi
 printf 'training_command:'; printf ' %q' python train_paths.py "${ARGS[@]}"; printf '\n'

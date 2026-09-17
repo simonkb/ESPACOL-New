@@ -1,4 +1,4 @@
-"""PATHS: PGF Analysis of Tangent-removed Hotspot Spectra.
+"""PATHS-v3: spectral evidence with signed adjacent probability transport.
 
 PATHS retains the audited ORIGIN-v3 cumulative-atom ledger and pure-birth
 posterior as its safety path. It asks one additional structural question: for
@@ -17,9 +17,14 @@ never renormalized during intervention, so every correction is an exact sum
 of stored local terms. Deleting a cell removes both its ORIGIN rate and its
 PATHS focality contribution before replaying the same decoders.
 
-The correction is non-negative and bounded. Concentrated evidence may
-increase a continuation probability, but the refiner cannot create a
-lower-severity counter-signal. ``strength=0`` returns the actual
+PATHS-v3 converts each boundary's concentration ``q`` into two non-negative
+odds: one transports probability one grade upward and the other transports it
+one grade downward.  Their balance is controlled by a bounded signed direction
+``tanh(slope * (q - threshold))``.  The resulting tridiagonal Markov kernel is
+row stochastic, so refinement conserves probability mass, never skips a grade,
+and remains exactly replayable after deleting stored spatial evidence.  Unlike
+the previous one-sided continuation correction, it can repair both under- and
+over-grading.  ``strength=0`` still returns the actual
 :class:`~models.origin.OriginOutput` object, making the V3 control exact.
 
 Atoms and focality values are model-internal evidence quantities, not lesion
@@ -205,6 +210,187 @@ class PathsContinuationDistribution:
         return self.posterior_median
 
 
+@dataclass
+class PathsAdjacentTransportDistribution:
+    """Trace of a signed, mass-conserving adjacent-grade transport step."""
+
+    class_probs: torch.Tensor
+    transport_matrix: torch.Tensor
+    direction: torch.Tensor
+    upward_odds: torch.Tensor
+    downward_odds: torch.Tensor
+    net_boundary_flow: torch.Tensor
+
+
+def apply_signed_adjacent_transport(
+    base_class_probs: torch.Tensor,
+    boundary_concentration: torch.Tensor,
+    thresholds: torch.Tensor,
+    slopes: torch.Tensor,
+    gains: torch.Tensor,
+    *,
+    strength: float = 1.0,
+    probability_tolerance: float = 5e-12,
+) -> PathsAdjacentTransportDistribution:
+    r"""Transport posterior mass only between adjacent ordinal grades.
+
+    For boundary concentration :math:`q_k`, the signed direction and transport
+    odds are
+
+    .. math::
+
+       d_k &= \tanh(s_k(q_k-\theta_k)),\\
+       o_k^+ &= \rho g_k q_k(1+d_k)/2,\\
+       o_k^- &= \rho g_k q_k(1-d_k)/2.
+
+    Row ``j`` of the tridiagonal kernel has unnormalised weights ``1`` for
+    staying, ``o_j^+`` for moving to ``j+1``, and ``o_{j-1}^-`` for moving to
+    ``j-1``.  Normalising each row makes the operation a Markov transport, not
+    an unconstrained logit residual.  It therefore conserves total posterior
+    mass exactly up to audited FP64 roundoff and cannot jump over a grade.
+    """
+
+    if not torch.is_tensor(base_class_probs) or not base_class_probs.is_floating_point():
+        raise TypeError("base_class_probs must be a floating-point tensor")
+    if base_class_probs.ndim < 2 or base_class_probs.shape[-1] < 2:
+        raise ValueError("base_class_probs must have shape (..., K), K >= 2")
+    if not math.isfinite(strength) or not 0.0 <= float(strength) <= 1.0:
+        raise ValueError("strength must lie in [0, 1]")
+    if not math.isfinite(probability_tolerance) or probability_tolerance < 0.0:
+        raise ValueError("probability_tolerance must be finite and non-negative")
+
+    probabilities = base_class_probs.to(dtype=_PATHS_DTYPE)
+    _require_finite(probabilities, "PATHS base class probabilities")
+    probability_tolerance = float(probability_tolerance)
+    if bool((probabilities < -probability_tolerance).any()):
+        raise ValueError("base_class_probs must be non-negative")
+    row_error = (probabilities.sum(dim=-1) - 1.0).abs()
+    if bool((row_error > probability_tolerance).any()):
+        raise ValueError(
+            "base_class_probs must sum to one "
+            f"(maximum error={float(row_error.max().item()):g})"
+        )
+
+    num_boundaries = probabilities.shape[-1] - 1
+    expected_shape = probabilities.shape[:-1] + (num_boundaries,)
+    if not torch.is_tensor(boundary_concentration) or not (
+        boundary_concentration.is_floating_point()
+    ):
+        raise TypeError("boundary_concentration must be a floating-point tensor")
+    concentration = _canonical_unit_interval(
+        boundary_concentration.to(device=probabilities.device, dtype=_PATHS_DTYPE),
+        name="PATHS boundary concentration",
+    )
+    if concentration.shape != expected_shape:
+        raise ValueError(
+            "boundary_concentration must have shape "
+            f"{tuple(expected_shape)}, observed {tuple(concentration.shape)}"
+        )
+
+    def _boundary_parameter(value: torch.Tensor, name: str) -> torch.Tensor:
+        if not torch.is_tensor(value) or not value.is_floating_point():
+            raise TypeError(f"{name} must be a floating-point tensor")
+        result = value.to(device=probabilities.device, dtype=_PATHS_DTYPE)
+        _require_finite(result, name)
+        if result.shape != (num_boundaries,):
+            raise ValueError(
+                f"{name} must have shape ({num_boundaries},), observed "
+                f"{tuple(result.shape)}"
+            )
+        return result
+
+    thresholds = _boundary_parameter(thresholds, "PATHS transport thresholds")
+    slopes = _boundary_parameter(slopes, "PATHS transport slopes")
+    gains = _boundary_parameter(gains, "PATHS transport gains")
+    if bool(((thresholds < 0.0) | (thresholds > 1.0)).any()):
+        raise ValueError("PATHS transport thresholds must lie in [0, 1]")
+    if bool((slopes <= 0.0).any()):
+        raise ValueError("PATHS transport slopes must be positive")
+    if bool((gains < 0.0).any()):
+        raise ValueError("PATHS transport gains must be non-negative")
+
+    direction = torch.tanh(slopes * (concentration - thresholds))
+    transport_budget = float(strength) * gains * concentration
+    upward_odds = transport_budget * (1.0 + direction) * 0.5
+    downward_odds = transport_budget * (1.0 - direction) * 0.5
+    _require_finite(direction, "PATHS transport direction")
+    _require_finite(upward_odds, "PATHS upward transport odds")
+    _require_finite(downward_odds, "PATHS downward transport odds")
+
+    zero = torch.zeros_like(upward_odds[..., :1])
+    row_up = torch.cat((upward_odds, zero), dim=-1)
+    row_down = torch.cat((zero, downward_odds), dim=-1)
+    normalizer = 1.0 + row_up + row_down
+    diagonal = 1.0 / normalizer
+    upper = row_up[..., :-1] / normalizer[..., :-1]
+    lower = row_down[..., 1:] / normalizer[..., 1:]
+    transport = (
+        torch.diag_embed(diagonal)
+        + torch.diag_embed(upper, offset=1)
+        + torch.diag_embed(lower, offset=-1)
+    )
+    _require_finite(transport, "PATHS adjacent transport matrix")
+    transport_row_error = (transport.sum(dim=-1) - 1.0).abs()
+    if bool((transport_row_error > probability_tolerance).any()):
+        raise FloatingPointError(
+            "PATHS transport matrix is not row stochastic "
+            f"(maximum error={float(transport_row_error.max().item()):g})"
+        )
+    if bool((transport < -probability_tolerance).any()):
+        raise FloatingPointError("PATHS transport matrix contains negative mass")
+    grade_axis = torch.arange(
+        probabilities.shape[-1], device=transport.device
+    )
+    non_adjacent = (
+        grade_axis[:, None] - grade_axis[None, :]
+    ).abs() > 1
+    if bool((transport[..., non_adjacent] != 0.0).any()):
+        raise FloatingPointError("PATHS transport matrix contains a non-adjacent edge")
+
+    transported = torch.matmul(probabilities.unsqueeze(-2), transport).squeeze(-2)
+    _require_finite(transported, "PATHS transported class probabilities")
+    transported_error = (transported.sum(dim=-1) - 1.0).abs()
+    if bool((transported_error > probability_tolerance).any()):
+        raise FloatingPointError(
+            "PATHS adjacent transport did not conserve posterior mass "
+            f"(maximum error={float(transported_error.max().item()):g})"
+        )
+    if bool((transported < -probability_tolerance).any()):
+        raise FloatingPointError("PATHS adjacent transport produced negative mass")
+
+    upper_probability = transport.diagonal(offset=1, dim1=-2, dim2=-1)
+    lower_probability = transport.diagonal(offset=-1, dim1=-2, dim2=-1)
+    net_flow = (
+        probabilities[..., :-1] * upper_probability
+        - probabilities[..., 1:] * lower_probability
+    )
+    _require_finite(net_flow, "PATHS signed net boundary flow")
+    reconstructed_delta = torch.cat(
+        (
+            -net_flow[..., :1],
+            net_flow[..., :-1] - net_flow[..., 1:],
+            net_flow[..., -1:],
+        ),
+        dim=-1,
+    )
+    flow_error = (
+        transported - probabilities - reconstructed_delta
+    ).abs()
+    if bool((flow_error > probability_tolerance).any()):
+        raise FloatingPointError(
+            "PATHS boundary flows do not replay the transported posterior "
+            f"(maximum error={float(flow_error.max().item()):g})"
+        )
+    return PathsAdjacentTransportDistribution(
+        class_probs=transported,
+        transport_matrix=transport,
+        direction=direction,
+        upward_odds=upward_odds,
+        downward_odds=downward_odds,
+        net_boundary_flow=net_flow,
+    )
+
+
 def continuation_logits_from_log_probs(log_class_probs: torch.Tensor) -> torch.Tensor:
     """Convert a categorical law into at-risk continuation log-odds."""
 
@@ -298,22 +484,36 @@ class PathsScaleSpectrum:
     local_concentration_spectrum: torch.Tensor
     concentration_spectrum: torch.Tensor
     mixed_concentration: torch.Tensor
-    local_correction_map: torch.Tensor
+    local_transport_map: torch.Tensor
     metadata: object
+
+    @property
+    def local_correction_map(self) -> torch.Tensor:
+        """Compatibility alias for the former one-sided implementation."""
+
+        return self.local_transport_map
 
 
 @dataclass
 class PathsOutput:
-    """Full PATHS computation trace with the unchanged V3 base ledger."""
+    """Full PATHS-v3 trace with an unchanged, replayable V3 base ledger."""
 
     base_output: OriginOutput
     spectrum_evidence: Dict[str, PathsScaleSpectrum]
     probe_z: torch.Tensor
     probe_weights: torch.Tensor
-    gains: torch.Tensor
+    transport_gains: torch.Tensor
+    transport_thresholds: torch.Tensor
+    transport_slopes: torch.Tensor
     strength: float
-    correction_cap: float
+    transport_gain_cap: float
+    transport_slope_cap: float
     boundary_concentration: torch.Tensor
+    transport_direction: torch.Tensor
+    upward_odds: torch.Tensor
+    downward_odds: torch.Tensor
+    transport_matrix: torch.Tensor
+    net_boundary_flow: torch.Tensor
     boundary_correction: torch.Tensor
     base_continuation_logits: torch.Tensor
     continuation_logits: torch.Tensor
@@ -416,17 +616,28 @@ class PathsOutput:
 
     @property
     def local_correction_maps(self) -> Dict[str, torch.Tensor]:
-        """Current additive focality ledger in ``(N,H,W,K-1)`` layout."""
+        """Compatibility alias for local concentration-transport maps."""
+
+        return self.local_transport_maps
+
+    @property
+    def local_transport_maps(self) -> Dict[str, torch.Tensor]:
+        """Additive concentration ledger in ``(N,H,W,K-1)`` layout.
+
+        Summing these maps over scales and spatial cells exactly recovers
+        :attr:`boundary_concentration`.  Transport itself is deliberately
+        compiled only after this additive evidence ledger is complete.
+        """
 
         return {
-            name: evidence.local_correction_map.permute(0, 2, 3, 1)
+            name: evidence.local_transport_map.permute(0, 2, 3, 1)
             for name, evidence in self.spectrum_evidence.items()
         }
 
     @property
     def local_intervention_scores(self) -> Dict[str, torch.Tensor]:
         return {
-            name: evidence.local_correction_map.sum(dim=1)
+            name: evidence.local_transport_map.sum(dim=1)
             for name, evidence in self.spectrum_evidence.items()
         }
 
@@ -482,23 +693,31 @@ class PathsOutput:
     def cumulative_probabilities(self) -> torch.Tensor:
         return self.cumulative_probs
 
-    # Compatibility aliases for the first trainer draft. PATHS now has one
-    # advancing branch; every stop quantity is exactly zero.
+    # Compatibility aliases for earlier trainer/audit code.  They do not
+    # change the v3 signed-transport semantics.
+    @property
+    def gains(self) -> torch.Tensor:
+        return self.transport_gains
+
+    @property
+    def correction_cap(self) -> float:
+        return self.transport_gain_cap
+
     @property
     def advance_gains(self) -> torch.Tensor:
-        return self.gains
+        return self.transport_gains
 
     @property
     def stop_gains(self) -> torch.Tensor:
-        return torch.zeros_like(self.gains)
+        return self.transport_gains
 
     @property
     def advance_correction(self) -> torch.Tensor:
-        return self.boundary_correction
+        return self.boundary_correction.clamp_min(0.0)
 
     @property
     def stop_correction(self) -> torch.Tensor:
-        return torch.zeros_like(self.boundary_correction)
+        return (-self.boundary_correction).clamp_min(0.0)
 
 
 def _compile_scale_spectrum(
@@ -506,8 +725,6 @@ def _compile_scale_spectrum(
     *,
     scale_weights: torch.Tensor,
     probe_weights: torch.Tensor,
-    gains: torch.Tensor,
-    strength: float,
 ) -> PathsScaleSpectrum:
     """Reaggregate a stored local ledger without changing its denominator."""
 
@@ -515,20 +732,15 @@ def _compile_scale_spectrum(
     concentration = local.sum(dim=(2, 3))
     mixed = torch.einsum("nbl,bl->nb", concentration, probe_weights)
     per_cell_mixed = torch.einsum("nbhwl,bl->nbhw", local, probe_weights)
-    local_correction = (
-        per_cell_mixed
-        * scale_weights[None, :, None, None]
-        * gains[None, :, None, None]
-        * float(strength)
-    )
+    local_transport = per_cell_mixed * scale_weights[None, :, None, None]
     _require_finite(concentration, f"PATHS concentration spectrum at {evidence.name}")
-    _require_finite(local_correction, f"PATHS local correction at {evidence.name}")
+    _require_finite(local_transport, f"PATHS local transport at {evidence.name}")
     return replace(
         evidence,
         surviving_mass=evidence.local_mass_map.sum(dim=(-2, -1)),
         concentration_spectrum=concentration,
         mixed_concentration=mixed,
-        local_correction_map=local_correction,
+        local_transport_map=local_transport,
     )
 
 
@@ -538,46 +750,66 @@ def _paths_output_from_ledgers(
     *,
     probe_z: torch.Tensor,
     probe_weights: torch.Tensor,
-    gains: torch.Tensor,
+    transport_gains: torch.Tensor,
+    transport_thresholds: torch.Tensor,
+    transport_slopes: torch.Tensor,
     strength: float,
-    correction_cap: float,
+    transport_gain_cap: float,
+    transport_slope_cap: float,
 ) -> PathsOutput:
     if not spectrum_evidence:
         raise ValueError("PATHS requires at least one scale spectrum")
-    correction = sum(
-        item.local_correction_map.sum(dim=(-2, -1))
+    concentration = sum(
+        item.local_transport_map.sum(dim=(-2, -1))
         for item in spectrum_evidence.values()
     )
-    concentration = sum(
-        base_output.scale_simplex[index].to(dtype=_PATHS_DTYPE)[None]
-        * item.mixed_concentration
-        for index, item in enumerate(spectrum_evidence.values())
-    )
-    bound = float(strength) * float(correction_cap)
-    tolerance = 128.0 * torch.finfo(correction.dtype).eps * max(1.0, bound)
-    if bool((correction < -tolerance).any()) or bool(
-        (correction > bound + tolerance).any()
-    ):
-        raise FloatingPointError(
-            "PATHS correction exceeded its architectural bound "
-            f"[0, {bound:g}]"
-        )
+    tolerance = 128.0 * torch.finfo(concentration.dtype).eps
     if bool((concentration < -tolerance).any()) or bool(
         (concentration > 1.0 + tolerance).any()
     ):
         raise FloatingPointError("PATHS concentration left [0,1]")
 
     base_logits = continuation_logits_from_log_probs(base_output.log_class_probs)
-    decoded = decode_continuation_logits(base_logits + correction)
+    transported = apply_signed_adjacent_transport(
+        base_output.class_probs,
+        concentration,
+        transport_thresholds,
+        transport_slopes,
+        transport_gains,
+        strength=strength,
+    )
+    if bool((transported.class_probs <= 0.0).any()):
+        raise FloatingPointError(
+            "PATHS transported posterior must be strictly positive for exact "
+            "continuation factorization"
+        )
+    final_logits = continuation_logits_from_log_probs(transported.class_probs.log())
+    decoded = decode_continuation_logits(final_logits)
+    factorization_error = (decoded.class_probs - transported.class_probs).abs()
+    factorization_tolerance = 5e-12 + 5e-12 * transported.class_probs.abs()
+    if bool((factorization_error > factorization_tolerance).any()):
+        raise FloatingPointError(
+            "PATHS continuation factorization did not replay transported posterior "
+            f"(maximum error={float(factorization_error.max().item()):g})"
+        )
+    correction = final_logits - base_logits
     return PathsOutput(
         base_output=base_output,
         spectrum_evidence=spectrum_evidence,
         probe_z=probe_z,
         probe_weights=probe_weights,
-        gains=gains,
+        transport_gains=transport_gains,
+        transport_thresholds=transport_thresholds,
+        transport_slopes=transport_slopes,
         strength=float(strength),
-        correction_cap=float(correction_cap),
+        transport_gain_cap=float(transport_gain_cap),
+        transport_slope_cap=float(transport_slope_cap),
         boundary_concentration=concentration,
+        transport_direction=transported.direction,
+        upward_odds=transported.upward_odds,
+        downward_odds=transported.downward_odds,
+        transport_matrix=transported.transport_matrix,
+        net_boundary_flow=transported.net_boundary_flow,
         boundary_correction=correction,
         base_continuation_logits=base_logits,
         continuation_logits=decoded.continuation_logits,
@@ -593,7 +825,7 @@ def _paths_output_from_ledgers(
 
 
 class PathsContinuationRefiner(nn.Module):
-    """Compile normalized ORIGIN atoms into a bounded focality correction."""
+    """Compile normalized ORIGIN atoms into signed adjacent transport."""
 
     def __init__(
         self,
@@ -601,9 +833,14 @@ class PathsContinuationRefiner(nn.Module):
         evidence_scales: Sequence[str],
         *,
         probe_z: Sequence[float] = _DEFAULT_PROBES,
-        correction_cap: float = 4.0,
-        gain_init: float = 0.05,
+        transport_gain_cap: float = 1.0,
+        transport_gain_init: float = 0.05,
+        transport_threshold_init: float = 0.5,
+        transport_slope_init: float = 2.0,
+        transport_slope_cap: float = 8.0,
         strength: float = 1.0,
+        correction_cap: Optional[float] = None,
+        gain_init: Optional[float] = None,
     ) -> None:
         super().__init__()
         if num_boundaries < 1:
@@ -612,38 +849,91 @@ class PathsContinuationRefiner(nn.Module):
         if not scales or len(scales) != len(set(scales)):
             raise ValueError("evidence_scales must be non-empty and unique")
         probes = _canonical_probe_values(probe_z)
-        if not math.isfinite(correction_cap) or correction_cap <= 0.0:
-            raise ValueError("correction_cap must be finite and positive")
+        # Transitional aliases keep old checkpoints/tools readable while all
+        # v3 metadata and public model kwargs use the transport terminology.
+        if correction_cap is not None:
+            transport_gain_cap = float(correction_cap)
+        if gain_init is not None:
+            transport_gain_init = float(gain_init)
+        if not math.isfinite(transport_gain_cap) or transport_gain_cap <= 0.0:
+            raise ValueError("transport_gain_cap must be finite and positive")
+        if not math.isfinite(transport_slope_cap) or transport_slope_cap <= 0.0:
+            raise ValueError("transport_slope_cap must be finite and positive")
+        if not math.isfinite(transport_threshold_init) or not (
+            0.0 < transport_threshold_init < 1.0
+        ):
+            raise ValueError("transport_threshold_init must lie strictly in (0, 1)")
         if not math.isfinite(strength) or not 0.0 <= strength <= 1.0:
             raise ValueError("strength must lie in [0, 1]")
-        initial_raw = _inverse_bounded_sigmoid(
-            gain_init, correction_cap, name="PATHS gain"
+        gain_raw = _inverse_bounded_sigmoid(
+            transport_gain_init, transport_gain_cap, name="PATHS transport gain"
+        )
+        threshold_raw = _inverse_bounded_sigmoid(
+            transport_threshold_init, 1.0, name="PATHS transport threshold"
+        )
+        slope_raw = _inverse_bounded_sigmoid(
+            transport_slope_init, transport_slope_cap, name="PATHS transport slope"
         )
 
         self.num_boundaries = int(num_boundaries)
         self.evidence_scales = scales
-        self.correction_cap = float(correction_cap)
-        self.gain_init = float(gain_init)
+        self.transport_gain_cap = float(transport_gain_cap)
+        self.transport_gain_init = float(transport_gain_init)
+        self.transport_threshold_init = float(transport_threshold_init)
+        self.transport_slope_init = float(transport_slope_init)
+        self.transport_slope_cap = float(transport_slope_cap)
         self.strength = float(strength)
         self.register_buffer("probe_z", torch.tensor(probes, dtype=torch.float64))
         self.probe_logits = nn.Parameter(torch.zeros(self.num_boundaries, len(probes)))
-        self.raw_gains = nn.Parameter(torch.full((self.num_boundaries,), initial_raw))
+        self.raw_transport_gains = nn.Parameter(
+            torch.full((self.num_boundaries,), gain_raw)
+        )
+        self.raw_transport_thresholds = nn.Parameter(
+            torch.full((self.num_boundaries,), threshold_raw)
+        )
+        self.raw_transport_slopes = nn.Parameter(
+            torch.full((self.num_boundaries,), slope_raw)
+        )
 
     @property
     def probe_weights(self) -> torch.Tensor:
         return self.probe_logits.double().softmax(dim=-1)
 
     @property
+    def transport_gains(self) -> torch.Tensor:
+        return self.transport_gain_cap * self.raw_transport_gains.double().sigmoid()
+
+    @property
+    def transport_thresholds(self) -> torch.Tensor:
+        return self.raw_transport_thresholds.double().sigmoid()
+
+    @property
+    def transport_slopes(self) -> torch.Tensor:
+        return self.transport_slope_cap * self.raw_transport_slopes.double().sigmoid()
+
+    @property
+    def raw_gains(self) -> torch.Tensor:
+        return self.raw_transport_gains
+
+    @property
     def gains(self) -> torch.Tensor:
-        return self.correction_cap * self.raw_gains.double().sigmoid()
+        return self.transport_gains
+
+    @property
+    def correction_cap(self) -> float:
+        return self.transport_gain_cap
+
+    @property
+    def gain_init(self) -> float:
+        return self.transport_gain_init
 
     @property
     def advance_gains(self) -> torch.Tensor:
-        return self.gains
+        return self.transport_gains
 
     @property
     def stop_gains(self) -> torch.Tensor:
-        return torch.zeros_like(self.gains)
+        return self.transport_gains
 
     def forward(self, base_output: OriginOutput) -> Union[OriginOutput, PathsOutput]:
         if self.strength == 0.0:
@@ -659,7 +949,9 @@ class PathsContinuationRefiner(nn.Module):
             raise ValueError("V3 boundary count differs from PATHS")
 
         probe_weights = self.probe_weights
-        gains = self.gains
+        transport_gains = self.transport_gains
+        transport_thresholds = self.transport_thresholds
+        transport_slopes = self.transport_slopes
         scale_weights = base_output.scale_simplex.to(dtype=_PATHS_DTYPE)
         _require_finite(scale_weights, "V3 scale simplex")
         if scale_weights.shape != (len(self.evidence_scales), self.num_boundaries):
@@ -717,15 +1009,13 @@ class PathsContinuationRefiner(nn.Module):
                 local_concentration_spectrum=local_concentration,
                 concentration_spectrum=torch.empty(0, device=normalized.device),
                 mixed_concentration=torch.empty(0, device=normalized.device),
-                local_correction_map=torch.empty(0, device=normalized.device),
+                local_transport_map=torch.empty(0, device=normalized.device),
                 metadata=source.metadata,
             )
             spectra[name] = _compile_scale_spectrum(
                 initial,
                 scale_weights=scale_weights[scale_index],
                 probe_weights=probe_weights,
-                gains=gains,
-                strength=self.strength,
             )
 
         return _paths_output_from_ledgers(
@@ -733,9 +1023,12 @@ class PathsContinuationRefiner(nn.Module):
             spectra,
             probe_z=self.probe_z,
             probe_weights=probe_weights,
-            gains=gains,
+            transport_gains=transport_gains,
+            transport_thresholds=transport_thresholds,
+            transport_slopes=transport_slopes,
             strength=self.strength,
-            correction_cap=self.correction_cap,
+            transport_gain_cap=self.transport_gain_cap,
+            transport_slope_cap=self.transport_slope_cap,
         )
 
 
@@ -747,6 +1040,8 @@ class PathsInterventionOutput:
     output: PathsOutput
     removal_masks: Dict[str, torch.Tensor]
     removed_rates: torch.Tensor
+    removed_boundary_concentration: torch.Tensor
+    removed_net_boundary_flow: torch.Tensor
     removed_boundary_correction: torch.Tensor
     removed_phi_sums: Dict[str, torch.Tensor]
     removed_mass_sums: Dict[str, torch.Tensor]
@@ -771,6 +1066,10 @@ class PathsInterventionOutput:
     @property
     def removed_signed_correction(self) -> torch.Tensor:
         return self.removed_boundary_correction
+
+    @property
+    def removed_signed_boundary_flow(self) -> torch.Tensor:
+        return self.removed_net_boundary_flow
 
     @property
     def removed_advance_correction(self) -> torch.Tensor:
@@ -837,10 +1136,12 @@ def replay_paths_without(
     replayed: Dict[str, PathsScaleSpectrum] = {}
     removed_phi: Dict[str, torch.Tensor] = {}
     removed_mass: Dict[str, torch.Tensor] = {}
+    removed_concentration_by_scale: list[torch.Tensor] = []
     for scale_index, (name, evidence) in enumerate(output.spectrum_evidence.items()):
         mask = canonical[name]
         spectrum_mask = mask[:, None, :, :, None]
         atom_mask = mask[:, None]
+        transport_mask = mask[:, None]
         removed_phi[name] = torch.where(
             spectrum_mask,
             evidence.local_phi_spectrum,
@@ -851,6 +1152,16 @@ def replay_paths_without(
             evidence.local_mass_map,
             torch.zeros_like(evidence.local_mass_map),
         ).sum(dim=(-2, -1))
+        # This is the independently accumulated additive ledger removed by
+        # the intervention.  Do not define it as ``baseline - replay``: that
+        # would make the replay certificate tautological.
+        removed_concentration_by_scale.append(
+            torch.where(
+                transport_mask,
+                evidence.local_transport_map,
+                torch.zeros_like(evidence.local_transport_map),
+            ).sum(dim=(-2, -1))
+        )
 
         kept_phi = torch.where(
             spectrum_mask,
@@ -879,8 +1190,6 @@ def replay_paths_without(
             provisional,
             scale_weights=output.scale_simplex[scale_index].to(dtype=_PATHS_DTYPE),
             probe_weights=output.probe_weights,
-            gains=output.gains,
-            strength=output.strength,
         )
 
     replay_output = _paths_output_from_ledgers(
@@ -888,16 +1197,24 @@ def replay_paths_without(
         replayed,
         probe_z=output.probe_z,
         probe_weights=output.probe_weights,
-        gains=output.gains,
+        transport_gains=output.transport_gains,
+        transport_thresholds=output.transport_thresholds,
+        transport_slopes=output.transport_slopes,
         strength=output.strength,
-        correction_cap=output.correction_cap,
+        transport_gain_cap=output.transport_gain_cap,
+        transport_slope_cap=output.transport_slope_cap,
     )
     removed_correction = output.boundary_correction - replay_output.boundary_correction
+    removed_concentration = sum(removed_concentration_by_scale)
     return PathsInterventionOutput(
         baseline=output,
         output=replay_output,
         removal_masks=canonical,
         removed_rates=base_intervention.removed_rates,
+        removed_boundary_concentration=removed_concentration,
+        removed_net_boundary_flow=(
+            output.net_boundary_flow - replay_output.net_boundary_flow
+        ),
         removed_boundary_correction=removed_correction,
         removed_phi_sums=removed_phi,
         removed_mass_sums=removed_mass,
@@ -906,15 +1223,20 @@ def replay_paths_without(
 
 
 class PathsModel(OriginModel):
-    """ORIGIN-v3 with a bounded mass-normalized focality refinement."""
+    """ORIGIN-v3 with signed adjacent probability transport (SAPT)."""
 
     def __init__(
         self,
         *,
         paths_probe_z: Sequence[float] = _DEFAULT_PROBES,
-        paths_correction_cap: float = 4.0,
-        paths_gain_init: float = 0.05,
+        paths_transport_gain_cap: float = 1.0,
+        paths_transport_gain_init: float = 0.05,
+        paths_transport_threshold_init: float = 0.5,
+        paths_transport_slope_init: float = 2.0,
+        paths_transport_slope_cap: float = 8.0,
         paths_strength: float = 1.0,
+        paths_correction_cap: Optional[float] = None,
+        paths_gain_init: Optional[float] = None,
         **origin_kwargs,
     ) -> None:
         super().__init__(**origin_kwargs)
@@ -922,9 +1244,14 @@ class PathsModel(OriginModel):
             self.num_classes - 1,
             self.evidence_scales,
             probe_z=paths_probe_z,
+            transport_gain_cap=paths_transport_gain_cap,
+            transport_gain_init=paths_transport_gain_init,
+            transport_threshold_init=paths_transport_threshold_init,
+            transport_slope_init=paths_transport_slope_init,
+            transport_slope_cap=paths_transport_slope_cap,
+            strength=paths_strength,
             correction_cap=paths_correction_cap,
             gain_init=paths_gain_init,
-            strength=paths_strength,
         )
 
     def load_origin_v3_state_dict(
@@ -964,26 +1291,36 @@ class PathsModel(OriginModel):
         base = super().architecture_metadata()
         return {
             **base,
-            "name": "PATHS",
+            "name": "PATHS-v3-SAPT",
+            "architecture_schema": "paths-signed-adjacent-transport-v3",
             "base_architecture": "ORIGIN-v3-bounded-rate",
             "posterior_path": (
                 "nested_local_atoms_to_v3_ctmc_then_mass_normalized_"
-                "tangent_removed_pgf_focality_to_continuation_stick_breaking"
+                "tangent_removed_pgf_focality_to_signed_adjacent_markov_transport"
             ),
             "pgf_probes": self.paths_refiner.probe_z.detach().cpu().tolist(),
-            "probe_parameterization": "fixed_z_boundary_simplex_v2",
+            "probe_parameterization": "fixed_z_boundary_simplex_v3",
             "focality_transform": "tangent_removed_bernoulli_log_pgf_v2",
             "normalization": "frozen_baseline_atom_mass_per_scale_boundary",
-            "correction_parameterization": (
-                "shared_v3_scale_simplex_bounded_nonnegative_gain_v2"
+            "transport_parameterization": (
+                "bounded_gain_threshold_slope_signed_adjacent_odds_v3"
             ),
-            "correction_cap": self.paths_refiner.correction_cap,
-            "gain_init": self.paths_refiner.gain_init,
+            "transport_gain_cap": self.paths_refiner.transport_gain_cap,
+            "transport_gain_init": self.paths_refiner.transport_gain_init,
+            "transport_threshold_init": (
+                self.paths_refiner.transport_threshold_init
+            ),
+            "transport_slope_init": self.paths_refiner.transport_slope_init,
+            "transport_slope_cap": self.paths_refiner.transport_slope_cap,
             "strength": self.paths_refiner.strength,
-            "continuation_decoder": "fp64_conditional_stick_breaking_v1",
-            "local_correction_layout": "NHW(K-1)",
+            "transport_decoder": "fp64_row_stochastic_tridiagonal_markov_v1",
+            "continuation_decoder": "fp64_replay_of_transported_posterior_v1",
+            "local_transport_layout": "NHW(K-1)",
+            "mass_conservation": "exact_row_stochastic_posterior_transport",
+            "maximum_grade_jump": 1,
             "intervention": (
-                "joint_stored_rate_and_frozen_mass_focality_ledger_deletion"
+                "joint_stored_rate_and_frozen_mass_focality_ledger_deletion_"
+                "with_exact_transport_recompilation"
             ),
             "no_classifier_bypass": True,
         }
@@ -1031,12 +1368,14 @@ def build_paths_model(**kwargs) -> PathsModel:
 
 
 __all__ = [
+    "PathsAdjacentTransportDistribution",
     "PathsContinuationDistribution",
     "PathsContinuationRefiner",
     "PathsInterventionOutput",
     "PathsModel",
     "PathsOutput",
     "PathsScaleSpectrum",
+    "apply_signed_adjacent_transport",
     "build_paths_model",
     "continuation_logits_from_log_probs",
     "decode_continuation_logits",

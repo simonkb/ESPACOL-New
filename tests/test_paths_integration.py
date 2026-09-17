@@ -12,7 +12,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 from configs.origin_config import OriginConfig
-from configs.paths_config import PathsConfig
+from configs.paths_config import PATHS_PROTOCOL_VERSION, PathsConfig
 from models.origin import ConservedOrdinalGenerator, OriginModel, decode_pure_birth_rates
 from models.origin_encoder import (
     OriginEncoderOutput,
@@ -22,6 +22,7 @@ from models.origin_encoder import (
 from models.paths import (
     PathsContinuationRefiner,
     PathsModel,
+    apply_signed_adjacent_transport,
     continuation_logits_from_log_probs,
     decode_continuation_logits,
     replay_paths_without,
@@ -93,6 +94,13 @@ def _source_checkpoint(path: Path, *, split: str = "split-a") -> str:
             "mae": 0.18,
             "balanced_acc": 60.0,
             "macro_f1": 0.60,
+            "confusion": [
+                [10, 0, 0, 0, 0],
+                [0, 10, 0, 0, 0],
+                [0, 0, 10, 0, 0],
+                [0, 0, 0, 10, 0],
+                [0, 0, 0, 0, 10],
+            ],
         },
         "likelihood_component_unweighted": True,
         "population_objective_proper": True,
@@ -103,6 +111,11 @@ def _source_checkpoint(path: Path, *, split: str = "split-a") -> str:
 
 def test_paths_config_rejects_protocol_drift() -> None:
     cfg = PathsConfig()
+    assert cfg.paths_variant == "signed_transport"
+    assert cfg.transport_gain_cap == 1.0
+    assert cfg.transport_threshold_init == 0.5
+    assert cfg.transport_slope_init == 2.0
+    assert cfg.transport_slope_cap == 8.0
     assert cfg.evidence_scales == ("s4", "s8", "s16", "s32")
     assert cfg.class_weighting == "none"
     assert cfg.stratified_batches is False
@@ -141,9 +154,12 @@ def test_v3_warm_start_is_hash_split_architecture_and_state_strict(tmp_path) -> 
     model = PathsModel(
         **_model_kwargs(),
         paths_probe_z=cfg.pgf_probes,
-        paths_correction_cap=cfg.correction_cap,
-        paths_gain_init=cfg.correction_gain_init,
-        paths_strength=cfg.correction_strength,
+        paths_transport_gain_cap=cfg.transport_gain_cap,
+        paths_transport_gain_init=cfg.transport_gain_init,
+        paths_transport_threshold_init=cfg.transport_threshold_init,
+        paths_transport_slope_init=cfg.transport_slope_init,
+        paths_transport_slope_cap=cfg.transport_slope_cap,
+        paths_strength=cfg.transport_strength,
     )
     provenance = load_audited_origin_v3_warm_start(
         model, cfg, fold=0, split_signature="split-a"
@@ -197,9 +213,12 @@ def test_trainer_fixes_risk_weights_from_training_fold_labels_only(tmp_path) -> 
     model = PathsModel(
         **_model_kwargs(),
         paths_probe_z=cfg.pgf_probes,
-        paths_correction_cap=cfg.correction_cap,
-        paths_gain_init=cfg.correction_gain_init,
-        paths_strength=cfg.correction_strength,
+        paths_transport_gain_cap=cfg.transport_gain_cap,
+        paths_transport_gain_init=cfg.transport_gain_init,
+        paths_transport_threshold_init=cfg.transport_threshold_init,
+        paths_transport_slope_init=cfg.transport_slope_init,
+        paths_transport_slope_cap=cfg.transport_slope_cap,
+        paths_strength=cfg.transport_strength,
     )
     trainer = PathsTrainer(
         model,
@@ -269,9 +288,12 @@ def test_paths_checkpoint_transaction_and_resume_match_parent_protocol(tmp_path)
         model = PathsModel(
             **_model_kwargs(),
             paths_probe_z=cfg.pgf_probes,
-            paths_correction_cap=cfg.correction_cap,
-            paths_gain_init=cfg.correction_gain_init,
-            paths_strength=cfg.correction_strength,
+            paths_transport_gain_cap=cfg.transport_gain_cap,
+            paths_transport_gain_init=cfg.transport_gain_init,
+            paths_transport_threshold_init=cfg.transport_threshold_init,
+            paths_transport_slope_init=cfg.transport_slope_init,
+            paths_transport_slope_cap=cfg.transport_slope_cap,
+            paths_strength=cfg.transport_strength,
         )
         return PathsTrainer(
             model,
@@ -305,7 +327,8 @@ def test_paths_checkpoint_transaction_and_resume_match_parent_protocol(tmp_path)
     assert prepared.is_file()
     assert not trainer.best_path.exists()
     selected = torch.load(prepared, map_location="cpu", weights_only=False)
-    assert selected["schema"] == "paths-checkpoint-v2"
+    assert selected["schema"] == "paths-checkpoint-v3-sapt"
+    assert selected["paths_variant"] == "signed_transport"
     assert selected["checkpoint_role"] == "paths_selected_learned"
     assert selected["warm_start_provenance"] is None
     assert selected["paths_warm_start_provenance"] == (
@@ -336,7 +359,8 @@ def test_paths_checkpoint_transaction_and_resume_match_parent_protocol(tmp_path)
         checkpoint_transaction=transaction,
     )
     last = torch.load(trainer.last_path, map_location="cpu", weights_only=False)
-    assert last["schema"] == "paths-checkpoint-v2"
+    assert last["schema"] == "paths-checkpoint-v3-sapt"
+    assert last["paths_variant"] == "signed_transport"
     assert last["checkpoint_role"] == "resume_state"
     trainer._validate_resume(last, recover_transaction=True)
     assert trainer.best_path.is_file()
@@ -344,13 +368,14 @@ def test_paths_checkpoint_transaction_and_resume_match_parent_protocol(tmp_path)
     assert hashlib.sha256(trainer.best_path.read_bytes()).hexdigest() == prepared_hash
 
     learned = trainer._materialize_best_learned_checkpoint()
-    assert learned["checkpoint_role"] == "best_learned"
+    assert learned["checkpoint_role"] == "paths_selected_learned"
     assert learned["epoch"] == selected["epoch"]
     assert learned["metrics"] == selected["metrics"]
     stored_learned = torch.load(
         trainer.best_learned_path, map_location="cpu", weights_only=False
     )
-    assert stored_learned["checkpoint_role"] == "best_learned"
+    assert stored_learned["checkpoint_role"] == "paths_selected_learned"
+    assert trainer.best_learned_path.read_bytes() == trainer.best_path.read_bytes()
     for name, value in selected["model_state"].items():
         torch.testing.assert_close(stored_learned["model_state"][name], value)
 
@@ -404,7 +429,11 @@ def _joint_output():
     ).eval()
     base = generator(encoded, force_decoder_fp64=True)
     return PathsContinuationRefiner(
-        4, ("s4",), probe_z=(0.1, 0.5, 0.9), correction_cap=3.0
+        4,
+        ("s4",),
+        probe_z=(0.1, 0.5, 0.9),
+        transport_gain_cap=1.0,
+        transport_gain_init=0.1,
     )(base)
 
 
@@ -416,21 +445,27 @@ def test_joint_audit_certifies_final_not_base_only_replay() -> None:
     audit = audit_paths_joint_replay(baseline, intervention)
     for name in (
         "rate_replay_error",
+        "concentration_replay_error",
         "correction_replay_error",
         "baseline_joint_logit_error",
         "replayed_joint_logit_error",
         "baseline_posterior_replay_error",
         "replayed_posterior_replay_error",
+        "transport_matrix_row_sum_error",
+        "transport_non_adjacent_max_abs",
+        "baseline_transport_posterior_error",
+        "replayed_transport_posterior_error",
     ):
         assert audit[name] < 1e-10
     assert audit["final_correction_max_abs"] > 0.0
     assert audit["removed_correction_max_abs"] > 0.0
+    assert audit["transport_effect_max_abs"] > 0.0
 
 
 def _synthetic_rank_output(
     *,
     cell_rate: float = 2.0,
-    correction: float = 0.0,
+    concentration: float = 0.0,
 ) -> SimpleNamespace:
     """Small exact ledger with two tied valid cells and one invalid distractor."""
 
@@ -439,24 +474,41 @@ def _synthetic_rank_output(
         [[[[cell_rate] * boundaries, [cell_rate] * boundaries, [99.0] * boundaries]]],
         dtype=torch.float64,
     )
-    corrections = torch.tensor(
-        [[[[correction] * boundaries, [correction] * boundaries, [99.0] * boundaries]]],
+    local_transport = torch.tensor(
+        [[[[concentration] * boundaries, [concentration] * boundaries, [99.0] * boundaries]]],
         dtype=torch.float64,
     )
     valid = torch.tensor([[[True, True, False]]])
     valid_rates = rates * valid.unsqueeze(-1)
-    valid_corrections = corrections * valid.unsqueeze(-1)
+    valid_transport = local_transport * valid.unsqueeze(-1)
     total_rates = valid_rates.sum(dim=(1, 2)) + 1e-4
-    boundary_correction = valid_corrections.sum(dim=(1, 2))
+    boundary_concentration = valid_transport.sum(dim=(1, 2))
     base = decode_pure_birth_rates(total_rates, force_fp64=True)
     base_logits = continuation_logits_from_log_probs(base.log_class_probs)
-    final = decode_continuation_logits(base_logits + boundary_correction)
+    thresholds = torch.full((boundaries,), 0.5, dtype=torch.float64)
+    slopes = torch.full((boundaries,), 2.0, dtype=torch.float64)
+    gains = torch.full((boundaries,), 0.25, dtype=torch.float64)
+    transported = apply_signed_adjacent_transport(
+        base.class_probs,
+        boundary_concentration,
+        thresholds,
+        slopes,
+        gains,
+        strength=1.0,
+    )
+    final_logits = continuation_logits_from_log_probs(transported.class_probs.log())
+    final = decode_continuation_logits(final_logits)
     return SimpleNamespace(
         local_rate_maps={"s4": valid_rates},
-        local_correction_maps={"s4": valid_corrections},
+        local_transport_maps={"s4": valid_transport},
         valid_masks={"s4": valid},
         total_rates=total_rates,
-        boundary_correction=boundary_correction,
+        boundary_concentration=boundary_concentration,
+        transport_thresholds=thresholds,
+        transport_slopes=slopes,
+        transport_gains=gains,
+        strength=1.0,
+        boundary_correction=final_logits - base_logits,
         base_continuation_logits=base_logits,
         continuation_logits=final.continuation_logits,
         class_probs=final.class_probs,
@@ -474,7 +526,7 @@ def _synthetic_rank_output(
 def test_singleton_ranker_matches_brute_replay_and_ties_are_deterministic(
     decision_rule: str,
 ) -> None:
-    output = _synthetic_rank_output(correction=0.0)
+    output = _synthetic_rank_output(concentration=0.0)
     ranked = rank_paths_singleton_witnesses(
         output, decision_rule=decision_rule, chunk_size=1
     )[0]
@@ -503,14 +555,20 @@ def test_singleton_ranker_matches_brute_replay_and_ties_are_deterministic(
     )[0]
     for flat in (0, 1):
         removed_rate = output.local_rate_maps["s4"].reshape(-1, 4)[flat]
-        removed_correction = output.local_correction_maps["s4"].reshape(-1, 4)[flat]
+        removed_concentration = output.local_transport_maps["s4"].reshape(-1, 4)[flat]
         replay_base = decode_pure_birth_rates(
             output.total_rates - removed_rate.unsqueeze(0), force_fp64=True
         )
-        replay_logits = (
-            continuation_logits_from_log_probs(replay_base.log_class_probs)
-            + output.boundary_correction
-            - removed_correction.unsqueeze(0)
+        replay_transport = apply_signed_adjacent_transport(
+            replay_base.class_probs,
+            output.boundary_concentration - removed_concentration.unsqueeze(0),
+            output.transport_thresholds,
+            output.transport_slopes,
+            output.transport_gains,
+            strength=output.strength,
+        )
+        replay_logits = continuation_logits_from_log_probs(
+            replay_transport.class_probs.log()
         )
         replay = decode_continuation_logits(replay_logits)
         base_log = output.log_class_probs[0, target]
@@ -534,7 +592,7 @@ def test_singleton_ranker_matches_brute_replay_and_ties_are_deterministic(
 
 
 def test_singleton_ranker_reports_when_no_positive_supporter_exists() -> None:
-    output = _synthetic_rank_output(cell_rate=0.005, correction=0.0)
+    output = _synthetic_rank_output(cell_rate=0.005, concentration=0.0)
     ranked = rank_paths_singleton_witnesses(
         output, decision_rule="class_map", chunk_size=2
     )[0]
@@ -557,7 +615,7 @@ def test_target_logprob_boundary_contributions_are_exact(grade: int) -> None:
     torch.testing.assert_close(contributions.sum(), exact, atol=1e-14, rtol=0.0)
 
 
-def test_certificate_v2_serializes_exact_final_predictor_and_geometry(tmp_path) -> None:
+def test_certificate_v3_sapt_serializes_exact_transport_and_geometry(tmp_path) -> None:
     baseline = _joint_output()
 
     class _ReplayModel(nn.Module):
@@ -581,6 +639,7 @@ def test_certificate_v2_serializes_exact_final_predictor_and_geometry(tmp_path) 
     )
     trainer.use_amp = False
     trainer.decision_rule = "rounded_expected"
+    trainer.paths_variant = "signed_transport"
     trainer.num_classes = 5
     trainer.fold = 0
     trainer.split_signature = "split-a"
@@ -596,10 +655,35 @@ def test_certificate_v2_serializes_exact_final_predictor_and_geometry(tmp_path) 
     trainer._forward = lambda images, pixel_mask: baseline
 
     payload = trainer._write_validation_certificates(checkpoint_epoch=7)
-    assert payload["schema"] == "paths-exact-joint-validation-certificates-v2"
+    assert payload["schema"] == "paths-exact-joint-validation-certificates-v3-sapt"
+    assert payload["protocol"] == PATHS_PROTOCOL_VERSION
+    assert payload["paths_variant"] == "signed_transport"
+    assert "pgf_concentration" in payload["interpretation_scope"]
+    assert "signed_adjacent_transport" in payload["interpretation_scope"]
+    assert "pgf_correction" not in payload["interpretation_scope"]
     assert payload["certifies_final_paths_prediction"] is True
     assert payload["singleton_ranking_canonical_replay_max_abs_error"] < 2e-5
     assert payload["faithfulness_audit"]["paired_sample_count"] == 2
+    audit = payload["joint_replay_audit"]
+    for key in (
+        "rate_replay_error",
+        "concentration_replay_error",
+        "correction_replay_error",
+        "baseline_joint_logit_error",
+        "replayed_joint_logit_error",
+        "baseline_posterior_replay_error",
+        "replayed_posterior_replay_error",
+        "transport_matrix_row_sum_error",
+        "transport_non_adjacent_max_abs",
+        "baseline_transport_posterior_error",
+        "replayed_transport_posterior_error",
+        "baseline_flow_reconstruction_error",
+        "replayed_flow_reconstruction_error",
+        "net_boundary_flow_replay_error",
+    ):
+        assert audit[key] < 2e-5
+    assert audit["transport_matrix_minimum"] >= -2e-5
+    assert audit["transport_effect_max_abs"] > 0.0
     certificate = payload["certificates"][0]
     selected = certificate["selected_positive_supporter"]
     assert selected is not None
@@ -607,6 +691,81 @@ def test_certificate_v2_serializes_exact_final_predictor_and_geometry(tmp_path) 
     assert isinstance(selected["touches_padding"], bool)
     assert isinstance(selected["covers_entire_input"], bool)
     assert isinstance(selected["global_support"], bool)
+    for key in (
+        "removed_base_boundary_rates",
+        "removed_boundary_concentration",
+        "removed_net_boundary_flow",
+        "removed_boundary_correction",
+        "baseline_boundary_concentration",
+        "replayed_boundary_concentration",
+        "baseline_transport_direction",
+        "replayed_transport_direction",
+        "baseline_net_boundary_flow",
+        "replayed_net_boundary_flow",
+        "base_boundary_logit_delta",
+        "correction_boundary_logit_delta",
+        "final_boundary_logit_delta",
+    ):
+        assert len(selected[key]) == 4
+    for key in ("baseline_transport_matrix", "replayed_transport_matrix"):
+        assert len(selected[key]) == 5
+        assert all(len(row) == 5 for row in selected[key])
     assert selected["target_log_probability_contribution_error"] < 2e-5
     assert certificate["deterministic_scale_matched_random"] is not None
     assert trainer.certificate_path.is_file()
+
+
+def test_full_validation_transport_audit_aggregates_all_batches() -> None:
+    def output(flow: list[float], concentration: list[float]):
+        base = torch.tensor(
+            [[0.40, 0.25, 0.18, 0.10, 0.07]], dtype=torch.float64
+        )
+        final = torch.tensor(
+            [[0.38, 0.26, 0.19, 0.10, 0.07]], dtype=torch.float64
+        )
+        return SimpleNamespace(
+            net_boundary_flow=torch.tensor([flow], dtype=torch.float64),
+            boundary_concentration=torch.tensor(
+                [concentration], dtype=torch.float64
+            ),
+            transport_direction=torch.tanh(
+                torch.tensor([concentration], dtype=torch.float64) - 0.5
+            ),
+            transport_matrix=torch.eye(5, dtype=torch.float64).unsqueeze(0),
+            class_probs=final,
+            base_output=SimpleNamespace(class_probs=base),
+        )
+
+    outputs = iter(
+        (
+            output([0.01, 0.0, -0.02, 0.03], [0.2, 0.4, 0.6, 0.8]),
+            output([-0.01, 0.02, 0.0, -0.04], [0.3, 0.5, 0.7, 0.9]),
+        )
+    )
+    trainer = PathsTrainer.__new__(PathsTrainer)
+    trainer.paths_variant = "signed_transport"
+    trainer.model = nn.Identity()
+    trainer.use_amp = False
+    trainer.val_loader = [
+        (torch.zeros(1, 3, 4, 4), None, torch.tensor([0]), torch.tensor([1])),
+        (torch.zeros(1, 3, 4, 4), None, torch.tensor([1]), torch.tensor([2])),
+    ]
+    trainer._unpack_batch = lambda batch: batch
+    trainer._forward = lambda images, pixel_mask: next(outputs)
+
+    audit = trainer._evaluate_validation_transport()
+    assert audit["sample_count"] == 2
+    assert audit["boundary_value_count"] == 8
+    assert audit["positive_upward_flow_count"] == 3
+    assert audit["negative_downward_flow_count"] == 3
+    assert audit["near_zero_flow_count"] == 2
+    assert audit["bidirectional_flow_observed"] is True
+    assert audit["transport_active"] is True
+    assert audit["transport_matrix_row_sum_error"] == 0.0
+    assert audit["transport_non_adjacent_max_abs"] == 0.0
+    assert audit["posterior_mass_error"] < 1e-12
+
+    trainer.paths_variant = "risk_objective_v3"
+    control = trainer._evaluate_validation_transport()
+    assert control["transport_active"] is False
+    assert control["reason"] == "matched_strength_zero_control"

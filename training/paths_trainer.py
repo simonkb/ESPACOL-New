@@ -6,7 +6,8 @@ checkpointing, scheduler, and metric loop.  This module changes four things:
 * a hash-bound, architecture-audited ORIGIN-v3 warm start is mandatory;
 * the objective is the proper training-risk-set score in ``losses.paths``;
 * three differential-learning-rate groups protect the audited warm start; and
-* certificates replay both the V3 rate ledger and PATHS focality ledger.
+* certificates replay both the V3 rate ledger and PATHS concentration ledger,
+  including the signed adjacent-grade transport compiled from that ledger.
 
 A base-only replay is never labelled a PATHS certificate.
 """
@@ -17,6 +18,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -28,8 +30,10 @@ import torch.nn.functional as F
 from torch.amp import autocast
 
 from losses.paths import PathsLoss
+from configs.paths_config import PATHS_PROTOCOL_VERSION
 from models.origin import decode_pure_birth_rates
 from models.paths import (
+    apply_signed_adjacent_transport,
     continuation_logits_from_log_probs,
     decode_continuation_logits,
 )
@@ -60,6 +64,11 @@ _PATHS_IMPLEMENTATION_FILES = (
     "training/origin_trainer.py",
     "training/paths_trainer.py",
     "train_paths.py",
+    "scripts/submit_paths_preflight.sh",
+    "scripts/submit_paths_aptos_f0.sh",
+    "scripts/submit_paths_aptos_control_f0.sh",
+    "scripts/submit_paths_aptos_gate.sh",
+    "scripts/submit_paths_dr_f0.sh",
     "utils/spatial_mask.py",
 )
 
@@ -247,12 +256,21 @@ def load_audited_origin_v3_warm_start(
     if not isinstance(metrics, Mapping):
         raise ValueError("ORIGIN-v3 checkpoint has no validation metrics")
     required_metrics = ("acc", "qwk", "mae", "balanced_acc", "macro_f1")
-    source_metrics: dict[str, float] = {}
+    source_metrics: dict[str, Any] = {}
     for name in required_metrics:
         value = float(metrics.get(name, math.nan))
         if not math.isfinite(value):
             raise ValueError(f"ORIGIN-v3 source metric {name!r} is missing/non-finite")
         source_metrics[name] = value
+    confusion = metrics.get("confusion")
+    if (
+        not isinstance(confusion, Sequence)
+        or len(confusion) != int(getattr(cfg, "n_classes"))
+    ):
+        raise ValueError("ORIGIN-v3 source confusion matrix is missing/malformed")
+    source_metrics["confusion"] = [
+        [int(value) for value in row] for row in confusion
+    ]
     return {
         "schema": "paths-audited-origin-v3-warm-start-v1",
         "source_checkpoint": str(checkpoint),
@@ -370,8 +388,12 @@ def _candidate_metrics(
     *,
     base_total_rates: torch.Tensor,
     removed_rates: torch.Tensor,
-    base_boundary_correction: torch.Tensor,
-    removed_correction: torch.Tensor,
+    base_boundary_concentration: torch.Tensor,
+    removed_concentration: torch.Tensor,
+    transport_thresholds: torch.Tensor,
+    transport_slopes: torch.Tensor,
+    transport_gains: torch.Tensor,
+    transport_strength: float,
     target_grade: int,
     decision_rule: str,
     baseline_margin: torch.Tensor,
@@ -391,11 +413,28 @@ def _candidate_metrics(
             f"singleton removal produced a negative base rate ({minimum:g})"
         )
     base_replay = decode_pure_birth_rates(candidate_rates, force_fp64=True)
-    base_logits = continuation_logits_from_log_probs(base_replay.log_class_probs)
-    final_logits = (
-        base_logits
-        + base_boundary_correction.unsqueeze(0).to(torch.float64)
-        - removed_correction.to(torch.float64)
+    candidate_concentration = (
+        base_boundary_concentration.unsqueeze(0).to(torch.float64)
+        - removed_concentration.to(torch.float64)
+    )
+    tolerance = 128.0 * torch.finfo(candidate_concentration.dtype).eps
+    if bool((candidate_concentration < -tolerance).any()) or bool(
+        (candidate_concentration > 1.0 + tolerance).any()
+    ):
+        raise FloatingPointError(
+            "singleton removal produced an invalid transport concentration"
+        )
+    candidate_concentration = candidate_concentration.clamp(0.0, 1.0)
+    transported = apply_signed_adjacent_transport(
+        base_replay.class_probs,
+        candidate_concentration,
+        transport_thresholds,
+        transport_slopes,
+        transport_gains,
+        strength=float(transport_strength),
+    )
+    final_logits = continuation_logits_from_log_probs(
+        transported.class_probs.log()
     )
     final_replay = decode_continuation_logits(final_logits)
     margin = _fixed_grade_decision_margin(
@@ -433,12 +472,12 @@ def rank_paths_singleton_witnesses(
     if not math.isfinite(positive_tolerance) or positive_tolerance < 0.0:
         raise ValueError("positive_tolerance must be finite and non-negative")
     local_rates = _mapping_field(output, "local_rate_maps")
-    local_corrections = _mapping_field(output, "local_correction_maps")
+    local_transport = _mapping_field(output, "local_transport_maps")
     valid_masks = _mapping_field(output, "valid_masks")
-    if set(local_rates) != set(local_corrections) or set(local_rates) != set(
+    if set(local_rates) != set(local_transport) or set(local_rates) != set(
         valid_masks
     ):
-        raise ValueError("PATHS rate, correction, and validity scales differ")
+        raise ValueError("PATHS rate, transport, and validity scales differ")
     # ORIGIN emits scales in the audited increasing-stride order. Preserve
     # that order; lexicographic sorting would incorrectly place s16 before s4.
     scale_order = tuple(str(name) for name in local_rates)
@@ -448,7 +487,11 @@ def rank_paths_singleton_witnesses(
     expected = _tensor_field(output, "expected_grade")
     predictions = _decision_grade(output, decision_rule)
     total_rates = _tensor_field(output, "total_rates")
-    correction = _tensor_field(output, "boundary_correction")
+    concentration = _tensor_field(output, "boundary_concentration")
+    thresholds = _tensor_field(output, "transport_thresholds")
+    slopes = _tensor_field(output, "transport_slopes")
+    gains = _tensor_field(output, "transport_gains")
+    strength = float(_field(output, "strength"))
     batch_size = int(class_probs.shape[0])
     requested = (
         tuple(range(batch_size))
@@ -475,21 +518,25 @@ def rank_paths_singleton_witnesses(
         valid_count = 0
         for scale_rank, scale in enumerate(scale_order):
             rates = local_rates[scale][sample]
-            corrections = local_corrections[scale][sample]
+            transport = local_transport[scale][sample]
             valid = valid_masks[scale][sample].bool()
-            if rates.shape[:-1] != valid.shape or corrections.shape != rates.shape:
+            if rates.shape[:-1] != valid.shape or transport.shape != rates.shape:
                 raise ValueError(f"PATHS singleton ledger shape mismatch at {scale!r}")
             flat_valid = torch.nonzero(valid.reshape(-1), as_tuple=False).flatten()
             valid_count += int(flat_valid.numel())
             flat_rates = rates.reshape(-1, rates.shape[-1])
-            flat_corrections = corrections.reshape(-1, corrections.shape[-1])
+            flat_transport = transport.reshape(-1, transport.shape[-1])
             for start in range(0, int(flat_valid.numel()), chunk_size):
                 indices = flat_valid[start : start + chunk_size]
                 margin_drop, log_prob_drop = _candidate_metrics(
                     base_total_rates=total_rates[sample],
                     removed_rates=flat_rates.index_select(0, indices),
-                    base_boundary_correction=correction[sample],
-                    removed_correction=flat_corrections.index_select(0, indices),
+                    base_boundary_concentration=concentration[sample],
+                    removed_concentration=flat_transport.index_select(0, indices),
+                    transport_thresholds=thresholds,
+                    transport_slopes=slopes,
+                    transport_gains=gains,
+                    transport_strength=strength,
                     target_grade=target,
                     decision_rule=decision_rule,
                     baseline_margin=base_margin,
@@ -687,15 +734,25 @@ def audit_paths_joint_replay(
     baseline: object,
     intervention: object,
 ) -> dict[str, float]:
-    """Audit rate, correction, continuation, and posterior replay identities."""
+    """Audit V3 rate, focality ledger, transport, and posterior identities."""
 
     replayed = _field(intervention, "output")
     removed_rates = _field(intervention, "removed_rates")
+    removed_concentration = _field(
+        intervention, "removed_boundary_concentration"
+    )
+    removed_flow = _field(intervention, "removed_net_boundary_flow")
     removed_correction = _field(intervention, "removed_boundary_correction")
     base_rates = _tensor_field(baseline, "total_rates")
     replay_rates = _tensor_field(replayed, "total_rates")
     base_correction = _tensor_field(baseline, "boundary_correction")
     replay_correction = _tensor_field(replayed, "boundary_correction")
+    base_concentration = _tensor_field(baseline, "boundary_concentration")
+    replay_concentration = _tensor_field(replayed, "boundary_concentration")
+    base_transport = _tensor_field(baseline, "transport_matrix")
+    replay_transport = _tensor_field(replayed, "transport_matrix")
+    base_flow = _tensor_field(baseline, "net_boundary_flow")
+    replay_flow = _tensor_field(replayed, "net_boundary_flow")
     # Use the stored FP64 base logits rather than reconstructing them from
     # probability-space tails, which can underflow for rare grades.
     base_logits = _tensor_field(baseline, "base_continuation_logits")
@@ -709,12 +766,67 @@ def audit_paths_joint_replay(
     )
     posterior = continuation_posterior_from_logits(final_logits)
     replay_posterior = continuation_posterior_from_logits(replay_logits)
+    base_v3_probs = _tensor_field(_field(baseline, "base_output"), "class_probs")
+    replay_v3_probs = _tensor_field(_field(replayed, "base_output"), "class_probs")
+    transported = torch.matmul(
+        base_v3_probs.to(torch.float64).unsqueeze(-2), base_transport
+    ).squeeze(-2)
+    replay_transported = torch.matmul(
+        replay_v3_probs.to(torch.float64).unsqueeze(-2), replay_transport
+    ).squeeze(-2)
+    row_sum_error = max(
+        float((base_transport.sum(dim=-1) - 1.0).abs().max().detach().cpu()),
+        float((replay_transport.sum(dim=-1) - 1.0).abs().max().detach().cpu()),
+    )
+    grade_axis = torch.arange(
+        base_transport.shape[-1], device=base_transport.device
+    )
+    non_adjacent = (grade_axis[:, None] - grade_axis[None, :]).abs() > 1
+    if bool(non_adjacent.any()):
+        non_adjacent_max = max(
+            float(base_transport[..., non_adjacent].abs().max().detach().cpu()),
+            float(replay_transport[..., non_adjacent].abs().max().detach().cpu()),
+        )
+    else:
+        non_adjacent_max = 0.0
+
+    def _flow_replay_error(
+        source: torch.Tensor,
+        transported_probs: torch.Tensor,
+        flow: torch.Tensor,
+    ) -> float:
+        delta = torch.cat(
+            (
+                -flow[..., :1],
+                flow[..., :-1] - flow[..., 1:],
+                flow[..., -1:],
+            ),
+            dim=-1,
+        )
+        return float(
+            (transported_probs - source.to(torch.float64) - delta)
+            .abs()
+            .max()
+            .detach()
+            .cpu()
+        )
     return {
         "rate_replay_error": float(
             (base_rates - removed_rates - replay_rates).abs().max().detach().cpu()
         ),
         "correction_replay_error": float(
             (base_correction - removed_correction - replay_correction)
+            .abs()
+            .max()
+            .detach()
+            .cpu()
+        ),
+        "concentration_replay_error": float(
+            (
+                base_concentration
+                - removed_concentration
+                - replay_concentration
+            )
             .abs()
             .max()
             .detach()
@@ -739,6 +851,59 @@ def audit_paths_joint_replay(
             .max()
             .detach()
             .cpu()
+        ),
+        "transport_matrix_row_sum_error": row_sum_error,
+        "transport_matrix_minimum": float(
+            torch.minimum(base_transport.min(), replay_transport.min())
+            .detach()
+            .cpu()
+        ),
+        "transport_non_adjacent_max_abs": non_adjacent_max,
+        "baseline_transport_posterior_error": float(
+            (transported - _tensor_field(baseline, "class_probs"))
+            .abs()
+            .max()
+            .detach()
+            .cpu()
+        ),
+        "replayed_transport_posterior_error": float(
+            (replay_transported - _tensor_field(replayed, "class_probs"))
+            .abs()
+            .max()
+            .detach()
+            .cpu()
+        ),
+        "transport_effect_max_abs": float(
+            (
+                _tensor_field(baseline, "class_probs")
+                - base_v3_probs
+            )
+            .abs()
+            .max()
+            .detach()
+            .cpu()
+        ),
+        "net_boundary_flow_min": float(base_flow.min().detach().cpu()),
+        "net_boundary_flow_max": float(base_flow.max().detach().cpu()),
+        "baseline_flow_reconstruction_error": _flow_replay_error(
+            base_v3_probs,
+            _tensor_field(baseline, "class_probs"),
+            base_flow,
+        ),
+        "replayed_flow_reconstruction_error": _flow_replay_error(
+            replay_v3_probs,
+            _tensor_field(replayed, "class_probs"),
+            replay_flow,
+        ),
+        "net_boundary_flow_replay_error": float(
+            (base_flow - removed_flow - replay_flow)
+            .abs()
+            .max()
+            .detach()
+            .cpu()
+        ),
+        "removed_net_boundary_flow_max_abs": float(
+            removed_flow.abs().max().detach().cpu()
         ),
         "final_correction_max_abs": float(base_correction.abs().max().detach().cpu()),
         "removed_correction_max_abs": float(
@@ -836,12 +1001,23 @@ class PathsTrainer(OriginTrainer):
         self.correction_only_epochs = int(
             getattr(cfg, "correction_only_epochs", 0)
         )
+        self.paths_variant = str(getattr(cfg, "paths_variant", "signed_transport"))
+        if self.paths_variant not in {"signed_transport", "risk_objective_v3"}:
+            raise ValueError(f"unsupported PATHS variant {self.paths_variant!r}")
         self.implementation_signature = paths_implementation_signature()
         self.architecture = _architecture_record(self.model)
         self.architecture_signature = _canonical_sha256(self.architecture)
         self.critical_config = _critical_config(cfg)
         self.config_signature = _canonical_sha256(self.critical_config)
-        self.checkpoint_schema = "paths-checkpoint-v2"
+        self.run_git_commit = os.environ.get("PATHS_RUN_GIT_COMMIT")
+        if self.run_git_commit is not None:
+            commit = self.run_git_commit.lower()
+            if len(commit) not in {40, 64} or any(
+                character not in "0123456789abcdef" for character in commit
+            ):
+                raise ValueError("PATHS_RUN_GIT_COMMIT must be a hexadecimal commit id")
+            self.run_git_commit = commit
+        self.checkpoint_schema = "paths-checkpoint-v3-sapt"
         self.base_control_path = self.run_dir / "v3_strength_zero_control.json"
         self.best_learned_path = self.run_dir / "best_learned.pth"
 
@@ -920,7 +1096,7 @@ class PathsTrainer(OriginTrainer):
         correction_only = epoch <= self.correction_only_epochs
         for name, parameter in self.model.named_parameters():
             if name.startswith("paths_refiner."):
-                parameter.requires_grad_(True)
+                parameter.requires_grad_(self.paths_variant == "signed_transport")
             else:
                 parameter.requires_grad_(not correction_only)
         encoder = getattr(self.model, "encoder", None)
@@ -977,7 +1153,9 @@ class PathsTrainer(OriginTrainer):
         payload.update(
             {
                 "schema": self.checkpoint_schema,
-                "paths_protocol_version": "paths-v2",
+                "paths_protocol_version": PATHS_PROTOCOL_VERSION,
+                "paths_variant": self.paths_variant,
+                "run_git_commit": self.run_git_commit,
                 "checkpoint_role": selected_role,
                 "warm_start_provenance": None,
                 "paths_warm_start_provenance": self.paths_warm_start_provenance,
@@ -989,7 +1167,7 @@ class PathsTrainer(OriginTrainer):
                 "correction_only_epochs": self.correction_only_epochs,
                 "optimizer_group_contract": self.optimizer_group_contract,
                 "training_phase": (
-                    "paths_correction_only"
+                    "paths_refiner_only"
                     if 1 <= int(epoch) <= self.correction_only_epochs
                     else "paths_joint"
                 ),
@@ -1016,22 +1194,21 @@ class PathsTrainer(OriginTrainer):
             raise ValueError(
                 "selected PATHS checkpoint does not declare its learned role"
             )
-        learned_state = dict(state)
-        learned_state["checkpoint_role"] = "best_learned"
-        learned_state["best_learned_selection_key"] = state.get(
-            "best_selection_key"
-        )
-        learned_state["best_learned_epoch"] = int(state["epoch"])
         temporary = self.best_learned_path.with_name(
             f".{self.best_learned_path.name}.{os.getpid()}.tmp"
         )
         try:
-            torch.save(learned_state, temporary)
+            # PATHS has one learned selection track.  Keep a separately named
+            # artifact for paired-control tooling, but make it a byte-exact
+            # alias rather than mutating and reserializing checkpoint metadata.
+            shutil.copyfile(self.best_path, temporary)
             os.replace(temporary, self.best_learned_path)
         finally:
             if temporary.exists():
                 temporary.unlink()
-        return learned_state
+        if _file_sha256(self.best_learned_path) != _file_sha256(self.best_path):
+            raise AssertionError("best_learned.pth is not a byte-exact best.pth alias")
+        return state
 
     def _validate_resume(
         self,
@@ -1042,9 +1219,13 @@ class PathsTrainer(OriginTrainer):
         # Authenticate PATHS-owned fields before allowing the parent to act on
         # a recorded filesystem transaction.
         if state.get("schema") != self.checkpoint_schema:
-            raise ValueError("PATHS resume requires a paths-checkpoint-v2 checkpoint")
-        if state.get("paths_protocol_version") != "paths-v2":
+            raise ValueError("PATHS resume requires a paths-checkpoint-v3-sapt checkpoint")
+        if state.get("paths_protocol_version") != PATHS_PROTOCOL_VERSION:
             raise ValueError("PATHS resume protocol mismatch")
+        if state.get("paths_variant") != self.paths_variant:
+            raise ValueError("PATHS resume variant mismatch")
+        if state.get("run_git_commit") != self.run_git_commit:
+            raise ValueError("PATHS resume git-commit identity mismatch")
         if state.get("warm_start_provenance") is not None:
             raise ValueError("PATHS resume unexpectedly activates the ORIGIN relation hook")
         if state.get("paths_warm_start_provenance") != self.paths_warm_start_provenance:
@@ -1072,12 +1253,19 @@ class PathsTrainer(OriginTrainer):
         probabilities: list[torch.Tensor] = []
         predictions: list[torch.Tensor] = []
         labels_all: list[torch.Tensor] = []
+        ordered_ids: list[str] = []
+        running_index = 0
         with torch.no_grad():
             for batch in self.val_loader:
-                images, pixel_mask, labels, _ = self._unpack_batch(batch)
+                images, pixel_mask, labels, indices = self._unpack_batch(batch)
                 with autocast(device_type="cuda", enabled=self.use_amp):
                     output = self._forward(images, pixel_mask)
-                base = _field(output, "base_output")
+                base = (
+                    _field(output, "base_output")
+                    if hasattr(output, "base_output")
+                    or (isinstance(output, Mapping) and "base_output" in output)
+                    else output
+                )
                 probabilities.append(_tensor_field(base, "class_probs").float().cpu())
                 if self.decision_rule == "rounded_expected":
                     base_prediction = _tensor_field(base, "expected_grade").round()
@@ -1085,29 +1273,60 @@ class PathsTrainer(OriginTrainer):
                     base_prediction = _tensor_field(base, self.decision_rule)
                 predictions.append(base_prediction.long().cpu())
                 labels_all.append(labels.cpu())
+                if indices is None:
+                    ordered_ids.extend(
+                        str(value)
+                        for value in range(
+                            running_index,
+                            running_index + int(labels.numel()),
+                        )
+                    )
+                elif torch.is_tensor(indices):
+                    ordered_ids.extend(str(value) for value in indices.detach().cpu().tolist())
+                else:
+                    ordered_ids.extend(str(value) for value in indices)
+                running_index += int(labels.numel())
         metrics = evaluate_origin_predictions(
             torch.cat(probabilities), torch.cat(predictions), torch.cat(labels_all)
         )
         source = self.paths_warm_start_provenance["source_metrics"]
         tolerance = float(getattr(self.cfg, "warm_start_metric_tolerance", 1e-6))
+        scalar_names = ("acc", "qwk", "mae", "balanced_acc", "macro_f1")
         errors = {
             name: abs(float(metrics[name]) - float(source[name]))
-            for name in source
+            for name in scalar_names
         }
         if any(value > tolerance for value in errors.values()):
             raise AssertionError(
                 "hash-bound V3 warm start did not reproduce source validation metrics: "
                 f"errors={errors}, tolerance={tolerance}"
             )
+        observed_confusion = [
+            [int(value) for value in row] for row in metrics["confusion"]
+        ]
+        if observed_confusion != source["confusion"]:
+            raise AssertionError(
+                "hash-bound V3 warm start did not reproduce source confusion matrix"
+            )
+        identity_payload = {
+            "ordered_ids": ordered_ids,
+            "labels": torch.cat(labels_all).tolist(),
+            "predictions": torch.cat(predictions).tolist(),
+        }
         payload = {
-            "schema": "paths-v3-strength-zero-control-v1",
+            "schema": "paths-v3-strength-zero-control-v2",
             "scope": "inner_validation_only",
             "fold": self.fold,
             "split_signature": self.split_signature,
             "source_checkpoint_sha256": self.paths_warm_start_provenance[
                 "source_checkpoint_sha256"
             ],
+            "paths_protocol_version": PATHS_PROTOCOL_VERSION,
+            "paths_variant": self.paths_variant,
+            "implementation_signature": self.implementation_signature,
+            "architecture_signature": self.architecture_signature,
             "metrics": metrics,
+            "ordered_prediction_checksum_sha256": _canonical_sha256(identity_payload),
             "source_metric_absolute_errors": errors,
             "reproduction_tolerance": tolerance,
             "reproduced": True,
@@ -1126,6 +1345,13 @@ class PathsTrainer(OriginTrainer):
         return payload
 
     def _write_validation_certificates(self, checkpoint_epoch: int) -> dict[str, Any]:
+        if getattr(self, "paths_variant", "signed_transport") == "risk_objective_v3":
+            # The matched control intentionally has no PATHS transport.  Use
+            # the inherited exact V3 rate-ledger certificate and label it as
+            # such instead of fabricating a nonzero transport witness.
+            return OriginTrainer._write_validation_certificates(
+                self, checkpoint_epoch
+            )
         replay = getattr(self.model, "replay_without", None)
         if not callable(replay):
             raise TypeError("PATHS model must expose replay_without")
@@ -1138,8 +1364,6 @@ class PathsTrainer(OriginTrainer):
         with torch.no_grad():
             with autocast(device_type="cuda", enabled=self.use_amp):
                 baseline = self._forward(images, pixel_mask)
-            rate_maps = _mapping_field(baseline, "local_rate_maps")
-            correction_maps = _mapping_field(baseline, "local_correction_maps")
             valid_masks = _mapping_field(baseline, "valid_masks")
             rankings = rank_paths_singleton_witnesses(
                 baseline,
@@ -1168,7 +1392,7 @@ class PathsTrainer(OriginTrainer):
                 random_flat = _deterministic_matched_random_flat_index(
                     valid_masks[scale][sample],
                     excluded_flat_index=flat,
-                    token=f"paths-v2|{sample_id!r}|{scale}",
+                    token=f"paths-v3-sapt|{sample_id!r}|{scale}",
                 )
                 if random_flat is not None:
                     random_spatial = tuple(
@@ -1206,11 +1430,19 @@ class PathsTrainer(OriginTrainer):
             )
             identity_keys = (
                 "rate_replay_error",
+                "concentration_replay_error",
                 "correction_replay_error",
                 "baseline_joint_logit_error",
                 "replayed_joint_logit_error",
                 "baseline_posterior_replay_error",
                 "replayed_posterior_replay_error",
+                "transport_matrix_row_sum_error",
+                "transport_non_adjacent_max_abs",
+                "baseline_transport_posterior_error",
+                "replayed_transport_posterior_error",
+                "baseline_flow_reconstruction_error",
+                "replayed_flow_reconstruction_error",
+                "net_boundary_flow_replay_error",
             )
             failures = {
                 key: audit[key] for key in identity_keys if audit[key] > tolerance
@@ -1229,9 +1461,15 @@ class PathsTrainer(OriginTrainer):
                     "PATHS matched-random replay identity failed: "
                     f"{random_failures}, tolerance={tolerance}"
                 )
-            if audit["final_correction_max_abs"] <= 1e-10:
+            if min(
+                audit["transport_matrix_minimum"],
+                random_audit["transport_matrix_minimum"],
+            ) < -tolerance:
+                raise AssertionError("PATHS transport matrix contains negative mass")
+            if audit["transport_effect_max_abs"] <= 1e-10:
                 raise AssertionError(
-                    "selected checkpoint has zero PATHS correction; refusing a base-only certificate"
+                    "selected checkpoint has zero signed transport effect; "
+                    "refusing a base-only certificate"
                 )
 
             base_probs = _tensor_field(baseline, "class_probs").detach().cpu()
@@ -1266,8 +1504,38 @@ class PathsTrainer(OriginTrainer):
             replay_predictions = self._predictions(replayed).detach().cpu()
             random_predictions = self._predictions(random_replayed).detach().cpu()
             removed_rates = _field(intervention, "removed_rates").detach().cpu()
+            removed_concentration = _field(
+                intervention, "removed_boundary_concentration"
+            ).detach().cpu()
+            removed_flow = _field(
+                intervention, "removed_net_boundary_flow"
+            ).detach().cpu()
             removed_correction = _field(
                 intervention, "removed_boundary_correction"
+            ).detach().cpu()
+            base_concentration = _tensor_field(
+                baseline, "boundary_concentration"
+            ).detach().cpu()
+            replay_concentration = _tensor_field(
+                replayed, "boundary_concentration"
+            ).detach().cpu()
+            base_direction = _tensor_field(
+                baseline, "transport_direction"
+            ).detach().cpu()
+            replay_direction = _tensor_field(
+                replayed, "transport_direction"
+            ).detach().cpu()
+            base_transport = _tensor_field(
+                baseline, "transport_matrix"
+            ).detach().cpu()
+            replay_transport = _tensor_field(
+                replayed, "transport_matrix"
+            ).detach().cpu()
+            base_flow = _tensor_field(
+                baseline, "net_boundary_flow"
+            ).detach().cpu()
+            replay_flow = _tensor_field(
+                replayed, "net_boundary_flow"
             ).detach().cpu()
             base_base_logits = _tensor_field(
                 baseline, "base_continuation_logits"
@@ -1384,9 +1652,29 @@ class PathsTrainer(OriginTrainer):
                         "removed_base_boundary_rates": removed_rates[
                             sample
                         ].tolist(),
+                        "removed_boundary_concentration": removed_concentration[
+                            sample
+                        ].tolist(),
+                        "removed_net_boundary_flow": removed_flow[sample].tolist(),
                         "removed_boundary_correction": removed_correction[
                             sample
                         ].tolist(),
+                        "baseline_boundary_concentration": base_concentration[
+                            sample
+                        ].tolist(),
+                        "replayed_boundary_concentration": replay_concentration[
+                            sample
+                        ].tolist(),
+                        "baseline_transport_direction": base_direction[
+                            sample
+                        ].tolist(),
+                        "replayed_transport_direction": replay_direction[
+                            sample
+                        ].tolist(),
+                        "baseline_transport_matrix": base_transport[sample].tolist(),
+                        "replayed_transport_matrix": replay_transport[sample].tolist(),
+                        "baseline_net_boundary_flow": base_flow[sample].tolist(),
+                        "replayed_net_boundary_flow": replay_flow[sample].tolist(),
                         "base_boundary_logit_delta": base_logit_delta.tolist(),
                         "correction_boundary_logit_delta": correction_delta.tolist(),
                         "final_boundary_logit_delta": final_logit_delta.tolist(),
@@ -1526,8 +1814,10 @@ class PathsTrainer(OriginTrainer):
             }
 
         payload: dict[str, Any] = {
-            "schema": "paths-exact-joint-validation-certificates-v2",
+            "schema": "paths-exact-joint-validation-certificates-v3-sapt",
             "scope": "inner_validation_only",
+            "protocol": PATHS_PROTOCOL_VERSION,
+            "paths_variant": "signed_transport",
             "fold": self.fold,
             "split_signature": self.split_signature,
             "checkpoint_epoch": int(checkpoint_epoch),
@@ -1547,7 +1837,8 @@ class PathsTrainer(OriginTrainer):
                 "probability drop are strictly positive"
             ),
             "interpretation_scope": (
-                "exact_joint_stored_base_rate_and_pgf_correction_intervention;"
+                "exact_joint_stored_base_rate_and_pgf_concentration_intervention;"
+                "exact_recompilation_of_mass_conserving_signed_adjacent_transport;"
                 "theoretical_encoder_receptive_field_support;"
                 "not_input_pixel_causality_or_named_lesion_semantics"
             ),
@@ -1576,6 +1867,146 @@ class PathsTrainer(OriginTrainer):
                 temporary.unlink()
         return payload
 
+    def _evaluate_validation_transport(self) -> dict[str, Any]:
+        """Audit the learned transport over the complete validation split.
+
+        The small certificate batch proves exact cell-deletion replay.  This
+        split-wide audit answers a different question: whether the selected
+        checkpoint actually uses both directions of the signed transport and
+        whether every emitted kernel remains a valid adjacent Markov kernel.
+        """
+
+        if self.paths_variant == "risk_objective_v3":
+            return {
+                "schema": "paths-v3-sapt-validation-transport-audit-v1",
+                "scope": "full_inner_validation",
+                "variant": self.paths_variant,
+                "transport_active": False,
+                "reason": "matched_strength_zero_control",
+            }
+
+        self.model.eval()
+        flows: list[torch.Tensor] = []
+        concentrations: list[torch.Tensor] = []
+        directions: list[torch.Tensor] = []
+        sample_count = 0
+        effect_abs_sum = 0.0
+        effect_count = 0
+        effect_max = 0.0
+        row_sum_error = 0.0
+        non_adjacent_max = 0.0
+        matrix_minimum = math.inf
+        posterior_mass_error = 0.0
+        with torch.no_grad():
+            for batch in self.val_loader:
+                images, pixel_mask, labels, _ = self._unpack_batch(batch)
+                with autocast(device_type="cuda", enabled=self.use_amp):
+                    output = self._forward(images, pixel_mask)
+                if not hasattr(output, "transport_matrix"):
+                    raise TypeError(
+                        "signed-transport validation produced no transport matrix"
+                    )
+                flow = _tensor_field(output, "net_boundary_flow").double()
+                concentration = _tensor_field(
+                    output, "boundary_concentration"
+                ).double()
+                direction = _tensor_field(output, "transport_direction").double()
+                matrix = _tensor_field(output, "transport_matrix").double()
+                probabilities = _tensor_field(output, "class_probs").double()
+                base_probabilities = _tensor_field(
+                    _field(output, "base_output"), "class_probs"
+                ).double()
+                flows.append(flow.detach().cpu())
+                concentrations.append(concentration.detach().cpu())
+                directions.append(direction.detach().cpu())
+                sample_count += int(labels.numel())
+                effect = (probabilities - base_probabilities).abs()
+                effect_abs_sum += float(effect.sum().detach().cpu())
+                effect_count += int(effect.numel())
+                effect_max = max(effect_max, float(effect.max().detach().cpu()))
+                row_sum_error = max(
+                    row_sum_error,
+                    float((matrix.sum(dim=-1) - 1.0).abs().max().detach().cpu()),
+                )
+                matrix_minimum = min(
+                    matrix_minimum, float(matrix.min().detach().cpu())
+                )
+                posterior_mass_error = max(
+                    posterior_mass_error,
+                    float(
+                        (probabilities.sum(dim=-1) - 1.0)
+                        .abs()
+                        .max()
+                        .detach()
+                        .cpu()
+                    ),
+                )
+                grade_axis = torch.arange(matrix.shape[-1], device=matrix.device)
+                non_adjacent = (
+                    grade_axis[:, None] - grade_axis[None, :]
+                ).abs() > 1
+                if bool(non_adjacent.any()):
+                    non_adjacent_max = max(
+                        non_adjacent_max,
+                        float(
+                            matrix[..., non_adjacent]
+                            .abs()
+                            .max()
+                            .detach()
+                            .cpu()
+                        ),
+                    )
+
+        if not flows or sample_count == 0:
+            raise RuntimeError("PATHS validation transport audit saw no samples")
+        flow = torch.cat(flows, dim=0)
+        concentration = torch.cat(concentrations, dim=0)
+        direction = torch.cat(directions, dim=0)
+        sign_tolerance = 1e-12
+
+        def _quantiles(values: torch.Tensor) -> dict[str, float]:
+            flattened = values.flatten().double()
+            return {
+                name: float(torch.quantile(flattened, quantile))
+                for name, quantile in (
+                    ("q0", 0.0),
+                    ("q25", 0.25),
+                    ("q50", 0.50),
+                    ("q75", 0.75),
+                    ("q95", 0.95),
+                    ("q100", 1.0),
+                )
+            }
+
+        positive = int((flow > sign_tolerance).sum())
+        negative = int((flow < -sign_tolerance).sum())
+        total = int(flow.numel())
+        return {
+            "schema": "paths-v3-sapt-validation-transport-audit-v1",
+            "scope": "full_inner_validation",
+            "variant": self.paths_variant,
+            "transport_active": effect_max > sign_tolerance,
+            "sample_count": sample_count,
+            "boundary_value_count": total,
+            "positive_upward_flow_count": positive,
+            "negative_downward_flow_count": negative,
+            "near_zero_flow_count": total - positive - negative,
+            "bidirectional_flow_observed": positive > 0 and negative > 0,
+            "net_boundary_flow_min": float(flow.min()),
+            "net_boundary_flow_max": float(flow.max()),
+            "mean_absolute_net_boundary_flow": float(flow.abs().mean()),
+            "transport_effect_mean_abs": (
+                effect_abs_sum / float(max(1, effect_count))
+            ),
+            "transport_effect_max_abs": effect_max,
+            "transport_matrix_row_sum_error": row_sum_error,
+            "transport_matrix_minimum": matrix_minimum,
+            "transport_non_adjacent_max_abs": non_adjacent_max,
+            "posterior_mass_error": posterior_mass_error,
+            "boundary_concentration_quantiles": _quantiles(concentration),
+            "transport_direction_quantiles": _quantiles(direction),
+        }
+
     def fit(self, *, evaluate_test: bool = False) -> dict[str, Any]:
         if not bool(getattr(self.cfg, "resume", False)):
             if self.best_learned_path.exists():
@@ -1584,12 +2015,20 @@ class PathsTrainer(OriginTrainer):
                 )
             self._evaluate_v3_control()
         result = super().fit(evaluate_test=evaluate_test)
+        validation_transport = self._evaluate_validation_transport()
         best_learned = self._materialize_best_learned_checkpoint()
         if not self.best_learned_path.is_file():
             raise RuntimeError("PATHS training produced no best_learned.pth")
         result.update(
             {
-                "protocol": "paths-v2",
+                "protocol": PATHS_PROTOCOL_VERSION,
+                "paths_variant": self.paths_variant,
+                "implementation_signature": self.implementation_signature,
+                "architecture_signature": self.architecture_signature,
+                "config_signature": self.config_signature,
+                "critical_config": self.critical_config,
+                "run_git_commit": self.run_git_commit,
+                "split_signature": self.split_signature,
                 "warm_start_provenance": self.paths_warm_start_provenance,
                 "v3_strength_zero_control_path": str(self.base_control_path),
                 "training_label_counts": list(self.training_label_counts),
@@ -1604,10 +2043,10 @@ class PathsTrainer(OriginTrainer):
                 ),
                 "best_learned_epoch": int(best_learned["epoch"]),
                 "best_learned_validation": dict(best_learned["metrics"]),
-                "best_learned_checkpoint_role": best_learned[
-                    "checkpoint_role"
-                ],
+                "best_learned_checkpoint_role": best_learned["checkpoint_role"],
+                "best_learned_is_byte_exact_best_alias": True,
                 "v3_control_promoted_as_paths": False,
+                "validation_transport_summary": validation_transport,
             }
         )
         return result

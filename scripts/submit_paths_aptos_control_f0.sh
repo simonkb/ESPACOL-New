@@ -1,6 +1,7 @@
 #!/bin/bash
-# PATHS-v3 SAPT treatment: APTOS fold 0, inner validation only.
-#SBATCH --job-name=paths_a0
+# Matched PATHS-v3 control: identical V3 warm start, split, risk-set loss,
+# batches, generator schedule, and seed, with signed transport disabled.
+#SBATCH --job-name=paths_c0
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -8,8 +9,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
 #SBATCH --time=1-00:00:00
-#SBATCH --output=/dpc/kuin0170/ESPACOL-New/paths_aptos_f0_%j.out
-#SBATCH --error=/dpc/kuin0170/ESPACOL-New/paths_aptos_f0_%j.err
+#SBATCH --output=/dpc/kuin0170/ESPACOL-New/paths_aptos_control_f0_%j.out
+#SBATCH --error=/dpc/kuin0170/ESPACOL-New/paths_aptos_control_f0_%j.err
 #SBATCH --account=kuin0170
 
 set -eo pipefail
@@ -41,7 +42,7 @@ for PATHS_FILE in \
   }
 done
 
-RUN_DIR="${PATHS_APTOS_RUN_DIR:-runs/paths_aptos_f0_v3_sapt}"
+RUN_DIR="${PATHS_APTOS_CONTROL_RUN_DIR:-runs/paths_aptos_f0_v3_risk_control}"
 DATA_ROOT="${ORIGIN_APTOS_ROOT:-Datasets/aptos2019-blindness-detection}"
 SOURCE_CHECKPOINT="${PATHS_V3_APTOS_CHECKPOINT:-runs/origin_aptos_f0_v3_bounded/fold0/best.pth}"
 SOURCE_SHA="${PATHS_V3_APTOS_SHA256:-}"
@@ -60,11 +61,11 @@ if [[ "${PATHS_RESUME:-0}" == "1" ]]; then
   [[ -f "${FOLD_DIR}/last.pth" && ! -f "${FOLD_DIR}/result.json" ]] || exit 4
   RESUME_ARGS+=(--resume)
 elif [[ -e "${FOLD_DIR}/last.pth" || -e "${FOLD_DIR}/history.csv" ]]; then
-  echo "Fresh PATHS run refused: artifacts exist in ${FOLD_DIR}." >&2
+  echo "Fresh PATHS control refused: artifacts exist in ${FOLD_DIR}." >&2
   exit 5
 fi
 
-echo "=== PATHS-v3 SAPT APTOS fold 0 / inner validation only ==="
+echo "=== PATHS-v3 risk-objective V3 control / APTOS fold 0 ==="
 date --iso-8601=seconds
 git rev-parse HEAD
 git status --short
@@ -88,11 +89,11 @@ ARGS=(
   --projection_dim 128 --reference_count 4096 --atom_rate_init 1e-6
   --prior_rate_init 1e-4 --boundary_scale_init 1.0 --total_rate_cap 64.0
   --prior_rate_cap 1.0 --boundary_scale_cap 2.0 --rate_roundoff_margin 1.0
-  --decision_rule class_map --paths_variant signed_transport
+  --decision_rule class_map --paths_variant risk_objective_v3
   --pgf_probes 0.05,0.20,0.50,0.80
   --transport_gain_cap 1.0 --transport_gain_init 0.05
   --transport_threshold_init 0.5 --transport_slope_init 2.0
-  --transport_slope_cap 8.0 --transport_strength 1.0
+  --transport_slope_cap 8.0 --transport_strength 0.0
   --risk_set_alpha 0.5 --rps_weight 0.25 --batch_size 8 --epochs 12
   --num_workers 8 --paths_encoder_lr 1e-5 --paths_base_lr 1e-5
   --paths_refiner_lr 5e-4 --weight_decay 1e-5
@@ -103,4 +104,5 @@ ARGS=(
 if (( ${#RESUME_ARGS[@]} )); then ARGS+=("${RESUME_ARGS[@]}"); fi
 printf 'training_command:'; printf ' %q' python train_paths.py "${ARGS[@]}"; printf '\n'
 python train_paths.py "${ARGS[@]}"
-echo "PATHS-v3 SAPT APTOS treatment completed; paired gate remains separate."
+
+echo "PATHS-v3 matched APTOS control completed."

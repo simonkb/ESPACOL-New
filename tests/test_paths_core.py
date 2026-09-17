@@ -18,6 +18,7 @@ from models.paths import (
     PathsContinuationRefiner,
     PathsModel,
     PathsOutput,
+    apply_signed_adjacent_transport,
     continuation_logits_from_log_probs,
     decode_continuation_logits,
     tangent_removed_pgf_probe,
@@ -83,8 +84,8 @@ def _paths_output(
         4,
         ("s4", "s8"),
         probe_z=(0.1, 0.25, 0.5, 0.75, 0.9),
-        correction_cap=4.0,
-        gain_init=gain_init,
+        transport_gain_cap=1.0,
+        transport_gain_init=gain_init,
     )
     output = refiner(base)
     assert isinstance(output, PathsOutput)
@@ -144,21 +145,81 @@ def test_strength_zero_returns_the_actual_v3_output_object() -> None:
     assert refiner(base) is base
 
 
-def test_positive_focality_correction_is_bounded_and_exactly_additive() -> None:
+def test_signed_adjacent_transport_is_stochastic_local_and_bidirectional() -> None:
+    base = torch.tensor(
+        [[0.20, 0.20, 0.20, 0.20, 0.20]], dtype=torch.float64
+    )
+    concentration = torch.tensor([[0.8, 0.2, 0.8, 0.2]], dtype=torch.float64)
+    result = apply_signed_adjacent_transport(
+        base,
+        concentration,
+        thresholds=torch.full((4,), 0.5, dtype=torch.float64),
+        slopes=torch.full((4,), 4.0, dtype=torch.float64),
+        gains=torch.full((4,), 0.5, dtype=torch.float64),
+    )
+
+    assert torch.all(result.direction[0, (0, 2)] > 0.0)
+    assert torch.all(result.direction[0, (1, 3)] < 0.0)
+    assert torch.all(result.upward_odds[0, (0, 2)] > result.downward_odds[0, (0, 2)])
+    assert torch.all(result.downward_odds[0, (1, 3)] > result.upward_odds[0, (1, 3)])
+    torch.testing.assert_close(
+        result.transport_matrix.sum(dim=-1),
+        torch.ones(1, 5, dtype=torch.float64),
+        atol=2e-15,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        result.class_probs.sum(dim=-1),
+        torch.ones(1, dtype=torch.float64),
+        atol=2e-15,
+        rtol=0.0,
+    )
+    rows = torch.arange(5)[:, None]
+    columns = torch.arange(5)[None, :]
+    non_adjacent = (rows - columns).abs() > 1
+    assert torch.equal(
+        result.transport_matrix[:, non_adjacent],
+        torch.zeros_like(result.transport_matrix[:, non_adjacent]),
+    )
+
+
+def test_zero_spectrum_is_exact_identity_transport() -> None:
+    base = torch.tensor(
+        [[0.13, 0.21, 0.17, 0.29, 0.20]], dtype=torch.float64
+    )
+    result = apply_signed_adjacent_transport(
+        base,
+        torch.zeros(1, 4, dtype=torch.float64),
+        thresholds=torch.full((4,), 0.5, dtype=torch.float64),
+        slopes=torch.full((4,), 2.0, dtype=torch.float64),
+        gains=torch.full((4,), 0.7, dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        result.transport_matrix,
+        torch.eye(5, dtype=torch.float64).unsqueeze(0),
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(result.class_probs, base, atol=0.0, rtol=0.0)
+    assert torch.equal(result.net_boundary_flow, torch.zeros_like(result.net_boundary_flow))
+
+
+def test_focality_ledger_compiles_to_mass_conserving_transport() -> None:
     output, _ = _paths_output()
 
-    assert torch.all(output.boundary_correction >= 0.0)
-    assert torch.all(output.boundary_correction <= 4.0 + 1e-12)
     local_sum = sum(
         value.to(torch.float64).sum(dim=(1, 2))
-        for value in output.local_correction_maps.values()
+        for value in output.local_transport_maps.values()
     )
-    torch.testing.assert_close(local_sum, output.boundary_correction)
+    torch.testing.assert_close(local_sum, output.boundary_concentration)
     torch.testing.assert_close(
         output.continuation_logits,
         output.base_continuation_logits + output.boundary_correction,
     )
-    assert torch.all(output.continuation_probs >= torch.sigmoid(output.base_continuation_logits))
+    torch.testing.assert_close(
+        output.transport_matrix.sum(dim=-1),
+        torch.ones_like(output.transport_matrix[..., 0]),
+    )
     torch.testing.assert_close(
         output.class_probs.sum(dim=-1),
         torch.ones(output.class_probs.shape[0], dtype=torch.float64),
@@ -178,7 +239,7 @@ def test_positive_focality_correction_is_bounded_and_exactly_additive() -> None:
         assert torch.all(evidence.concentration_spectrum <= 1.0 + 1e-12)
 
 
-def test_learned_path_backpropagates_to_probes_gain_and_base_atoms() -> None:
+def test_learned_path_backpropagates_to_all_transport_parameters_and_base_atoms() -> None:
     output, refiner = _paths_output(requires_grad=True)
     for evidence in output.base_output.scale_evidence.values():
         evidence.compiled_atoms.retain_grad()
@@ -189,20 +250,29 @@ def test_learned_path_backpropagates_to_probes_gain_and_base_atoms() -> None:
     assert refiner.probe_logits.grad is not None
     assert torch.isfinite(refiner.probe_logits.grad).all()
     assert float(refiner.probe_logits.grad.abs().sum()) > 0.0
-    assert refiner.raw_gains.grad is not None
-    assert torch.isfinite(refiner.raw_gains.grad).all()
-    assert float(refiner.raw_gains.grad.abs().sum()) > 0.0
+    for parameter in (
+        refiner.raw_transport_gains,
+        refiner.raw_transport_thresholds,
+        refiner.raw_transport_slopes,
+    ):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+        assert float(parameter.grad.abs().sum()) > 0.0
     atom_grad = sum(
         float(evidence.compiled_atoms.grad.abs().sum())
         for evidence in output.base_output.scale_evidence.values()
         if evidence.compiled_atoms.grad is not None
     )
     assert atom_grad > 0.0
-    assert torch.all(refiner.gains >= 0.0)
-    assert torch.all(refiner.gains <= refiner.correction_cap)
+    assert torch.all(refiner.transport_gains >= 0.0)
+    assert torch.all(refiner.transport_gains <= refiner.transport_gain_cap)
+    assert torch.all(refiner.transport_thresholds > 0.0)
+    assert torch.all(refiner.transport_thresholds < 1.0)
+    assert torch.all(refiner.transport_slopes > 0.0)
+    assert torch.all(refiner.transport_slopes <= refiner.transport_slope_cap)
 
 
-def test_zero_atom_mass_has_zero_finite_spectrum_and_correction() -> None:
+def test_zero_atom_mass_has_zero_finite_spectrum_and_identity_transport() -> None:
     base = _base_output()
     zero_atoms = {
         name: torch.zeros_like(evidence.compiled_atoms, requires_grad=True)
@@ -217,6 +287,12 @@ def test_zero_atom_mass_has_zero_finite_spectrum_and_correction() -> None:
     output = refiner(zero_base)
     assert isinstance(output, PathsOutput)
     assert torch.equal(output.boundary_correction, torch.zeros_like(output.boundary_correction))
+    torch.testing.assert_close(
+        output.transport_matrix,
+        torch.eye(5, dtype=torch.float64).expand(output.class_probs.shape[0], -1, -1),
+        atol=0.0,
+        rtol=0.0,
+    )
     for evidence in output.spectrum_evidence.values():
         assert torch.equal(evidence.baseline_mass, torch.zeros_like(evidence.baseline_mass))
         assert torch.equal(

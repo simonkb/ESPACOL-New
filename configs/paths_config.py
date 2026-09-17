@@ -1,8 +1,8 @@
-"""Prospective configuration for PATHS severity grading.
+"""Prospective configuration for PATHS signed ordinal transport.
 
 PATHS is intentionally configured separately from ORIGIN.  The inherited
 fields describe the immutable ORIGIN-v3 base; the fields declared here define
-the PGF continuation correction and its validation-only development protocol.
+the PGF-driven adjacent-grade transport and its validation-only protocol.
 """
 
 from __future__ import annotations
@@ -14,22 +14,30 @@ from typing import Optional, Tuple
 from .origin_config import OriginConfig
 
 
-PATHS_PROTOCOL_VERSION = "paths-v2"
+PATHS_PROTOCOL_VERSION = "paths-v3-sapt"
 
 
 @dataclass
 class PathsConfig(OriginConfig):
     """One PATHS fold with a hash-bound ORIGIN-v3 warm start."""
 
-    run_dir: str = "runs/paths_aptos_f0_v2"
+    run_dir: str = "runs/paths_aptos_f0_v3_sapt"
+
+    # The control keeps the same objective and warm start but removes the
+    # transport mechanism.  It is a required matched experiment, not a
+    # deployable fallback silently mixed into treatment selection.
+    paths_variant: str = "signed_transport"
 
     # Fixed probability-generating-function probes.  They are architectural
     # coordinates, not fitted thresholds, and therefore remain identical
     # across datasets and folds.
     pgf_probes: Tuple[float, ...] = (0.05, 0.20, 0.50, 0.80)
-    correction_cap: float = 3.0
-    correction_gain_init: float = 0.05
-    correction_strength: float = 1.0
+    transport_gain_cap: float = 1.0
+    transport_gain_init: float = 0.05
+    transport_threshold_init: float = 0.50
+    transport_slope_init: float = 2.0
+    transport_slope_cap: float = 8.0
+    transport_strength: float = 1.0
     correction_only_epochs: int = 3
     encoder_freeze_epochs: int = 3
 
@@ -60,7 +68,7 @@ class PathsConfig(OriginConfig):
         if self.atom_mode != "cumulative":
             raise ValueError("PATHS primary architecture requires cumulative V3 atoms")
         if self.evidence_scales != ("s4", "s8", "s16", "s32"):
-            raise ValueError("PATHS-v2 fixes the audited four-scale V3 base")
+            raise ValueError("PATHS-v3 fixes the audited four-scale V3 base")
         if self.class_weighting != "none" or self.stratified_batches:
             raise ValueError(
                 "PATHS uses boundary-risk weighting, not outcome weighting or oversampling"
@@ -77,20 +85,48 @@ class PathsConfig(OriginConfig):
             raise ValueError("every PGF probe must lie strictly in (0, 1)")
         if tuple(sorted(set(self.pgf_probes))) != self.pgf_probes:
             raise ValueError("pgf_probes must be unique and strictly increasing")
-        if not math.isfinite(self.correction_cap) or self.correction_cap <= 0.0:
-            raise ValueError("correction_cap must be finite and positive")
-        if (
-            not math.isfinite(self.correction_gain_init)
-            or not 0.0 < self.correction_gain_init < self.correction_cap
-        ):
+        if self.paths_variant not in {"signed_transport", "risk_objective_v3"}:
             raise ValueError(
-                "correction_gain_init must lie in (0, correction_cap)"
+                "paths_variant must be 'signed_transport' or 'risk_objective_v3'"
             )
         if (
-            not math.isfinite(self.correction_strength)
-            or not 0.0 < self.correction_strength <= 1.0
+            not math.isfinite(self.transport_gain_cap)
+            or self.transport_gain_cap <= 0.0
         ):
-            raise ValueError("correction_strength must lie in (0, 1]")
+            raise ValueError("transport_gain_cap must be finite and positive")
+        if (
+            not math.isfinite(self.transport_gain_init)
+            or not 0.0 < self.transport_gain_init < self.transport_gain_cap
+        ):
+            raise ValueError(
+                "transport_gain_init must lie in (0, transport_gain_cap)"
+            )
+        if (
+            not math.isfinite(self.transport_threshold_init)
+            or not 0.0 < self.transport_threshold_init < 1.0
+        ):
+            raise ValueError("transport_threshold_init must lie in (0, 1)")
+        if (
+            not math.isfinite(self.transport_slope_cap)
+            or self.transport_slope_cap <= 0.0
+        ):
+            raise ValueError("transport_slope_cap must be finite and positive")
+        if (
+            not math.isfinite(self.transport_slope_init)
+            or not 0.0 < self.transport_slope_init < self.transport_slope_cap
+        ):
+            raise ValueError(
+                "transport_slope_init must lie in (0, transport_slope_cap)"
+            )
+        if (
+            not math.isfinite(self.transport_strength)
+            or not 0.0 <= self.transport_strength <= 1.0
+        ):
+            raise ValueError("transport_strength must lie in [0, 1]")
+        if self.paths_variant == "signed_transport" and self.transport_strength <= 0.0:
+            raise ValueError("signed_transport requires positive transport_strength")
+        if self.paths_variant == "risk_objective_v3" and self.transport_strength != 0.0:
+            raise ValueError("risk_objective_v3 requires transport_strength=0")
         if self.correction_only_epochs < 0:
             raise ValueError("correction_only_epochs must be non-negative")
         if self.encoder_freeze_epochs < self.correction_only_epochs:

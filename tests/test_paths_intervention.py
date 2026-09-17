@@ -13,8 +13,8 @@ from models.origin_encoder import (
 from models.paths import (
     PathsContinuationRefiner,
     PathsOutput,
+    apply_signed_adjacent_transport,
     continuation_logits_from_log_probs,
-    decode_continuation_logits,
     replay_paths_without,
 )
 
@@ -61,8 +61,8 @@ def _output(batch: int = 2) -> PathsOutput:
     output = PathsContinuationRefiner(
         4,
         ("s4", "s8"),
-        correction_cap=4.0,
-        gain_init=0.05,
+        transport_gain_cap=1.0,
+        transport_gain_init=0.05,
     )(base)
     assert isinstance(output, PathsOutput)
     return output
@@ -86,22 +86,34 @@ def test_joint_deletion_replays_rate_and_focality_ledgers_exactly() -> None:
         intervention.output.boundary_correction,
         baseline.boundary_correction - intervention.removed_boundary_correction,
     )
-    removed_local = torch.zeros_like(baseline.boundary_correction)
+    removed_local = torch.zeros_like(baseline.boundary_concentration)
     for name, mask in intervention.removal_masks.items():
-        local = baseline.local_correction_maps[name]
+        local = baseline.local_transport_maps[name]
         removed_local += torch.where(
             mask[..., None], local, torch.zeros_like(local)
         ).sum(dim=(1, 2))
     torch.testing.assert_close(
-        intervention.removed_boundary_correction, removed_local
+        baseline.boundary_concentration - intervention.output.boundary_concentration,
+        removed_local,
     )
 
     direct_base = decode_pure_birth_rates(intervention.output.total_rates)
-    direct_logits = continuation_logits_from_log_probs(direct_base.log_class_probs)
-    direct = decode_continuation_logits(
-        direct_logits + intervention.output.boundary_correction
+    direct = apply_signed_adjacent_transport(
+        direct_base.class_probs,
+        intervention.output.boundary_concentration,
+        intervention.output.transport_thresholds,
+        intervention.output.transport_slopes,
+        intervention.output.transport_gains,
+        strength=intervention.output.strength,
     )
     torch.testing.assert_close(intervention.output.class_probs, direct.class_probs)
+
+    direct_logits = continuation_logits_from_log_probs(direct.class_probs.log())
+    torch.testing.assert_close(
+        intervention.output.boundary_correction,
+        direct_logits
+        - continuation_logits_from_log_probs(direct_base.log_class_probs),
+    )
 
 
 def test_replay_freezes_baseline_mass_instead_of_renormalizing_survivors() -> None:
