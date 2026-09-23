@@ -277,9 +277,20 @@ def aggregate(*, dataset: str, cv_root: Path, data_root: Path, protocol_path: Pa
             torch.tensor(fold_labels, dtype=torch.long),
         )
         exported_metrics = prediction_manifest.get("metrics", {})
-        for key in (*PRIMARY_METRICS, "ece", "confusion", "per_grade_recall", "per_grade_support"):
+        # The fold-completion marker intentionally stores the compact metrics
+        # needed for CV aggregation.  Per-grade recall remains bound to the
+        # checksummed prediction export and is replayed from the CSV here, but
+        # is not duplicated in the compact marker.
+        for key in (*PRIMARY_METRICS, "ece", "confusion", "per_grade_support"):
             if not values_close(fold_metrics.get(key), marker["outer_test"].get(key)):
                 raise AssertionError(f"fold {fold} CSV does not reproduce marker {key}")
+        for key in (
+            *PRIMARY_METRICS,
+            "ece",
+            "confusion",
+            "per_grade_recall",
+            "per_grade_support",
+        ):
             if not values_close(fold_metrics.get(key), exported_metrics.get(key)):
                 raise AssertionError(f"fold {fold} CSV does not reproduce export {key}")
         outer_sets.append(split_sets[2])
