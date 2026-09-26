@@ -205,7 +205,12 @@ class OriginConfig:
                 "inside the derived ORIGIN-v3 atom_mass_cap "
                 f"({atom_mass_cap:g})"
             )
-        if self.atom_mode not in {"cumulative", "independent", "hybrid"}:
+        if self.atom_mode not in {
+            "cumulative",
+            "simplex_direct",
+            "independent",
+            "hybrid",
+        }:
             raise ValueError(f"unsupported atom_mode: {self.atom_mode!r}")
         if not 0.0 < self.hybrid_cumulative_init < 1.0:
             raise ValueError("hybrid_cumulative_init must lie in (0, 1)")

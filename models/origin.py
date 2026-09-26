@@ -33,7 +33,9 @@ from .origin_encoder import (
 )
 
 
-_ATOM_MODES = frozenset(("cumulative", "independent", "hybrid"))
+_ATOM_MODES = frozenset(
+    ("cumulative", "simplex_direct", "independent", "hybrid")
+)
 _DECODER_DTYPE = torch.float64
 _EXP_TAYLOR_DEGREE = 24
 _EXP_SCALING_THETA = 0.5
@@ -361,7 +363,7 @@ class ChannelLayerNorm2d(nn.Module):
 class PointwiseSeverityAtomHead(nn.Module):
     """A channel-only MLP that emits a bounded local severity measure.
 
-    In cumulative/hybrid modes, each cell distributes a fixed finite mass
+    In cumulative/hybrid/simplex-direct modes, each cell distributes a fixed finite mass
     budget between the ordinal severity atoms and an explicit null atom. In
     the matched independent ablation, each boundary instead receives its own
     bounded sigmoid atom so boundaries do not compete. Both constructions are
@@ -752,7 +754,7 @@ class ConservedOrdinalGenerator(nn.Module):
         cumulative = reverse_cumulative_atoms(atoms, dim=1)
         if self.atom_mode == "cumulative":
             return cumulative
-        if self.atom_mode == "independent":
+        if self.atom_mode in {"simplex_direct", "independent"}:
             return atoms
         if self.atom_mix_logits is None:  # pragma: no cover - constructor invariant
             raise RuntimeError("hybrid atom mode has no mixing parameters")
