@@ -15,6 +15,7 @@ import numpy as np
 
 from scripts.origin_acceptance_baseline_common import (
     BASELINE_ORDER,
+    BASELINE_SPECS,
     DATASET_FOLDS,
     PAIRED_BOOTSTRAP_SAMPLES,
     PAIRED_BOOTSTRAP_SEED,
@@ -32,6 +33,7 @@ _METRICS = (
     "acc",
     "qwk",
     "mae",
+    "expected_grade_mae",
     "balanced_acc",
     "macro_f1",
     "ece",
@@ -41,24 +43,32 @@ _METRICS = (
     "threshold_ece",
 )
 _BOUNDARY_ECE_METRICS = tuple(f"threshold_ece_boundary_{index}" for index in range(4))
-_SUMMARY_METRICS = _METRICS + _BOUNDARY_ECE_METRICS
+_PER_GRADE_RECALL_METRICS = tuple(f"per_grade_recall_{index}" for index in range(5))
+_SUMMARY_METRICS = _METRICS + _BOUNDARY_ECE_METRICS + _PER_GRADE_RECALL_METRICS
 _BOOTSTRAP_METRICS = (
     "acc",
     "qwk",
     "mae",
+    "expected_grade_mae",
+    "balanced_acc",
+    "macro_f1",
     "nll",
     "rps",
     "multiclass_brier",
     "threshold_ece",
-)
+) + _PER_GRADE_RECALL_METRICS
 _HIGHER_IS_BETTER = {
     "acc": True,
     "qwk": True,
     "mae": False,
+    "expected_grade_mae": False,
+    "balanced_acc": True,
+    "macro_f1": True,
     "nll": False,
     "rps": False,
     "multiclass_brier": False,
     "threshold_ece": False,
+    **{metric: True for metric in _PER_GRADE_RECALL_METRICS},
 }
 
 
@@ -82,6 +92,7 @@ def _cluster_statistics(record: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     cumulative = record["cumulative_probs"].astype(np.float64, copy=False)
     labels = record["label"].astype(np.int64, copy=False)
     predicted = record["prediction"].astype(np.int64, copy=False)
+    expected_grade = record["expected_grade"].astype(np.float64, copy=False)
     cluster_ids = record["cluster_id"].astype(str)
     clusters = list(dict.fromkeys(cluster_ids.tolist()))
     lookup = {cluster: index for index, cluster in enumerate(clusters)}
@@ -94,6 +105,7 @@ def _cluster_statistics(record: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         "n": np.zeros(cluster_count),
         "correct": np.zeros(cluster_count),
         "absolute_error": np.zeros(cluster_count),
+        "expected_absolute_error": np.zeros(cluster_count),
         "nll": np.zeros(cluster_count),
         "rps": np.zeros(cluster_count),
         "multiclass_brier": np.zeros(cluster_count),
@@ -104,6 +116,9 @@ def _cluster_statistics(record: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     np.add.at(stats["n"], inverse, 1.0)
     np.add.at(stats["correct"], inverse, (predicted == labels).astype(np.float64))
     np.add.at(stats["absolute_error"], inverse, np.abs(predicted - labels))
+    np.add.at(
+        stats["expected_absolute_error"], inverse, np.abs(expected_grade - labels)
+    )
     selected = np.clip(probs[np.arange(len(labels)), labels], np.finfo(np.float64).tiny, 1.0)
     np.add.at(stats["nll"], inverse, -np.log(selected))
     thresholds = np.arange(boundaries)[None, :]
@@ -143,15 +158,42 @@ def _weighted_metrics(
     result = {
         "acc": 100.0 * (weights @ stats["correct"]) / total,
         "mae": (weights @ stats["absolute_error"]) / total,
+        "expected_grade_mae": (weights @ stats["expected_absolute_error"]) / total,
         "nll": (weights @ stats["nll"]) / total,
         "rps": (weights @ stats["rps"]) / total,
         "multiclass_brier": (weights @ stats["multiclass_brier"]) / total,
     }
     confusion = np.tensordot(weights, stats["confusion"], axes=(1, 0))
+    classes = confusion.shape[1]
     row = confusion.sum(axis=2)
     column = confusion.sum(axis=1)
+    diagonal = np.diagonal(confusion, axis1=1, axis2=2)
+    recalls = np.divide(
+        diagonal,
+        row,
+        out=np.zeros_like(diagonal),
+        where=row > 0.0,
+    )
+    precisions = np.divide(
+        diagonal,
+        column,
+        out=np.zeros_like(diagonal),
+        where=column > 0.0,
+    )
+    f1_denominator = recalls + precisions
+    f1 = np.divide(
+        2.0 * recalls * precisions,
+        f1_denominator,
+        out=np.zeros_like(recalls),
+        where=f1_denominator > 0.0,
+    )
+    present = row > 0.0
+    present_count = np.maximum(present.sum(axis=1), 1)
+    result["balanced_acc"] = 100.0 * (recalls * present).sum(axis=1) / present_count
+    result["macro_f1"] = (f1 * present).sum(axis=1) / present_count
+    for grade in range(classes):
+        result[f"per_grade_recall_{grade}"] = recalls[:, grade]
     expected = row[:, :, None] * column[:, None, :] / total[:, None, None]
-    classes = confusion.shape[1]
     coordinates = np.arange(classes, dtype=np.float64)
     penalty = (coordinates[:, None] - coordinates[None, :]) ** 2
     penalty /= max(1, (classes - 1) ** 2)
@@ -439,6 +481,11 @@ def main() -> None:
             (task.dataset, task.fold, task.baseline_variant, task.training_seed)
         ] = record
         metrics = payload["metrics"]
+        per_grade_recall = metrics.get("per_grade_recall")
+        if not isinstance(per_grade_recall, list) or len(per_grade_recall) != 5:
+            raise ValueError(
+                f"outer metrics must contain recalls for grades 0--4: {metrics_path}"
+            )
         rows.append(
             {
                 "dataset": task.dataset,
@@ -451,6 +498,10 @@ def main() -> None:
                     for index, value in enumerate(
                         metrics["threshold_ece_by_boundary"]
                     )
+                },
+                **{
+                    f"per_grade_recall_{index}": float(value)
+                    for index, value in enumerate(per_grade_recall)
                 },
                 "n": int(metrics["n"]),
                 "best_epoch": int(payload["best_epoch"]),
@@ -525,6 +576,21 @@ def main() -> None:
             "included_in_paired_contrasts": False,
             "included_in_model_selection": False,
             "note": "origin_ctmc is retrained in every registered fold/seed cell",
+        },
+        "comparator_implementation_scope": {
+            "kind": "matched_in_repo_analogues",
+            "official_author_implementations": False,
+            "comparator_variants": [
+                variant for variant in BASELINE_ORDER if variant != "origin_ctmc"
+            ],
+            "implementation_origin_by_variant": {
+                variant: BASELINE_SPECS[variant]["implementation_origin"]
+                for variant in BASELINE_ORDER
+            },
+            "claim_boundary": (
+                "These are controlled matched analogues implemented in this repository, "
+                "not results from official author implementations."
+            ),
         },
         "summary": summary,
         "paired_cluster_bootstrap": bootstrap,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -31,6 +32,7 @@ from scripts.origin_acceptance_baseline_common import (
     PROTOCOL_SHA256,
     canary_tasks,
     full_tasks,
+    protocol_payload,
     task_at,
 )
 from scripts.aggregate_origin_acceptance_release import (
@@ -340,6 +342,15 @@ def test_protocol_task_map_is_stable_and_canary_first() -> None:
     assert task_at("full", 0).key == "aptos__fold0__ledger_sequential_hazard__seed42"
     assert task_at("full", 224).key == "dr__fold9__origin_ctmc__seed27182"
     assert len(PROTOCOL_SHA256) == 64
+    protocol = protocol_payload()
+    scope = protocol["comparator_implementation_scope"]
+    assert scope["kind"] == "matched_in_repo_analogues"
+    assert scope["official_author_implementations"] is False
+    for variant in BASELINE_ORDER[:-1]:
+        assert (
+            protocol["baseline_specs"][variant]["implementation_origin"]
+            == "matched_in_repo_analogue_not_official_author_implementation"
+        )
 
 
 def test_release_reports_brier_and_threshold_reliability() -> None:
@@ -409,6 +420,64 @@ def test_paired_fold_seed_cluster_bootstrap_preserves_pairing() -> None:
             samples=2,
             seed=91,
         )
+
+
+def test_paired_bootstrap_reports_all_grading_metrics_with_origin_orientation() -> None:
+    records = {}
+    origin = _bootstrap_record()
+    labels = np.asarray(origin["label"], dtype=np.int64)
+    control = dict(_bootstrap_record())
+    control_probs = np.full((5, 5), 0.01, dtype=np.float64)
+    control_probs[:, 0] = 0.96
+    control["prediction"] = np.zeros(5, dtype=np.int64)
+    control["class_probs"] = control_probs
+    # Construct cumulative P(Y>k) in the same direction as the release worker.
+    control["cumulative_probs"] = (
+        control_probs[:, 1:].copy()[:, ::-1].cumsum(axis=1)[:, ::-1]
+    )
+    control["expected_grade"] = (
+        control_probs * np.arange(5, dtype=np.float64)[None]
+    ).sum(axis=1)
+    assert np.array_equal(labels, np.arange(5))
+    for fold in range(5):
+        for seed in (42, 31415, 27182):
+            records[("aptos", fold, "origin_ctmc", seed)] = origin
+            records[("aptos", fold, "pooled_conditional", seed)] = control
+
+    result = paired_fold_seed_cluster_bootstrap(
+        records,
+        dataset="aptos",
+        comparator="pooled_conditional",
+        samples=32,
+        seed=92,
+        chunk_size=8,
+    )
+    comparisons = result["comparisons"]
+    expected = {
+        "acc",
+        "qwk",
+        "mae",
+        "expected_grade_mae",
+        "balanced_acc",
+        "macro_f1",
+        "nll",
+        "rps",
+        "multiclass_brier",
+        "threshold_ece",
+        *(f"per_grade_recall_{grade}" for grade in range(5)),
+    }
+    assert set(comparisons) == expected
+    assert result["delta_orientation"] == "origin_ctmc_minus_comparator"
+    assert comparisons["acc"]["origin_minus_comparator"] > 0.0
+    assert comparisons["balanced_acc"]["origin_minus_comparator"] > 0.0
+    assert comparisons["macro_f1"]["origin_minus_comparator"] > 0.0
+    assert comparisons["mae"]["origin_minus_comparator"] < 0.0
+    assert comparisons["expected_grade_mae"]["origin_minus_comparator"] < 0.0
+    assert comparisons["per_grade_recall_0"]["origin_minus_comparator"] == 0.0
+    for grade in range(1, 5):
+        assert comparisons[f"per_grade_recall_{grade}"]["origin_minus_comparator"] > 0.0
+    assert comparisons["acc"]["higher_is_better"] is True
+    assert comparisons["expected_grade_mae"]["higher_is_better"] is False
 
 
 class _ToyDataset(Dataset):

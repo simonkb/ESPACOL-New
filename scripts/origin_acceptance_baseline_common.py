@@ -28,22 +28,35 @@ PAIRED_BOOTSTRAP_SEED = 20_261_001
 BASELINE_SPECS: Mapping[str, Mapping[str, Any]] = {
     "ledger_sequential_hazard": {
         "description": "same conserved ORIGIN ledger decoded by adjacent conditional hazards",
+        "implementation_origin": (
+            "matched_in_repo_analogue_not_official_author_implementation"
+        ),
         "sparse_l1_weight": 0.0,
     },
     "pooled_conditional": {
         "description": "all-scale masked global pooling with sequential continuation head",
+        "implementation_origin": (
+            "matched_in_repo_analogue_not_official_author_implementation"
+        ),
         "sparse_l1_weight": 0.0,
     },
     "ordinal_additive_mil": {
         "description": "signed boundary-local Additive-MIL with fixed original-valid-count mean",
+        "implementation_origin": (
+            "matched_in_repo_analogue_not_official_author_implementation"
+        ),
         "sparse_l1_weight": 0.0,
     },
     "sparse_bagnet": {
         "description": "nonnegative multiclass local evidence with masked mean and activation L1",
+        "implementation_origin": (
+            "matched_in_repo_analogue_not_official_author_implementation"
+        ),
         "sparse_l1_weight": SPARSE_L1_WEIGHT,
     },
     "origin_ctmc": {
         "description": "standard ORIGIN-v3 conserved local ledger and FP64 pure-birth CTMC decoder",
+        "implementation_origin": "in_repo_proposed_method",
         "sparse_l1_weight": 0.0,
     },
 }
@@ -127,6 +140,14 @@ def protocol_payload() -> dict[str, Any]:
         "full_task_count": len(full_tasks()),
         "selection_scope": "inner_validation_only",
         "outer_release": "one_post_freeze_suite_level_pass",
+        "comparator_implementation_scope": {
+            "kind": "matched_in_repo_analogues",
+            "official_author_implementations": False,
+            "claim_boundary": (
+                "architecture-matched controlled comparisons only; results must not "
+                "be attributed to official author implementations"
+            ),
+        },
         "historical_origin_oof_role": (
             "external_sanity_reference_only_not_a_paired_arm_or_selection_input"
         ),
