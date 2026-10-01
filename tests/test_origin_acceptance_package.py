@@ -18,6 +18,7 @@ from tools.assemble_origin_acceptance_package import (
     BASELINE_BOOTSTRAP_METRICS,
     BASELINE_SUMMARY_METRICS,
     _assert_privacy_safe_release,
+    _validate_baseline_execution_provenance,
     assemble_package,
     canonical_sha256,
     file_sha256,
@@ -36,6 +37,13 @@ def _write_sealed(path: Path, payload: dict) -> Path:
     payload = dict(payload)
     payload["content_checksum_sha256"] = canonical_sha256(payload)
     return _write_json(path, payload)
+
+
+def _reseal(payload: dict) -> dict:
+    payload = dict(payload)
+    payload.pop("content_checksum_sha256", None)
+    payload["content_checksum_sha256"] = canonical_sha256(payload)
+    return payload
 
 
 def _git_repo(path: Path) -> tuple[Path, str]:
@@ -57,6 +65,10 @@ def _git_repo(path: Path) -> tuple[Path, str]:
     (path / "scripts" / "analyze_origin_oof_statistics.py").write_text("# oof\n")
     (path / "scripts" / "origin_acceptance_baseline_common.py").write_text(
         "# executable protocol\n"
+    )
+    (path / "scripts" / "submit_origin_acceptance_full_array.sh").write_text(
+        '#!/bin/bash\ncd "${ORIGIN_REPO_ROOT:?ORIGIN_REPO_ROOT is required}"\n'
+        'python train_origin.py --epochs 35\n'
     )
     _write_sealed(
         path / "scripts" / "protocols" / "origin_idrid_semantic_statistics_protocol.json",
@@ -685,6 +697,171 @@ def _baseline(root: Path, commit: str) -> Path:
     return aggregate
 
 
+def _install_restart_submission(
+    *, experiment: Path, repo: Path, parent_commit: str,
+    changed_path: str = "docs/continuation.md",
+) -> dict:
+    """Create a real two-worktree continuation provenance chain for tests."""
+
+    parent_worktree = repo.parent / f"{repo.name}-parent-worktree"
+    subprocess.run(
+        ["git", "worktree", "add", "--detach", str(parent_worktree), parent_commit],
+        cwd=repo, check=True, capture_output=True,
+    )
+    submission_path = experiment / "SUBMISSION.json"
+    submission = json.loads(submission_path.read_text())
+    submission.update({
+        "protocol_id": "origin-acceptance-test-protocol-v1",
+        "source_repository": str(repo),
+        "immutable_worktree": str(parent_worktree),
+        "conda_environment": "test",
+        "data_roots": {
+            "aptos": str(repo.parent / "aptos"),
+            "dr": str(repo.parent / "dr"),
+        },
+        "jobs": {
+            "aptos_fold0_canary_array": "100",
+            "canary_gate_audit": "101",
+            "full_training_array": "102",
+            "full_freeze_audit": "103",
+            "coordinated_outer_release_array": "104",
+            "release_aggregate": "105",
+        },
+    })
+    _write_json(submission_path, _reseal(submission))
+    submission = json.loads(submission_path.read_text())
+
+    workers = []
+    worker_manifests = {}
+    checkpoints = {}
+    for index, variant in enumerate(EXPECTED_SHORTCUT_VARIANTS):
+        manifest_digest = hashlib.sha256(f"manifest-{variant}".encode()).hexdigest()
+        checkpoint_digest = hashlib.sha256(f"checkpoint-{variant}".encode()).hexdigest()
+        workers.append({
+            "task": {
+                "dataset": "aptos",
+                "fold": 0,
+                "baseline_variant": variant,
+                "training_seed": 42,
+            },
+            "fold_dir": str(experiment / "canary" / "training" / variant),
+            "manifest_sha256": manifest_digest,
+            "best_learned_sha256": checkpoint_digest,
+            "split_signature": hashlib.sha256(b"aptos-fold0").hexdigest(),
+            "best_epoch": index + 1,
+        })
+        worker_manifests[variant] = manifest_digest
+        checkpoints[variant] = checkpoint_digest
+    gate = _reseal({
+        "schema": "origin-acceptance-training-audit-v1",
+        "protocol_id": submission["protocol_id"],
+        "protocol_sha256": submission["protocol_sha256"],
+        "scope": "canary",
+        "status": "passed",
+        "worker_count": len(workers),
+        "workers": workers,
+        "outer_test_released": False,
+    })
+    _write_json(experiment / "canary" / "CANARY_PASSED.json", gate)
+
+    changed = repo / changed_path
+    changed.parent.mkdir(parents=True, exist_ok=True)
+    changed.write_text("continuation infrastructure repair\n")
+    subprocess.run(["git", "add", changed_path], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "continuation repair"], cwd=repo,
+        check=True, capture_output=True,
+    )
+    continuation_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    continuation_worktree = repo.parent / f"{repo.name}-continuation-worktree"
+    subprocess.run(
+        [
+            "git", "worktree", "add", "--detach", str(continuation_worktree),
+            continuation_commit,
+        ],
+        cwd=repo, check=True, capture_output=True,
+    )
+
+    task_keys = sorted(
+        f"aptos__fold0__{variant}__seed42"
+        for variant in EXPECTED_SHORTCUT_VARIANTS
+    )
+    preflight = _reseal({
+        "schema": "origin-acceptance-continuation-preflight-v1",
+        "protocol_id": submission["protocol_id"],
+        "protocol_sha256": submission["protocol_sha256"],
+        "experiment_root": str(experiment.resolve()),
+        "parent": {
+            "submission_path": str(submission_path.resolve()),
+            "submission_file_sha256": file_sha256(submission_path),
+            "submission_content_checksum_sha256": submission[
+                "content_checksum_sha256"
+            ],
+            "parent_launch_commit": parent_commit,
+            "parent_immutable_worktree": str(parent_worktree.resolve()),
+            "parent_jobs": dict(submission["jobs"]),
+        },
+        "reused_canary": {
+            "task_count": len(task_keys),
+            "task_keys": task_keys,
+            "training_audit_content_checksum_sha256": gate[
+                "content_checksum_sha256"
+            ],
+            "valid_gate_already_present": True,
+            "worker_manifest_sha256": worker_manifests,
+            "best_learned_sha256": checkpoints,
+        },
+        "downstream_state": "absent",
+    })
+    restart = _reseal({
+        "schema": "origin-acceptance-restart-submission-v1",
+        "created_at_utc": "2026-10-01T00:00:00+00:00",
+        "protocol_id": submission["protocol_id"],
+        "protocol_sha256": submission["protocol_sha256"],
+        "experiment_root": str(experiment.resolve()),
+        "continuation_reason": "parent audit import path repair",
+        "scientific_protocol_changed": False,
+        "canary_training_reused": True,
+        "preflight": preflight,
+        "launch_commit": continuation_commit,
+        "immutable_worktree": str(continuation_worktree.resolve()),
+        "conda_environment": "test",
+        "scheduler_parent_states": {
+            "canary_array": "COMPLETED",
+            "failed_canary_audit": "FAILED",
+        },
+        "canary_reaudit_dependency_mode": "verified_completed_no_dependency",
+        "jobs": {
+            "canary_reaudit": "200",
+            "full_training_array": "201",
+            "full_freeze_audit": "202",
+            "coordinated_outer_release_array": "203",
+            "release_aggregate": "204",
+        },
+    })
+    restart_path = _write_json(experiment / "RESTART_SUBMISSION.json", restart)
+    return {
+        "submission": submission,
+        "submission_path": submission_path,
+        "restart": restart,
+        "restart_path": restart_path,
+        "parent_commit": parent_commit,
+        "continuation_commit": continuation_commit,
+        "parent_worktree": parent_worktree,
+        "continuation_worktree": continuation_worktree,
+    }
+
+
+def _write_resealed_restart(path: Path, payload: dict) -> None:
+    preflight = payload.get("preflight")
+    if isinstance(preflight, dict):
+        payload["preflight"] = _reseal(preflight)
+    _write_json(path, _reseal(payload))
+
+
 def _inputs(tmp_path: Path, *, gate_a: str = "pass", gate_b: bool = True) -> dict:
     repo, commit = _git_repo(tmp_path / "repo")
     artifacts = tmp_path / "artifacts"
@@ -860,3 +1037,181 @@ def test_baseline_prediction_checksum_mismatch_prevents_completion(
     with pytest.raises(ValueError, match="predictions SHA-256 mismatch"):
         assemble_package(**inputs)
     assert not inputs["output_dir"].exists()
+
+
+def test_continued_baseline_records_both_commits_worktrees_and_job_chains(
+    tmp_path: Path,
+) -> None:
+    inputs = _inputs(tmp_path)
+    chain = _install_restart_submission(
+        experiment=inputs["baseline_aggregate"].parents[2],
+        repo=inputs["repo_root"],
+        parent_commit=inputs["expected_commit"],
+    )
+    record = validate_baseline_aggregate(
+        inputs["baseline_aggregate"], inputs["repo_root"]
+    )
+    provenance = record["execution_provenance"]
+    assert record["source_commit"] == chain["continuation_commit"]
+    assert record["parent_canary_source_commit"] == chain["parent_commit"]
+    assert record["continuation_source_commit"] == chain["continuation_commit"]
+    assert provenance["mode"] == "infrastructure_only_continuation"
+    assert provenance["parent_canary_worktree"]["recorded_worktree_verified"] is True
+    assert provenance["continuation_worktree"]["recorded_worktree_verified"] is True
+    assert provenance["infrastructure_only_commit_delta"]["verified"] is True
+    assert provenance["infrastructure_only_commit_delta"]["changed_files"] == [
+        "docs/continuation.md"
+    ]
+    assert provenance["parent_job_chain"]["canary_gate_audit"] == "101"
+    assert provenance["continuation_job_chain"]["canary_reaudit"] == "200"
+    inputs["expected_commit"] = chain["continuation_commit"]
+    package = assemble_package(**inputs)
+    packaged_provenance = package["components"][
+        "matched_baseline_outer_release"
+    ]["execution_provenance"]
+    assert packaged_provenance["parent_canary_source_commit"] == chain[
+        "parent_commit"
+    ]
+    sanitized = inputs["output_dir"] / "bundle" / "matched_baselines" / (
+        "RESTART_SUBMISSION_sanitized.json"
+    )
+    assert sanitized.is_file()
+    assert str(tmp_path) not in sanitized.read_text()
+
+
+def test_continuation_restart_checksum_tampering_is_rejected(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    chain = _install_restart_submission(
+        experiment=inputs["baseline_aggregate"].parents[2],
+        repo=inputs["repo_root"], parent_commit=inputs["expected_commit"],
+    )
+    restart = dict(chain["restart"])
+    restart["scientific_protocol_changed"] = True
+    _write_json(chain["restart_path"], restart)
+    with pytest.raises(ValueError, match="canonical content checksum mismatch"):
+        _validate_baseline_execution_provenance(
+            experiment_root=inputs["baseline_aggregate"].parents[2],
+            submission=chain["submission"],
+            aggregate_protocol_sha256=chain["submission"]["protocol_sha256"],
+            repo_root=inputs["repo_root"],
+        )
+
+
+def test_resealed_parent_submission_digest_tampering_is_rejected(
+    tmp_path: Path,
+) -> None:
+    inputs = _inputs(tmp_path)
+    chain = _install_restart_submission(
+        experiment=inputs["baseline_aggregate"].parents[2],
+        repo=inputs["repo_root"], parent_commit=inputs["expected_commit"],
+    )
+    restart = dict(chain["restart"])
+    preflight = dict(restart["preflight"])
+    parent = dict(preflight["parent"])
+    parent["submission_file_sha256"] = "f" * 64
+    preflight["parent"] = parent
+    restart["preflight"] = preflight
+    _write_resealed_restart(chain["restart_path"], restart)
+    with pytest.raises(ValueError, match="parent submission file digest mismatch"):
+        _validate_baseline_execution_provenance(
+            experiment_root=inputs["baseline_aggregate"].parents[2],
+            submission=chain["submission"],
+            aggregate_protocol_sha256=chain["submission"]["protocol_sha256"],
+            repo_root=inputs["repo_root"],
+        )
+
+
+def test_resealed_parent_job_chain_tampering_is_rejected(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    chain = _install_restart_submission(
+        experiment=inputs["baseline_aggregate"].parents[2],
+        repo=inputs["repo_root"], parent_commit=inputs["expected_commit"],
+    )
+    restart = dict(chain["restart"])
+    preflight = dict(restart["preflight"])
+    parent = dict(preflight["parent"])
+    jobs = dict(parent["parent_jobs"])
+    jobs["release_aggregate"] = "999"
+    parent["parent_jobs"] = jobs
+    preflight["parent"] = parent
+    restart["preflight"] = preflight
+    _write_resealed_restart(chain["restart_path"], restart)
+    with pytest.raises(ValueError, match="parent job chain mismatch"):
+        _validate_baseline_execution_provenance(
+            experiment_root=inputs["baseline_aggregate"].parents[2],
+            submission=chain["submission"],
+            aggregate_protocol_sha256=chain["submission"]["protocol_sha256"],
+            repo_root=inputs["repo_root"],
+        )
+
+
+def test_resealed_continuation_protocol_tampering_is_rejected(
+    tmp_path: Path,
+) -> None:
+    inputs = _inputs(tmp_path)
+    chain = _install_restart_submission(
+        experiment=inputs["baseline_aggregate"].parents[2],
+        repo=inputs["repo_root"], parent_commit=inputs["expected_commit"],
+    )
+    restart = dict(chain["restart"])
+    restart["protocol_sha256"] = "b" * 64
+    _write_resealed_restart(chain["restart_path"], restart)
+    with pytest.raises(ValueError, match="restart protocol digest mismatch"):
+        _validate_baseline_execution_provenance(
+            experiment_root=inputs["baseline_aggregate"].parents[2],
+            submission=chain["submission"],
+            aggregate_protocol_sha256=chain["submission"]["protocol_sha256"],
+            repo_root=inputs["repo_root"],
+        )
+
+
+def test_continuation_with_scientific_source_change_is_rejected(
+    tmp_path: Path,
+) -> None:
+    inputs = _inputs(tmp_path)
+    chain = _install_restart_submission(
+        experiment=inputs["baseline_aggregate"].parents[2],
+        repo=inputs["repo_root"], parent_commit=inputs["expected_commit"],
+        changed_path="models/origin.py",
+    )
+    with pytest.raises(ValueError, match="changes non-infrastructure files"):
+        _validate_baseline_execution_provenance(
+            experiment_root=inputs["baseline_aggregate"].parents[2],
+            submission=chain["submission"],
+            aggregate_protocol_sha256=chain["submission"]["protocol_sha256"],
+            repo_root=inputs["repo_root"],
+        )
+
+
+def test_continuation_wrapper_scientific_change_is_rejected(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    chain = _install_restart_submission(
+        experiment=inputs["baseline_aggregate"].parents[2],
+        repo=inputs["repo_root"], parent_commit=inputs["expected_commit"],
+        changed_path="scripts/submit_origin_acceptance_full_array.sh",
+    )
+    with pytest.raises(ValueError, match="changes non-infrastructure files"):
+        _validate_baseline_execution_provenance(
+            experiment_root=inputs["baseline_aggregate"].parents[2],
+            submission=chain["submission"],
+            aggregate_protocol_sha256=chain["submission"]["protocol_sha256"],
+            repo_root=inputs["repo_root"],
+        )
+
+
+def test_dirty_continuation_worktree_is_rejected(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    chain = _install_restart_submission(
+        experiment=inputs["baseline_aggregate"].parents[2],
+        repo=inputs["repo_root"], parent_commit=inputs["expected_commit"],
+    )
+    (chain["continuation_worktree"] / "docs" / "continuation.md").write_text(
+        "dirty continuation\n"
+    )
+    with pytest.raises(ValueError, match="tracked modifications"):
+        _validate_baseline_execution_provenance(
+            experiment_root=inputs["baseline_aggregate"].parents[2],
+            submission=chain["submission"],
+            aggregate_protocol_sha256=chain["submission"]["protocol_sha256"],
+            repo_root=inputs["repo_root"],
+        )

@@ -104,6 +104,50 @@ BASELINE_POSTERIOR_CONTRACT = {
     "reliability_scope": "pooled_out_of_fold_predictions_per_training_seed",
 }
 
+BASELINE_PARENT_JOB_KEYS = (
+    "aptos_fold0_canary_array",
+    "canary_gate_audit",
+    "full_training_array",
+    "full_freeze_audit",
+    "coordinated_outer_release_array",
+    "release_aggregate",
+)
+BASELINE_CONTINUATION_JOB_KEYS = (
+    "canary_reaudit",
+    "full_training_array",
+    "full_freeze_audit",
+    "coordinated_outer_release_array",
+    "release_aggregate",
+)
+BASELINE_PARENT_FAILURE_STATES = {
+    "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL",
+    "PREEMPTED", "BOOT_FAIL", "DEADLINE",
+}
+
+# A baseline continuation may repair orchestration and packaging, but it may
+# not change the executable scientific protocol.  These paths are deliberately
+# enumerated instead of treating a commit message or a manifest boolean as
+# evidence that a continuation was infrastructure-only.
+BASELINE_CONTINUATION_INFRASTRUCTURE_PREFIXES = ("docs/", "paper/", "tests/")
+BASELINE_CONTINUATION_INFRASTRUCTURE_FILES = {
+    "tools/assemble_origin_acceptance_package.py",
+    "scripts/continue_origin_acceptance_baselines.sh",
+    "scripts/validate_origin_acceptance_continuation.py",
+    "scripts/launch_origin_acceptance_package.sh",
+    "scripts/submit_origin_acceptance_package.sh",
+    "scripts/submit_origin_shortcut_comparator_preflight_v2.sh",
+    "scripts/submit_origin_shortcut_comparator_aggregate_v2.sh",
+}
+BASELINE_CONTINUATION_WRAPPERS = {
+    "scripts/submit_origin_acceptance_aptos_f0_canary.sh",
+    "scripts/submit_origin_acceptance_canary_audit.sh",
+    "scripts/submit_origin_acceptance_full_array.sh",
+    "scripts/submit_origin_acceptance_full_audit.sh",
+    "scripts/submit_origin_acceptance_outer_release.sh",
+    "scripts/submit_origin_acceptance_release_aggregate.sh",
+}
+BASELINE_EXECUTABLE_PROTOCOL = "scripts/origin_acceptance_baseline_common.py"
+
 
 def canonical_sha256(value: Any) -> str:
     encoded = json.dumps(
@@ -211,6 +255,442 @@ def _verify_commit(repo_root: Path, commit: Any, *, field: str) -> str:
     except subprocess.CalledProcessError as error:
         raise ValueError(f"{field} is not present in the repository: {value}") from error
     return value
+
+
+def _verify_checksummed_mapping(
+    payload: Any, *, schema: str, label: str,
+) -> Mapping[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{label} is not a JSON object")
+    if payload.get("schema") != schema:
+        raise ValueError(f"{label} schema changed")
+    recorded = payload.get("content_checksum_sha256")
+    if not isinstance(recorded, str) or not HEX64.fullmatch(recorded):
+        raise ValueError(f"{label} lacks a canonical content checksum")
+    unsigned = dict(payload)
+    unsigned.pop("content_checksum_sha256", None)
+    if canonical_sha256(unsigned) != recorded:
+        raise ValueError(f"{label} canonical content checksum mismatch")
+    return payload
+
+
+def _require_scheduler_job_map(
+    value: Any, *, expected_keys: Sequence[str], label: str,
+) -> dict[str, str]:
+    if not isinstance(value, Mapping) or set(value) != set(expected_keys):
+        raise ValueError(f"{label} scheduler job map is incomplete")
+    jobs = {key: str(value[key]) for key in expected_keys}
+    if any(not identifier.isdigit() for identifier in jobs.values()):
+        raise ValueError(f"{label} scheduler job identifier is malformed")
+    if len(set(jobs.values())) != len(jobs):
+        raise ValueError(f"{label} scheduler job identifiers are not unique")
+    return jobs
+
+
+def _verify_recorded_worktree(
+    repo_root: Path, declaration: Any, *, commit: str, label: str,
+) -> dict[str, Any]:
+    worktree = Path(str(declaration)).expanduser().resolve()
+    if not worktree.is_dir():
+        raise ValueError(f"{label} recorded worktree is unavailable")
+    try:
+        head = _git(worktree, "rev-parse", "HEAD")
+        top_level = Path(_git(worktree, "rev-parse", "--show-toplevel")).resolve()
+        branch = _git(worktree, "branch", "--show-current")
+        dirty = _git(worktree, "status", "--porcelain", "--untracked-files=no")
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError(f"{label} recorded worktree is not a valid Git worktree") from error
+    if top_level != worktree:
+        raise ValueError(f"{label} declaration does not name the worktree root")
+    if head != commit:
+        raise ValueError(f"{label} recorded worktree commit mismatch")
+    if branch:
+        raise ValueError(f"{label} recorded worktree is not detached")
+    if dirty:
+        raise ValueError(f"{label} recorded worktree has tracked modifications")
+    # Confirm the object is also present in the assembly repository.  A
+    # worktree path alone is not accepted as a second source of truth.
+    _verify_commit(repo_root, commit, field=f"{label} commit")
+    return {
+        "commit": commit,
+        "recorded_worktree_verified": True,
+        "recorded_worktree_location_sha256": hashlib.sha256(
+            str(worktree).encode("utf-8")
+        ).hexdigest(),
+        "detached_head": True,
+        "tracked_worktree_clean": True,
+    }
+
+
+def _git_blob_text(repo_root: Path, commit: str, relative_path: str) -> str:
+    try:
+        completed = subprocess.run(
+            ("git", "-C", str(repo_root), "show", f"{commit}:{relative_path}"),
+            check=True, capture_output=True,
+        )
+    except subprocess.CalledProcessError as error:
+        raise ValueError(
+            f"continued baseline provenance cannot read {relative_path} at {commit}"
+        ) from error
+    try:
+        return completed.stdout.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(
+            f"continued baseline infrastructure file is not UTF-8: {relative_path}"
+        ) from error
+
+
+def _normalized_baseline_wrapper(source: str) -> str:
+    """Erase only the audited import-path repair from a Slurm wrapper."""
+
+    normalized: list[str] = []
+    for line in source.splitlines():
+        if line == 'REPO_ROOT="${ORIGIN_REPO_ROOT:?ORIGIN_REPO_ROOT is required}"':
+            continue
+        if line == 'export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"':
+            continue
+        if line == 'cd "${REPO_ROOT}"':
+            line = 'cd "${ORIGIN_REPO_ROOT:?ORIGIN_REPO_ROOT is required}"'
+        if line == "python -m scripts.audit_origin_acceptance_baselines \\":
+            line = "python scripts/audit_origin_acceptance_baselines.py " + '\\'
+        if line == "python -m scripts.aggregate_origin_acceptance_release \\":
+            line = "python scripts/aggregate_origin_acceptance_release.py " + '\\'
+        normalized.append(line)
+    return "\n".join(normalized).rstrip() + "\n"
+
+
+def _verify_infrastructure_only_continuation(
+    repo_root: Path, *, parent_commit: str, continuation_commit: str,
+) -> dict[str, Any]:
+    if parent_commit == continuation_commit:
+        raise ValueError("continued baseline provenance reuses the parent commit")
+    ancestry = subprocess.run(
+        (
+            "git", "-C", str(repo_root), "merge-base", "--is-ancestor",
+            parent_commit, continuation_commit,
+        ),
+        capture_output=True,
+    )
+    if ancestry.returncode != 0:
+        raise ValueError("continued baseline commit is not descended from its parent")
+    changed_text = _git(
+        repo_root, "diff", "--no-renames", "--name-only",
+        parent_commit, continuation_commit,
+    )
+    changed = tuple(line for line in changed_text.splitlines() if line)
+    if not changed:
+        raise ValueError("continued baseline commit contains no auditable repair")
+    disallowed: list[str] = []
+    for relative in changed:
+        if relative in BASELINE_CONTINUATION_WRAPPERS:
+            before = _normalized_baseline_wrapper(
+                _git_blob_text(repo_root, parent_commit, relative)
+            )
+            after = _normalized_baseline_wrapper(
+                _git_blob_text(repo_root, continuation_commit, relative)
+            )
+            if before != after:
+                disallowed.append(relative)
+            continue
+        if relative in BASELINE_CONTINUATION_INFRASTRUCTURE_FILES:
+            continue
+        if relative.startswith(BASELINE_CONTINUATION_INFRASTRUCTURE_PREFIXES):
+            continue
+        disallowed.append(relative)
+    if disallowed:
+        raise ValueError(
+            "continued baseline commit changes non-infrastructure files: "
+            + ", ".join(sorted(disallowed))
+        )
+
+    parent_protocol = _git(
+        repo_root, "rev-parse", f"{parent_commit}:{BASELINE_EXECUTABLE_PROTOCOL}"
+    )
+    continuation_protocol = _git(
+        repo_root, "rev-parse", f"{continuation_commit}:{BASELINE_EXECUTABLE_PROTOCOL}"
+    )
+    if parent_protocol != continuation_protocol:
+        raise ValueError("continued baseline executable scientific protocol changed")
+    protocol_sha256 = hashlib.sha256(
+        _git_blob_text(repo_root, parent_commit, BASELINE_EXECUTABLE_PROTOCOL).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    patch = subprocess.run(
+        (
+            "git", "-C", str(repo_root), "diff", "--binary", "--no-renames",
+            parent_commit, continuation_commit,
+        ),
+        check=True, capture_output=True,
+    ).stdout
+    return {
+        "verified": True,
+        "parent_is_ancestor": True,
+        "changed_files": list(changed),
+        "changed_file_count": len(changed),
+        "git_patch_sha256": hashlib.sha256(patch).hexdigest(),
+        "executable_protocol_git_blob_oid": parent_protocol,
+        "executable_protocol_sha256": protocol_sha256,
+        "wrapper_changes_limited_to_import_path_repair": all(
+            path not in BASELINE_CONTINUATION_WRAPPERS
+            or _normalized_baseline_wrapper(
+                _git_blob_text(repo_root, parent_commit, path)
+            ) == _normalized_baseline_wrapper(
+                _git_blob_text(repo_root, continuation_commit, path)
+            )
+            for path in changed
+        ),
+    }
+
+
+def _canary_task_key(task: Mapping[str, Any]) -> str:
+    try:
+        return (
+            f"{task['dataset']}__fold{int(task['fold'])}__"
+            f"{task['baseline_variant']}__seed{int(task['training_seed'])}"
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("continued baseline canary task identity is malformed") from error
+
+
+def _validate_reused_canary(
+    experiment_root: Path, *, protocol_id: str, protocol_sha256: str,
+    preflight_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    gate = verify_checksummed_payload(
+        experiment_root / "canary" / "CANARY_PASSED.json",
+        schema="origin-acceptance-training-audit-v1",
+    )
+    if (
+        gate.get("scope") != "canary"
+        or gate.get("status") != "passed"
+        or gate.get("outer_test_released") is not False
+        or int(gate.get("worker_count", 0)) != len(EXPECTED_SHORTCUT_VARIANTS)
+    ):
+        raise ValueError("continued baseline canary gate is not an exact passed canary")
+    if gate.get("protocol_id") != protocol_id:
+        raise ValueError("continued baseline canary protocol identifier mismatch")
+    if gate.get("protocol_sha256") != protocol_sha256:
+        raise ValueError("continued baseline canary protocol mismatch")
+    workers = gate.get("workers")
+    if not isinstance(workers, list) or len(workers) != len(EXPECTED_SHORTCUT_VARIANTS):
+        raise ValueError("continued baseline canary worker census changed")
+    expected_keys = {
+        f"aptos__fold0__{variant}__seed42"
+        for variant in EXPECTED_SHORTCUT_VARIANTS
+    }
+    observed_keys: set[str] = set()
+    manifest_hashes: dict[str, str] = {}
+    checkpoint_hashes: dict[str, str] = {}
+    for worker in workers:
+        if not isinstance(worker, Mapping) or not isinstance(worker.get("task"), Mapping):
+            raise ValueError("continued baseline canary worker record is malformed")
+        task = worker["task"]
+        key = _canary_task_key(task)
+        variant = str(task.get("baseline_variant"))
+        if key not in expected_keys or key in observed_keys:
+            raise ValueError("continued baseline canary task census changed")
+        manifest_digest = str(worker.get("manifest_sha256"))
+        checkpoint_digest = str(worker.get("best_learned_sha256"))
+        if not HEX64.fullmatch(manifest_digest) or not HEX64.fullmatch(
+            checkpoint_digest
+        ):
+            raise ValueError("continued baseline canary artifact digest is malformed")
+        observed_keys.add(key)
+        manifest_hashes[variant] = manifest_digest
+        checkpoint_hashes[variant] = checkpoint_digest
+    if observed_keys != expected_keys:
+        raise ValueError("continued baseline canary task coverage is incomplete")
+
+    expected_task_keys = preflight_record.get("task_keys")
+    if expected_task_keys != sorted(expected_keys):
+        raise ValueError("continued baseline preflight canary task binding changed")
+    if int(preflight_record.get("task_count", 0)) != len(expected_keys):
+        raise ValueError("continued baseline preflight canary count changed")
+    if preflight_record.get("training_audit_content_checksum_sha256") != gate.get(
+        "content_checksum_sha256"
+    ):
+        raise ValueError("continued baseline canary re-audit checksum mismatch")
+    if preflight_record.get("worker_manifest_sha256") != manifest_hashes:
+        raise ValueError("continued baseline canary manifest hashes changed")
+    if preflight_record.get("best_learned_sha256") != checkpoint_hashes:
+        raise ValueError("continued baseline canary checkpoint hashes changed")
+    if not isinstance(preflight_record.get("valid_gate_already_present"), bool):
+        raise ValueError("continued baseline preflight gate-state record is malformed")
+    return {
+        "verified": True,
+        "worker_count": len(expected_keys),
+        "task_keys": sorted(expected_keys),
+        "training_audit_content_checksum_sha256": gate[
+            "content_checksum_sha256"
+        ],
+    }
+
+
+def _validate_baseline_execution_provenance(
+    *, experiment_root: Path, submission: Mapping[str, Any],
+    aggregate_protocol_sha256: str, repo_root: Path,
+) -> dict[str, Any]:
+    parent_commit = _verify_commit(
+        repo_root, submission.get("launch_commit"),
+        field="matched-baseline parent launch commit",
+    )
+    parent_protocol_sha256 = hashlib.sha256(
+        _git_blob_text(repo_root, parent_commit, BASELINE_EXECUTABLE_PROTOCOL).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    if file_sha256(repo_root / BASELINE_EXECUTABLE_PROTOCOL) != parent_protocol_sha256:
+        raise ValueError(
+            "assembly repository executable protocol differs from the baseline run"
+        )
+    restart_path = experiment_root / "RESTART_SUBMISSION.json"
+    if not restart_path.exists():
+        return {
+            "mode": "single_submission",
+            "source_commit": parent_commit,
+            "parent_canary_source_commit": parent_commit,
+            "continuation_source_commit": None,
+            "restart_submission_present": False,
+            "executable_protocol_sha256": parent_protocol_sha256,
+        }
+
+    restart = verify_checksummed_payload(
+        restart_path, schema="origin-acceptance-restart-submission-v1"
+    )
+    preflight = _verify_checksummed_mapping(
+        restart.get("preflight"),
+        schema="origin-acceptance-continuation-preflight-v1",
+        label="matched-baseline continuation preflight",
+    )
+    parent_record = preflight.get("parent")
+    canary_record = preflight.get("reused_canary")
+    if not isinstance(parent_record, Mapping) or not isinstance(canary_record, Mapping):
+        raise ValueError("matched-baseline continuation preflight is incomplete")
+
+    protocol_id = submission.get("protocol_id")
+    if not isinstance(protocol_id, str) or not protocol_id:
+        raise ValueError("matched-baseline parent protocol identifier is missing")
+    for label, record in (("restart", restart), ("preflight", preflight)):
+        if record.get("protocol_id") != protocol_id:
+            raise ValueError(f"matched-baseline {label} protocol identifier mismatch")
+        if record.get("protocol_sha256") != aggregate_protocol_sha256:
+            raise ValueError(f"matched-baseline {label} protocol digest mismatch")
+    if submission.get("protocol_sha256") != aggregate_protocol_sha256:
+        raise ValueError("matched-baseline parent protocol digest mismatch")
+    if restart.get("scientific_protocol_changed") is not False:
+        raise ValueError("matched-baseline continuation claims a scientific change")
+    if restart.get("canary_training_reused") is not True:
+        raise ValueError("matched-baseline continuation does not bind canary reuse")
+    if not isinstance(restart.get("continuation_reason"), str) or not str(
+        restart.get("continuation_reason")
+    ).strip():
+        raise ValueError("matched-baseline continuation reason is missing")
+    if not isinstance(restart.get("conda_environment"), str) or not str(
+        restart.get("conda_environment")
+    ).strip():
+        raise ValueError("matched-baseline continuation environment is missing")
+    if Path(str(restart.get("experiment_root"))).resolve() != experiment_root.resolve():
+        raise ValueError("matched-baseline restart experiment-root binding changed")
+    if Path(str(preflight.get("experiment_root"))).resolve() != experiment_root.resolve():
+        raise ValueError("matched-baseline preflight experiment-root binding changed")
+    if preflight.get("downstream_state") != "absent":
+        raise ValueError("matched-baseline continuation began after downstream work")
+
+    submission_path = experiment_root / "SUBMISSION.json"
+    if Path(str(parent_record.get("submission_path"))).resolve() != submission_path.resolve():
+        raise ValueError("matched-baseline parent submission path binding changed")
+    if parent_record.get("submission_file_sha256") != file_sha256(submission_path):
+        raise ValueError("matched-baseline parent submission file digest mismatch")
+    if parent_record.get("submission_content_checksum_sha256") != submission.get(
+        "content_checksum_sha256"
+    ):
+        raise ValueError("matched-baseline parent submission checksum binding changed")
+    if parent_record.get("parent_launch_commit") != parent_commit:
+        raise ValueError("matched-baseline preflight parent commit mismatch")
+    if parent_record.get("parent_immutable_worktree") != submission.get(
+        "immutable_worktree"
+    ):
+        raise ValueError("matched-baseline parent worktree binding changed")
+
+    parent_jobs = _require_scheduler_job_map(
+        submission.get("jobs"), expected_keys=BASELINE_PARENT_JOB_KEYS,
+        label="matched-baseline parent",
+    )
+    recorded_parent_jobs = _require_scheduler_job_map(
+        parent_record.get("parent_jobs"), expected_keys=BASELINE_PARENT_JOB_KEYS,
+        label="matched-baseline preflight parent",
+    )
+    if recorded_parent_jobs != parent_jobs:
+        raise ValueError("matched-baseline preflight parent job chain mismatch")
+    continuation_jobs = _require_scheduler_job_map(
+        restart.get("jobs"), expected_keys=BASELINE_CONTINUATION_JOB_KEYS,
+        label="matched-baseline continuation",
+    )
+    if set(continuation_jobs.values()) & set(parent_jobs.values()):
+        raise ValueError("matched-baseline continuation reuses a parent scheduler job")
+
+    states = restart.get("scheduler_parent_states")
+    if not isinstance(states, Mapping) or set(states) != {
+        "canary_array", "failed_canary_audit"
+    }:
+        raise ValueError("matched-baseline continuation scheduler-state record changed")
+    if states.get("canary_array") != "COMPLETED":
+        raise ValueError("matched-baseline parent canary did not complete")
+    if states.get("failed_canary_audit") not in BASELINE_PARENT_FAILURE_STATES:
+        raise ValueError("matched-baseline parent audit lacks a terminal failure state")
+    dependency_mode = restart.get("canary_reaudit_dependency_mode")
+    if dependency_mode not in {
+        "afterok_live_reaudit", "verified_completed_no_dependency"
+    }:
+        raise ValueError("matched-baseline continuation dependency mode changed")
+
+    continuation_commit = _verify_commit(
+        repo_root, restart.get("launch_commit"),
+        field="matched-baseline continuation launch commit",
+    )
+    parent_worktree = _verify_recorded_worktree(
+        repo_root, submission.get("immutable_worktree"), commit=parent_commit,
+        label="matched-baseline parent",
+    )
+    continuation_worktree = _verify_recorded_worktree(
+        repo_root, restart.get("immutable_worktree"), commit=continuation_commit,
+        label="matched-baseline continuation",
+    )
+    canary = _validate_reused_canary(
+        experiment_root, protocol_id=protocol_id,
+        protocol_sha256=aggregate_protocol_sha256,
+        preflight_record=canary_record,
+    )
+    infrastructure = _verify_infrastructure_only_continuation(
+        repo_root, parent_commit=parent_commit,
+        continuation_commit=continuation_commit,
+    )
+    if infrastructure["executable_protocol_sha256"] != parent_protocol_sha256:
+        raise ValueError(
+            "continued baseline executable protocol digest changed unexpectedly"
+        )
+    return {
+        "mode": "infrastructure_only_continuation",
+        "source_commit": continuation_commit,
+        "parent_canary_source_commit": parent_commit,
+        "continuation_source_commit": continuation_commit,
+        "restart_submission_present": True,
+        "parent_submission_file_sha256": file_sha256(submission_path),
+        "restart_submission_file_sha256": file_sha256(restart_path),
+        "restart_submission_content_checksum_sha256": restart[
+            "content_checksum_sha256"
+        ],
+        "protocol_unchanged": True,
+        "parent_canary_worktree": parent_worktree,
+        "continuation_worktree": continuation_worktree,
+        "parent_job_chain": parent_jobs,
+        "continuation_job_chain": continuation_jobs,
+        "scheduler_parent_states": dict(states),
+        "canary_reaudit_dependency_mode": dependency_mode,
+        "reused_canary": canary,
+        "infrastructure_only_commit_delta": infrastructure,
+    }
 
 
 def runtime_provenance(repo_root: Path, expected_commit: str | None) -> dict[str, Any]:
@@ -984,6 +1464,9 @@ def validate_baseline_aggregate(path: Path, repo_root: Path) -> dict[str, Any]:
     _validate_aggregate_posterior_quality(payload)
 
     release_root = path.parent
+    # OUTER_RELEASE_COMPLETE is the atomically written terminal commit marker.
+    # Aggregate/CSV files left behind without this hash-binding marker are a
+    # partial publication and must never be accepted or packaged.
     marker_path = release_root / "OUTER_RELEASE_COMPLETE.json"
     marker = read_json(marker_path)
     if marker.get("schema") != "origin-acceptance-outer-release-complete-v2":
@@ -1003,8 +1486,11 @@ def validate_baseline_aggregate(path: Path, repo_root: Path) -> dict[str, Any]:
     )
     if submission.get("protocol_sha256") != payload.get("protocol_sha256"):
         raise ValueError("matched-baseline submission/aggregate protocol mismatch")
-    launch_commit = _verify_commit(
-        repo_root, submission.get("launch_commit"), field="matched-baseline launch commit"
+    execution_provenance = _validate_baseline_execution_provenance(
+        experiment_root=experiment_root,
+        submission=submission,
+        aggregate_protocol_sha256=str(payload.get("protocol_sha256")),
+        repo_root=repo_root,
     )
     frozen = verify_checksummed_payload(
         experiment_root / "full" / "TRAINING_FROZEN.json",
@@ -1097,7 +1583,14 @@ def validate_baseline_aggregate(path: Path, repo_root: Path) -> dict[str, Any]:
         "schema": payload["schema"],
         "file_sha256": file_sha256(path),
         "content_checksum_sha256": payload["content_checksum_sha256"],
-        "source_commit": launch_commit,
+        "source_commit": execution_provenance["source_commit"],
+        "parent_canary_source_commit": execution_provenance[
+            "parent_canary_source_commit"
+        ],
+        "continuation_source_commit": execution_provenance[
+            "continuation_source_commit"
+        ],
+        "execution_provenance": execution_provenance,
         "protocol_sha256": payload["protocol_sha256"],
         "release_workers": 225,
         "datasets": ["aptos", "dr"],
@@ -1448,6 +1941,13 @@ def _build_release_bundle(
         "matched_baselines/SUBMISSION_sanitized.json",
         role="matched_baseline_submission_protocol_binding",
     )
+    restart_submission = baseline_experiment / "RESTART_SUBMISSION.json"
+    if restart_submission.is_file():
+        builder.sanitized_json(
+            restart_submission,
+            "matched_baselines/RESTART_SUBMISSION_sanitized.json",
+            role="matched_baseline_continuation_protocol_binding",
+        )
     builder.sanitized_json(
         baseline_experiment / "full" / "TRAINING_FROZEN.json",
         "matched_baselines/TRAINING_FROZEN_sanitized.json",
