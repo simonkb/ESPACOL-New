@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -20,7 +21,6 @@ import torch
 from torch.nn import functional as F
 
 from benchmarks.ordinal_shortcut import (
-    SHORTCUT_CONDITIONS,
     SHORTCUT_FAMILIES,
     OrdinalShortcutDataset,
     OrdinalShortcutProtocol,
@@ -43,7 +43,11 @@ from Datasets.origin_data import (
     split_origin_items,
     split_paths_are_disjoint,
 )
-from models.origin import build_origin_model, replay_without, topk_rate_intervention
+from models.origin import build_origin_model
+from models.origin_acceptance_baselines import (
+    AcceptanceLocalOutput,
+    build_origin_acceptance_baseline,
+)
 from train_origin import split_signature
 
 
@@ -155,6 +159,9 @@ def _transform_parameter_hash(
 
 
 def _model_from_config(config: Mapping[str, Any]):
+    variant = str(config.get("model_variant", config.get("baseline_variant", "origin_ctmc")))
+    if variant != "origin_ctmc":
+        return build_origin_acceptance_baseline(config, pretrained=False)
     return build_origin_model(
         num_classes=int(config["n_classes"]),
         encoder_name=str(config["encoder"]),
@@ -175,6 +182,101 @@ def _model_from_config(config: Mapping[str, Any]):
         mask_valid_fraction=float(config["mask_valid_fraction"]),
         grad_checkpoint=bool(config["grad_checkpoint"]),
     )
+
+
+@dataclass(frozen=True)
+class _LocalLedgerView:
+    boundary_maps_cf: Mapping[str, torch.Tensor]
+    valid_masks: Mapping[str, torch.Tensor]
+    semantics: str
+
+
+@dataclass(frozen=True)
+class _LocalIntervention:
+    output: object
+    removal_masks: Mapping[str, torch.Tensor]
+
+
+def _local_ledger_view(output: object, model_variant: str) -> _LocalLedgerView | None:
+    """Expose comparable boundary-support maps without changing predictions.
+
+    Sparse-BagNet stores class activations, so its boundary-k support is the
+    sum of the stored class channels above k.  Additive-MIL stores signed
+    boundary logit contributions directly.  These are explicitly custom
+    matched analogues, not author-code implementations or CTMC rates.
+    """
+
+    source = getattr(output, "ledger_output", output)
+    scale_evidence = getattr(source, "scale_evidence", None)
+    if isinstance(scale_evidence, Mapping) and scale_evidence:
+        return _LocalLedgerView(
+            boundary_maps_cf={
+                name: item.local_rate_map for name, item in scale_evidence.items()
+            },
+            valid_masks={name: item.valid_mask for name, item in scale_evidence.items()},
+            semantics="nonnegative_boundary_rate_ledger",
+        )
+    if isinstance(output, AcceptanceLocalOutput):
+        if model_variant == "ordinal_additive_mil":
+            maps = {
+                name: value.permute(0, 3, 1, 2).contiguous()
+                for name, value in output.effective_local_maps.items()
+            }
+            semantics = "signed_boundary_logit_contribution"
+        elif model_variant == "sparse_bagnet":
+            maps = {}
+            for name, value in output.effective_local_maps.items():
+                # (N,H,W,K) -> (N,K-1,H,W), channel k supports Y>k.
+                severity = torch.stack(
+                    [value[..., boundary + 1 :].sum(dim=-1) for boundary in range(4)],
+                    dim=1,
+                )
+                maps[name] = severity
+            semantics = "nonnegative_sum_of_class_activations_above_boundary"
+        else:
+            raise ValueError(f"unsupported local comparator {model_variant!r}")
+        return _LocalLedgerView(
+            boundary_maps_cf=maps,
+            valid_masks=output.original_valid_masks,
+            semantics=semantics,
+        )
+    return None
+
+
+def _topk_local_intervention(
+    model: object,
+    output: object,
+    view: _LocalLedgerView,
+    *,
+    boundary: int,
+    k: int,
+) -> _LocalIntervention:
+    score_parts: list[torch.Tensor] = []
+    valid_parts: list[torch.Tensor] = []
+    offsets: dict[str, tuple[int, int]] = {}
+    cursor = 0
+    for name, scores_cf in view.boundary_maps_cf.items():
+        scores = scores_cf[:, boundary].flatten(1)
+        valid = view.valid_masks[name].flatten(1).bool()
+        score_parts.append(scores)
+        valid_parts.append(valid)
+        offsets[name] = (cursor, cursor + scores.shape[1])
+        cursor += scores.shape[1]
+    scores = torch.cat(score_parts, dim=1)
+    valid = torch.cat(valid_parts, dim=1)
+    if bool((valid.sum(dim=1) < k).any()):
+        raise ValueError("k exceeds the valid local-cell count")
+    selected = scores.masked_fill(~valid, -torch.inf).topk(k, dim=1).indices
+    removals: dict[str, torch.Tensor] = {}
+    for name, valid_mask in view.valid_masks.items():
+        start, stop = offsets[name]
+        counts = torch.zeros_like(valid_mask.flatten(1), dtype=torch.int64)
+        within = (selected >= start) & (selected < stop)
+        local = (selected - start).clamp(0, stop - start - 1)
+        counts.scatter_add_(1, local, within.to(torch.int64))
+        removals[name] = (counts > 0).reshape_as(valid_mask)
+    replayed = model.replay_without(output, removals, force_decoder_fp64=True)
+    return _LocalIntervention(output=replayed.output, removal_masks=removals)
 
 
 def _prediction(output: object, rule: str) -> torch.Tensor:
@@ -325,7 +427,7 @@ def _run_condition(
 
 
 def _scale_matched_random_masks(
-    output: object,
+    valid_masks: Mapping[str, torch.Tensor],
     selected_masks: Mapping[str, torch.Tensor],
     *,
     sample_indices: Sequence[int],
@@ -333,8 +435,7 @@ def _scale_matched_random_masks(
     audit_seed: int,
 ) -> dict[str, torch.Tensor]:
     random_masks: dict[str, torch.Tensor] = {}
-    for scale_index, (name, evidence) in enumerate(output.scale_evidence.items()):
-        valid = evidence.valid_mask
+    for scale_index, (name, valid) in enumerate(valid_masks.items()):
         requested = selected_masks[name].flatten(1).sum(dim=1)
         flat_valid = valid.flatten(1)
         chosen = torch.zeros_like(flat_valid)
@@ -383,6 +484,7 @@ def _main_audit(
     factorial_transform_sha256: str,
     main_transform_sha256: str,
     decision_rule: str,
+    model_variant: str,
 ) -> dict[str, Any]:
     evidence_batches: list[torch.Tensor] = []
     marker_batches: list[torch.Tensor] = []
@@ -395,6 +497,7 @@ def _main_audit(
     factorial_prediction_records: list[dict[str, Any]] = []
     internal_effect_records: list[dict[str, Any]] = []
     mask_digest = hashlib.sha256()
+    local_semantics: str | None = None
 
     with torch.inference_mode():
         for batch_indices in _chunks(indices, batch_size):
@@ -402,28 +505,39 @@ def _main_audit(
             images_device = images.to(device)
             valid_device = valid.to(device)
             output = model(images_device, valid_device, force_decoder_fp64=True)
-
-            raster = rasterize_native_ledger(
-                output.local_rate_maps_channels_first,
-                output_size=(audit_grid, audit_grid),
-            )
             support = torch.stack([sample.metadata.support_masks for sample in samples])
-            evidence_batches.append(raster.detach().float().cpu())
-            marker_batches.append(_downsample_masks(support, audit_grid).cpu())
-            valid_batches.append(
-                F.interpolate(valid.float(), size=(audit_grid, audit_grid), mode="nearest").bool()
-            )
             for sample in samples:
                 mask_digest.update(sample.metadata.support_masks.numpy().tobytes())
                 if len(metadata_records) < 16:
                     metadata_records.append(sample.metadata.to_record())
-
-            all_cells = {
-                name: evidence.valid_mask for name, evidence in output.scale_evidence.items()
-            }
-            prior = replay_without(output, all_cells, force_decoder_fp64=True).output
             full_tails = output.cumulative_probs
-            denominator = (full_tails - prior.cumulative_probs).clamp_min(1e-12)
+            local_view = _local_ledger_view(output, model_variant)
+            if local_view is not None:
+                if local_semantics is None:
+                    local_semantics = local_view.semantics
+                elif local_semantics != local_view.semantics:
+                    raise AssertionError("local ledger semantics changed between batches")
+                raster = rasterize_native_ledger(
+                    local_view.boundary_maps_cf,
+                    output_size=(audit_grid, audit_grid),
+                )
+                evidence_batches.append(raster.detach().float().cpu())
+                marker_batches.append(_downsample_masks(support, audit_grid).cpu())
+                valid_batches.append(
+                    F.interpolate(
+                        valid.float(), size=(audit_grid, audit_grid), mode="nearest"
+                    ).bool()
+                )
+                all_cells = {
+                    name: value.clone() for name, value in local_view.valid_masks.items()
+                }
+                prior = model.replay_without(
+                    output, all_cells, force_decoder_fp64=True
+                ).output
+                denominator = (full_tails - prior.cumulative_probs).abs().clamp_min(1e-12)
+            else:
+                prior = None
+                denominator = None
 
             batch_paired = torch.empty(
                 len(batch_indices),
@@ -432,11 +546,19 @@ def _main_audit(
                 dataset.protocol.num_boundaries,
                 dtype=torch.float64,
             )
-            batch_internal = torch.empty(
+            batch_internal = (
+                torch.empty(
+                    len(batch_indices), dataset.protocol.num_boundaries, dtype=torch.float64
+                )
+                if local_view is not None
+                else None
+            )
+            batch_random = (
+                torch.empty_like(batch_internal) if batch_internal is not None else None
+            )
+            batch_pixel = torch.empty(
                 len(batch_indices), dataset.protocol.num_boundaries, dtype=torch.float64
             )
-            batch_random = torch.empty_like(batch_internal)
-            batch_pixel = torch.empty_like(batch_internal)
             pixel_fraction = torch.stack(
                 [
                     sample.metadata.support_masks.float().mean(dim=(-2, -1))
@@ -444,9 +566,18 @@ def _main_audit(
                 ]
             )
             budget_fraction = pixel_fraction.median(dim=0).values.clamp(max=0.10)
-            minimum_valid = min(
-                int(sum(evidence.valid_mask[row].sum() for evidence in output.scale_evidence.values()))
-                for row in range(len(batch_indices))
+            minimum_valid = (
+                min(
+                    int(
+                        sum(
+                            mask[row].sum()
+                            for mask in local_view.valid_masks.values()
+                        )
+                    )
+                    for row in range(len(batch_indices))
+                )
+                if local_view is not None
+                else 0
             )
 
             # Evaluate the complete 2^4 factorial on exactly the same clean
@@ -578,148 +709,186 @@ def _main_audit(
                         }
                     )
 
-            for boundary in range(dataset.protocol.num_boundaries):
-                k = max(1, int(round(float(budget_fraction[boundary]) * minimum_valid)))
-                top = topk_rate_intervention(
-                    output, boundary=boundary, k=k, force_decoder_fp64=True
-                )
-                random_masks = _scale_matched_random_masks(
-                    output,
-                    top.intervention.removal_masks,
-                    sample_indices=batch_indices,
-                    boundary=boundary,
-                    audit_seed=audit_seed,
-                )
-                random_replay = replay_without(
-                    output, random_masks, force_decoder_fp64=True
-                ).output
-                batch_internal[:, boundary] = (
-                    (full_tails[:, boundary] - top.intervention.output.cumulative_probs[:, boundary])
-                    / denominator[:, boundary]
-                ).detach().cpu()
-                batch_random[:, boundary] = (
-                    (full_tails[:, boundary] - random_replay.cumulative_probs[:, boundary])
-                    / denominator[:, boundary]
-                ).detach().cpu()
-                for row, sample in enumerate(samples):
-                    target_id = f"aptos:fold{fold}:outer:{sample.metadata.sample_index}"
-                    internal_effect_records.append(
-                        {
-                            "record_type": "internal_pixel_effect",
-                            "sample_id": target_id,
-                            "clean_source_id": (
-                                f"aptos:fold{fold}:clean-source:"
-                                f"{sample.metadata.source_index}"
-                            ),
-                            "sample_index": sample.metadata.sample_index,
-                            "source_index": sample.metadata.source_index,
-                            "label": int(sample.label),
-                            "family": dataset.family,
-                            "condition": dataset.condition,
-                            "boundary": boundary,
-                            "protocol_seed": dataset.protocol.seed,
-                            "sample_seed": sample.metadata.sample_seed,
-                            "native_selected_cells_by_scale": {
-                                name: int(mask[row].sum())
-                                for name, mask in top.intervention.removal_masks.items()
-                            },
-                            "full_class_probabilities": output.class_probs[row]
-                            .detach()
-                            .cpu()
-                            .tolist(),
-                            "prior_class_probabilities": prior.class_probs[row]
-                            .detach()
-                            .cpu()
-                            .tolist(),
-                            "top_deleted_class_probabilities": (
-                                top.intervention.output.class_probs[row]
-                                .detach()
-                                .cpu()
-                                .tolist()
-                            ),
-                            "random_deleted_class_probabilities": (
-                                random_replay.class_probs[row].detach().cpu().tolist()
-                            ),
-                            "full_threshold_probabilities": full_tails[row]
-                            .detach()
-                            .cpu()
-                            .tolist(),
-                            "prior_threshold_probabilities": prior.cumulative_probs[row]
-                            .detach()
-                            .cpu()
-                            .tolist(),
-                            "top_deleted_threshold_probabilities": (
-                                top.intervention.output.cumulative_probs[row]
-                                .detach()
-                                .cpu()
-                                .tolist()
-                            ),
-                            "random_deleted_threshold_probabilities": (
-                                random_replay.cumulative_probs[row]
-                                .detach()
-                                .cpu()
-                                .tolist()
-                            ),
-                            "normalized_internal_effect": float(
-                                batch_internal[row, boundary]
-                            ),
-                            "normalized_random_effect": float(
-                                batch_random[row, boundary]
-                            ),
-                            "factorial_pixel_marginal_effect": float(
-                                batch_pixel[row, boundary]
-                            ),
-                            "transform_parameter_sha256": main_transform_sha256,
-                            "factorial_transform_parameter_sha256": (
-                                factorial_transform_sha256
-                            ),
-                        }
+            if local_view is not None:
+                assert prior is not None and denominator is not None
+                assert batch_internal is not None and batch_random is not None
+                for boundary in range(dataset.protocol.num_boundaries):
+                    k = max(
+                        1,
+                        int(
+                            round(
+                                float(budget_fraction[boundary]) * minimum_valid
+                            )
+                        ),
                     )
+                    top = _topk_local_intervention(
+                        model, output, local_view, boundary=boundary, k=k
+                    )
+                    random_masks = _scale_matched_random_masks(
+                        local_view.valid_masks,
+                        top.removal_masks,
+                        sample_indices=batch_indices,
+                        boundary=boundary,
+                        audit_seed=audit_seed,
+                    )
+                    random_replay = model.replay_without(
+                        output, random_masks, force_decoder_fp64=True
+                    ).output
+                    batch_internal[:, boundary] = (
+                        (
+                            full_tails[:, boundary]
+                            - top.output.cumulative_probs[:, boundary]
+                        )
+                        / denominator[:, boundary]
+                    ).detach().cpu()
+                    batch_random[:, boundary] = (
+                        (
+                            full_tails[:, boundary]
+                            - random_replay.cumulative_probs[:, boundary]
+                        )
+                        / denominator[:, boundary]
+                    ).detach().cpu()
+                    for row, sample in enumerate(samples):
+                        target_id = (
+                            f"aptos:fold{fold}:outer:{sample.metadata.sample_index}"
+                        )
+                        internal_effect_records.append(
+                            {
+                                "record_type": "internal_pixel_effect",
+                                "sample_id": target_id,
+                                "clean_source_id": (
+                                    f"aptos:fold{fold}:clean-source:"
+                                    f"{sample.metadata.source_index}"
+                                ),
+                                "sample_index": sample.metadata.sample_index,
+                                "source_index": sample.metadata.source_index,
+                                "label": int(sample.label),
+                                "family": dataset.family,
+                                "condition": dataset.condition,
+                                "boundary": boundary,
+                                "protocol_seed": dataset.protocol.seed,
+                                "sample_seed": sample.metadata.sample_seed,
+                                "native_selected_cells_by_scale": {
+                                    name: int(mask[row].sum())
+                                    for name, mask in top.removal_masks.items()
+                                },
+                                "full_class_probabilities": output.class_probs[row]
+                                .detach()
+                                .cpu()
+                                .tolist(),
+                                "prior_class_probabilities": prior.class_probs[row]
+                                .detach()
+                                .cpu()
+                                .tolist(),
+                                "top_deleted_class_probabilities": (
+                                    top.output.class_probs[row]
+                                    .detach()
+                                    .cpu()
+                                    .tolist()
+                                ),
+                                "random_deleted_class_probabilities": (
+                                    random_replay.class_probs[row]
+                                    .detach()
+                                    .cpu()
+                                    .tolist()
+                                ),
+                                "full_threshold_probabilities": full_tails[row]
+                                .detach()
+                                .cpu()
+                                .tolist(),
+                                "prior_threshold_probabilities": (
+                                    prior.cumulative_probs[row]
+                                    .detach()
+                                    .cpu()
+                                    .tolist()
+                                ),
+                                "top_deleted_threshold_probabilities": (
+                                    top.output.cumulative_probs[row]
+                                    .detach()
+                                    .cpu()
+                                    .tolist()
+                                ),
+                                "random_deleted_threshold_probabilities": (
+                                    random_replay.cumulative_probs[row]
+                                    .detach()
+                                    .cpu()
+                                    .tolist()
+                                ),
+                                "normalized_internal_effect": float(
+                                    batch_internal[row, boundary]
+                                ),
+                                "normalized_random_effect": float(
+                                    batch_random[row, boundary]
+                                ),
+                                "factorial_pixel_marginal_effect": float(
+                                    batch_pixel[row, boundary]
+                                ),
+                                "transform_parameter_sha256": main_transform_sha256,
+                                "factorial_transform_parameter_sha256": (
+                                    factorial_transform_sha256
+                                ),
+                            }
+                        )
 
             paired_tail_batches.append(batch_paired)
-            internal_effects.append(batch_internal)
-            random_effects.append(batch_random)
+            if batch_internal is not None and batch_random is not None:
+                internal_effects.append(batch_internal)
+                random_effects.append(batch_random)
             pixel_effects.append(batch_pixel)
 
-    evidence = torch.cat(evidence_batches).numpy()
-    marker_masks = torch.cat(marker_batches).numpy()
-    valid_masks = torch.cat(valid_batches).numpy()
     paired_tails = torch.cat(paired_tail_batches).numpy()
-    internal = torch.cat(internal_effects).numpy()
-    random_effect = torch.cat(random_effects).numpy()
     pixel = torch.cat(pixel_effects).numpy()
-
-    localization = localization_metrics(
-        evidence,
-        marker_masks,
-        valid_masks,
-        localization_applicable=dataset.family != "diffuse",
-    )
-    permutation = familywise_localization_permutation_test(
-        evidence,
-        marker_masks,
-        valid_masks,
-        permutations=permutations,
-        seed=audit_seed,
-    )
     response = boundary_response_matrix(paired_tails)
-    effects = internal_pixel_effect_audit(
-        internal,
-        random_effect,
-        pixel,
-        bootstrap_replicates=bootstrap_replicates,
-        seed=audit_seed + 1,
-    )
-    effects["per_boundary"] = [
-        internal_pixel_effect_audit(
-            internal[:, boundary],
-            random_effect[:, boundary],
-            pixel[:, boundary],
-            bootstrap_replicates=bootstrap_replicates,
-            seed=audit_seed + 11 + boundary,
+    if evidence_batches:
+        evidence = torch.cat(evidence_batches).numpy()
+        marker_masks = torch.cat(marker_batches).numpy()
+        valid_masks = torch.cat(valid_batches).numpy()
+        internal = torch.cat(internal_effects).numpy()
+        random_effect = torch.cat(random_effects).numpy()
+        localization = localization_metrics(
+            evidence,
+            marker_masks,
+            valid_masks,
+            localization_applicable=dataset.family != "diffuse",
         )
-        for boundary in range(dataset.protocol.num_boundaries)
-    ]
+        permutation = familywise_localization_permutation_test(
+            evidence,
+            marker_masks,
+            valid_masks,
+            permutations=permutations,
+            seed=audit_seed,
+        )
+        effects = internal_pixel_effect_audit(
+            internal,
+            random_effect,
+            pixel,
+            bootstrap_replicates=bootstrap_replicates,
+            seed=audit_seed + 1,
+        )
+        effects["per_boundary"] = [
+            internal_pixel_effect_audit(
+                internal[:, boundary],
+                random_effect[:, boundary],
+                pixel[:, boundary],
+                bootstrap_replicates=bootstrap_replicates,
+                seed=audit_seed + 11 + boundary,
+            )
+            for boundary in range(dataset.protocol.num_boundaries)
+        ]
+    else:
+        localization = {
+            "applicable": False,
+            "reason": "pooled comparator exposes no spatial prediction ledger",
+        }
+        permutation = {
+            "applicable": False,
+            "reason": "pooled comparator exposes no spatial prediction ledger",
+        }
+        effects = {
+            "applicable": False,
+            "reason": "pooled comparator has no exact stored-ledger intervention",
+            "pixel_factorial_effects_remain_reported": True,
+        }
     return {
         "localization": localization,
         "localization_permutation": permutation,
@@ -729,9 +898,19 @@ def _main_audit(
         "procedural_mask_sha256": mask_digest.hexdigest(),
         "procedural_metadata_examples": metadata_records,
         "audit_grid": audit_grid,
-        "native_selection": True,
-        "selection_rule": "top native target-boundary ledger entries",
-        "random_control": "same per-scale native-cell count",
+        "native_selection": bool(evidence_batches),
+        "local_ledger_applicable": bool(evidence_batches),
+        "local_ledger_semantics": local_semantics,
+        "selection_rule": (
+            "top native target-boundary ledger entries"
+            if evidence_batches
+            else "not_applicable"
+        ),
+        "random_control": (
+            "same per-scale native-cell count"
+            if evidence_batches
+            else "not_applicable"
+        ),
         "factorial_prediction_records": factorial_prediction_records,
         "internal_effect_records": internal_effect_records,
         "factorial_states_per_sample": 16,
@@ -789,6 +968,9 @@ def main() -> None:
     if not required.issubset(config):
         raise ValueError("checkpoint is not a controlled-shortcut run")
     arm = str(config["shortcut_arm"])
+    model_variant = str(
+        config.get("model_variant", config.get("baseline_variant", "origin_ctmc"))
+    )
     family = args.family or str(config["shortcut_family"])
     if family not in SHORTCUT_FAMILIES:
         raise ValueError(f"invalid family {family!r}")
@@ -961,6 +1143,7 @@ def main() -> None:
         factorial_transform_sha256=transform_hashes["factorial"],
         main_transform_sha256=transform_hashes[main_condition],
         decision_rule=str(config["decision_rule"]),
+        model_variant=model_variant,
     )
     factorial_prediction_records = audit.pop("factorial_prediction_records")
     internal_effect_records = audit.pop("internal_effect_records")
@@ -971,7 +1154,7 @@ def main() -> None:
         *internal_effect_records,
     ]
     for record in all_prediction_records:
-        record["training_seed"] = int(config["seed"])
+        record["training_seed"] = int(config.get("training_seed", config["seed"]))
         record["split_seed"] = int(config["split_seed"])
         record["checkpoint_sha256"] = checkpoint_sha256
     prediction_manifest = {
@@ -982,8 +1165,13 @@ def main() -> None:
         "fold": fold,
         "shortcut_arm": arm,
         "shortcut_family": family,
-        "training_seed": int(config["seed"]),
+        "training_seed": int(config.get("training_seed", config["seed"])),
         "split_seed": int(config["split_seed"]),
+        "model_variant": model_variant,
+        "comparator_implementation_origin": config.get(
+            "comparator_implementation_origin", "in_repo_proposed_method"
+        ),
+        "official_author_implementation": False,
         "protocol_seed": protocol.seed,
         "shortcut_protocol_signature": protocol.signature,
         "transform_parameter_sha256": transform_hashes,
@@ -1006,8 +1194,13 @@ def main() -> None:
         "fold": fold,
         "shortcut_arm": arm,
         "shortcut_family": family,
-        "training_seed": int(config["seed"]),
+        "training_seed": int(config.get("training_seed", config["seed"])),
         "split_seed": int(config["split_seed"]),
+        "model_variant": model_variant,
+        "comparator_implementation_origin": config.get(
+            "comparator_implementation_origin", "in_repo_proposed_method"
+        ),
+        "official_author_implementation": False,
         "shortcut_protocol": protocol.as_dict(),
         "shortcut_protocol_signature": protocol.signature,
         "transform_parameter_sha256": transform_hashes,

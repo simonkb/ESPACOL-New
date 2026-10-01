@@ -27,6 +27,12 @@ def _float_array(value: Any, *, ndim: int | None = None) -> np.ndarray:
     return result
 
 
+def _finite_mean_or_nan(value: Any) -> float:
+    array = np.asarray(value, dtype=np.float64)
+    finite = array[np.isfinite(array)]
+    return float(finite.mean()) if finite.size else float("nan")
+
+
 def binary_average_precision(scores: Any, targets: Any) -> float:
     """Average precision with deterministic stable tie handling.
 
@@ -180,7 +186,7 @@ def localization_metrics(
         "macro_auprc": float(np.nanmean(per_sample_ap)),
         "macro_auprc_lift": float(np.nanmean(per_sample_ap - prevalence)),
         "macro_pointing_accuracy": float(np.nanmean(points)),
-        "macro_effective_support_fraction": float(np.nanmean(effective_support)),
+        "macro_effective_support_fraction": _finite_mean_or_nan(effective_support),
         "macro_boundary_identification_accuracy": (
             float(np.nanmean(assignment_correct)) if localization_applicable else float("nan")
         ),
@@ -306,9 +312,10 @@ def boundary_response_selectivity(matrix: Any) -> dict[str, float]:
         "diagonal_mean_abs": diagonal_mean,
         "off_diagonal_mean_abs": off_mean,
         "diagonal_minus_off_diagonal": diagonal_mean - off_mean,
-        "diagonal_to_off_diagonal_ratio": (
-            diagonal_mean / off_mean if off_mean > 0.0 else float("inf")
-        ),
+        # Ordinal decoders may legitimately propagate a cue across later
+        # tails, so this is a dominance ratio rather than a zero-leakage
+        # demand.  Keep it finite for strict JSON and sealed-artifact replay.
+        "diagonal_to_off_diagonal_ratio": diagonal_mean / max(off_mean, 1e-12),
         "dominant_diagonal_fraction": float(
             np.mean(np.argmax(magnitude, axis=0) == np.arange(response.shape[1]))
         ),
@@ -368,6 +375,48 @@ def bootstrap_spearman_interval(
     return tuple(float(value) for value in np.quantile(estimates, [alpha, 1.0 - alpha]))
 
 
+def bootstrap_spearman_image_cluster_interval(
+    left: Any,
+    right: Any,
+    *,
+    replicates: int = 2000,
+    seed: int = 991,
+    confidence: float = 0.95,
+) -> tuple[float, float]:
+    """Bootstrap a pooled Spearman statistic with the image as the cluster.
+
+    ``left`` and ``right`` must have shape ``(image, observation)``.  For the
+    controlled shortcut audit the second axis contains the four ordinal
+    boundaries.  A bootstrap draw samples image rows and retains *all*
+    observations from each selected image.  Treating the flattened
+    image-by-boundary cells as independent would give an anti-conservative
+    interval because the four effects share pixels and one model forward pass.
+    """
+
+    x = _float_array(left, ndim=2)
+    y = _float_array(right, ndim=2)
+    if x.shape != y.shape or x.shape[0] < 3 or x.shape[1] < 1:
+        raise ValueError(
+            "cluster bootstrap inputs must have equal shape "
+            "(at least three images, at least one observation)"
+        )
+    if replicates < 1 or not 0.0 < confidence < 1.0:
+        raise ValueError("invalid bootstrap configuration")
+    generator = np.random.default_rng(int(seed))
+    estimates: list[float] = []
+    for _ in range(replicates):
+        image_rows = generator.integers(0, x.shape[0], size=x.shape[0])
+        estimate = spearman_correlation(
+            x[image_rows].reshape(-1), y[image_rows].reshape(-1)
+        )
+        if math.isfinite(estimate):
+            estimates.append(estimate)
+    if not estimates:
+        return float("nan"), float("nan")
+    alpha = (1.0 - confidence) / 2.0
+    return tuple(float(value) for value in np.quantile(estimates, [alpha, 1.0 - alpha]))
+
+
 def internal_pixel_effect_audit(
     internal_effect: Any,
     random_internal_effect: Any,
@@ -376,21 +425,39 @@ def internal_pixel_effect_audit(
     bootstrap_replicates: int = 2000,
     seed: int = 991,
 ) -> dict[str, Any]:
-    internal = _float_array(internal_effect).reshape(-1)
-    random_effect = _float_array(random_internal_effect).reshape(-1)
-    pixel = _float_array(pixel_effect).reshape(-1)
+    internal_matrix = _float_array(internal_effect)
+    random_matrix = _float_array(random_internal_effect)
+    pixel_matrix = _float_array(pixel_effect)
+    if internal_matrix.ndim == 1:
+        internal_matrix = internal_matrix[:, None]
+        random_matrix = random_matrix[:, None]
+        pixel_matrix = pixel_matrix[:, None]
+    if (
+        internal_matrix.ndim != 2
+        or random_matrix.ndim != 2
+        or pixel_matrix.ndim != 2
+        or internal_matrix.shape != random_matrix.shape
+        or internal_matrix.shape != pixel_matrix.shape
+    ):
+        raise ValueError("effect arrays must have shape (image, observation)")
+    internal = internal_matrix.reshape(-1)
+    random_effect = random_matrix.reshape(-1)
+    pixel = pixel_matrix.reshape(-1)
     if internal.shape != random_effect.shape or internal.shape != pixel.shape:
         raise ValueError("internal, random, and pixel effects must have equal shape")
     ratio_values = internal / np.maximum(np.abs(random_effect), 1e-12)
     correlation = spearman_correlation(internal, pixel)
-    interval = bootstrap_spearman_interval(
-        internal,
-        pixel,
+    interval = bootstrap_spearman_image_cluster_interval(
+        internal_matrix,
+        pixel_matrix,
         replicates=bootstrap_replicates,
         seed=seed,
     )
     return {
         "n_effects": int(len(internal)),
+        "n_image_clusters": int(internal_matrix.shape[0]),
+        "observations_per_image": int(internal_matrix.shape[1]),
+        "bootstrap_unit": "image_cluster_all_boundary_observations_retained",
         "median_internal_effect": float(np.median(internal)),
         "median_random_internal_effect": float(np.median(random_effect)),
         "median_internal_minus_random": float(np.median(internal - random_effect)),
@@ -449,6 +516,13 @@ class GateBThresholds:
     correlation_target: float = 0.50
     correlation_lower_bound_min: float = 0.30
     clean_auprc_lift_max: float = 0.02
+    cue_only_accuracy_min: float = 0.80
+    cue_only_seeds_required: int = 2
+    boundary_dominant_diagonal_fraction_min: float = 0.75
+    boundary_diagonal_to_off_ratio_min: float = 2.0
+    boundary_selective_seeds_required: int = 2
+    diffuse_effective_support_fraction_min: float = 0.10
+    diffuse_broad_seeds_required: int = 2
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -457,6 +531,7 @@ class GateBThresholds:
 def assess_gate_b(
     shortcut_seed_reports: Sequence[Mapping[str, Any]],
     clean_seed_reports: Sequence[Mapping[str, Any]],
+    cue_only_seed_reports: Sequence[Mapping[str, Any]],
     *,
     thresholds: GateBThresholds | None = None,
 ) -> dict[str, Any]:
@@ -465,10 +540,13 @@ def assess_gate_b(
     gate = thresholds or GateBThresholds()
     if not shortcut_seed_reports:
         raise ValueError("Gate B requires shortcut seed reports")
+    if not cue_only_seed_reports:
+        raise ValueError("Gate B requires cue-only positive-control reports")
     learned_cue: list[bool] = []
     localized_boundaries: list[int] = []
     deletion_pass: list[bool] = []
     correlation_pass: list[bool] = []
+    boundary_selectivity_pass: list[bool] = []
     for report in shortcut_seed_reports:
         performance = report["condition_performance"]
         gap = min(
@@ -488,12 +566,49 @@ def assess_gate_b(
             float(effects["internal_pixel_spearman"]) >= gate.correlation_target
             and lower > gate.correlation_lower_bound_min
         )
+        selectivity = report.get("boundary_response_selectivity")
+        if not isinstance(selectivity, Mapping):
+            boundary_selectivity_pass.append(False)
+        else:
+            dominant = selectivity.get("dominant_diagonal_fraction")
+            ratio = selectivity.get("diagonal_to_off_diagonal_ratio")
+            try:
+                dominant_value = float(dominant)
+                ratio_value = float(ratio)
+            except (TypeError, ValueError):
+                boundary_selectivity_pass.append(False)
+            else:
+                boundary_selectivity_pass.append(
+                    math.isfinite(dominant_value)
+                    and dominant_value
+                    >= gate.boundary_dominant_diagonal_fraction_min
+                    and (
+                        math.isinf(ratio_value)
+                        or (
+                            math.isfinite(ratio_value)
+                            and ratio_value
+                            >= gate.boundary_diagonal_to_off_ratio_min
+                        )
+                    )
+                )
 
     clean_lifts = [
         float(report["localization"]["macro_auprc_lift"])
         for report in clean_seed_reports
     ]
+    cue_only_accuracies = [
+        float(report["condition_performance"]["cue_only"]["accuracy"])
+        for report in cue_only_seed_reports
+    ]
+    positive_control_pass = (
+        sum(value >= gate.cue_only_accuracy_min for value in cue_only_accuracies)
+        >= gate.cue_only_seeds_required
+    )
     checks = {
+        # This confirms that the procedural cue is learnable by the training
+        # stack.  It is necessary but deliberately not sufficient: every
+        # faithfulness/localization/negative-control check below must pass too.
+        "cue_only_positive_control": positive_control_pass,
         "cue_learned_all_seeds": all(learned_cue),
         "localization_seed_requirement": (
             sum(value >= gate.localized_boundaries_required for value in localized_boundaries)
@@ -501,6 +616,10 @@ def assess_gate_b(
         ),
         "deletion_all_seeds": all(deletion_pass),
         "internal_pixel_correlation_all_seeds": all(correlation_pass),
+        "boundary_response_selectivity": (
+            sum(boundary_selectivity_pass)
+            >= gate.boundary_selective_seeds_required
+        ),
         "clean_negative_control": (
             bool(clean_lifts) and float(np.median(clean_lifts)) <= gate.clean_auprc_lift_max
         ),
@@ -512,10 +631,131 @@ def assess_gate_b(
             "localized_boundaries": localized_boundaries,
             "deletion_pass": deletion_pass,
             "correlation_pass": correlation_pass,
+            "boundary_selectivity_pass": boundary_selectivity_pass,
             "clean_auprc_lift": clean_lifts,
+            "cue_only_accuracy": cue_only_accuracies,
         },
         "checks": checks,
         "passed": all(checks.values()),
+        "positive_control_is_sufficient_for_promotion": False,
+    }
+
+
+def assess_diffuse_nonfocal_gate(
+    shortcut_seed_reports: Sequence[Mapping[str, Any]],
+    cue_only_seed_reports: Sequence[Mapping[str, Any]],
+    *,
+    thresholds: GateBThresholds | None = None,
+) -> dict[str, Any]:
+    """Fail closed when globally rendered evidence is attributed focally.
+
+    Effective support is the inverse participation ratio divided by the valid
+    lattice size.  The diffuse procedural family has global support, so at
+    least two of three seeds must distribute evidence across at least 10% of
+    the valid lattice.  Cue learnability and boundary selectivity remain
+    necessary controls here, but none can substitute for the non-focal support
+    requirement.  This gate can never be used as evidence of lesion
+    localization.
+    """
+
+    gate = thresholds or GateBThresholds()
+    if not shortcut_seed_reports:
+        raise ValueError("diffuse gate requires shortcut seed reports")
+    if not cue_only_seed_reports:
+        raise ValueError("diffuse gate requires cue-only positive-control reports")
+    values: list[float | None] = []
+    broad_support_pass: list[bool] = []
+    cue_learned_pass: list[bool] = []
+    boundary_selectivity_pass: list[bool] = []
+    for report in shortcut_seed_reports:
+        localization = report.get("localization")
+        value = (
+            localization.get("macro_effective_support_fraction")
+            if isinstance(localization, Mapping)
+            else None
+        )
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = float("nan")
+        values.append(number if math.isfinite(number) else None)
+        broad_support_pass.append(
+            math.isfinite(number)
+            and number >= gate.diffuse_effective_support_fraction_min
+        )
+        performance = report.get("condition_performance", {})
+        try:
+            cue_gap = min(
+                float(performance["aligned_minus_neutral_accuracy"]),
+                float(performance["aligned_minus_inverted_accuracy"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            cue_gap = float("nan")
+        cue_learned_pass.append(
+            math.isfinite(cue_gap) and cue_gap >= gate.cue_accuracy_gap_min
+        )
+        selectivity = report.get("boundary_response_selectivity", {})
+        try:
+            dominant = float(selectivity["dominant_diagonal_fraction"])
+            ratio = float(selectivity["diagonal_to_off_diagonal_ratio"])
+        except (KeyError, TypeError, ValueError):
+            dominant = ratio = float("nan")
+        boundary_selectivity_pass.append(
+            math.isfinite(dominant)
+            and dominant >= gate.boundary_dominant_diagonal_fraction_min
+            and (
+                math.isinf(ratio)
+                or (
+                    math.isfinite(ratio)
+                    and ratio >= gate.boundary_diagonal_to_off_ratio_min
+                )
+            )
+        )
+    cue_only_accuracies: list[float | None] = []
+    cue_only_pass: list[bool] = []
+    for report in cue_only_seed_reports:
+        try:
+            accuracy = float(report["condition_performance"]["cue_only"]["accuracy"])
+        except (KeyError, TypeError, ValueError):
+            accuracy = float("nan")
+        cue_only_accuracies.append(accuracy if math.isfinite(accuracy) else None)
+        cue_only_pass.append(
+            math.isfinite(accuracy) and accuracy >= gate.cue_only_accuracy_min
+        )
+    checks = {
+        "cue_only_positive_control": (
+            sum(cue_only_pass) >= gate.cue_only_seeds_required
+        ),
+        "cue_learned_all_seeds": all(cue_learned_pass),
+        "boundary_response_selectivity": (
+            sum(boundary_selectivity_pass)
+            >= gate.boundary_selective_seeds_required
+        ),
+        "diffuse_nonfocal_support": (
+            sum(broad_support_pass) >= gate.diffuse_broad_seeds_required
+        ),
+    }
+    return {
+        "localization_gate_applicable": False,
+        "gate_kind": "diffuse_nonfocal_negative_locality",
+        "thresholds": {
+            "effective_support_fraction_min": (
+                gate.diffuse_effective_support_fraction_min
+            ),
+            "broad_seeds_required": gate.diffuse_broad_seeds_required,
+        },
+        "broad_support_values": values,
+        "per_seed": {
+            "broad_support_pass": broad_support_pass,
+            "cue_learned_pass": cue_learned_pass,
+            "boundary_selectivity_pass": boundary_selectivity_pass,
+            "cue_only_accuracy": cue_only_accuracies,
+            "cue_only_pass": cue_only_pass,
+        },
+        "checks": checks,
+        "passed": all(checks.values()),
+        "positive_control_is_sufficient_for_promotion": False,
+        "must_not_be_reported_as_focal_lesion": True,
     }
 
 
@@ -624,8 +864,10 @@ def json_ready(value: Any) -> Any:
 
 __all__ = [
     "GateBThresholds",
+    "assess_diffuse_nonfocal_gate",
     "assess_gate_b",
     "binary_average_precision",
+    "bootstrap_spearman_image_cluster_interval",
     "bootstrap_spearman_interval",
     "boundary_response_matrix",
     "boundary_response_selectivity",

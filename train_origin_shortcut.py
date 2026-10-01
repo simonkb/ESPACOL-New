@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Train preregistered APTOS controlled-shortcut arms with ORIGIN.
+"""Train APTOS controlled-shortcut arms with ORIGIN or matched comparators.
 
-This entry point intentionally reuses the unchanged ORIGIN model, loss, and
-trainer.  Only the dataset is wrapped, so comparisons with clean checkpoints
-cannot acquire a separate classifier bypass or optimization policy.
+The original protocol-v1 path remains the unchanged ORIGIN model/loss/trainer.
+Protocol v2 additionally exposes four explicitly labelled in-repository
+analogues under the same data transforms and optimization schedule; none is
+claimed to be an official third-party implementation.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from benchmarks.ordinal_shortcut import (
     make_shortcut_loaders,
 )
 from configs.origin_config import OriginConfig
+from configs.origin_acceptance_baseline_config import OriginAcceptanceBaselineConfig
 from Datasets.origin_data import (
     OriginFundusTransform,
     OriginImageDataset,
@@ -35,6 +37,11 @@ from Datasets.origin_data import (
     validate_ordinal_labels,
 )
 from models.origin import build_origin_model
+from models.origin_acceptance_baselines import (
+    ACCEPTANCE_BASELINE_VARIANTS,
+    build_origin_acceptance_baseline,
+)
+from scripts.origin_acceptance_baseline_common import BASELINE_SPECS
 from train_origin import (
     build_parser as build_origin_parser,
     guard_and_write_split_manifest,
@@ -45,6 +52,9 @@ from train_origin import (
     write_json_atomic,
 )
 from training.origin_trainer import OriginTrainer
+from training.origin_acceptance_baseline_trainer import (
+    OriginAcceptanceBaselineTrainer,
+)
 
 
 SHORTCUT_ARMS = ("shortcut", "cue_only", "clean")
@@ -66,6 +76,15 @@ def build_parser():
     )
     benchmark.add_argument("--shortcut_strength", type=float, default=0.30)
     benchmark.add_argument("--marker_radius_fraction", type=float, default=0.040)
+    benchmark.add_argument(
+        "--model_variant",
+        choices=ACCEPTANCE_BASELINE_VARIANTS,
+        default="origin_ctmc",
+        help=(
+            "matched in-repository architecture used in protocol v2; comparator "
+            "names denote controlled analogues, not official author code"
+        ),
+    )
     return parser
 
 
@@ -125,6 +144,8 @@ def _wrapped_dataset(
 
 
 def _model_from_cfg(cfg: OriginConfig):
+    if isinstance(cfg, OriginAcceptanceBaselineConfig):
+        return build_origin_acceptance_baseline(cfg)
     return build_origin_model(
         num_classes=cfg.n_classes,
         encoder_name=cfg.encoder,
@@ -163,14 +184,14 @@ def main() -> None:
     items = load_aptos_items(data_root, args.labels_csv)
     validate_ordinal_labels(items, 5)
 
-    cfg = OriginConfig(
+    base_cfg = OriginConfig(
         dataset="aptos",
         n_classes=5,
         n_folds=n_folds,
         val_fraction=args.val_fraction,
         run_dir=run_dir,
         preprocessing_version=f"{ORDINAL_SHORTCUT_VERSION}+canonical-square-fixed-ellipse-v1",
-        seed=args.seed,
+        seed=(args.seed if args.model_variant == "origin_ctmc" else args.split_seed),
         img_size=args.image_size,
         encoder=args.encoder,
         pretrained=not args.no_pretrained,
@@ -222,6 +243,19 @@ def main() -> None:
         stratified_batches=False,
         labels_csv=args.labels_csv,
     )
+    if args.model_variant == "origin_ctmc":
+        cfg: OriginConfig = base_cfg
+    else:
+        spec = BASELINE_SPECS[args.model_variant]
+        cfg = OriginAcceptanceBaselineConfig(
+            **asdict(base_cfg),
+            baseline_variant=args.model_variant,
+            ablation_variant=args.model_variant,
+            baseline_description=str(spec["description"]),
+            training_seed=int(args.seed),
+            sparse_l1_weight=float(spec["sparse_l1_weight"]),
+            sparse_l1_delay_epochs=0,
+        )
     if args.stratified_batches:
         raise ValueError("the shortcut pilot fixes ordinary shuffled training batches")
     if cfg.class_weighting != "none" and not cfg.allow_weighted_likelihood:
@@ -240,11 +274,16 @@ def main() -> None:
             "shortcut_protocol": shortcut_protocol.as_dict(),
             "shortcut_protocol_signature": shortcut_protocol.signature,
             "split_seed": int(args.split_seed),
+            "model_variant": args.model_variant,
+            "comparator_implementation_origin": BASELINE_SPECS[
+                args.model_variant
+            ]["implementation_origin"],
         }
     )
 
     log = setup_logging(run_dir)
-    set_seed(cfg.seed)
+    optimization_seed = int(getattr(cfg, "training_seed", cfg.seed))
+    set_seed(optimization_seed)
     device = torch.device(
         "cuda"
         if torch.cuda.is_available()
@@ -257,14 +296,14 @@ def main() -> None:
         "shortcut arm=%s family=%s training_seed=%d split_seed=%d protocol=%s",
         args.shortcut_arm,
         args.shortcut_family,
-        cfg.seed,
+        optimization_seed,
         args.split_seed,
         shortcut_protocol.signature,
     )
 
     fold_results: list[dict[str, Any]] = []
     for fold in folds:
-        set_seed(cfg.seed + fold)
+        set_seed(optimization_seed + fold)
         train_items, validation_items, test_items = split_origin_items(
             "aptos",
             items,
@@ -287,7 +326,8 @@ def main() -> None:
             "dataset": "aptos",
             "fold": fold,
             "split_seed": int(args.split_seed),
-            "training_seed": int(cfg.seed),
+            "training_seed": optimization_seed,
+            "optimization_seed": optimization_seed,
             "signature": signature,
             "evaluation_scope": (
                 "outer_test_after_selection" if args.include_test else "inner_validation_only"
@@ -305,6 +345,10 @@ def main() -> None:
             "shortcut_arm": args.shortcut_arm,
             "shortcut_family": args.shortcut_family,
             "shortcut_protocol_signature": shortcut_protocol.signature,
+            "model_variant": args.model_variant,
+            "comparator_implementation_origin": BASELINE_SPECS[
+                args.model_variant
+            ]["implementation_origin"],
             "train_domain": {"position": "seen", "appearance": "seen"},
             "outer_domain": {"position": "unseen", "appearance": "unseen"},
         }
@@ -312,15 +356,24 @@ def main() -> None:
         # fields; the shortcut-specific fields remain additional provenance.
         guard_and_write_split_manifest(fold_dir, split_manifest, resume=cfg.resume)
         protocol_payload = {
-            "schema": "origin-ordinal-shortcut-protocol-v1",
+            "schema": (
+                "origin-ordinal-shortcut-protocol-v1"
+                if args.model_variant == "origin_ctmc"
+                else "origin-ordinal-shortcut-comparator-protocol-v2"
+            ),
             "dataset": "aptos",
             "fold": fold,
             "shortcut_arm": args.shortcut_arm,
             "shortcut_family": args.shortcut_family,
-            "training_seed": int(cfg.seed),
+            "training_seed": optimization_seed,
+            "optimization_seed": optimization_seed,
             "split_seed": int(args.split_seed),
             "split_signature": signature,
             "shortcut": shortcut_protocol.as_dict(),
+            "model_variant": args.model_variant,
+            "comparator_implementation_origin": BASELINE_SPECS[
+                args.model_variant
+            ]["implementation_origin"],
             "train_condition": {
                 "shortcut": "aligned",
                 "cue_only": "cue_only",
@@ -368,10 +421,15 @@ def main() -> None:
             batch_size=cfg.batch_size,
             num_workers=0 if device.type == "mps" else cfg.num_workers,
             pin_memory=device.type == "cuda",
-            seed=cfg.seed + fold,
+            seed=optimization_seed + fold,
         )
         model = _model_from_cfg(cfg)
-        trainer = OriginTrainer(
+        trainer_class = (
+            OriginTrainer
+            if args.model_variant == "origin_ctmc"
+            else OriginAcceptanceBaselineTrainer
+        )
+        trainer = trainer_class(
             model,
             *loaders,
             training_cfg,
@@ -380,14 +438,22 @@ def main() -> None:
             split_signature=signature,
             device=device,
         )
-        result = trainer.fit(evaluate_test=args.include_test)
+        if args.model_variant != "origin_ctmc" and args.include_test:
+            raise ValueError(
+                "comparator selection workers keep the outer fold locked; "
+                "the blind shortcut audit performs the one outer release"
+            )
+        result = trainer.fit(
+            evaluate_test=(args.include_test if args.model_variant == "origin_ctmc" else False)
+        )
         fold_result = {
             "fold": fold,
             "shortcut_arm": args.shortcut_arm,
             "shortcut_family": args.shortcut_family,
-            "training_seed": cfg.seed,
+            "training_seed": optimization_seed,
             "split_seed": args.split_seed,
             "shortcut_protocol_signature": shortcut_protocol.signature,
+            "model_variant": args.model_variant,
             **result,
         }
         fold_results.append(fold_result)

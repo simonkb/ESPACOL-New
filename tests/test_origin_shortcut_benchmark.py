@@ -20,8 +20,10 @@ from benchmarks.ordinal_shortcut import (
 )
 from benchmarks.shortcut_metrics import (
     GateBThresholds,
+    assess_diffuse_nonfocal_gate,
     assess_gate_b,
     binary_average_precision,
+    bootstrap_spearman_image_cluster_interval,
     boundary_response_matrix,
     boundary_response_selectivity,
     familywise_localization_permutation_test,
@@ -31,12 +33,23 @@ from benchmarks.shortcut_metrics import (
     spearman_correlation,
 )
 from models.origin import OriginModel
+from models.origin_ablation import MultiScaleMaskedPoolingModel
+from models.origin_acceptance_baselines import FixedCountLocalEvidenceModel
 from models.origin_encoder import (
     OriginEncoderOutput,
     OriginEncoderScale,
     OriginScaleMetadata,
 )
 from scripts.audit_origin_shortcut import _main_audit, _transform_parameter_hash
+from scripts.origin_shortcut_comparator_common import (
+    COMPARATOR_VARIANTS,
+    PROTOCOL_CORE_SHA256,
+    TASK_COUNT,
+    all_tasks,
+    canonical_sha256,
+    protocol_core,
+    task_at,
+)
 
 
 class _CleanDataset(Dataset):
@@ -315,12 +328,96 @@ def test_render_model_factorial_and_intervention_audit_smoke() -> None:
         factorial_transform_sha256=transform_hash,
         main_transform_sha256=transform_hash,
         decision_rule="class_map",
+        model_variant="origin_ctmc",
     )
     assert result["factorial_states_per_sample"] == 16
     assert len(result["factorial_prediction_records"]) == 3 * 16
     assert len(result["internal_effect_records"]) == 3 * 4
     assert np.asarray(result["boundary_response_matrix"]).shape == (4, 4)
     assert result["localization_permutation"]["permutations"] == 7
+
+
+@pytest.mark.parametrize("variant", ["ordinal_additive_mil", "sparse_bagnet"])
+def test_matched_local_comparator_runs_same_shortcut_audit(variant: str) -> None:
+    dataset = OrdinalShortcutDataset(
+        _CleanDataset(count=5, size=32), family="localized", condition="aligned"
+    )
+    model = FixedCountLocalEvidenceModel(
+        variant=variant,
+        num_classes=5,
+        projection_dim=4,
+        pretrained=False,
+        encoder=_TinyPyramid(),
+    ).eval()
+    transform_hash = _transform_parameter_hash(
+        protocol=dataset.protocol,
+        image_size=32,
+        family="localized",
+        condition="aligned",
+        position_domain="seen",
+        appearance_domain="seen",
+    )
+    result = _main_audit(
+        model,
+        dataset,
+        [0, 1, 2],
+        device=torch.device("cpu"),
+        batch_size=2,
+        audit_grid=13,
+        audit_seed=17,
+        permutations=3,
+        bootstrap_replicates=5,
+        fold=0,
+        factorial_transform_sha256=transform_hash,
+        main_transform_sha256=transform_hash,
+        decision_rule="class_map",
+        model_variant=variant,
+    )
+    assert result["local_ledger_applicable"]
+    assert len(result["internal_effect_records"]) == 12
+    assert result["internal_pixel_effects"]["n_image_clusters"] == 3
+
+
+def test_pooled_comparator_reports_behavior_without_fabricated_local_ledger() -> None:
+    dataset = OrdinalShortcutDataset(
+        _CleanDataset(count=5, size=32), family="localized", condition="aligned"
+    )
+    model = MultiScaleMaskedPoolingModel(
+        variant="pooled_conditional",
+        num_classes=5,
+        projection_dim=4,
+        pretrained=False,
+        encoder=_TinyPyramid(),
+    ).eval()
+    transform_hash = _transform_parameter_hash(
+        protocol=dataset.protocol,
+        image_size=32,
+        family="localized",
+        condition="aligned",
+        position_domain="seen",
+        appearance_domain="seen",
+    )
+    result = _main_audit(
+        model,
+        dataset,
+        [0, 1, 2],
+        device=torch.device("cpu"),
+        batch_size=2,
+        audit_grid=13,
+        audit_seed=17,
+        permutations=3,
+        bootstrap_replicates=5,
+        fold=0,
+        factorial_transform_sha256=transform_hash,
+        main_transform_sha256=transform_hash,
+        decision_rule="class_map",
+        model_variant="pooled_conditional",
+    )
+    assert not result["local_ledger_applicable"]
+    assert not result["localization"]["applicable"]
+    assert not result["internal_pixel_effects"]["applicable"]
+    assert len(result["internal_effect_records"]) == 0
+    assert np.asarray(result["boundary_response_matrix"]).shape == (4, 4)
 
 
 def _perfect_localization_fixture(samples: int = 12):
@@ -365,7 +462,39 @@ def test_localization_response_and_internal_pixel_metrics() -> None:
     )
     assert audit["median_internal_to_random_ratio"] == pytest.approx(5.0)
     assert audit["internal_pixel_spearman"] == pytest.approx(1.0)
+    assert audit["n_image_clusters"] == 30
+    assert audit["observations_per_image"] == 1
+    assert audit["bootstrap_unit"] == (
+        "image_cluster_all_boundary_observations_retained"
+    )
     assert spearman_correlation(internal, pixel) == pytest.approx(1.0)
+
+
+def test_spearman_bootstrap_resamples_images_and_keeps_boundary_clusters() -> None:
+    internal = np.asarray(
+        [[0.1, 0.2, 0.4, 0.8], [0.9, 0.3, 0.2, 0.1], [0.3, 0.7, 0.5, 0.2],
+         [0.8, 0.9, 0.1, 0.4], [0.6, 0.2, 0.9, 0.7]],
+        dtype=np.float64,
+    )
+    pixel = internal * np.asarray([1.0, -0.4, 0.7, 0.2])[None]
+    observed = bootstrap_spearman_image_cluster_interval(
+        internal, pixel, replicates=37, seed=118
+    )
+
+    # Independent reference implementation: one integer draw per image row,
+    # then flatten all four retained boundary observations.
+    generator = np.random.default_rng(118)
+    estimates = []
+    for _ in range(37):
+        rows = generator.integers(0, len(internal), size=len(internal))
+        estimates.append(
+            spearman_correlation(internal[rows].reshape(-1), pixel[rows].reshape(-1))
+        )
+    expected = tuple(np.quantile(estimates, [0.025, 0.975]))
+    assert observed == pytest.approx(expected)
+    assert observed == bootstrap_spearman_image_cluster_interval(
+        internal, pixel, replicates=37, seed=118
+    )
 
 
 def test_rasterization_preserves_ledger_mass_for_divisible_lattices() -> None:
@@ -422,7 +551,15 @@ def _passing_seed_report(clean: bool = False):
             "aligned_minus_inverted_accuracy": 0.30,
         },
         "localization_permutation": {"fwer_p": [0.01, 0.02, 0.03, 0.20]},
-        "localization": {"macro_auprc_lift": 0.0 if clean else 0.8},
+        "localization": {
+            "macro_auprc_lift": 0.0 if clean else 0.8,
+            "macro_effective_support_fraction": 0.20,
+        },
+        "boundary_response_selectivity": {
+            "dominant_diagonal_fraction": 1.0,
+            "diagonal_to_off_diagonal_ratio": 4.0,
+            "diagonal_minus_off_diagonal": 0.3,
+        },
         "internal_pixel_effects": {
             "median_internal_minus_random": 0.30,
             "median_internal_to_random_ratio": 3.0,
@@ -432,14 +569,111 @@ def _passing_seed_report(clean: bool = False):
     }
 
 
+def _passing_cue_only_report(accuracy: float = 0.95):
+    return {"condition_performance": {"cue_only": {"accuracy": accuracy}}}
+
+
 def test_gate_b_requires_multiseed_localization_and_clean_negative_control() -> None:
     shortcut = [_passing_seed_report(), _passing_seed_report(), _passing_seed_report()]
     clean = [_passing_seed_report(clean=True) for _ in range(3)]
-    result = assess_gate_b(shortcut, clean, thresholds=GateBThresholds())
+    cue_only = [_passing_cue_only_report() for _ in range(3)]
+    result = assess_gate_b(
+        shortcut, clean, cue_only, thresholds=GateBThresholds()
+    )
     assert result["passed"]
+    assert result["checks"]["cue_only_positive_control"]
+    assert not result["positive_control_is_sufficient_for_promotion"]
     shortcut[0]["localization_permutation"]["fwer_p"] = [0.5] * 4
     shortcut[1]["localization_permutation"]["fwer_p"] = [0.5] * 4
-    assert not assess_gate_b(shortcut, clean)["passed"]
+    assert not assess_gate_b(shortcut, clean, cue_only)["passed"]
+
+
+def test_gate_b_rejects_failed_positive_control_even_when_other_checks_pass() -> None:
+    shortcut = [_passing_seed_report(), _passing_seed_report(), _passing_seed_report()]
+    clean = [_passing_seed_report(clean=True) for _ in range(3)]
+    cue_only = [_passing_cue_only_report(0.79) for _ in range(3)]
+    result = assess_gate_b(shortcut, clean, cue_only)
+    assert not result["checks"]["cue_only_positive_control"]
+    assert not result["passed"]
+
+
+def test_gate_b_rejects_nonselective_boundary_response() -> None:
+    shortcut = [_passing_seed_report(), _passing_seed_report(), _passing_seed_report()]
+    clean = [_passing_seed_report(clean=True) for _ in range(3)]
+    cue_only = [_passing_cue_only_report() for _ in range(3)]
+    for report in shortcut[:2]:
+        report["boundary_response_selectivity"] = {
+            "dominant_diagonal_fraction": 0.25,
+            "diagonal_to_off_diagonal_ratio": 1.0,
+            "diagonal_minus_off_diagonal": 0.0,
+        }
+    result = assess_gate_b(shortcut, clean, cue_only)
+    assert not result["checks"]["boundary_response_selectivity"]
+    assert not result["passed"]
+
+
+def test_diffuse_nonfocal_gate_requires_broad_effective_support() -> None:
+    reports = [_passing_seed_report() for _ in range(3)]
+    reports[0]["localization"]["macro_effective_support_fraction"] = 0.14
+    reports[1]["localization"]["macro_effective_support_fraction"] = 0.11
+    reports[2]["localization"]["macro_effective_support_fraction"] = 0.03
+    cue_only = [_passing_cue_only_report() for _ in range(3)]
+    passing = assess_diffuse_nonfocal_gate(reports, cue_only)
+    assert passing["passed"]
+    assert passing["must_not_be_reported_as_focal_lesion"]
+
+    reports[1]["localization"]["macro_effective_support_fraction"] = 0.09
+    failing = assess_diffuse_nonfocal_gate(reports, cue_only)
+    assert not failing["passed"]
+
+
+def test_diffuse_nonfocal_gate_fails_closed_on_missing_support() -> None:
+    reports = [_passing_seed_report() for _ in range(3)]
+    for report in reports:
+        report["localization"].pop("macro_effective_support_fraction")
+    result = assess_diffuse_nonfocal_gate(
+        reports, [_passing_cue_only_report() for _ in range(3)]
+    )
+    assert result["broad_support_values"] == [None, None, None]
+    assert not result["passed"]
+
+
+def test_diffuse_nonfocal_gate_still_requires_positive_control() -> None:
+    reports = [_passing_seed_report() for _ in range(3)]
+    cue_only = [_passing_cue_only_report(0.79) for _ in range(3)]
+    result = assess_diffuse_nonfocal_gate(reports, cue_only)
+    assert not result["checks"]["cue_only_positive_control"]
+    assert not result["passed"]
+    assert not result["positive_control_is_sufficient_for_promotion"]
+
+
+def test_shortcut_comparator_v2_exactly_enumerates_84_additional_workers() -> None:
+    tasks = all_tasks()
+    assert TASK_COUNT == 84
+    assert len(tasks) == len({task.key for task in tasks}) == 84
+    assert {task.model_variant for task in tasks} == set(COMPARATOR_VARIANTS)
+    for variant in COMPARATOR_VARIANTS:
+        variant_tasks = [task for task in tasks if task.model_variant == variant]
+        assert len(variant_tasks) == 21
+        assert sum(task.arm == "shortcut" for task in variant_tasks) == 9
+        assert sum(task.arm == "cue_only" for task in variant_tasks) == 9
+        assert sum(task.arm == "clean" for task in variant_tasks) == 3
+    assert task_at(0).model_variant == "ledger_sequential_hazard"
+    assert task_at(83).model_variant == "sparse_bagnet"
+    with pytest.raises(IndexError):
+        task_at(84)
+    assert canonical_sha256(protocol_core()) == PROTOCOL_CORE_SHA256
+    assert protocol_core()["implementation_scope"]["official_author_implementations"] is False
+    assert protocol_core()["execution_topology"] == {
+        "cpu_preflight_jobs": 1,
+        "gpu_training_and_blind_audit_workers": 84,
+        "cpu_expanded_aggregate_jobs": 1,
+        "sealed_origin_v1_workers_reused": 21,
+    }
+    frozen_thresholds = protocol_core()["gate_b_thresholds"]
+    assert frozen_thresholds["boundary_dominant_diagonal_fraction_min"] == 0.75
+    assert frozen_thresholds["boundary_diagonal_to_off_ratio_min"] == 2.0
+    assert frozen_thresholds["diffuse_effective_support_fraction_min"] == 0.10
 
 
 def test_binary_average_precision_is_tie_order_independent() -> None:
