@@ -16,8 +16,10 @@ source /etc/profile.d/lmod.sh
 module load miniconda/3
 source activate "${ORIGIN_CONDA_ENV:-espacol}"
 set -u
-cd "${ORIGIN_REPO_ROOT:?ORIGIN_REPO_ROOT is required}"
+REPO_ROOT="${ORIGIN_REPO_ROOT:?ORIGIN_REPO_ROOT is required}"
+cd "${REPO_ROOT}"
 [[ "$(git rev-parse HEAD)" == "${ORIGIN_LAUNCH_COMMIT:?ORIGIN_LAUNCH_COMMIT is required}" ]] || exit 2
-python scripts/audit_origin_acceptance_baselines.py \
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+python -m scripts.audit_origin_acceptance_baselines \
   --experiment_root "${ORIGIN_ACCEPTANCE_ROOT:?ORIGIN_ACCEPTANCE_ROOT is required}" \
   --scope canary --write_gate

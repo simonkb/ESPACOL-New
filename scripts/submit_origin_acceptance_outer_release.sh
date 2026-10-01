@@ -21,8 +21,10 @@ module load miniconda/3
 module load cuda/12.6
 source activate "${ORIGIN_CONDA_ENV:-espacol}"
 set -u
-cd "${ORIGIN_REPO_ROOT:?ORIGIN_REPO_ROOT is required}"
+REPO_ROOT="${ORIGIN_REPO_ROOT:?ORIGIN_REPO_ROOT is required}"
+cd "${REPO_ROOT}"
 [[ "$(git rev-parse HEAD)" == "${ORIGIN_LAUNCH_COMMIT:?ORIGIN_LAUNCH_COMMIT is required}" ]] || exit 2
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 python release_origin_acceptance_baselines.py \
   --experiment_root "${ORIGIN_ACCEPTANCE_ROOT:?ORIGIN_ACCEPTANCE_ROOT is required}" \
   --task_index "${SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID is required}" \

@@ -30,6 +30,7 @@ TASK_ID="${SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID is required}"
 cd "${REPO_ROOT}"
 [[ "$(git rev-parse HEAD)" == "${LAUNCH_COMMIT}" ]] || { echo "commit mismatch" >&2; exit 2; }
 [[ -z "$(git status --porcelain --untracked-files=no)" ]] || { echo "tracked worktree is dirty" >&2; exit 3; }
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 TASK_KEY="$(python -c 'import sys; from scripts.origin_acceptance_baseline_common import task_at; print(task_at("canary", int(sys.argv[1])).key)' "${TASK_ID}")"

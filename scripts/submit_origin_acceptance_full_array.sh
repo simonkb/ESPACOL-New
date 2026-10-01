@@ -30,6 +30,7 @@ cd "${REPO_ROOT}"
 [[ "$(git rev-parse HEAD)" == "${LAUNCH_COMMIT}" ]] || { echo "commit mismatch" >&2; exit 2; }
 [[ -f "${EXPERIMENT_ROOT}/canary/CANARY_PASSED.json" ]] || { echo "canary gate missing" >&2; exit 3; }
 [[ -z "$(git status --porcelain --untracked-files=no)" ]] || { echo "tracked worktree is dirty" >&2; exit 4; }
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 TASK_INFO="$(python -c 'import sys; from scripts.origin_acceptance_baseline_common import task_at; t=task_at("full", int(sys.argv[1])); print(t.key, t.dataset)' "${TASK_ID}")"

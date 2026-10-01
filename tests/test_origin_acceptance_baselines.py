@@ -39,6 +39,7 @@ from scripts.origin_acceptance_baseline_common import (
 from scripts.aggregate_origin_acceptance_release import (
     paired_fold_seed_cluster_bootstrap,
 )
+import scripts.validate_origin_acceptance_continuation as continuation
 from release_origin_acceptance_baselines import (
     classwise_reliability,
     multiclass_brier_score,
@@ -677,3 +678,204 @@ def test_slurm_pipeline_is_fail_closed_and_test_locked() -> None:
     assert "cd \"${SNAPSHOT_ROOT}\"" in launch_text
     assert "python -m pytest -q tests/test_origin_acceptance_baselines.py" in launch_text
     assert '"${SNAPSHOT_ROOT}/scripts/submit_origin_acceptance_aptos_f0_canary.sh"' in launch_text
+
+    baseline_workers = (
+        "submit_origin_acceptance_aptos_f0_canary.sh",
+        "submit_origin_acceptance_canary_audit.sh",
+        "submit_origin_acceptance_full_array.sh",
+        "submit_origin_acceptance_full_audit.sh",
+        "submit_origin_acceptance_outer_release.sh",
+        "submit_origin_acceptance_release_aggregate.sh",
+    )
+    for name in baseline_workers:
+        assert "PYTHONPATH" in (root / "scripts" / name).read_text()
+    assert "python -m scripts.audit_origin_acceptance_baselines" in (
+        root / "scripts" / "submit_origin_acceptance_canary_audit.sh"
+    ).read_text()
+    assert "python -m scripts.audit_origin_acceptance_baselines" in (
+        root / "scripts" / "submit_origin_acceptance_full_audit.sh"
+    ).read_text()
+    assert "python -m scripts.aggregate_origin_acceptance_release" in (
+        root / "scripts" / "submit_origin_acceptance_release_aggregate.sh"
+    ).read_text()
+
+
+def _parent_submission_fixture(tmp_path: Path) -> dict[str, object]:
+    experiment = tmp_path / "experiment"
+    source = tmp_path / "source"
+    snapshot = tmp_path / "old-snapshot"
+    aptos = tmp_path / "aptos"
+    dr = tmp_path / "dr"
+    for path in (experiment, source, snapshot, aptos, dr):
+        path.mkdir()
+    payload: dict[str, object] = {
+        "schema": "origin-acceptance-submission-v1",
+        "protocol_id": continuation.PROTOCOL_ID,
+        "protocol_sha256": continuation.PROTOCOL_SHA256,
+        "launch_commit": "a" * 40,
+        "source_repository": str(source),
+        "immutable_worktree": str(snapshot),
+        "data_roots": {"aptos": str(aptos), "dr": str(dr)},
+        "jobs": {
+            "aptos_fold0_canary_array": "100",
+            "canary_gate_audit": "101",
+            "full_training_array": "102",
+            "full_freeze_audit": "103",
+            "coordinated_outer_release_array": "104",
+            "release_aggregate": "105",
+        },
+    }
+    payload["content_checksum_sha256"] = continuation.canonical_sha256(payload)
+    submission = experiment / "SUBMISSION.json"
+    submission.write_text(json.dumps(payload))
+    return {
+        "experiment": experiment,
+        "source": source,
+        "snapshot": snapshot,
+        "aptos": aptos,
+        "dr": dr,
+        "submission": submission,
+    }
+
+
+def test_continuation_parent_is_bound_to_digest_jobs_roots_and_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _parent_submission_fixture(tmp_path)
+
+    def fake_git(path: Path, *args: str) -> str:
+        if args == ("rev-parse", "HEAD"):
+            return "a" * 40
+        return ""
+
+    monkeypatch.setattr(continuation, "_git", fake_git)
+    result = continuation.validate_parent_submission(
+        experiment_root=fixture["experiment"],
+        expected_submission_sha256=continuation.file_sha256(fixture["submission"]),
+        expected_canary_job="100",
+        expected_failed_canary_audit_job="101",
+        source_repository=fixture["source"],
+        aptos_root=fixture["aptos"],
+        dr_root=fixture["dr"],
+    )
+    assert result["parent_launch_commit"] == "a" * 40
+    assert result["parent_jobs"]["canary_gate_audit"] == "101"
+
+    with pytest.raises(ValueError, match="failed canary-audit job"):
+        continuation.validate_parent_submission(
+            experiment_root=fixture["experiment"],
+            expected_submission_sha256=continuation.file_sha256(fixture["submission"]),
+            expected_canary_job="100",
+            expected_failed_canary_audit_job="999",
+            source_repository=fixture["source"],
+            aptos_root=fixture["aptos"],
+            dr_root=fixture["dr"],
+        )
+
+
+def test_continuation_requires_exact_canary_census_and_replays_existing_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "experiment"
+    training = root / "canary" / "training"
+    training.mkdir(parents=True)
+    for task in canary_tasks():
+        (training / task.key).mkdir()
+    audit: dict[str, object] = {
+        "schema": "origin-acceptance-training-audit-v1",
+        "protocol_id": continuation.PROTOCOL_ID,
+        "protocol_sha256": continuation.PROTOCOL_SHA256,
+        "scope": "canary",
+        "status": "passed",
+        "worker_count": len(canary_tasks()),
+        "workers": [
+            {
+                "task": {"baseline_variant": task.baseline_variant},
+                "manifest_sha256": f"{index + 1:064x}",
+                "best_learned_sha256": f"{index + 11:064x}",
+            }
+            for index, task in enumerate(canary_tasks())
+        ],
+        "outer_test_released": False,
+    }
+    audit["content_checksum_sha256"] = continuation.canonical_sha256(audit)
+    monkeypatch.setattr(continuation, "audit_scope", lambda *_: dict(audit))
+
+    result = continuation.validate_canary_reuse(root)
+    assert result["task_count"] == 5
+    assert result["valid_gate_already_present"] is False
+
+    gate = root / "canary" / "CANARY_PASSED.json"
+    gate.write_text(json.dumps(audit))
+    assert continuation.validate_canary_reuse(root)["valid_gate_already_present"] is True
+
+    (training / "unexpected_worker").mkdir()
+    with pytest.raises(ValueError, match="canary census mismatch"):
+        continuation.validate_canary_reuse(root)
+
+
+def test_continuation_manifest_is_checksummed_and_single_use(tmp_path: Path) -> None:
+    root = tmp_path / "experiment"
+    root.mkdir()
+    preflight: dict[str, object] = {
+        "schema": "origin-acceptance-continuation-preflight-v1",
+        "protocol_id": continuation.PROTOCOL_ID,
+        "protocol_sha256": continuation.PROTOCOL_SHA256,
+        "experiment_root": str(root.resolve()),
+    }
+    preflight["content_checksum_sha256"] = continuation.canonical_sha256(preflight)
+    output = root / "RESTART_SUBMISSION.json"
+    jobs = {
+        "canary_reaudit": "201",
+        "full_training_array": "202",
+        "full_freeze_audit": "203",
+        "coordinated_outer_release_array": "204",
+        "release_aggregate": "205",
+    }
+    payload = continuation.write_restart_submission(
+        output=output,
+        preflight=preflight,
+        launch_commit="b" * 40,
+        immutable_worktree=tmp_path,
+        conda_environment="G",
+        jobs=jobs,
+        scheduler_parent_states={"canary_array": "COMPLETED", "failed_canary_audit": "FAILED"},
+        reaudit_dependency_mode="verified_completed_no_dependency",
+    )
+    unsigned = dict(payload)
+    checksum = unsigned.pop("content_checksum_sha256")
+    assert checksum == continuation.canonical_sha256(unsigned)
+    assert payload["jobs"]["canary_reaudit"] == "201"
+    with pytest.raises(FileExistsError):
+        continuation.write_restart_submission(
+            output=output,
+            preflight=preflight,
+            launch_commit="b" * 40,
+            immutable_worktree=tmp_path,
+            conda_environment="G",
+            jobs=jobs,
+            scheduler_parent_states={},
+            reaudit_dependency_mode="verified_completed_no_dependency",
+        )
+
+
+def test_continuation_launcher_reuses_external_reaudit_and_is_fail_closed() -> None:
+    root = Path(__file__).resolve().parents[1]
+    launcher = (root / "scripts" / "continue_origin_acceptance_baselines.sh").read_text()
+    assert "ORIGIN_PARENT_SUBMISSION_SHA256" in launcher
+    assert "ORIGIN_PARENT_CANARY_JOB" in launcher
+    assert "ORIGIN_PARENT_FAILED_CANARY_AUDIT_JOB" in launcher
+    assert "ORIGIN_CANARY_AUDIT_JOB" in launcher
+    assert 'REAUDIT_STATE}" == "COMPLETED"' in launcher
+    assert 'REAUDIT_DEPENDENCY_MODE="verified_completed_no_dependency"' in launcher
+    assert 'REAUDIT_DEPENDENCY_MODE="afterok_live_reaudit"' in launcher
+    assert 'FULL_DEPENDENCY_ARGS+=(--dependency="afterok:${CANARY_REAUDIT_JOB}")' in launcher
+    assert 'sbatch --parsable "${FULL_DEPENDENCY_ARGS[@]}"' in launcher
+    assert "submit_origin_acceptance_canary_audit.sh" in launcher
+    assert "sbatch" not in launcher.split("submit_origin_acceptance_canary_audit.sh", 1)[1].split(
+        'FULL_JOB="', 1
+    )[0]
+    assert "RESTART_SUBMISSION.json" in launcher
+    assert "cancel_partial_submission" in launcher
+    assert 'mktemp -d "${TMPDIR:-/tmp}/origin-acceptance-continuation.XXXXXX"' in launcher
+    assert 'PREFLIGHT_RECORD="${PREFLIGHT_DIR}/preflight.json"' in launcher
