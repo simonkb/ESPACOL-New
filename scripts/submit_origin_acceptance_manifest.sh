@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=org_artifact
-#SBATCH --partition=gpu
+#SBATCH --partition=prod
 #SBATCH --account=kuin0170
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=03:00:00
@@ -18,12 +17,12 @@ CV_ROOT="${ORIGIN_V3_CV_ROOT:-$REPO_ROOT/runs/origin_v3_full_cv_20260922T084547Z
 OUTPUT_ROOT="${ORIGIN_ACCEPTANCE_ROOT:-$REPO_ROOT/runs/origin_acceptance}"
 cd "$REPO_ROOT"
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-set +u
-source /etc/profile.d/lmod.sh || exit 1
-module load miniconda/3 || exit 1
-module load cuda/12.6 || exit 1
-source activate "${ORIGIN_CONDA_ENV:-G}" || exit 1
-set -u
+ENV_NAME="${ORIGIN_CONDA_ENV:-G}"
+ENV_PYTHON="${ORIGIN_PYTHON:-${HOME}/.conda/envs/${ENV_NAME}/bin/python}"
+[[ -x "$ENV_PYTHON" ]] || {
+  echo "Missing cluster Python environment: $ENV_PYTHON" >&2; exit 1;
+}
+export PATH="$(dirname "$ENV_PYTHON"):$PATH"
 
 printf '=== ORIGIN acceptance artifact manifest ===\n'
 date --iso-8601=seconds
