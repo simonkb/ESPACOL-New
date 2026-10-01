@@ -143,14 +143,12 @@ if [[ "${REAUDIT_STATE}" == "COMPLETED" && ! -f "${EXPERIMENT_ROOT}/canary/CANAR
   exit 19
 fi
 
-FULL_DEPENDENCY_ARGS=()
 if [[ "${REAUDIT_STATE}" == "COMPLETED" ]]; then
   # Slurm may purge a completed job from the active-controller dependency
   # window (MinJobAge).  The validator above has independently replayed and
   # matched the exact CANARY_PASSED gate, so no scheduler dependency is needed.
   REAUDIT_DEPENDENCY_MODE="verified_completed_no_dependency"
 else
-  FULL_DEPENDENCY_ARGS+=(--dependency="afterok:${CANARY_REAUDIT_JOB}")
   REAUDIT_DEPENDENCY_MODE="afterok_live_reaudit"
 fi
 
@@ -164,10 +162,17 @@ cancel_partial_submission() {
 }
 trap 'cancel_partial_submission; cleanup_preflight' ERR
 
-FULL_JOB="$(sbatch --parsable "${FULL_DEPENDENCY_ARGS[@]}" \
-  --export="${EXPORTS}" \
-  --output="${LOG_ROOT}/full_%A_%a.out" --error="${LOG_ROOT}/full_%A_%a.err" \
-  "${SNAPSHOT_ROOT}/scripts/submit_origin_acceptance_full_array.sh" | cut -d';' -f1)"
+if [[ "${REAUDIT_STATE}" == "COMPLETED" ]]; then
+  FULL_JOB="$(sbatch --parsable \
+    --export="${EXPORTS}" \
+    --output="${LOG_ROOT}/full_%A_%a.out" --error="${LOG_ROOT}/full_%A_%a.err" \
+    "${SNAPSHOT_ROOT}/scripts/submit_origin_acceptance_full_array.sh" | cut -d';' -f1)"
+else
+  FULL_JOB="$(sbatch --parsable --dependency="afterok:${CANARY_REAUDIT_JOB}" \
+    --export="${EXPORTS}" \
+    --output="${LOG_ROOT}/full_%A_%a.out" --error="${LOG_ROOT}/full_%A_%a.err" \
+    "${SNAPSHOT_ROOT}/scripts/submit_origin_acceptance_full_array.sh" | cut -d';' -f1)"
+fi
 NEW_JOBS+=("${FULL_JOB}")
 FULL_AUDIT_JOB="$(sbatch --parsable --dependency="afterok:${FULL_JOB}" \
   --export="${EXPORTS}" \

@@ -869,8 +869,12 @@ def test_continuation_launcher_reuses_external_reaudit_and_is_fail_closed() -> N
     assert 'REAUDIT_STATE}" == "COMPLETED"' in launcher
     assert 'REAUDIT_DEPENDENCY_MODE="verified_completed_no_dependency"' in launcher
     assert 'REAUDIT_DEPENDENCY_MODE="afterok_live_reaudit"' in launcher
-    assert 'FULL_DEPENDENCY_ARGS+=(--dependency="afterok:${CANARY_REAUDIT_JOB}")' in launcher
-    assert 'sbatch --parsable "${FULL_DEPENDENCY_ARGS[@]}"' in launcher
+    assert "FULL_DEPENDENCY_ARGS" not in launcher
+    completed_branch, live_branch = launcher.split(
+        'if [[ "${REAUDIT_STATE}" == "COMPLETED" ]]; then', 2
+    )[2].split("else", 1)
+    assert '--dependency="afterok:${CANARY_REAUDIT_JOB}"' not in completed_branch
+    assert '--dependency="afterok:${CANARY_REAUDIT_JOB}"' in live_branch
     assert "submit_origin_acceptance_canary_audit.sh" in launcher
     assert "sbatch" not in launcher.split("submit_origin_acceptance_canary_audit.sh", 1)[1].split(
         'FULL_JOB="', 1
