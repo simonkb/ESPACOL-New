@@ -58,7 +58,7 @@ fold accuracy is
 $85.99\!\pm\!0.44$\%.  On complete 5-fold APTOS outer cross-validation, it
 obtains 84.87\% accuracy, 0.9118 QWK, and 0.1936 MAP-grade MAE.
 In a protocol frozen before its ten trainings but after EyePACS fold~9 had
-already been observed, a retrospective study finds that a pooled conditional
+already been observed, a retrospective study finds that a pooled continuation-ratio
 control obtains 86.40\% accuracy
 versus 85.66\% for \method and reduces MAP-grade MAE by 0.0145 (paired
 patient-cluster 95\% CI $[0.0017,0.0274]$), but worsens ECE by 0.0273
@@ -126,8 +126,9 @@ Our contributions are:
   posterior change under that frozen-ledger intervention; no backward pass,
   pixel replacement, or renormalization is involved.
   \item \textbf{Explicit decoder contracts.}  Both the CTMC and matched
-  sequential-hazard decoder yield normalized monotone fixed-horizon posteriors
-  and exact ledger replay.  The CTMC-specific property is a homogeneous
+  sequential-hazard decoder yield normalized fixed-horizon posteriors whose
+  cumulative tails are coordinatewise monotone in the rates, as well as exact
+  ledger replay.  The CTMC-specific property is a homogeneous
   shared-clock Markov semigroup across horizons, whose utility is not tested by
   one endpoint grade per image.
   \item \textbf{Locked ordinal evaluation.}  We report complete 5-fold APTOS
@@ -337,7 +338,11 @@ Starting in state zero, the unit-exposure posterior is
 \end{equation}
 Since $Q$ is a valid generator, $\mathbf p$ is nonnegative and sums to one.
 We compute \cref{eq:posterior} in FP64 with a degree-24 Taylor
-scaling-and-squaring routine, without posterior clipping or renormalization.
+scaling-and-squaring routine.  For a decoder batch, let
+$\eta=\max_n\lVert Q_n\rVert_\infty$ and
+$s=\max\{0,\lceil\log_2(\eta/0.5)\rceil\}$.  We evaluate each Taylor
+polynomial at $Q_n/2^s$ and square the result $s$ times.  No posterior clipping
+or renormalization is applied.
 The unit exposure is simply a fixed decoder convention; $\lambda$ is latent
 ordinal evidence, not biological time.
 
@@ -418,6 +423,10 @@ effect.  Overlapping receptive fields mean that cells are computational units,
 not disjoint pixel segments.  Accordingly, exactness establishes
 \emph{computational faithfulness inside \method}; it does not by itself prove
 pixel causality, lesion identity, clinical sufficiency, or clinical necessity.
+For budget-matched audits we define the nominal stride-area cost
+$A_{\mathrm{nom}}(S)=\sum_{(s,u)\in S}\operatorname{stride}_s^2$.  This is an
+additive multiscale addressability cost, not unique pixel coverage or the union
+area of overlapping receptive fields.
 
 \subsection{Objective}
 
@@ -461,9 +470,8 @@ finalized, the checkpoint is evaluated on the locked outer fold; a second
 deterministic pass exports per-image probabilities for auditing.  Neither pass
 affects training or selection.  Architecture and hyperparameters were developed
 on fixed inner-validation splits.  The bounded V3 architecture was frozen on
-10 September 2026 (commit \texttt{b0f4609b}); the immutable full-CV launcher,
-split policy, and selection rule were frozen on 22 September
-(\texttt{a9e9f65}) before the 15 outer-fold evaluations.  Thus per-fold
+10 September 2026; the immutable full-CV launcher, split policy, and selection
+rule were frozen on 22 September before the 15 outer-fold evaluations.  Thus per-fold
 checkpointing is nested, but architecture selection was not independently
 repeated inside every outer fold.  No outer test fold was used for checkpoint
 selection.  The final EyePACS OOF audit contains 35,126 unique images from
@@ -489,8 +497,8 @@ outer tests; alternative decoders are not selected post hoc.
 
 \paragraph{Numerical reference audit.}
 The deployed FP64 Taylor scaling-and-squaring decoder was compared with an
-independent 90-decimal-digit \texttt{mpmath.expm} reference on 74 seeded random
-and adversarial rate vectors in $[0,64]^4$, plus eight independent
+independent 90-decimal-digit \texttt{mpmath.expm} reference on 138 seeded random
+and adversarial rate vectors in $[0,64]^4$, plus 12 independent
 finite-difference gradient cases.  The audit passed without clipping or
 renormalization: maximum absolute posterior, row-sum, and absolute-gradient
 errors were respectively below $1.5\times10^{-14}$,
@@ -502,10 +510,9 @@ compressed split-membership tables to SHA-256 hashes, split signatures,
 implementation signatures, and the source commit.  The anonymous release gate
 also requires OOF posteriors, deterministic split construction, intervention
 records, metric/bootstrap scripts, and restart provenance to pass checksums
-before any derived table is reported.  Membership identities are hashed and no
-fundus pixels are redistributed; image access remains subject to the source
-dataset licenses.  The ongoing audit outputs named explicitly below remain
-placeholders until their complete aggregates pass this gate.
+before any newly added acceptance-audit table is reported.  Membership
+identities are hashed and no fundus pixels are redistributed; image access
+remains subject to the source dataset licenses.
 
 \subsection{Required comparisons}
 
@@ -527,17 +534,18 @@ reimplementations of published CORAL or CORN systems.  Matched CLOC and
 sparse/additive local models were not part of that retrospective suite.  A
 separately frozen acceptance matrix now reserves comparisons against the
 same-ledger hazard, pooled continuation ratio, and matched in-repo analogues of
-ordinal Additive MIL and Sparse BagNet across matched folds and seeds.  These
+ordinal Additive MIL and a nonnegative sparse local-logit model across matched
+folds and seeds.  These
 are controlled architectural analogues, not claims of reproducing the original
-authors' training code; their results remain the explicit placeholder in
-\cref{tab:acceptance-placeholders} until the complete release gate passes.
+authors' training code.  Their results are withheld until the complete release
+gate passes.
 
 \subsection{Retrospective matched fold-9 mechanism study}
 \label{sec:ablation-protocol}
 
 We separately study mechanisms on EyePACS outer fold~9.  The final V3
 architecture predates full CV, but the mechanism protocol was added on 26
-September (\texttt{290e0a0}) after the full-CV aggregate and fold~9 had been
+September after the full-CV aggregate and fold~9 had been
 observed.  This is therefore retrospective evidence, not a confirmatory test.
 The split contains 28,456 training, 3,162
 inner-validation, and 3,508 locked outer-test images.  The test images form
@@ -657,35 +665,15 @@ localization.  We therefore separate the proved \emph{arithmetic identity of
 frozen-ledger replay} from the still-open empirical question of whether learned
 witnesses are local, useful, or semantically aligned.
 
-% RESULT PLACEHOLDERS: replace only from complete checksummed aggregates.
-\begin{table}[t]
-  \centering
-  \caption{\textbf{Acceptance-audit status.} Pending rows make no empirical
-  claim and will be replaced only by complete checksummed aggregates, never
-  partial jobs.}
-  \label{tab:acceptance-placeholders}
-  \setlength{\tabcolsep}{3.2pt}
-  \begin{tabular}{@{}>{\raggedright\arraybackslash}p{2.15cm}
-                       >{\raggedright\arraybackslash}p{4.65cm}@{}}
-    \toprule
-    Frozen audit & Reserved result \\
-    \midrule
-    OOF grouped replay & \textit{Pending:} boundary-wise deletion/retention
-    AOPC and patient-cluster CIs versus count-, area-, footprint-, and
-    rate-mass-matched controls. \\
-    Ordinal shortcuts & \textit{Pending:} three-seed known-cue localization,
-    boundary selectivity, exact internal intervention, and reversed-correlation
-    performance. \\
-    Matched intrinsic models & \textit{Pending:} multi-fold/seed grading and
-    calibration for CTMC, same-ledger hazards, pooled continuation,
-    matched in-repo analogues of ordinal Additive MIL and Sparse BagNet. \\
-    IDRiD semantics & 81 images, averaged within image over 10 checkpoints:
-    fine-bin AP $0.186$ [0.164, 0.210] at prevalence $0.0815$; mask-guided
-    versus count-matched random internal-deletion lift in $E[Y]$ $0.171$
-    [0.149, 0.194] (image-cluster 95\% CIs) \cite{porwal2020idrid}. \\
-    \bottomrule
-  \end{tabular}
-\end{table}
+\paragraph{IDRiD mask association.}
+On 81 IDRiD images \cite{porwal2020idrid}, fine-scale ledger bins have
+lesion-mask association AP $0.1861$ (95\% image-cluster CI
+$[0.1637,0.2095]$) at prevalence $0.0815$; lesion-mask-guided stored-ledger
+replay exceeds count-matched replay by $0.0111$ in $|\Delta E[Y]|$
+($[0.0097,0.0125]$).  Across all scales, the matched quantities are AP
+$0.2690$ ($[0.2455,0.2929]$) at prevalence $0.1666$ and replay lift $0.1710$
+($[0.1490,0.1941]$).  This is mask association and an internal ledger
+intervention, not pixel deletion, lesion recognition, or clinical necessity.
 
 \section{Ablations and Falsification Tests}
 \label{sec:ablations}
