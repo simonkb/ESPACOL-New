@@ -676,6 +676,17 @@ def test_shortcut_comparator_v2_exactly_enumerates_84_additional_workers() -> No
     assert frozen_thresholds["diffuse_effective_support_fraction_min"] == 0.10
 
 
+def test_shortcut_comparator_v2_binds_actual_v1_protocol_filename() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    launcher = (repo_root / "scripts/launch_origin_shortcut_comparator_v2.sh").read_text()
+    preflight = (
+        repo_root / "scripts/submit_origin_shortcut_comparator_preflight_v2.sh"
+    ).read_text()
+    assert "LOCKED_PROTOCOL.json" in launcher
+    assert "LOCKED_PROTOCOL.json" in preflight
+    assert 'REFERENCE_ROOT}/PROTOCOL.json' not in launcher
+
+
 def test_binary_average_precision_is_tie_order_independent() -> None:
     scores = [1.0, 1.0, 0.0, 0.0]
     assert binary_average_precision(scores, [1, 0, 1, 0]) == pytest.approx(0.5)

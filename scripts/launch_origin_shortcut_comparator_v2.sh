@@ -30,8 +30,8 @@ SUITE_ROOT="${ORIGIN_SHORTCUT_COMPARATOR_ROOT:-${REPO_ROOT}/runs/origin_shortcut
 SNAPSHOT_ROOT="${ORIGIN_SHORTCUT_COMPARATOR_WORKTREE:-${REPO_ROOT}-origin-shortcut-comparators-${SHORT_COMMIT}}"
 PROTOCOL="${SUITE_ROOT}/PROTOCOL_V2.json"
 
-[[ -f "${REFERENCE_ROOT}/PROTOCOL.json" && -f "${REFERENCE_ROOT}/SUBMISSION.json" ]] || {
-  echo "Reference root lacks sealed v1 PROTOCOL.json/SUBMISSION.json." >&2; exit 4;
+[[ -f "${REFERENCE_ROOT}/LOCKED_PROTOCOL.json" && -f "${REFERENCE_ROOT}/SUBMISSION.json" ]] || {
+  echo "Reference root lacks sealed v1 LOCKED_PROTOCOL.json/SUBMISSION.json." >&2; exit 4;
 }
 [[ -d "${DATA_ROOT}" ]] || { echo "APTOS data root missing: ${DATA_ROOT}" >&2; exit 5; }
 [[ ! -e "${SUITE_ROOT}" ]] || { echo "Fresh suite root already exists." >&2; exit 6; }
@@ -67,7 +67,7 @@ payload = {
     "data_root": str(Path(os.environ["ORIGIN_PROTOCOL_DATA"]).resolve()),
     "origin_reference_root": str(reference),
     "origin_reference_protocol_sha256": hashlib.sha256(
-        (reference / "PROTOCOL.json").read_bytes()
+        (reference / "LOCKED_PROTOCOL.json").read_bytes()
     ).hexdigest(),
     "origin_reference_submission_sha256": hashlib.sha256(
         (reference / "SUBMISSION.json").read_bytes()

@@ -57,7 +57,7 @@ if payload.get("launch_commit") != expected_commit:
 if TASK_COUNT != 84 or len(all_tasks()) != 84:
     raise RuntimeError("comparator task registry is not exactly 84 workers")
 for filename, key in (
-    ("PROTOCOL.json", "origin_reference_protocol_sha256"),
+    ("LOCKED_PROTOCOL.json", "origin_reference_protocol_sha256"),
     ("SUBMISSION.json", "origin_reference_submission_sha256"),
 ):
     path = reference / filename
