@@ -336,12 +336,23 @@ Validate the FP64 matrix exponential against an independent SciPy or high-precis
 
 `tools/assemble_origin_acceptance_package.py` is the final release barrier. It
 validates, in place, the numerical decoder audit, decoder-contract audit,
-checkpoint/split manifest, IDRiD image-cluster statistics, OOF Gate A,
+checkpoint/split manifest, corrective IDRiD v2 image-cluster statistics, OOF Gate A,
 controlled-shortcut Gate B, and the matched multi-fold/multi-seed outer
 release. It verifies canonical and file digests, nested artifact digests,
 registered protocols, complete fold/seed/model censuses, clean Git provenance,
 and the privacy contract before writing anything. Missing, incomplete, dirty,
 or checksum-inconsistent inputs prevent both outputs.
+
+The IDRiD component is version-gated rather than accepted by filename. The
+revised package rejects the historical v1 manifest and requires v2 to recompute
+threshold-grouped AP and use a bidirectional unique-cell control, which pairs
+$m=\min(n_{\rm lesion},n_{\rm nonlesion})$ cells per side independently at
+every image, native scale, and seeded repeat. The v2 validator also seals the
+14 dense image--scale cases that would have truncated the original one-sided
+control, the complete 20-repeat census, and equality of nominal cell,
+scale-composition, geometry, and pre-atom boundary-multiplier budgets. The
+release bundle includes sanitized image-level v2 units, with raw IDs and local
+paths removed, rather than publishing only aggregate point estimates.
 
 The package embeds a deterministic, checksummed, independently inspectable
 bundle: sanitized audit outputs and protocols, all 15 anonymous split

@@ -1,0 +1,86 @@
+{
+  "schema": "origin-idrid-semantic-statistics-protocol-v2",
+  "protocol_version": 2,
+  "input_schema": "origin-idrid-semantic-audit-v2",
+  "expected_images": 81,
+  "expected_segmentation_split_counts": {
+    "training": 54,
+    "testing": 27
+  },
+  "expected_checkpoint_folds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "expected_checkpoint_sha256_by_fold": {
+    "0": "e4ee0ab12882de4e4b57e0bf09cd7f48a69bfd8e1c5ee3a1b00368d461346112",
+    "1": "1fa55f24e39807ff3a7f35ca5f89acda51233e9e73efdd667ea7b721a21b55dc",
+    "2": "fa67e327d5ef4cb39eb31daf7e7b89595382d2ab1149af0eab9622ef3ed52ae3",
+    "3": "e98065cc68ef0907bc8158d9ce3db07fa5f79260664522aaa769b1aa94cf515a",
+    "4": "49788d4ebc96e54ab50845670fc6fcb1a3d0bc48706054fce274d3c678cdf195",
+    "5": "eddd40b63c4578615e36eb8700209e5c09d31b99bfc7fa7c8ec9a90d3823a588",
+    "6": "3d592f9e640dd746f8752ade1caba5478c8d4ef0648352c3c759274d58c71cae",
+    "7": "5065ee7625fa3414b4859ae6362ffea9fe24a4fbaa46ef4d09417eacd1d90f78",
+    "8": "eac089b19bf40eb121f02bcea0d80127e6f0f38317f5b2478776558e05000d3e",
+    "9": "a2232182869e1cf3326548b8a0cd59663b98b2dede8e187f83481275585774db"
+  },
+  "expected_architecture_signature": "02d2e5455d89b9dbacd1522a22fa7da4a25e91ebcaf0ce0c60de6aea214b44e6",
+  "expected_config_signature": "9ddf05ca3fd8660f7ee563799b73422f3d9f05bf446ffd40fd03c38c7ba5f914",
+  "checkpoint_identity_source": "checksum-verified_origin_v3_cv_fold_complete_markers",
+  "expected_paired_repeats": 20,
+  "expected_matching_seed": 20261011,
+  "expected_dense_image_scale_cases": 14,
+  "dense_case_census_unit": "unique_idrid_image_by_native_evidence_scale",
+  "matching_contract": "within_image_within_scale_unique_bidirectional_min_count_v1",
+  "matching_rule": "m=min(n_lesion,n_nonlesion); sample_m_unique_cells_from_each_side_per_repeat",
+  "matched_nominal_budgets": [
+    "per_scale_cell_count",
+    "scale_composition",
+    "conserved_geometry_exposure",
+    "target_boundary_pre_atom_multiplier"
+  ],
+  "unmatched_outcome": "actual_stored_rate_mass_removed",
+  "unmatched_control_attributes": [
+    "retinal_anatomy",
+    "radial_position"
+  ],
+  "inference_unit": "idrid_image_after_repeat_then_checkpoint_aggregation",
+  "cluster_limitation": "patient_linkage_unavailable_image_is_cluster",
+  "alignment_primary": "union_lesion_at_grade_selected_boundary",
+  "alignment_scalar": "stored_local_rate_for_one_scale_cell_and_ordinal_boundary",
+  "alignment_average_precision_definition": "noninterpolated_threshold_ap_with_exact_score_ties_grouped_v1",
+  "alignment_positive_bin_rule": "any_annotated_lesion_pixel_after_joint_crop_nearest_mask_resize_and_adaptive_max_pool",
+  "alignment_enrichment_null": "within_image_average_precision_equals_same_lattice_lesion_prevalence",
+  "deletion_primary": "all_scale_guided_minus_bidirectionally_matched_control_internal_ledger_deletion",
+  "interpretation_scope": "stored_internal_ledger_not_causal_pixel_intervention",
+  "aggregation_order": [
+    "paired_repeats_within_checkpoint_and_image",
+    "checkpoints_within_image",
+    "image_cluster_inference"
+  ],
+  "strata": [
+    "overall_fine_coarse",
+    "true_grade",
+    "ordinal_boundary",
+    "segmentation_split",
+    "lesion_type"
+  ],
+  "multiplicity_policy": "descriptive_intervals_and_tests_without_multiplicity_adjustment",
+  "config": {
+    "bootstrap_samples": 10000,
+    "bootstrap_seed": 20261012,
+    "confidence_level": 0.95,
+    "permutation_samples": 99999,
+    "permutation_seed": 20261013,
+    "exact_sign_flip_max_n": 20,
+    "zero_tolerance": 1e-12
+  },
+  "content_checksum_sha256": "d99ec88a9c83533d825c954d49061d88d349a14a23d55fe15105c2afee74e414"
+}

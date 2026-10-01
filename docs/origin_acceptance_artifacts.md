@@ -34,7 +34,15 @@ without redistributing the licensed source images.
    - explicit statement that exact deletion replay belongs to the additive
      ledger, not uniquely to the matrix exponential.
 6. **External and synthetic audits**
-   - IDRiD cell-bin alignment and mask-guided internal deletion records;
+   - IDRiD v2 cell-bin alignment and mask-guided internal deletion records;
+   - unique lesion and non-lesion cells paired within each image, native
+     evidence scale, and seeded repeat using
+     $m=\min(n_{\mathrm{lesion}},n_{\mathrm{nonlesion}})$ per side;
+   - the dense image--scale census, all 20 paired repeats, and exact nominal
+     equality of cell count, scale composition, receptive-field geometry
+     exposure, and the pre-atom boundary multiplier;
+   - privacy-sanitized image-level inferential units (local paths and raw
+     image identifiers removed) so aggregate estimates can be recomputed;
    - shortcut-transform definitions, hidden masks, seeds, cue-only controls,
      factorial interventions, and per-sample posteriors.
 7. **Matched baselines**
@@ -58,3 +66,11 @@ split overlap, incomplete randomized control, or non-finite value invalidates
 the aggregate. Partial results can be discussed as pilot evidence but cannot be
 silently presented as the preregistered complete analysis.
 
+For the revised release, the top-level assembler accepts only
+`origin-idrid-semantic-statistics-manifest-v2`. The historical v1 semantic
+manifest is retained as an audit trail, but it is excluded from the package
+because its one-sided coarse/all-scale control can under-match dense lesion
+lattices and its AP implementation did not group exact score ties. The exactly
+matched v1 fine-scale deletion result remains part of the audit trail, but v1
+AP and coarse/all-scale deletion estimates are excluded from the publication
+bundle in favor of the corrective v2 outputs.

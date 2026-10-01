@@ -32,7 +32,10 @@ SUBMISSION_RECORD="${OUTPUT_DIR}.SUBMISSION.json"
 RESERVATION_DIR="${OUTPUT_DIR}.launch-reservation"
 LAUNCHER_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
-# Authoritative artifact locations and matching producer job IDs. The package
+# Authoritative artifact locations and matching producer job IDs. The IDRiD
+# entry is the corrective bidirectionally matched v2 statistics manifest; a
+# legacy v1 manifest will pass the scheduler barrier but fail closed in the
+# immutable package worker before any release is written. The package
 # worker independently revalidates contents/checksums after all live barriers
 # open; this launcher establishes scheduler state and artifact existence.
 UPSTREAM_LABELS=(numerical decoder artifacts idrid oof shortcut baselines)

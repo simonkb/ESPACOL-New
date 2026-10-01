@@ -1,5 +1,7 @@
 #!/bin/bash
 # Assemble the final ORIGIN evidence package after every prerequisite succeeds.
+# The semantic input must be the corrective, bidirectionally matched IDRiD v2
+# manifest; the assembler deliberately rejects the historical v1 control.
 # This is a CPU-only validation/manifest job and must run from an immutable
 # detached worktree.  No raw image, checkpoint, prediction, or identifier is
 # copied into the resulting package. Privacy-safe outer predictions and
@@ -68,7 +70,9 @@ done
 echo "=== ORIGIN fail-closed acceptance package assembly ==="
 date --iso-8601=seconds
 git rev-parse HEAD
-"${ENV_PYTHON}" -m pytest -q tests/test_origin_acceptance_package.py
+"${ENV_PYTHON}" -m pytest -q \
+  tests/test_origin_acceptance_package.py \
+  tests/test_origin_idrid_semantics_v2.py
 
 ARGS=(
   --repo-root "${REPO_ROOT}"

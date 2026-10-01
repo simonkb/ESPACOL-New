@@ -62,6 +62,15 @@ def _git_repo(path: Path) -> tuple[Path, str]:
         Path("tools/assemble_origin_acceptance_package.py").read_text()
     )
     (path / "tools" / "analyze_origin_idrid_semantics.py").write_text("# idrid\n")
+    (path / "tools" / "audit_origin_idrid_semantics.py").write_text(
+        "# idrid audit v1\n"
+    )
+    (path / "tools" / "analyze_origin_idrid_semantics_v2.py").write_text(
+        Path("tools/analyze_origin_idrid_semantics_v2.py").read_text()
+    )
+    (path / "tools" / "audit_origin_idrid_semantics_v2.py").write_text(
+        Path("tools/audit_origin_idrid_semantics_v2.py").read_text()
+    )
     (path / "scripts" / "analyze_origin_oof_statistics.py").write_text("# oof\n")
     (path / "scripts" / "origin_acceptance_baseline_common.py").write_text(
         "# executable protocol\n"
@@ -70,9 +79,10 @@ def _git_repo(path: Path) -> tuple[Path, str]:
         '#!/bin/bash\ncd "${ORIGIN_REPO_ROOT:?ORIGIN_REPO_ROOT is required}"\n'
         'python train_origin.py --epochs 35\n'
     )
-    _write_sealed(
-        path / "scripts" / "protocols" / "origin_idrid_semantic_statistics_protocol.json",
-        {"schema": "origin-idrid-semantic-statistics-protocol-v1"},
+    (path / "scripts" / "protocols" / "origin_idrid_semantic_statistics_protocol_v2.json").write_text(
+        Path(
+            "scripts/protocols/origin_idrid_semantic_statistics_protocol_v2.json"
+        ).read_text()
     )
     _write_sealed(
         path / "scripts" / "protocols" / "origin_oof_statistics_protocol.json",
@@ -206,24 +216,80 @@ def _idrid(root: Path, repo: Path) -> Path:
     summary = _write_json(semantic / "summary.json", {"schema": "raw"})
     records = semantic / "records.jsonl"
     records.write_text("{}\n")
-    alignment = _write_sealed(stats / "alignment.json", {"schema": "align"})
-    deletion = _write_sealed(stats / "deletion.json", {"schema": "delete"})
-    units = stats / "units.jsonl"
-    units.write_text("{}\n")
-    protocol = json.loads(
-        (repo / "scripts" / "protocols" / "origin_idrid_semantic_statistics_protocol.json").read_text()
+    alignment = _write_sealed(
+        stats / "alignment.json",
+        {"schema": "origin-idrid-semantic-alignment-statistics-v2"},
     )
+    deletion = _write_sealed(
+        stats / "deletion.json",
+        {"schema": "origin-idrid-semantic-deletion-statistics-v2"},
+    )
+    units = stats / "units.jsonl"
+    units.write_text(
+        json.dumps(
+            {
+                "schema": "origin-idrid-semantic-image-unit-v2",
+                "image_id": "private-unit-0",
+                "expected_grade_delta_lift": 0.1,
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    protocol = json.loads(
+        (
+            repo
+            / "scripts"
+            / "protocols"
+            / "origin_idrid_semantic_statistics_protocol_v2.json"
+        ).read_text()
+    )
+    source_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
     return _write_sealed(
-        stats / "idrid_statistics_manifest.json",
+        stats / "idrid_statistics_manifest_v2.json",
         {
-            "schema": "origin-idrid-semantic-statistics-manifest-v1",
+            "schema": "origin-idrid-semantic-statistics-manifest-v2",
             "protocol_checksum_sha256": protocol["content_checksum_sha256"],
             "input_summary_path": str(summary),
             "input_summary_sha256": file_sha256(summary),
             "input_records_path": str(records),
             "input_records_sha256": file_sha256(records),
-            "input_census": {"images": [f"private-{index}" for index in range(81)]},
+            "input_census": {
+                "images": [f"private-{index}" for index in range(81)],
+                "alignment_rows": 10 * 81 * 4 * 5 * 4,
+                "deletion_paired_repeat_rows": 10 * 81 * 3 * 20,
+                "dense_image_scale_cases": 14,
+                "dense_image_scale_case_ids": ["private-dense-0:s32"],
+                "matching_rule": (
+                    "m=min(n_lesion,n_nonlesion) independently at every scale"
+                ),
+            },
+            "matching_scope": (
+                "unique lesion and non-lesion cells matched separately at every "
+                "image and scale; cell count, scale composition, geometry exposure, "
+                "and pre-atom multiplier equal"
+            ),
+            "input_dataset_inventory_checksum_sha256": "5" * 64,
+            "audit_generation": {
+                "source_commit": source_commit,
+                "audit_implementation_sha256": file_sha256(
+                    repo / "tools" / "audit_origin_idrid_semantics_v2.py"
+                ),
+                "v1_audit_dependency_sha256": file_sha256(
+                    repo / "tools" / "audit_origin_idrid_semantics.py"
+                ),
+                "checkpoint_order": list(range(10)),
+            },
             "analysis_implementation_sha256": file_sha256(
+                repo / "tools" / "analyze_origin_idrid_semantics_v2.py"
+            ),
+            "audit_implementation_sha256": file_sha256(
+                repo / "tools" / "audit_origin_idrid_semantics_v2.py"
+            ),
+            "v1_analysis_dependency_sha256": file_sha256(
                 repo / "tools" / "analyze_origin_idrid_semantics.py"
             ),
             "artifacts": {
@@ -241,6 +307,7 @@ def _idrid(root: Path, repo: Path) -> Path:
                 },
                 "image_level_units": {
                     "path": str(units), "sha256": file_sha256(units), "rows": 1,
+                    "row_schema": "origin-idrid-semantic-image-unit-v2",
                 },
             },
         },
@@ -898,16 +965,72 @@ def test_complete_package_is_checksum_sealed_and_exports_no_locations_or_ids(
     assert payload["artifact_availability"][
         "independent_reproduction_claim_authorized"
     ] is False
+    assert payload["artifact_availability"][
+        "idrid_v2_image_level_units_bundled"
+    ] is True
     bundle = inputs["output_dir"] / "bundle"
     assert (bundle / "BUNDLE_INDEX.json").is_file()
     assert len(list(bundle.glob("matched_baselines/workers/*/outer_predictions.npz"))) == 225
     assert len(list(bundle.glob("memberships/*.csv.gz"))) == 15
+    assert (
+        bundle
+        / "protocols"
+        / "origin_idrid_semantic_statistics_protocol_v2.json"
+    ).is_file()
+    sanitized_units = bundle / "idrid" / "image_level_units.jsonl"
+    assert sanitized_units.is_file()
+    assert "private-unit-0" not in sanitized_units.read_text()
+    assert "image_id" not in json.loads(sanitized_units.read_text())
+    assert json.loads(sanitized_units.read_text())["expected_grade_delta_lift"] == 0.1
+    bundle_index = json.loads((bundle / "BUNDLE_INDEX.json").read_text())
+    assert bundle_index["idrid_image_level_unit_rows"] == 1
+    idrid_component = payload["components"]["idrid_semantic_cluster_audit"]
+    assert idrid_component["schema"] == (
+        "origin-idrid-semantic-statistics-manifest-v2"
+    )
+    assert idrid_component["legacy_v1_admitted"] is False
+    assert idrid_component["paired_control_repeats_per_image_checkpoint"] == 20
     for json_file in bundle.rglob("*.json"):
         text = json_file.read_text()
         assert str(tmp_path) not in text
         assert "private-0" not in text
+        assert "private-dense-0" not in text
         _assert_privacy_safe_release(json.loads(text))
     _assert_privacy_safe_release(json.loads(manifest.read_text()))
+
+
+def test_legacy_idrid_v1_is_rejected_before_package_creation(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    manifest = json.loads(inputs["idrid_manifest"].read_text())
+    manifest["schema"] = "origin-idrid-semantic-statistics-manifest-v1"
+    _write_json(inputs["idrid_manifest"], _reseal(manifest))
+    with pytest.raises(ValueError, match="v1 is excluded"):
+        assemble_package(**inputs)
+    assert not inputs["output_dir"].exists()
+
+
+def test_idrid_v2_dense_case_census_is_fail_closed(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    manifest = json.loads(inputs["idrid_manifest"].read_text())
+    manifest["input_census"]["dense_image_scale_cases"] = 13
+    _write_json(inputs["idrid_manifest"], _reseal(manifest))
+    with pytest.raises(ValueError, match="dense image/scale census"):
+        assemble_package(**inputs)
+
+
+def test_idrid_v2_unit_rows_must_match_declared_schema(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    manifest = json.loads(inputs["idrid_manifest"].read_text())
+    unit_record = manifest["artifacts"]["image_level_units"]
+    unit_path = Path(unit_record["path"])
+    unit = json.loads(unit_path.read_text())
+    unit["schema"] = "wrong-image-unit-schema"
+    unit_path.write_text(json.dumps(unit, sort_keys=True) + "\n")
+    unit_record["sha256"] = file_sha256(unit_path)
+    _write_json(inputs["idrid_manifest"], _reseal(manifest))
+    with pytest.raises(ValueError, match="does not match its declared schema"):
+        assemble_package(**inputs)
+    assert not inputs["output_dir"].exists()
 
 
 def test_stable_checkpoint_archive_authorizes_independent_reproduction(

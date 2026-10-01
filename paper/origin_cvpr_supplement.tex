@@ -1,0 +1,518 @@
+% ORIGIN CVPR supplementary material.
+% This document intentionally reports only completed evidence. Pending
+% acceptance-revision experiments are identified explicitly and have no
+% result values in this version.
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+\usepackage[review]{cvpr}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{xspace}
+\usepackage{graphicx}
+
+\definecolor{cvprblue}{rgb}{0.21,0.49,0.74}
+\usepackage[pagebackref,breaklinks,colorlinks,allcolors=cvprblue]{hyperref}
+\usepackage[capitalize,nameinlink]{cleveref}
+
+\def\paperID{*****}
+\def\confName{CVPR}
+\def\confYear{2027}
+
+\newcommand{\method}{\textsc{Origin}\xspace}
+\newcommand{\NA}{\textemdash}
+\newcommand{\pending}{\textit{Pending sealed release}}
+
+\title{Every Threshold Has a Place:\\
+Conserved Spatial Evidence Ledgers for Auditable Ordinal Vision\\
+\vspace{3pt}\large Supplementary Material}
+\author{Anonymous Authors}
+
+\begin{document}
+\maketitle
+
+\section{Scope of this supplement}
+\label{sec:scope}
+
+This supplement makes the completed protocol, numerical, grading, and
+retrospective mechanism evidence inspectable in one place.  It also documents
+the exact contracts of the two declared ordinal decoders and the corrective
+IDRiD protocol.  It does \emph{not} fill unfinished experiments with pilot
+values.  At the time of this draft, the replicated intrinsic-baseline matrix,
+the shortcut audit, the validation-wide grouped-intervention gate, and the
+corrective IDRiD-v2 deletion statistics remain under checksum-sealed release
+gates.  Their table slots are marked pending; no conclusion in the main paper
+depends on assuming a favorable outcome.
+
+The main paper supplies the architecture and notation.  Briefly, the only
+image-dependent input to the ordinal decoder is a nonnegative spatial ledger
+$\ell_{nsuk}$ indexed by image $n$, scale $s$, cell $u$, and adjacent ordinal
+boundary $k$.  The total boundary rate is
+\begin{equation}
+  \lambda_{nk}=\pi_k+\sum_s\sum_u\ell_{nsuk},
+  \qquad \ell_{nsuk}\geq 0,
+  \label{eq:supp-ledger}
+\end{equation}
+where $\pi_k$ is image independent.  Group deletion subtracts selected stored
+entries and replays the same deterministic decoder.  Exact replay therefore
+belongs to the conserved ledger, not uniquely to a matrix exponential.
+
+\section{Decoder contracts and numerical verification}
+\label{sec:decoder-contracts}
+
+\subsection{Primary pure-birth CTMC decoder}
+
+For $K=5$ grades, $B=K-1=4$ rates define the upper-bidiagonal generator
+\begin{equation}
+ Q_{k,k}=-\lambda_k,\quad Q_{k,k+1}=\lambda_k,
+ \quad Q_{K-1,K-1}=0.
+ \label{eq:supp-generator}
+\end{equation}
+At exposure $t$, its posterior is
+\begin{equation}
+ \mathbf p_{\mathrm{ctmc}}(t)=e_0^\top\exp(tQ).
+ \label{eq:supp-ctmc}
+\end{equation}
+The deployed model fixes $t=1$.  Rates are bounded by construction to the
+audited domain $[0,64)^4$; neither the model nor our expressiveness statement
+uses unbounded rates.  The implementation evaluates a degree-24 Taylor
+polynomial after scaling $Q$ by $2^{-s}$, where
+\begin{equation}
+ s=\max\!\left\{0,\left\lceil
+ \log_2\!\left(\frac{\max_n\lVert Q_n\rVert_\infty}{0.5}\right)
+ \right\rceil\right\},
+ \label{eq:supp-scaling}
+\end{equation}
+and then squares $s$ times in FP64.  There is no posterior clipping or
+renormalization.
+
+\subsection{Same-ledger sequential-hazard decoder}
+
+The matched control consumes the identical four rates.  Its adjacent hazards,
+cumulative tails, and normalized posterior are
+\begin{align}
+ h_k(t)&=1-\exp(-t\lambda_k),\\
+ T_k(t)&\equiv P_{\mathrm{seq}}(Y>k)
+ =\prod_{j=0}^{k}h_j(t),
+ \label{eq:supp-hazards}\\
+ p^{\mathrm{seq}}_y(t)&=
+ \begin{cases}
+ (1-h_y(t))\prod_{j<y}h_j(t),&y<K-1,\\
+ \prod_{j=0}^{K-2}h_j(t),&y=K-1.
+ \end{cases}
+ \label{eq:supp-sequential}
+\end{align}
+The class probabilities telescope to one.  Both declared decoders are
+coordinatewise monotone in the cumulative tails and inherit exact frozen-ledger
+deletion and retention.  Only the CTMC defines one homogeneous shared-clock
+transition kernel satisfying
+$P(t+r)=P(t)P(r)$.  The natural restarted sequential construction generally
+does not obey that semigroup identity.  We claim this as a mathematical
+contract, not as validated longitudinal disease dynamics or an endpoint
+accuracy advantage.
+
+\begin{table}[t]
+  \centering
+  \caption{Attribution of guarantees.  ``Shared'' means the property holds for
+  both declared decoders when they consume the same conserved ledger.}
+  \label{tab:guarantees}
+  \small
+  \setlength{\tabcolsep}{3.6pt}
+  \begin{tabular}{@{}p{3.15cm}ccc@{}}
+    \toprule
+    Property & Ledger & CTMC & Sequential \\
+    \midrule
+    Nonnegative local entries & $\checkmark$ & -- & -- \\
+    Exclusive image path & $\checkmark$ & consumes & consumes \\
+    Exact grouped replay & $\checkmark$ & shared & shared \\
+    Normalized posterior & -- & $\checkmark$ & $\checkmark$ \\
+    Monotone ordinal tails & -- & $\checkmark$ & $\checkmark$ \\
+    Homogeneous semigroup & -- & $\checkmark$ & no, generally \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Independent numerical audits}
+
+The deployed FP64 CTMC routine was compared against an independent
+90-decimal-digit \texttt{mpmath.expm} reference on 138 seeded random and
+adversarial rate vectors spanning $[0,64]^4$.  Twelve additional cases compared
+autograd with independent finite differences.  \Cref{tab:numeric-audit}
+reports the completed maxima.  The relative gradient statistic is dominated by
+near-zero reference derivatives, so the absolute error is the more informative
+quantity.  These tests validate the declared bounded implementation; they do
+not establish universal saturation of the categorical simplex.
+
+\begin{table}[t]
+  \centering
+  \caption{Completed numerical reference audit.}
+  \label{tab:numeric-audit}
+  \small
+  \begin{tabular}{@{}lr@{}}
+    \toprule
+    Quantity & Maximum error \\
+    \midrule
+    Absolute posterior error & $1.4877\times10^{-14}$ \\
+    Relative posterior error & $9.4059\times10^{-14}$ \\
+    Posterior row-sum error & $1.6209\times10^{-14}$ \\
+    Absolute gradient error & $1.3323\times10^{-15}$ \\
+    Relative gradient error & $1.9054\times10^{-8}$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+A separate decoder-contract audit sampled bounded rates and interior posterior
+targets.  The largest tested endpoint reconstruction error was
+$2.08\times10^{-12}$ for the CTMC and $1.95\times10^{-16}$ for the sequential
+decoder; observed monotonicity error was zero.  The CTMC semigroup error was
+$4.55\times10^{-15}$, whereas the smallest recorded violation for the
+corresponding restarted sequential construction was $0.01119$.  These sampled
+inversion results provide no evidence of a fixed-horizon expressiveness
+advantage for the CTMC.
+
+\section{Freeze chronology and evaluation discipline}
+\label{sec:chronology}
+
+\Cref{tab:chronology} separates architecture development, locked evaluation,
+and retrospective analysis.  The bounded V3 architecture was frozen before
+the complete cross-validation run.  Architecture and hyperparameter search
+used fixed inner-development splits, however, and was not independently nested
+inside each outer fold.  Consequently, the full-CV results estimate one frozen
+configuration; they are not evidence from nested model-class selection.
+
+\begin{table*}[t]
+  \centering
+  \caption{Development and freeze chronology.  Commit IDs and signed run
+  manifests, rather than prose recollection, are the primary provenance.}
+  \label{tab:chronology}
+  \small
+  \setlength{\tabcolsep}{5pt}
+  \begin{tabular}{@{}p{1.8cm}p{3.2cm}p{6.1cm}p{4.6cm}@{}}
+    \toprule
+    Date & Commit/run & Event & Status and visible evaluation \\
+    \midrule
+    Sep. 8, 2026 & \texttt{49c541f...} & Initial conserved ordinal generator & Inner-validation development runs \\
+    Sep. 9--10 & \texttt{b0f4609...} & Bounded V3 parameterization, FP64 correction, and serializable certificate audit frozen & Final V3 architecture; no full-CV aggregate existed \\
+    Sep. 22 & \texttt{a9e9f65...} & Immutable split, selection, and full-CV launcher frozen & Outer folds remained locked during training and selection \\
+    Sep. 22--25 & full-CV run & 5 APTOS and 10 patient-grouped EyePACS outer folds & Complete OOF evaluation of frozen V3 \\
+    Sep. 26 & \texttt{290e0a0...} & Ten-arm fold-9 mechanism protocol added & Retrospective: fold 9 and full aggregate had been observed \\
+    Oct. 1 onward & acceptance-revision protocols & Numerical, artifact, IDRiD, shortcut, grouped-replay, and matched-baseline audits & May test claims; may not modify V3 and reuse its OOF results as prospective evidence \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+The exact full-CV run tag is
+\nolinkurl{origin_v3_full_cv_20260922T084547Z}.
+
+Within each outer training pool, 10\% is reserved for inner validation.
+Optimization and checkpoint selection use only the training and inner splits.
+The rule is lexicographic: higher inner-validation accuracy, then higher QWK,
+then lower loss.  The selected checkpoint is evaluated once on the locked
+outer fold; a deterministic second pass exports its posterior for auditing.
+EyePACS folds are grouped by patient identity parsed from paired-eye filenames.
+APTOS supplies no patient identifier, so its folds are image stratified.  A
+failed EyePACS fold-9 attempt was archived and rerun from scratch under the
+unchanged commit, split, seed, and configuration.
+
+\section{Complete outer-fold grading results}
+\label{sec:fold-results}
+
+\Cref{tab:eyepacs-folds,tab:aptos-folds} give every outer fold.  Accuracy and
+balanced accuracy are percentages; MAE uses the discrete MAP grade.  ECE is
+15-bin top-label expected calibration error.  Pooled OOF metrics are computed
+once from the union of per-image exports and therefore need not equal the
+unweighted mean of fold values.
+
+\begin{table*}[t]
+  \centering
+  \caption{Complete patient-grouped EyePACS 10-fold outer-CV results.}
+  \label{tab:eyepacs-folds}
+  \small
+  \setlength{\tabcolsep}{7pt}
+  \begin{tabular}{@{}rrrrrrrr@{}}
+    \toprule
+    Fold & $N$ & Acc. & MAP-MAE & QWK & Bal. acc. & Macro-F1 & ECE \\
+    \midrule
+    0 & 3518 & 85.759 & 0.1961 & 0.8242 & 56.774 & 0.6098 & 0.0384 \\
+    1 & 3518 & 86.356 & 0.1873 & 0.8295 & 56.428 & 0.6135 & 0.0273 \\
+    2 & 3514 & 85.714 & 0.2046 & 0.8027 & 57.969 & 0.6251 & 0.0318 \\
+    3 & 3514 & 85.544 & 0.2103 & 0.7857 & 53.982 & 0.5950 & 0.0248 \\
+    4 & 3514 & 86.027 & 0.2026 & 0.8030 & 56.519 & 0.6220 & 0.0333 \\
+    5 & 3510 & 86.752 & 0.1744 & 0.8510 & 60.305 & 0.6470 & 0.0405 \\
+    6 & 3510 & 86.382 & 0.1869 & 0.8249 & 57.876 & 0.6342 & 0.0265 \\
+    7 & 3510 & 86.154 & 0.1923 & 0.8203 & 61.016 & 0.6467 & 0.0372 \\
+    8 & 3510 & 85.926 & 0.1991 & 0.8149 & 59.198 & 0.6290 & 0.0281 \\
+    9 & 3508 & 85.262 & 0.2092 & 0.7961 & 55.286 & 0.5893 & 0.0218 \\
+    \midrule
+    Fold mean & -- & $85.988$ & $0.1963$ & $0.8152$ & $57.535$ & $0.6212$ & $0.0310$ \\
+    Sample SD & -- & $0.442$ & $0.0113$ & $0.0189$ & $2.195$ & $0.0196$ & $0.0063$ \\
+    Pooled OOF & 35126 & $85.988$ & $0.1963$ & $0.8153$ & $57.557$ & $0.6223$ & $0.0288$ \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+\begin{table*}[t]
+  \centering
+  \caption{Complete image-stratified APTOS 5-fold outer-CV results.}
+  \label{tab:aptos-folds}
+  \small
+  \setlength{\tabcolsep}{7pt}
+  \begin{tabular}{@{}rrrrrrrr@{}}
+    \toprule
+    Fold & $N$ & Acc. & MAP-MAE & QWK & Bal. acc. & Macro-F1 & ECE \\
+    \midrule
+    0 & 733 & 84.584 & 0.2019 & 0.9051 & 61.905 & 0.6103 & 0.0838 \\
+    1 & 733 & 84.175 & 0.2005 & 0.9046 & 60.171 & 0.6077 & 0.0563 \\
+    2 & 733 & 84.993 & 0.1855 & 0.9218 & 67.468 & 0.6903 & 0.0443 \\
+    3 & 732 & 85.109 & 0.1899 & 0.9155 & 66.056 & 0.6499 & 0.0315 \\
+    4 & 731 & 85.499 & 0.1902 & 0.9115 & 62.749 & 0.6405 & 0.0777 \\
+    \midrule
+    Fold mean & -- & $84.872$ & $0.1936$ & $0.9117$ & $63.670$ & $0.6397$ & $0.0587$ \\
+    Sample SD & -- & $0.508$ & $0.0072$ & $0.0073$ & $3.013$ & $0.0337$ & $0.0220$ \\
+    Pooled OOF & 3662 & $84.872$ & $0.1936$ & $0.9118$ & $63.673$ & $0.6438$ & $0.0502$ \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+\subsection{Pooled confusion matrices and long-tail behavior}
+
+The EyePACS pooled confusion matrix (rows are true grade, columns predicted
+grade) is
+\begin{equation*}
+\begin{bmatrix}
+25013&323&447&3&24\\
+1335&697&410&0&1\\
+974&312&3794&170&42\\
+34&8&500&308&23\\
+57&3&177&79&392
+\end{bmatrix}.
+\end{equation*}
+It yields per-grade recall
+$[96.91,28.53,71.69,35.28,55.37]\%$.  The corresponding APTOS matrix is
+\begin{equation*}
+\begin{bmatrix}
+1783&19&3&0&0\\
+30&186&145&0&9\\
+3&37&918&2&39\\
+0&0&136&14&43\\
+0&10&72&6&207
+\end{bmatrix},
+\end{equation*}
+with recall $[98.78,50.27,91.89,7.25,70.17]\%$.  These tables expose the
+minority-grade failures hidden by overall accuracy: EyePACS grade 1 and grade 3,
+and especially APTOS grade 3, remain poorly recognized.
+
+\section{Complete retrospective fold-9 mechanism study}
+\label{sec:ablation}
+
+This study was specified only after EyePACS fold 9 and the complete OOF
+aggregate had been observed.  It therefore provides retrospective mechanism
+evidence, not a confirmatory benchmark.  All ten variants share the same
+patient split, ImageNet initialization policy, optimizer, augmentation,
+checkpoint rule, and one training-stream seed.  The locked outer fold contains
+3,508 images from 1,754 paired-eye patient clusters.  Confidence intervals use
+10,000 paired patient-cluster bootstrap resamples; no multiplicity correction
+is applied.
+
+\begin{table*}[t]
+  \centering
+  \caption{Complete fold-9 mechanism results.  Deltas and 95\% intervals are
+  candidate minus full \method.  Lower MAP-MAE and ECE are better; higher
+  remaining metrics are better.}
+  \label{tab:ablation-full}
+  \scriptsize
+  \setlength{\tabcolsep}{3.2pt}
+  \begin{tabular}{@{}lrrrrrrrr@{}}
+    \toprule
+    Variant & Params (M) & Acc. & $\Delta$Acc. [95\% CI] & MAP-MAE & $\Delta$MAE [95\% CI] & QWK & Bal. acc. & ECE \\
+    \midrule
+    Full \method & 28.01 & 85.66 & reference & 0.2007 & reference & 0.8132 & 58.22 & 0.0429 \\
+    Pooled softmax & 28.07 & 85.86 & $+0.20[-0.57,0.97]$ & 0.1958 & $-0.0048[-0.0177,0.0080]$ & 0.8196 & 59.83 & 0.0597 \\
+    Pooled cumulative & 28.07 & 85.72 & $+0.06[-0.74,0.86]$ & 0.1978 & $-0.0029[-0.0151,0.0094]$ & 0.8210 & 57.10 & 0.0459 \\
+    Same-ledger hazard & 28.01 & 85.86 & $+0.20[-0.48,0.88]$ & 0.1984 & $-0.0023[-0.0145,0.0100]$ & 0.8120 & 57.26 & 0.0357 \\
+    Direct simplex atoms & 28.01 & 86.00 & $+0.34[-0.40,1.05]$ & 0.1984 & $-0.0023[-0.0145,0.0103]$ & 0.8110 & 59.53 & 0.0430 \\
+    NLL only & 28.01 & 86.23 & $+0.57[-0.06,1.20]$ & 0.1956 & $-0.0051[-0.0160,0.0057]$ & 0.8061 & 58.11 & 0.0441 \\
+    Fine scales ($s4,s8$) & 27.86 & 83.69 & $-1.97[-2.88,-1.08]$ & 0.2377 & $+0.0371[0.0217,0.0530]$ & 0.7544 & 42.10 & 0.0132 \\
+    Coarse scales ($s16,s32$) & 27.97 & 85.66 & $+0.00[-0.66,0.68]$ & 0.2052 & $+0.0046[-0.0071,0.0162]$ & 0.7987 & 57.48 & 0.0493 \\
+    Independent sigmoid atoms & 28.01 & 85.80 & $+0.14[-0.54,0.83]$ & 0.2013 & $+0.0006[-0.0108,0.0123]$ & 0.8094 & 59.22 & 0.0437 \\
+    Pooled continuation ratio & 28.07 & 86.40 & $+0.74[-0.06,1.54]$ & 0.1861 & $-0.0145[-0.0274,-0.0017]$ & 0.8299 & 62.48 & 0.0702 \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+The pooled continuation-ratio model has the lowest MAP-MAE and its paired
+interval excludes zero, while full \method has better ECE by 0.0273
+($[0.0198,0.0357]$ when expressed as pooled-minus-\method).  The fine-only
+variant is decisively worse, whereas the coarse-only interval spans zero.
+The same-ledger decoder comparison does not show a CTMC grading advantage.
+These results motivate, but cannot substitute for, the replicated matched
+baseline suite listed in \cref{sec:pending}.
+
+\section{IDRiD semantic-association protocol}
+\label{sec:idrid}
+
+\subsection{Initial v1 alignment analysis; corrective v2 pending}
+
+The external analysis uses all 81 images in the IDRiD segmentation subset
+\cite{porwal2020idrid}: 54 training-split and 27 testing-split images.  All ten
+independently inner-selected EyePACS outer-fold checkpoints are evaluated; no
+IDRiD image, mask, or statistic is used for training, checkpoint selection,
+hyperparameter tuning, or scale selection.
+
+For each image we form the union of the official microaneurysm, hemorrhage,
+hard-exudate, and soft-exudate masks.  The dominant-field-of-view crop is
+computed from the image and applied identically to image and masks.  Images are
+resized bilinearly; masks use nearest-neighbor interpolation.  For each native
+feature lattice, adaptive max pooling marks a bin positive iff any aligned
+lesion-mask pixel lies in its spatial support.  At true grade $y$, the scalar
+score for each cell is its stored local ledger rate at
+\begin{equation}
+ b(y)=\min\{\max(y-1,0),3\}.
+ \label{eq:idrid-boundary}
+\end{equation}
+Average precision (AP) is computed separately for every
+image$\times$checkpoint$\times$scale.  Checkpoints and scales are then averaged
+within image, and image is the inferential cluster.  This order makes the test
+within-image: it cannot obtain positive enrichment merely because one image has
+both more lesions and globally larger evidence.
+
+V1 reported fine-scale AP 0.1861 (95\% image-cluster CI
+$[0.1637,0.2095]$) at prevalence 0.0815 and within-image
+AP-minus-prevalence 0.1045 ($[0.0938,0.1159]$).  A later code audit found that
+its element-wise stable sort did not group exact score ties at common
+thresholds, so these values are provisional.  V2 recomputes non-interpolated
+threshold AP with exact ties grouped; no AP claim is promoted until that
+terminal manifest exists.
+
+\subsection{Corrective bidirectional deletion protocol (v2; pending)}
+
+The completed v1 fine-scale replay result used exact within-image/scale count
+matching and found a guided-minus-control increase of 0.0111 in
+$|\Delta E[Y]|$ ($[0.0097,0.0125]$).  A later census found that v1 could not
+match all lesion-positive cells at 14 dense image$\times$coarse-scale cases:
+there were fewer nonlesion cells than lesion cells.  The fine deletion result
+remains exactly matched, but v1 coarse/all-scale deletion lifts are demoted to
+exploratory; the separate AP issue above is also corrected by v2.
+
+The checksum-sealed v2 reanalysis corrects this without retraining.  For image
+$i$ and scale $s$, let $L_{is}$ and $C_{is}$ denote unique lesion-positive and
+nonlesion cells.  Each of 20 deterministic paired repeats uses
+\begin{equation}
+ m_{is}=\min(|L_{is}|,|C_{is}|)
+ \label{eq:idrid-m}
+\end{equation}
+and samples $m_{is}$ unique cells from each set.  Guided and control groups
+therefore have identical per-scale cell counts, scale composition, geometry
+exposure $R/N_s$, nominal stride-area cost, and target-boundary pre-atom
+multiplier.  The actual stored rate mass removed is intentionally not matched:
+it is the outcome being tested.  Retinal anatomy and eccentricity are not
+matched.  Aggregation is repeats within checkpoint and image, checkpoints
+within image, then image-cluster inference.  The primary
+contrast is all-scale guided minus bidirectionally matched control deletion;
+fine/coarse, grade, boundary, segmentation-split, and lesion-type strata are
+secondary and descriptive.  Protocol checksum:
+\begin{center}
+\scriptsize\ttfamily
+d99ec88a9c83533d825c954d49061d88\\
+d349a14a23d55fe15105c2afee74e414
+\end{center}
+
+The v2 effect estimate and interval remain pending until sealed release.  Until its terminal manifest
+exists, this document makes no positive claim from coarse/all-scale deletion.
+
+\section{Artifact and release manifest}
+\label{sec:artifacts}
+
+The completed base manifest indexes the 15 selected V3 checkpoints and 15
+compressed fold-membership artifacts and binds them to source, architecture,
+configuration, implementation, split, and SHA-256 signatures.  Its manifest
+checksum is
+\begin{center}
+\scriptsize\ttfamily
+fa56cd1d25a35dedf09b7f65a86f1c5\\
+91ef0ab9d434310256cd8dd1fa4d6e59d
+\end{center}
+Hashes establish identity only when the corresponding artifact is supplied;
+they do not by themselves enable re-inference.
+
+The anonymous package contract therefore requires the following concrete
+contents, without redistributing licensed fundus pixels:
+\begin{enumerate}[leftmargin=*,itemsep=2pt,topsep=3pt]
+  \item source commit, environment, architecture/configuration signatures, and
+        selected checkpoint tensors where hosting permits, otherwise stable
+        archival links plus SHA-256;
+  \item deterministic split code and compressed memberships containing hashed
+        image identity, hashed patient cluster where available, label, and role;
+  \item every OOF label, posterior, cumulative tail, MAP decision, expected
+        grade, fold, and hashed cluster;
+  \item per-image/per-boundary intervention curves, group masks or deterministic
+        control seeds, protocol hashes, and audit scripts;
+  \item numerical-reference and decoder-contract inputs and outputs;
+  \item IDRiD records and, if they pass their gates, shortcut and matched
+        intrinsic-baseline records; and
+  \item one top-level fail-closed manifest linking every reported table to a
+        checksummed aggregate.
+\end{enumerate}
+Any missing fold, split overlap, duplicate outer image, mismatched hash,
+incomplete randomized control, or nonfinite value invalidates the affected
+aggregate.  The final assembled anonymous archive is pending dependency-gated
+completion of the experiments in \cref{sec:pending}; the present document does
+not imply that this archive has already been released publicly.
+
+\section{Reserved acceptance-revision results}
+\label{sec:pending}
+
+\Cref{tab:pending} records the predeclared questions without converting running
+jobs into evidence.  The paper will be updated only from terminal, checksummed
+aggregate manifests.  If a gate fails, the corresponding claim will be
+withdrawn rather than tuned post hoc on the same outer predictions.
+
+\begin{table}[t]
+  \centering
+  \caption{Reserved experiments.  Every result is intentionally withheld until
+  its complete release gate passes.}
+  \label{tab:pending}
+  \scriptsize
+  \setlength{\tabcolsep}{3pt}
+  \begin{tabular}{@{}p{1.7cm}p{5.4cm}@{}}
+    \toprule
+    Experiment & Predeclared question and status \\
+    \midrule
+    Matched baselines & Does the ledger improve a concrete audit over same-ledger hazards, pooled continuation ratio, ordinal Additive-MIL, and sparse local-logit analogues while retaining grading?  \pending; no result claimed. \\
+    Grouped replay & Do ranked groups show necessity and sufficiency beyond scale-, footprint-, count-, and mass-matched controls?  \pending; no result claimed. \\
+    Ordinal shortcut & Does the ledger identify a known cue's location and boundary, and does internal deletion agree with pixel toggles?  \pending; no result claimed. \\
+    IDRiD v2 & Does tie-grouped AP remain above within-image prevalence, and does all-scale guided deletion exceed within-image/scale matched controls after correcting 14 dense cases?  \pending; protocol fixed in \cref{sec:idrid}. \\
+    Artifact assembly & Can promoted results be regenerated from predictions, memberships, records, scripts, and hashes?  \pending{} on upstream terminal artifacts. \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{Interpretation checklist}
+\label{sec:claims}
+
+The following language is supported by completed evidence:
+\begin{itemize}[leftmargin=*,itemsep=2pt,topsep=3pt]
+  \item the ledger is the exclusive image-dependent prediction path;
+  \item ledger entries are nonnegative, boundary indexed, and exactly conserved;
+  \item grouped frozen-ledger deletion/retention is exact for either declared
+        deterministic decoder;
+  \item the deployed CTMC is numerically accurate on its bounded rate domain;
+  \item complete CV supports competitive overall grading under the stated
+        protocols.
+\end{itemize}
+The following language is not supported by the completed evidence and is not
+used: pixel-causal explanation, automatic lesion recognition, clinical
+necessity, a demonstrated CTMC endpoint advantage, solved class imbalance,
+fully nested architecture selection, finalized IDRiD association, or
+superiority to intrinsic local predictors.  Those boundaries are part of the
+method's scientific contract, not presentation caveats.
+
+{\small
+  \bibliographystyle{ieeenat_fullname}
+  \bibliography{origin_cvpr_refs}
+}
+
+\end{document}

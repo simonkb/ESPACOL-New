@@ -34,8 +34,8 @@ import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PACKAGE_SCHEMA = "origin-acceptance-reproducibility-package-v2"
-COMPLETION_SCHEMA = "origin-acceptance-reproducibility-complete-v2"
+PACKAGE_SCHEMA = "origin-acceptance-reproducibility-package-v3"
+COMPLETION_SCHEMA = "origin-acceptance-reproducibility-complete-v3"
 MANIFEST_FILENAME = "ORIGIN_ACCEPTANCE_PACKAGE_MANIFEST.json"
 COMPLETION_FILENAME = "ORIGIN_ACCEPTANCE_PACKAGE_COMPLETE.json"
 BUNDLE_DIRECTORY = "bundle"
@@ -51,6 +51,21 @@ EXPECTED_SHORTCUT_VARIANTS = (
 EXPECTED_DATASET_IMAGES = {"aptos": 3662, "dr": 35126}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
+
+# The publication package intentionally fails closed on the original IDRiD
+# deletion analysis. That analysis remains a useful historical artifact, but
+# its one-sided control could under-match lesion-positive cells on dense
+# coarse lattices. The v2 contract samples the same number of unique lesion
+# and non-lesion cells independently at every image/scale/repeat and is the
+# only semantic audit admitted to the revised release.
+IDRID_MANIFEST_SCHEMA = "origin-idrid-semantic-statistics-manifest-v2"
+IDRID_PROTOCOL_SCHEMA = "origin-idrid-semantic-statistics-protocol-v2"
+IDRID_ALIGNMENT_SCHEMA = "origin-idrid-semantic-alignment-statistics-v2"
+IDRID_DELETION_SCHEMA = "origin-idrid-semantic-deletion-statistics-v2"
+IDRID_UNIT_SCHEMA = "origin-idrid-semantic-image-unit-v2"
+IDRID_MATCHING_CONTRACT = (
+    "within_image_within_scale_unique_bidirectional_min_count_v1"
+)
 
 BASELINE_SCALAR_METRICS = (
     "acc", "qwk", "mae", "expected_grade_mae", "balanced_acc", "macro_f1",
@@ -914,21 +929,92 @@ def validate_artifact_manifest(path: Path, repo_root: Path) -> dict[str, Any]:
 
 
 def validate_idrid_manifest(path: Path, repo_root: Path) -> dict[str, Any]:
-    payload = verify_checksummed_payload(
-        path, schema="origin-idrid-semantic-statistics-manifest-v1"
-    )
-    implementation = repo_root / "tools" / "analyze_origin_idrid_semantics.py"
+    raw = read_json(path)
+    if raw.get("schema") == "origin-idrid-semantic-statistics-manifest-v1":
+        raise ValueError(
+            "IDRiD v1 is excluded from the revised acceptance package because "
+            "its coarse/all-scale deletion control may under-match dense lesion "
+            "lattices; supply the bidirectionally matched v2 manifest"
+        )
+    payload = verify_checksummed_payload(path, schema=IDRID_MANIFEST_SCHEMA)
+    implementation = repo_root / "tools" / "analyze_origin_idrid_semantics_v2.py"
     if file_sha256(implementation) != payload.get("analysis_implementation_sha256"):
         raise ValueError("IDRiD analysis implementation differs from the sealed run")
-    protocol_path = repo_root / "scripts" / "protocols" / "origin_idrid_semantic_statistics_protocol.json"
+    audit_implementation = repo_root / "tools" / "audit_origin_idrid_semantics_v2.py"
+    if file_sha256(audit_implementation) != payload.get(
+        "audit_implementation_sha256"
+    ):
+        raise ValueError("IDRiD audit implementation differs from the sealed run")
+    v1_analysis_dependency = repo_root / "tools" / "analyze_origin_idrid_semantics.py"
+    if file_sha256(v1_analysis_dependency) != payload.get(
+        "v1_analysis_dependency_sha256"
+    ):
+        raise ValueError("IDRiD v1 analysis dependency differs from the sealed run")
+    protocol_path = (
+        repo_root
+        / "scripts"
+        / "protocols"
+        / "origin_idrid_semantic_statistics_protocol_v2.json"
+    )
     protocol = verify_checksummed_payload(
-        protocol_path, schema="origin-idrid-semantic-statistics-protocol-v1"
+        protocol_path, schema=IDRID_PROTOCOL_SCHEMA
     )
     if protocol["content_checksum_sha256"] != payload.get("protocol_checksum_sha256"):
         raise ValueError("IDRiD statistics protocol checksum mismatch")
     census = payload.get("input_census")
-    if not isinstance(census, Mapping) or len(census.get("images", [])) != 81:
+    expected_images = int(protocol.get("expected_images", -1))
+    if not isinstance(census, Mapping) or len(census.get("images", [])) != expected_images:
         raise ValueError("IDRiD audit does not cover exactly 81 image clusters")
+    expected_folds = protocol.get("expected_checkpoint_folds")
+    expected_repeats = int(protocol.get("expected_paired_repeats", -1))
+    if not isinstance(expected_folds, list) or sorted(expected_folds) != list(range(10)):
+        raise ValueError("IDRiD v2 protocol does not bind all 10 EyePACS folds")
+    expected_alignment_rows = len(expected_folds) * expected_images * 4 * 5 * 4
+    expected_deletion_rows = (
+        len(expected_folds) * expected_images * 3 * expected_repeats
+    )
+    if int(census.get("alignment_rows", -1)) != expected_alignment_rows:
+        raise ValueError("IDRiD v2 alignment-row census is incomplete")
+    if int(census.get("deletion_paired_repeat_rows", -1)) != expected_deletion_rows:
+        raise ValueError("IDRiD v2 paired-deletion census is incomplete")
+    if int(census.get("dense_image_scale_cases", -1)) != int(
+        protocol.get("expected_dense_image_scale_cases", -2)
+    ):
+        raise ValueError("IDRiD v2 dense image/scale census changed")
+    if census.get("matching_rule") != (
+        "m=min(n_lesion,n_nonlesion) independently at every scale"
+    ):
+        raise ValueError("IDRiD v2 bidirectional matching rule changed")
+    if protocol.get("matching_contract") != IDRID_MATCHING_CONTRACT:
+        raise ValueError("IDRiD v2 protocol matching contract changed")
+    if payload.get("matching_scope") != (
+        "unique lesion and non-lesion cells matched separately at every image "
+        "and scale; cell count, scale composition, geometry exposure, and "
+        "pre-atom multiplier equal"
+    ):
+        raise ValueError("IDRiD v2 manifest no longer declares exact paired budgets")
+    if not HEX64.fullmatch(
+        str(payload.get("input_dataset_inventory_checksum_sha256", ""))
+    ):
+        raise ValueError("IDRiD v2 dataset-inventory checksum is invalid")
+    generation = payload.get("audit_generation")
+    if not isinstance(generation, Mapping):
+        raise ValueError("IDRiD v2 audit-generation provenance is missing")
+    audit_source_commit = _verify_commit(
+        repo_root, generation.get("source_commit"),
+        field="IDRiD v2 audit source commit",
+    )
+    if generation.get("audit_implementation_sha256") != payload.get(
+        "audit_implementation_sha256"
+    ):
+        raise ValueError("IDRiD v2 audit implementation provenance disagrees")
+    v1_audit_dependency = repo_root / "tools" / "audit_origin_idrid_semantics.py"
+    if file_sha256(v1_audit_dependency) != generation.get(
+        "v1_audit_dependency_sha256"
+    ):
+        raise ValueError("IDRiD v1 audit dependency differs from the sealed run")
+    if generation.get("checkpoint_order") != expected_folds:
+        raise ValueError("IDRiD v2 checkpoint evaluation order changed")
 
     # The raw summary/records are validated in place but never copied.
     semantic_root = path.parent.parent.resolve()
@@ -951,6 +1037,13 @@ def validate_idrid_manifest(path: Path, repo_root: Path) -> dict[str, Any]:
         _verify_declared_hash(artifact, record.get("sha256"), label=name)
         if name != "image_level_units":
             nested = read_json(artifact)
+            expected_schema = (
+                IDRID_ALIGNMENT_SCHEMA
+                if name == "alignment_statistics"
+                else IDRID_DELETION_SCHEMA
+            )
+            if nested.get("schema") != expected_schema:
+                raise ValueError(f"IDRiD nested schema mismatch: {name}")
             recorded = record.get("content_checksum_sha256")
             if nested.get("content_checksum_sha256") != recorded:
                 raise ValueError(f"IDRiD nested checksum mismatch: {name}")
@@ -959,8 +1052,24 @@ def validate_idrid_manifest(path: Path, repo_root: Path) -> dict[str, Any]:
             if canonical_sha256(unsigned) != recorded:
                 raise ValueError(f"IDRiD nested canonical checksum mismatch: {name}")
         else:
+            if record.get("row_schema") != IDRID_UNIT_SCHEMA:
+                raise ValueError("IDRiD image-unit row schema mismatch")
             with artifact.open(encoding="utf-8") as stream:
-                rows = sum(1 for line in stream if line.strip())
+                rows = 0
+                for line_number, line in enumerate(stream, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        unit = json.loads(line)
+                    except json.JSONDecodeError as error:
+                        raise ValueError(
+                            f"invalid IDRiD image-unit JSONL at line {line_number}"
+                        ) from error
+                    if not isinstance(unit, Mapping) or unit.get("schema") != IDRID_UNIT_SCHEMA:
+                        raise ValueError(
+                            "IDRiD image-unit row does not match its declared schema"
+                        )
+                    rows += 1
             if rows != int(record.get("rows", -1)):
                 raise ValueError("IDRiD image-unit row census mismatch")
     return {
@@ -968,8 +1077,12 @@ def validate_idrid_manifest(path: Path, repo_root: Path) -> dict[str, Any]:
         "file_sha256": file_sha256(path),
         "content_checksum_sha256": payload["content_checksum_sha256"],
         "protocol_checksum_sha256": protocol["content_checksum_sha256"],
+        "audit_source_commit": audit_source_commit,
         "image_clusters": 81,
         "checkpoint_evaluations_per_image": 10,
+        "paired_control_repeats_per_image_checkpoint": expected_repeats,
+        "matching_contract": IDRID_MATCHING_CONTRACT,
+        "legacy_v1_admitted": False,
         "interpretation_scope": "stored_ledger_not_causal_pixel_intervention",
     }
 
@@ -1620,6 +1733,7 @@ def _assert_privacy_safe_release(payload: Any, *, trail: tuple[str, ...] = ()) -
             if lower in {
                 "image_id", "patient_id", "cluster_id", "sample_id", "subject_id",
                 "case_id", "image_key", "patient_key", "raw_cluster_id",
+                "dense_image_scale_case_ids",
             }:
                 raise ValueError(f"release payload exposes an individual identifier: {lower}")
             _assert_privacy_safe_release(value, trail=trail + (str(key),))
@@ -1641,7 +1755,7 @@ _DROP_FROM_PUBLIC_JSON = {
     "input_summary_path", "input_records_path", "prediction_artifact", "checkpoint",
     "image_id", "patient_id", "cluster_id", "sample_id", "raw_cluster_id",
     "subject_id", "case_id", "image_key", "patient_key", "image_path",
-    "filename", "images",
+    "filename", "images", "dense_image_scale_case_ids",
 }
 
 
@@ -1698,6 +1812,40 @@ def _write_sanitized_json_copy(
     _atomic_json(destination, envelope)
 
 
+def _write_sanitized_jsonl_copy(source: Path, destination: Path) -> int:
+    """Copy JSONL scientific units while removing private IDs and locations."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    row_count = 0
+    with source.open(encoding="utf-8") as input_stream, destination.open(
+        "w", encoding="utf-8"
+    ) as output_stream:
+        for line_number, line in enumerate(input_stream, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"invalid JSONL at {source.name}:{line_number}"
+                ) from error
+            if not isinstance(row, Mapping):
+                raise ValueError(
+                    f"JSONL row is not an object at {source.name}:{line_number}"
+                )
+            sanitized = _sanitize_public_json(row)
+            _assert_privacy_safe_release(sanitized)
+            output_stream.write(
+                json.dumps(
+                    sanitized, sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=True, allow_nan=False,
+                )
+                + "\n"
+            )
+            row_count += 1
+    return row_count
+
+
 class _BundleBuilder:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -1730,6 +1878,17 @@ class _BundleBuilder:
             "role": role,
             "sha256": file_sha256(destination),
             "bytes": destination.stat().st_size,
+        })
+
+    def sanitized_jsonl(self, source: Path, relative: str, *, role: str) -> None:
+        destination = self._destination(relative)
+        rows = _write_sanitized_jsonl_copy(source, destination)
+        self.entries.append({
+            "bundle_relative_path": relative,
+            "role": role,
+            "sha256": file_sha256(destination),
+            "bytes": destination.stat().st_size,
+            "rows": rows,
         })
 
     def json(self, payload: Mapping[str, Any], relative: str, *, role: str) -> None:
@@ -1899,6 +2058,15 @@ def _build_release_bundle(
         builder.sanitized_json(
             source, f"idrid/{name}.json", role=f"idrid_{name}"
         )
+    unit_record = idrid["artifacts"]["image_level_units"]
+    unit_source = _resolve_declared_file(
+        unit_record["path"], relative_to=idrid_manifest.parent,
+        allowed_roots=(idrid_manifest.parent,),
+    )
+    builder.sanitized_jsonl(
+        unit_source, "idrid/image_level_units.jsonl",
+        role="idrid_image_level_units_without_private_identifiers",
+    )
 
     oof = read_json(oof_manifest)
     builder.sanitized_json(oof_manifest, "oof/manifest_sanitized.json", role="oof_manifest")
@@ -1913,8 +2081,9 @@ def _build_release_bundle(
         "protocols/origin_oof_statistics_protocol.json", role="oof_protocol",
     )
     builder.copy(
-        repo_root / "scripts" / "protocols" / "origin_idrid_semantic_statistics_protocol.json",
-        "protocols/origin_idrid_semantic_statistics_protocol.json", role="idrid_protocol",
+        repo_root / "scripts" / "protocols" / "origin_idrid_semantic_statistics_protocol_v2.json",
+        "protocols/origin_idrid_semantic_statistics_protocol_v2.json",
+        role="idrid_bidirectionally_matched_protocol",
     )
 
     builder.sanitized_json(
@@ -2003,6 +2172,7 @@ def _build_release_bundle(
             "external_privacy_safe_evidence_archive_required"
         ),
         "anonymous_split_memberships": 15,
+        "idrid_image_level_unit_rows": int(unit_record["rows"]),
         "checkpoint_tensors_embedded": False,
     }
     index_payload["content_checksum_sha256"] = canonical_sha256(index_payload)
@@ -2033,6 +2203,18 @@ def _assert_bundle_privacy(bundle_root: Path) -> None:
                     raise ValueError(f"bundled prediction archive has no labels: {path.name}")
                 expected_n = len(np.asarray(archive["label"]))
             _validate_outer_prediction_archive(path, expected_n=expected_n)
+        elif path.suffix == ".jsonl":
+            with path.open(encoding="utf-8") as stream:
+                for line_number, line in enumerate(stream, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError as error:
+                        raise ValueError(
+                            f"invalid bundled JSONL at {path.name}:{line_number}"
+                        ) from error
+                    _assert_privacy_safe_release(row)
         elif path.name.endswith(".csv.gz"):
             with gzip.open(path, "rt", encoding="utf-8", newline="") as stream:
                 reader = csv.DictReader(stream)
@@ -2157,6 +2339,7 @@ def assemble_package(
             "checkpoint_inventory_count": 240,
             "privacy_safe_baseline_prediction_archives_bundled": 225,
             "anonymous_split_memberships_bundled": 15,
+            "idrid_v2_image_level_units_bundled": True,
             "licensed_input_pixels_required_but_not_redistributed": True,
             "independent_reproduction_claim_authorized": reproduction_authorized,
             "withheld_for_privacy_or_licensing": [

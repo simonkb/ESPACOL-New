@@ -372,12 +372,14 @@ p^{\mathrm{seq}}_y=
 \end{cases}
 \label{eq:sequential-posterior}
 \end{equation}
-Both decoders are normalized, saturated, and coordinatewise monotone ordinal
-maps at the fixed horizon $t=1$; both inherit exact deletion replay from the
-ledger.  A seeded inversion audit over 64 random interior-simplex targets found
-maximum posterior reconstruction errors of $2.08\times10^{-12}$ (CTMC) and
-$1.95\times10^{-16}$ (sequential), so the available endpoint experiment gives
-no evidence of a fixed-horizon expressiveness advantage for the CTMC.
+Both decoders are normalized and coordinatewise monotone on the deployed
+bounded rate domain at the fixed horizon $t=1$; both inherit exact deletion
+replay from the ledger.  A seeded numerical inversion audit over 64 sampled
+interior-simplex targets found maximum posterior reconstruction errors of
+$2.08\times10^{-12}$ (CTMC) and $1.95\times10^{-16}$ (sequential).  This
+supports coverage of those tested targets, not universal representation of
+every interior posterior under finite rate bounds, and gives no evidence of a
+fixed-horizon expressiveness advantage for the CTMC in the sampled audit.
 
 The CTMC-specific guarantee is cross-horizon: its transition kernel
 $P(t)=\exp(tQ)$ shares one clock and obeys the homogeneous Markov semigroup
@@ -666,14 +668,27 @@ frozen-ledger replay} from the still-open empirical question of whether learned
 witnesses are local, useful, or semantically aligned.
 
 \paragraph{IDRiD mask association.}
-On 81 IDRiD images \cite{porwal2020idrid}, fine-scale ledger bins have
-lesion-mask association AP $0.1861$ (95\% image-cluster CI
-$[0.1637,0.2095]$) at prevalence $0.0815$; lesion-mask-guided stored-ledger
-replay exceeds count-matched replay by $0.0111$ in $|\Delta E[Y]|$
-($[0.0097,0.0125]$).  Across all scales, the matched quantities are AP
-$0.2690$ ($[0.2455,0.2929]$) at prevalence $0.1666$ and replay lift $0.1710$
-($[0.1490,0.1941]$).  This is mask association and an internal ledger
-intervention, not pixel deletion, lesion recognition, or clinical necessity.
+All ten independently inner-selected EyePACS outer-fold checkpoints evaluate
+the 81-image IDRiD segmentation subset \cite{porwal2020idrid}, with no IDRiD
+training, tuning, or selection.  We form the official MA/HE/EX/SE union; apply
+the image-derived dominant-FOV crop to image and masks; and resize the image
+bilinearly and mask by nearest neighbor.  A native-lattice bin is positive iff
+it contains any mask pixel; its score is the stored \texttt{local\_rate\_map}
+at true-grade boundary $b(y)=\min\{\max(y-1,0),3\}$.  AP is computed per
+image$\times$checkpoint$\times$scale, then averaged over checkpoints/scales
+within image; inference clusters by image.  Deletion uses 20 seeded,
+deterministic nonlesion controls per image, checkpoint, and scale.
+
+V1 fine deletion was exactly count-matched and yielded mask-guided replay lift
+$0.0111$ in $|\Delta E[Y]|$ ($[0.0097,0.0125]$).  Its AP and coarse/all-scale
+deletion estimates are provisional: AP did not group exact score ties and 14
+coarse image$\times$scale cases were under-matched.  A sealed corrective v2
+(pending) uses threshold-grouped AP and 20 paired within-image/scale draws of
+equal unique lesion/nonlesion counts, matching scale composition, geometry
+exposure, and the pre-atom boundary multiplier.  Retinal anatomy and removed
+rate mass are not matched; the latter is the outcome.  These are internal
+ledger interventions, not pixel deletion, lesion recognition, or clinical
+necessity.
 
 \section{Ablations and Falsification Tests}
 \label{sec:ablations}
@@ -715,12 +730,11 @@ seed, and multiple unadjusted comparisons, these are mechanism findings only.
 \label{sec:discussion}
 
 \paragraph{What is novel.}
-The individual ingredients are established: ConvNeXt features, nonnegative
-maps, ordinal decoders, generators, and proper scores.  The contribution is the
-boundary-indexed ledger coupling: it is the exclusive image-dependent path,
-cumulative across prerequisites, and exactly replayable by group.  This
-falsifiable claim is narrower than calling a heatmap interpretable and holds for
-both our CTMC and sequential-hazard instantiations.
+The ingredients---ConvNeXt features, nonnegative maps, ordinal decoders,
+generators, and proper scores---are established.  The contribution is their
+coupling into a boundary-indexed ledger that is the exclusive image path,
+cumulative across prerequisites, and exactly group-replayable.  This narrow,
+falsifiable claim holds for both declared decoders.
 
 \paragraph{What exactness does not imply.}
 Deletion asks what the model would predict without selected stored entries while
@@ -734,11 +748,10 @@ EyePACS is strongly imbalanced, APTOS lacks patient identifiers, and both use
 single noisy competition labels.  Architecture search used a fixed inner split
 rather than fully nested hyperparameter selection, so CV estimates performance
 of the frozen configuration, not clinical deployment.  External domains and
-multi-reader labels are needed.  Two non-finite attempts were fail-closed and
-rerun under unchanged immutable configurations; full restart provenance is in
-the supplement.  Unlike the earlier result bundle, the revision manifest binds
-checkpoint hashes and hashed split memberships, enabling disjointness and
-re-inference checks without redistributing licensed images.
+multi-reader labels are needed.  Two non-finite attempts failed closed and were
+rerun unchanged; restart provenance is supplemental.  The revision manifest
+hashes checkpoints and split memberships for integrity and disjointness checks;
+hashes alone provide neither the artifacts nor executable re-inference.
 
 \paragraph{Model scope.}
 The ImageNet-pretrained model is not a medical foundation model.  Evidence
@@ -747,17 +760,16 @@ grading requires new modalities and datasets.
 
 \paragraph{Potential impact.}
 Replay can audit shortcuts only if the pending controlled benchmark passes; it
-does not replace ophthalmologist judgment.  Rare-grade errors require external
-validation, calibration, subgroup monitoring, and human oversight.
+does not replace clinical judgment.  Rare-grade errors require external
+validation, calibration, monitoring, and human oversight.
 
 \section{Conclusion}
 \label{sec:conclusion}
 
-\method makes a conserved boundary-indexed ledger both the exclusive prediction
-input and an exactly replayable audit object; the CTMC is a declared decoder,
-not the source of replay exactness.  Complete CV shows competitive grading, but
-a retrospective fold finds no pooled-head advantage and rejects fine-only
-sufficiency.  Claims beyond exact replay await the sealed pending audits.
+\method makes a conserved boundary-indexed ledger the exclusive prediction
+input and an exactly replayable audit object.  Complete CV supports competitive
+grading; a retrospective fold shows neither an advantage over pooled heads nor
+fine-only sufficiency.  Broader claims await the sealed audits.
 
 {\small
   \bibliographystyle{ieeenat_fullname}

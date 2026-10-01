@@ -1,0 +1,320 @@
+\documentclass[tikz,border=2mm]{standalone}
+
+\usepackage[T1]{fontenc}
+\usepackage{helvet}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\renewcommand{\familydefault}{\sfdefault}
+
+\usetikzlibrary{arrows.meta,calc,fit,positioning,backgrounds}
+
+% ORIGIN-v3 conference figure.  This source follows the frozen implementation
+% and deliberately distinguishes ledger-wide replay guarantees from the
+% decoder-specific CTMC semigroup and from causal pixel intervention.
+\definecolor{navy}{HTML}{173A68}
+\definecolor{ink}{HTML}{203040}
+\definecolor{muted}{HTML}{64748B}
+\definecolor{linegray}{HTML}{CBD5E1}
+\definecolor{panelgray}{HTML}{F8FAFC}
+\definecolor{encoder}{HTML}{4A78B0}
+\definecolor{encoderfill}{HTML}{EAF2FB}
+\definecolor{atom}{HTML}{E9852C}
+\definecolor{atomfill}{HTML}{FFF3E8}
+\definecolor{ledger}{HTML}{16867A}
+\definecolor{ledgerfill}{HTML}{E8F6F3}
+\definecolor{generator}{HTML}{B88712}
+\definecolor{generatorfill}{HTML}{FFF7D6}
+\definecolor{outputgreen}{HTML}{3F7F4F}
+\definecolor{outputfill}{HTML}{EBF6E9}
+\definecolor{intervention}{HTML}{7651A8}
+\definecolor{interventionfill}{HTML}{F2ECFA}
+\definecolor{lossred}{HTML}{A84444}
+\definecolor{lossfill}{HTML}{FCECEC}
+
+\tikzset{
+  >=Latex,
+  flow/.style={-{Latex[length=2.0mm,width=1.25mm]}, line width=0.85pt, draw=navy},
+  iflow/.style={-{Latex[length=2.0mm,width=1.25mm]}, line width=0.9pt, draw=intervention},
+  compare/.style={-{Latex[length=1.7mm,width=1.05mm]}, line width=0.7pt, draw=intervention, dashed},
+  panel/.style={rounded corners=2.5pt, line width=0.65pt, draw=linegray, fill=white},
+  box/.style={rounded corners=2.2pt, line width=0.7pt, align=center, inner sep=3pt},
+  tinylabel/.style={font=\fontsize{5.3}{6.2}\selectfont, text=muted, align=center},
+  smalltext/.style={font=\fontsize{5.8}{6.9}\selectfont, text=ink, align=center},
+  bodytext/.style={font=\fontsize{6.3}{7.4}\selectfont, text=ink, align=center},
+  stagehead/.style={font=\fontsize{7.2}{8.2}\selectfont\bfseries, text=navy, align=center},
+  paneltag/.style={circle, fill=navy, text=white, minimum size=4.2mm,
+                   inner sep=0pt, font=\fontsize{6.2}{6.2}\selectfont\bfseries},
+}
+
+\begin{document}
+\begin{tikzpicture}[x=1.18cm,y=1.12cm]
+  \useasboundingbox (0,0) rectangle (19.4,11.55);
+
+  % ------------------------------------------------------------------------
+  % Title
+  % ------------------------------------------------------------------------
+  \node[anchor=west, text=navy,
+        font=\fontsize{13.5}{15}\selectfont\bfseries]
+        at (0.15,11.22)
+        {ORIGIN: Ledger-Exclusive Ordinal Severity Grading};
+  \node[anchor=west, text=muted,
+        font=\fontsize{6.4}{7.4}\selectfont]
+        at (0.17,10.82)
+        {Spatial evidence is the computation: bounded local transition rates $\rightarrow$ one conserved ledger $\rightarrow$ one declared ordinal decoder $\rightarrow$ one grade posterior.};
+  \node[anchor=east, rounded corners=1.8pt, draw=navy, fill=navy!5,
+        text=navy, inner xsep=4pt, inner ysep=2.2pt,
+        font=\fontsize{5.8}{6.8}\selectfont\bfseries]
+        at (19.2,11.10) {NO POOLED CLASSIFIER / NO BYPASS};
+
+  % ------------------------------------------------------------------------
+  % Main prediction path panel
+  % ------------------------------------------------------------------------
+  \fill[panelgray, rounded corners=3pt] (0.08,4.92) rectangle (19.30,10.52);
+  \draw[linegray, line width=0.65pt, rounded corners=3pt] (0.08,4.92) rectangle (19.30,10.52);
+  \node[paneltag] at (0.38,10.23) {a};
+  \node[anchor=west, stagehead] at (0.66,10.23) {Ledger-exclusive prediction and audit path};
+
+  % Input fundus and geometry mask
+  \node[stagehead, text=ink] at (1.25,9.68) {Input};
+  \begin{scope}
+    \clip (1.25,8.25) circle (0.91);
+    \node at (1.25,8.25) {\includegraphics[width=2.55cm]{../Datasets/DR/sample/15_right.jpeg}};
+  \end{scope}
+  \draw[white, line width=0.75pt] (1.25,8.25) circle (0.91);
+  \draw[navy!75, densely dashed, line width=0.55pt]
+        (1.25,8.25) ellipse (0.78 and 0.69);
+  \node[smalltext, text width=2.25cm] at (1.25,7.06)
+        {Canonical fundus\\$\mathbf{x}\in\mathbb{R}^{N\times3\times640\times640}$};
+  \node[box, draw=linegray, fill=white, tinylabel, text width=2.06cm]
+        at (1.25,5.86)
+        {Fixed centered ellipse\\geometry-valid mask\\\textit{no annotation}};
+
+  % ConvNeXt pyramid
+  \draw[flow] (2.27,8.05) -- (2.68,8.05);
+  \node[box, draw=encoder, fill=encoderfill, minimum width=2.90cm,
+        minimum height=4.92cm] (encbox) at (4.00,7.55) {};
+  \node[stagehead, text=encoder] at (4.00,9.48) {ConvNeXt-Tiny pyramid};
+  \node[tinylabel, text width=2.48cm] at (4.00,9.08)
+        {ImageNet initialized; avgpool and classifier removed};
+  \foreach \yy/\ww/\name/\shape/\rf in {
+    8.55/1.86/s4/$160^2\!\times96$/76,
+    7.93/1.60/s8/$80^2\!\times192$/224,
+    7.31/1.34/s16/$40^2\!\times384$/1096,
+    6.69/1.08/s32/$20^2\!\times768$/1688}
+  {
+    \draw[fill=encoder!20, draw=encoder, line width=0.55pt, rounded corners=1pt]
+      ($(4.00,\yy)+(-\ww/2,-0.20)$) rectangle ($(4.00,\yy)+(\ww/2,0.20)$);
+    \node[font=\fontsize{5.3}{6}\selectfont\bfseries, text=encoder, anchor=east]
+      at (3.18,\yy) {\name};
+    \node[font=\fontsize{4.85}{5.6}\selectfont, text=ink]
+      at (4.00,\yy) {\shape};
+    \node[font=\fontsize{4.55}{5.2}\selectfont, text=muted, anchor=west]
+      at (4.82,\yy) {RF \rf};
+  }
+  \node[tinylabel, text width=2.45cm] at (4.00,5.85)
+        {Native spatial maps only\\invalid exposed cells $=0$};
+
+  % Pointwise atom heads and cumulative compiler
+  \draw[flow] (5.25,8.05) -- node[above, tinylabel] {four scales} (5.56,8.05);
+  \node[box, draw=atom, fill=atomfill, minimum width=4.18cm,
+        minimum height=4.92cm] (atombox) at (7.46,7.55) {};
+  \node[stagehead, text=atom] at (7.46,9.48) {Bounded cumulative severity atoms};
+  \node[tinylabel, text width=3.65cm] at (7.46,9.05)
+        {Independent pointwise head at each scale};
+  \node[box, draw=atom!70, fill=white, smalltext, text width=3.62cm]
+        at (7.46,8.61)
+        {$1{\times}1:\ C_s\!\rightarrow128$ $\rightarrow$ ChannelLN/GELU\\[-1pt]
+         $\rightarrow$ $1{\times}1:\ 128\!\rightarrow4$ logits $z_{s,i,m}$};
+  \node[bodytext, text width=3.72cm] at (7.46,7.72)
+        {$\displaystyle q_{s,i}=\operatorname{softmax}\!\bigl([z_{s,i,0:3},\,0_{\varnothing}]\bigr)$\\
+         $\displaystyle a_{s,i,m}=Aq_{s,i,m},\quad
+         A=\frac{64-1-1}{4096\cdot2}$};
+  \node[box, draw=atom!70, fill=white, smalltext, text width=3.62cm]
+        at (7.46,6.47)
+        {Prerequisite compiler\\[-1pt]
+         $\displaystyle \rho_{s,i,k}=\sum_{m\ge k}a_{s,i,m}$\\[-1pt]
+         higher severity supports every earlier transition};
+  \node[tinylabel, text width=3.55cm] at (7.46,5.70)
+        {Explicit null atom permits zero active evidence; all atoms are nonnegative and bounded.};
+
+  % Conserved transition-rate ledger
+  \draw[flow] (9.31,8.05) -- (9.63,8.05);
+  \node[box, draw=ledger, fill=ledgerfill, minimum width=3.42cm,
+        minimum height=4.92cm] (ledgerbox) at (11.18,7.55) {};
+  \node[stagehead, text=ledger] at (11.18,9.48) {Spatial transition-rate ledger};
+  \node[bodytext, text width=3.04cm] at (11.18,8.84)
+        {$\displaystyle r_{s,i,k}=v_{s,i}\,g_s\,w_{s,k}\,b_k\,\rho_{s,i,k}$};
+  \node[tinylabel, text width=3.02cm] at (11.18,8.42)
+        {$g_s=4096/n_s$; $\sum_s w_{s,k}=1$; $0<b_k<2$};
+
+  % Schematic ledgers: spatial indexing, not claimed pixel-level lesion maps.
+  \foreach \yy/\name in {7.95/s4,7.61/s8,7.27/s16,6.93/s32} {
+    \node[font=\fontsize{4.8}{5.4}\selectfont\bfseries, text=ledger, anchor=east]
+      at (10.24,\yy) {\name};
+    \foreach \xx/\op in {0/12,1/35,2/70,3/25,4/88,5/48,6/18} {
+      \fill[ledger, opacity=\op/100]
+        ($(10.36,\yy)+(0.235*\xx,-0.105)$) rectangle
+        ($(10.36,\yy)+(0.235*\xx+0.18,0.105)$);
+    }
+  }
+  \node[font=\fontsize{4.8}{5.5}\selectfont, text=muted, align=center,
+        text width=3.00cm] at (11.18,6.55)
+        {Stored spatial rates with stride/RF metadata};
+  \node[box, draw=ledger!75, fill=white, smalltext, text width=3.00cm]
+        at (11.18,5.75)
+        {$\displaystyle \lambda_k=\pi_k+\sum_{s,i}r_{s,i,k}\le64$\\[-1pt]
+         $0<\pi_k<1$ (image-independent prior)};
+
+  % Declared decoder: primary CTMC and same-ledger sequential-hazard control.
+  \draw[flow] (12.72,8.05) -- (13.04,8.05);
+  \node[box, draw=generator, fill=generatorfill, minimum width=3.42cm,
+        minimum height=4.92cm] (genbox) at (14.58,7.55) {};
+  \node[stagehead, text=generator] at (14.58,9.48) {Declared ordinal decoder};
+  \node[tinylabel, text width=3.05cm] at (14.58,9.08)
+        {Choose one fixed map $D(\boldsymbol\lambda)$; same conserved ledger};
+  \node[font=\fontsize{5.0}{5.7}\selectfont\bfseries, text=generator]
+        at (14.58,8.79) {PRIMARY: PURE-BIRTH CTMC};
+  \foreach \x/\state in {13.37/0,13.98/1,14.59/2,15.20/3,15.81/4} {
+    \node[circle, draw=generator, fill=white, line width=0.65pt,
+          minimum size=4.2mm, inner sep=0pt,
+          font=\fontsize{5.8}{6}\selectfont\bfseries, text=generator]
+          (q\state) at (\x,8.40) {\state};
+  }
+  \foreach \a/\b/\kk in {0/1/0,1/2/1,2/3/2,3/4/3} {
+    \draw[-{Latex[length=1.2mm]}, draw=generator, line width=0.65pt]
+      (q\a) -- node[above, font=\fontsize{4.5}{5}\selectfont, text=generator]
+      {$\lambda_{\kk}$} (q\b);
+  }
+  \node[bodytext, text width=3.03cm] at (14.58,7.74)
+        {$Q_{k,k}=-\lambda_k,\ Q_{k,k+1}=\lambda_k$\\[-1pt]
+         $\displaystyle \mathbf p^{\rm CTMC}=\mathbf e_0^{\!\top}\exp(Q)$};
+  \node[tinylabel, text width=3.00cm] at (14.58,7.18)
+        {Audited FP64 Taylor-24; homogeneous semigroup};
+  \draw[generator!55, line width=0.45pt] (13.22,6.86) -- (15.94,6.86);
+  \node[font=\fontsize{4.4}{5.0}\selectfont\bfseries, text=generator,
+        text width=3.02cm, align=center]
+        at (14.58,6.64) {CONTROL: SEQUENTIAL HAZARD (SAME LEDGER)};
+  \node[tinylabel, text=ink, text width=3.03cm] at (14.58,6.15)
+        {$h_k=1-e^{-\lambda_k}$\\[-1pt]
+         $P_{\rm seq}(Y>k)=h_0\cdots h_k$};
+  \node[font=\fontsize{4.15}{4.75}\selectfont, text=muted,
+        text width=3.04cm, align=center] at (14.58,5.61)
+        {Both: normalized, monotone, exact replay.\\
+         Semigroup: CTMC only; no time semantics.};
+
+  % Posterior and prediction outputs
+  \draw[flow] (16.12,8.05) -- (16.42,8.05);
+  \node[box, draw=outputgreen, fill=outputfill, minimum width=2.94cm,
+        minimum height=4.92cm] (outbox) at (17.75,7.55) {};
+  \node[stagehead, text=outputgreen] at (17.75,9.48) {Grade posterior};
+  \node[tinylabel] at (17.75,9.10) {$\mathbf p=[p_0,p_1,p_2,p_3,p_4]$};
+  \draw[outputgreen!55, line width=0.45pt] (16.77,7.62) -- (18.74,7.62);
+  \foreach \x/\h/\lab in {16.92/0.30/0,17.31/0.60/1,17.70/0.97/2,18.09/0.72/3,18.48/0.42/4} {
+    \fill[outputgreen!72] (\x,7.62) rectangle +(0.25,\h);
+    \node[font=\fontsize{4.7}{5.2}\selectfont, text=ink] at (\x+0.125,7.43) {\lab};
+  }
+  \node[box, draw=outputgreen!75, fill=white, bodytext, text width=2.52cm]
+        at (17.75,6.80)
+        {$\displaystyle \hat y=\arg\max_j p_j$\\[-1pt]
+         \textbf{MAP primary decision}};
+  \node[tinylabel, text width=2.58cm] at (17.75,6.12)
+        {$P(Y>k)$, $\mathbb E[Y]$, and posterior median retained as ordinal outputs};
+  \node[box, draw=lossred!75, fill=lossfill, tinylabel, text=lossred,
+        text width=2.54cm] at (17.75,5.70)
+        {Training only:\quad $\mathcal L=-\log p_y+0.25\,\mathrm{RPS}$};
+
+  % ------------------------------------------------------------------------
+  % Exact intervention panel
+  % ------------------------------------------------------------------------
+  \fill[interventionfill!50, rounded corners=3pt] (0.08,0.30) rectangle (19.30,4.62);
+  \draw[intervention!45, line width=0.65pt, rounded corners=3pt] (0.08,0.30) rectangle (19.30,4.62);
+  \node[paneltag, fill=intervention] at (0.38,4.33) {b};
+  \node[anchor=west, stagehead, text=intervention] at (0.66,4.33)
+        {Exact same-circuit intervention certificate};
+  \node[anchor=east, tinylabel, text=intervention] at (18.82,4.33)
+        {ledger $\rightarrow$ subtract stored evidence $\rightarrow$ replay the same frozen $D$};
+
+  % Branch from the actual ledger.
+  \draw[iflow] (11.18,5.35) -- (11.18,4.75) -- (2.00,4.75) -- (2.00,3.73);
+
+  % Step 1: select ledger entries.
+  \node[box, draw=intervention, fill=white, minimum width=3.52cm,
+        minimum height=2.70cm] (sel) at (2.02,2.38) {};
+  \node[font=\fontsize{6.4}{7.3}\selectfont\bfseries, text=intervention]
+        at (2.02,3.42) {1. Select evidence set $\mathcal A$};
+  \foreach \row in {0,...,3} {
+    \foreach \col in {0,...,7} {
+      \pgfmathtruncatemacro{\shade}{18+mod(17*\row+29*\col,72)}
+      \fill[ledger, opacity=\shade/100]
+        ($(1.12,2.38)+(0.225*\col,0.225*\row)$) rectangle
+        ($(1.12,2.38)+(0.225*\col+0.17,0.225*\row+0.17)$);
+    }
+  }
+  \draw[intervention, line width=0.9pt, rounded corners=0.7pt]
+        (1.77,2.78) rectangle +(0.62,0.62);
+  \node[tinylabel, text width=2.75cm] at (2.02,1.64)
+        {Any cells/scales; top-$k$ boundary witnesses are one auditable choice};
+
+  % Step 2: exact subtraction.
+  \draw[iflow] (3.67,2.38) -- (4.08,2.38);
+  \node[box, draw=intervention, fill=white, minimum width=3.70cm,
+        minimum height=2.70cm] (sub) at (5.84,2.38) {};
+  \node[font=\fontsize{6.4}{7.3}\selectfont\bfseries, text=intervention]
+        at (5.84,3.42) {2. Remove stored rates};
+  \node[bodytext, text width=3.04cm] at (5.84,2.68)
+        {$\displaystyle \lambda_k^{(-\mathcal A)}
+          =\lambda_k-\sum_{(s,i)\in\mathcal A}r_{s,i,k}$};
+  \node[tinylabel, text width=3.05cm] at (5.84,1.88)
+        {No re-encoding, reweighting, or renormalization; all surviving ledger entries stay fixed};
+
+  % Step 3: same decoder.
+  \draw[iflow] (7.61,2.38) -- (8.02,2.38);
+  \node[box, draw=intervention, fill=white, minimum width=3.50cm,
+        minimum height=2.70cm] (replay) at (9.63,2.38) {};
+  \node[font=\fontsize{6.4}{7.3}\selectfont\bfseries, text=intervention]
+        at (9.63,3.42) {3. Replay identical decoder};
+  \node[bodytext, text width=2.76cm] at (9.63,2.70)
+        {$\displaystyle \mathbf p^{(-\mathcal A)}
+         =D\!\left(\boldsymbol\lambda^{(-\mathcal A)}\right)$\\[2pt]
+         $D=D_{\rm CTMC}$ or $D_{\rm seq}$};
+  \node[tinylabel, text width=2.70cm] at (9.63,1.72)
+        {Same frozen declared decoder as the baseline forward pass};
+
+  % Step 4: compare posteriors.
+  \draw[iflow] (11.25,2.38) -- (11.66,2.38);
+  \node[box, draw=intervention, fill=white, minimum width=3.54cm,
+        minimum height=2.70cm] (effect) at (13.28,2.38) {};
+  \node[font=\fontsize{6.4}{7.3}\selectfont\bfseries, text=intervention]
+        at (13.28,3.42) {4. Exact decision effect};
+  \node[bodytext, text width=2.76cm] at (13.28,2.69)
+        {$\Delta P(Y>k)$ for every boundary\\[2pt]
+         $\Delta\mathbb E[Y]$ and posterior-quantile shift};
+  \node[tinylabel, text width=2.74cm] at (13.28,1.73)
+        {The explanation is the classifier's recomputed output, not a saliency proxy};
+
+  % Certificate contents.
+  \draw[iflow] (14.90,2.38) -- (15.31,2.38);
+  \node[box, draw=intervention, fill=intervention!8, minimum width=3.65cm,
+        minimum height=2.70cm] (cert) at (17.04,2.38) {};
+  \node[font=\fontsize{6.4}{7.3}\selectfont\bfseries, text=intervention]
+        at (17.04,3.42) {Intervention certificate};
+  \node[smalltext, text width=2.98cm] at (17.04,2.48)
+        {\textbf{Where:} scale, cell, stride, RF footprint\\[2pt]
+         \textbf{What:} full transition-rate vector\\[2pt]
+         \textbf{Effect:} baseline and replayed posteriors};
+  \node[tinylabel, text width=2.94cm] at (17.04,1.58)
+        {Exact internal computational faithfulness};
+
+  % Baseline posterior feeds the comparison, while the replay remains the same circuit.
+  \draw[compare] (18.86,7.28) -- (19.04,7.28) -- (19.04,3.32) -- (18.60,3.32);
+  \node[anchor=east, font=\fontsize{4.6}{5.2}\selectfont, text=intervention,
+        fill=interventionfill!50, inner sep=1pt]
+        at (18.96,3.98) {baseline $\mathbf p$};
+
+  % Scope/claim footer.
+  \node[anchor=west, font=\fontsize{5.15}{6.1}\selectfont, text=muted]
+        at (0.34,0.52)
+        {Scope: evidence units are spatially indexed encoder cells with overlapping receptive fields. Replay is exact for the conserved ledger and declared decoder; the semigroup is CTMC-only. Neither implies pixel causality or lesion identity.};
+
+\end{tikzpicture}
+\end{document}
