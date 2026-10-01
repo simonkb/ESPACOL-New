@@ -7,15 +7,19 @@ import numpy as np
 import pytest
 
 from scripts.analyze_origin_oof_statistics import (
+    GATE_A_SCHEMA,
     STATISTICS_MANIFEST_SCHEMA,
     GRADING_METRICS,
     GradeRow,
     StatisticsConfig,
+    adjudicate_gate_a,
     analyze_oof_statistics,
     cluster_bootstrap_grading,
+    derive_curve_endpoints,
     grading_metrics,
     load_statistics_protocol,
     paired_intervention_bootstrap,
+    paired_scalar_bootstrap,
     threshold_reliability,
 )
 from scripts.audit_origin_oof_interventions import AtomicJsonlGzipWriter
@@ -184,6 +188,12 @@ def test_checksum_sealed_aggregate_runs_end_to_end(tmp_path: Path) -> None:
                         "boundary": 0,
                         "method": method,
                         "auc_deletion_tail_normalized_by_cells": 1.0 - 0.1 * method_index,
+                        "auc_deletion_tail_normalized_by_nominal_stride_area": (
+                            1.0 - 0.1 * method_index
+                        ),
+                        "auc_retention_tail_normalized_by_nominal_stride_area": (
+                            1.0 - 0.1 * method_index
+                        ),
                     }
                 )
     aggregate = {
@@ -228,6 +238,8 @@ def test_checksum_sealed_aggregate_runs_end_to_end(tmp_path: Path) -> None:
         "proper_score_calibration",
         "grading_bootstrap",
         "intervention_bootstrap",
+        "rf_footprint_diagnostics",
+        "gate_a",
     }
     unsigned = dict(manifest)
     assert unsigned.pop("content_checksum_sha256") == canonical_sha256(unsigned)
@@ -235,3 +247,196 @@ def test_checksum_sealed_aggregate_runs_end_to_end(tmp_path: Path) -> None:
         path = Path(artifact["path"])
         assert path.is_file()
         assert file_sha256(path) == artifact["sha256"]
+    gate = json.loads((output / "OOF_GATE_A_ADJUDICATION.json").read_text())
+    assert gate["schema"] == GATE_A_SCHEMA
+    assert gate["status"] == "insufficient_data"
+    assert not gate["claim_authorized"]
+    inference = json.loads((output / "OOF_INTERVENTION_PAIRED_BOOTSTRAP.json").read_text())
+    scope_types = {row["scope_type"] for row in inference["records"]}
+    assert "dataset_correctness" in scope_types
+    assert "dataset_correct_true_grade" in scope_types
+    assert "dataset_boundary_outcome" in scope_types
+
+
+def _curve_profile(method: str) -> dict:
+    points = []
+    for index, (area, effect, preserved) in enumerate(
+        ((0.0, 0.0, 0.0), (0.1, 0.6, 1.0), (1.0, 1.0, 1.0))
+    ):
+        points.append(
+            {
+                "budget_index": index,
+                "requested_cell_fraction": area,
+                "selected_cell_fraction": area,
+                "selected_nominal_stride_area_fraction": area,
+                "selected_target_boundary_mass_fraction": effect,
+                "deletion_tail_normalized": effect,
+                "retention_tail_normalized": effect,
+                "retention_map_preserved": preserved,
+                "maximum_single_footprint_area_input_fraction": 0.02,
+                "summed_clipped_footprint_area_input_fraction": area,
+                "clipped_union_footprint_area_input_fraction": area,
+                "selected_count": area * 100,
+                "selected_count_s4": area * 100,
+                "selected_count_s32": 0.0,
+            }
+        )
+    return {
+        "dataset": "dr",
+        "image_key": "image",
+        "cluster_id": "patient",
+        "true_grade": 2,
+        "predicted_grade": 2,
+        "correct": True,
+        "boundary": 1,
+        "boundary_outcome": "true_positive",
+        "method": method,
+        "points": points,
+    }
+
+
+def test_curve_endpoints_report_concentration_and_global_rf_share() -> None:
+    profiles = [_curve_profile(method) for method in METHODS]
+    census = {
+        ("image", 1): {
+            "scale_geometry": {
+                "s4": {"theoretical_support_class": "finite_local"},
+                "s32": {"theoretical_support_class": "global_context"},
+            }
+        }
+    }
+    rows = derive_curve_endpoints(profiles, census, gate=_config().gate_a)
+    ranked = next(row for row in rows if row["method"] == "ranked_native")
+    assert ranked["area_to_50pct_deletion_effect"] == pytest.approx(1 / 12)
+    assert ranked["deletion_effect_at_10pct_area"] == pytest.approx(0.6)
+    assert ranked["retention_map_preserved_at_10pct_area"] == pytest.approx(1.0)
+    assert ranked["global_context_cell_fraction_at_10pct_area"] == pytest.approx(0.0)
+
+
+def test_paired_scalar_bootstrap_preserves_patient_pairing() -> None:
+    rows = []
+    for image, cluster in (("left", "patient-a"), ("right", "patient-a"), ("x", "patient-b")):
+        for method in METHODS:
+            base = 0.9 if method == "ranked_native" else 0.6
+            rows.append(
+                {
+                    "dataset": "dr", "image_key": image, "cluster_id": cluster,
+                    "boundary": 0, "method": method,
+                    "area_to_50pct_deletion_effect": 1.0 - base,
+                    "area_to_50pct_retention_effect": 1.0 - base,
+                    "deletion_effect_at_10pct_area": base,
+                    "retention_effect_at_10pct_area": base,
+                    "retention_map_preserved_at_10pct_area": base,
+                }
+            )
+    records = paired_scalar_bootstrap(
+        rows, config=_config(), seed_label="derived",
+        comparators=("random_scale_count_stride_area",),
+    )
+    preservation = next(
+        row for row in records
+        if row["metric"] == "retention_map_preserved_at_10pct_area"
+    )
+    assert preservation["n_clusters"] == 2
+    assert preservation["contrast_positive_favors_ranked"] == pytest.approx(0.3)
+    assert preservation["ci_percentile"] == pytest.approx([0.3, 0.3])
+
+
+def _passing_gate_inputs(config: StatisticsConfig) -> tuple[list[dict], list[dict], dict]:
+    auc = []
+    for dataset in config.gate_a.required_datasets:
+        for scope_type, scope in [
+            ("dataset_correct_positive", f"{dataset}:correct_positive"),
+            *(
+                ("dataset_correct_true_grade", f"{dataset}:grade={grade}")
+                for grade in (
+                    config.gate_a.dr_positive_grades
+                    if dataset == "dr" else config.gate_a.aptos_positive_grades
+                )
+            ),
+        ]:
+            for comparator in config.gate_a.matched_controls:
+                for metric in (
+                    config.gate_a.deletion_auc_metric,
+                    config.gate_a.retention_auc_metric,
+                ):
+                    auc.append(
+                        {
+                            "scope_type": scope_type, "scope": scope,
+                            "comparator": comparator, "metric": metric,
+                            "ranked_minus_comparator": 0.2,
+                            "ci_percentile": [0.1, 0.3], "n_clusters": 50,
+                        }
+                    )
+    derived_inference = []
+    for dataset in config.gate_a.required_datasets:
+        for comparator in config.gate_a.matched_controls:
+            derived_inference.append(
+                {
+                    "scope_type": "dataset_correct_positive",
+                    "scope": f"{dataset}:correct_positive",
+                    "comparator": comparator,
+                    "metric": "retention_map_preserved_at_10pct_area",
+                    "contrast_positive_favors_ranked": 0.1,
+                    "ci_percentile": [0.02, 0.2], "n_clusters": 50,
+                }
+            )
+    by_dataset = {}
+    for dataset in config.gate_a.required_datasets:
+        rows = []
+        for method in METHODS:
+            for index in range(100):
+                rows.append(
+                    {
+                        "dataset": dataset,
+                        "true_grade": 2,
+                        "predicted_grade": 2,
+                        "correct": True,
+                        "method": method,
+                        "area_to_50pct_deletion_effect": (
+                            0.05 if method == "ranked_native" else 0.2
+                        ),
+                        "area_to_50pct_retention_effect": (
+                            0.05 if method == "ranked_native" else 0.2
+                        ),
+                        "deletion_effect_at_10pct_area": 0.6,
+                        "retention_effect_at_10pct_area": 0.6,
+                    }
+                )
+        by_dataset[dataset] = rows
+    return auc, derived_inference, by_dataset
+
+
+def test_gate_a_passes_only_when_every_clause_passes() -> None:
+    config = _config()
+    auc, derived, by_dataset = _passing_gate_inputs(config)
+    result = adjudicate_gate_a(
+        config=config, intervention_records=auc,
+        derived_inference_records=derived, derived_by_dataset=by_dataset,
+        input_issues=[],
+        runtime_source={"git_commit_available": True, "tracked_worktree_clean": True},
+    )
+    assert result["status"] == "pass"
+    assert result["claim_authorized"]
+    auc[0]["ranked_minus_comparator"] = 0.01
+    result = adjudicate_gate_a(
+        config=config, intervention_records=auc,
+        derived_inference_records=derived, derived_by_dataset=by_dataset,
+        input_issues=[],
+        runtime_source={"git_commit_available": True, "tracked_worktree_clean": True},
+    )
+    assert result["status"] == "fail"
+    assert not result["claim_authorized"]
+
+
+def test_gate_a_withholds_claim_on_incomplete_input() -> None:
+    config = _config()
+    auc, derived, by_dataset = _passing_gate_inputs(config)
+    result = adjudicate_gate_a(
+        config=config, intervention_records=auc,
+        derived_inference_records=derived, derived_by_dataset=by_dataset,
+        input_issues=["missing curve artifact"],
+        runtime_source={"git_commit_available": True, "tracked_worktree_clean": True},
+    )
+    assert result["status"] == "insufficient_data"
+    assert result["auditability_claim_status"] == "withheld_incomplete"

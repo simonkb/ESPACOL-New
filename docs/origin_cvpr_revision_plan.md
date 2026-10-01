@@ -159,6 +159,29 @@ The auditability claim advances only if grouped evidence has a practically nontr
 
 If Gate A fails, do not call the learned maps useful explanations. The paper may still describe exact accounting, but that is unlikely to clear CVPR.
 
+### 4.5 Machine adjudication contract
+
+Gate A is evaluated by the checksum-sealed OOF statistics job rather than by
+manual selection of favorable plots.  The adjudicator consumes the complete
+curve artifact as well as the image--boundary census and emits one status per
+clause: `pass`, `fail`, or `insufficient_data`.  The auditability claim is
+authorized only when every clause passes.  A missing dataset, curve artifact,
+method pair, required grade stratum, source commit, protocol hash, or clean
+runtime provenance forces `insufficient_data` and withholds the claim.
+
+The primary matched controls for the gate are the scale/count/stride-area
+control and the scale/receptive-field-area control.  Coordinate permutation,
+least-evidential selection, and boundary-mass matching remain reported
+falsification diagnostics, but the mass-matched control is not used to demand
+an effect difference that conservation makes impossible.  Patient-cluster
+resampling is used for EyePACS and image resampling for APTOS, always preserving
+the same image--boundary pairing across selection methods.  The machine report
+also includes correct/error, true-grade, predicted-grade, boundary, and
+TP/FP/FN strata; linear interpolation over the frozen nominal-addressable-area
+grid for area-to-effect and top-area endpoints; and theoretical receptive-field
+footprint disclosure.  The latter is explicitly a false-locality diagnostic,
+not a pixel-localization claim.
+
 ## 5. Workstream B: controlled ordinal-shortcut benchmark
 
 This is the most decisive new experiment because the location, boundary, and pixel-level counterfactual are known exactly without clinical annotation.

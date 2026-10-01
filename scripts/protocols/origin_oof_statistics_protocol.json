@@ -1,6 +1,6 @@
 {
-  "schema": "origin-oof-statistics-protocol-v1",
-  "protocol_version": 1,
+  "schema": "origin-oof-statistics-protocol-v2",
+  "protocol_version": 2,
   "input_scope": "checksum_sealed_complete_oof_intervention_aggregates",
   "bootstrap_unit": "patient_cluster_for_dr_image_for_aptos",
   "bootstrap_pairing": "intervention_methods_paired_within_image_and_boundary",
@@ -24,6 +24,65 @@
   "intervention_contrast": "ranked_native_minus_each_paired_control_AUC",
   "intervention_scope": "exact_stored_ledger_replay_not_causal_pixel_intervention",
   "multiplicity_policy": "descriptive_intervals_no_multiplicity_adjusted_hypothesis_tests",
+  "stratified_inference": [
+    "dataset",
+    "ordinal_boundary",
+    "correct_vs_error",
+    "correct_positive_true_grade",
+    "predicted_grade",
+    "boundary_true_positive_false_positive_false_negative"
+  ],
+  "curve_endpoint_interpolation": "piecewise_linear_over_observed_nominal_stride_area_with_first_monotone_crossing",
+  "rf_footprint_policy": "theoretical_receptive_field_disclosure_not_a_pixel_locality_claim",
+  "gate_a": {
+    "primary_gate_cohort": "correct_class_map_predictions_with_true_grade_above_zero_on_fixed_curve_eligible_boundaries",
+    "required_datasets": [
+      "dr",
+      "aptos"
+    ],
+    "matched_controls": [
+      "random_scale_count_stride_area",
+      "random_scale_footprint"
+    ],
+    "deletion_auc_metric": "auc_deletion_tail_normalized_by_nominal_stride_area",
+    "retention_auc_metric": "auc_retention_tail_normalized_by_nominal_stride_area",
+    "minimum_auc_advantage": 0.1,
+    "minimum_stratum_clusters": 30,
+    "minimum_metric_coverage": 0.9,
+    "positive_grade_strata": {
+      "dr": {
+        "grades": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "minimum_passing": 3
+      },
+      "aptos": {
+        "grades": [
+          1,
+          2,
+          4
+        ],
+        "minimum_passing": 2
+      }
+    },
+    "concentration": {
+      "target_local_attributable_effect": 0.5,
+      "top_area_fraction": 0.1,
+      "maximum_ranked_area_to_target": 0.1,
+      "maximum_ranked_to_random_area_ratio": 0.5,
+      "aggregation": "median_over_fixed_eligible_image_boundary_cohort",
+      "pass_logic": "area_and_ratio_or_top_area_effect"
+    },
+    "retention_preservation": {
+      "endpoint": "map_prediction_preserved_at_10pct_nominal_addressable_area",
+      "minimum_absolute_advantage": 0.05,
+      "requires_cluster_interval_lower_bound_above_zero": true
+    },
+    "claim_policy": "fail_closed_no_auditability_claim_if_any_required_input_or_clause_is_incomplete"
+  },
   "config": {
     "bootstrap_samples": 10000,
     "bootstrap_seed": 20261002,
@@ -32,5 +91,5 @@
     "reliability_bins": 15,
     "nll_probability_floor": 1e-15
   },
-  "content_checksum_sha256": "427fbfa71496387a737a4b9a9a72abebcd70deb5d6c1ad3d7902f6a166d4f6d9"
+  "content_checksum_sha256": "160fb3717c34ed8a839ea5e0d8a07becd43705d8cced0aa5cc2e68a7df7a2d98"
 }
