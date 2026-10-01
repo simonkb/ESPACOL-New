@@ -35,7 +35,7 @@ CONTROL_METHODS = (
     "random_boundary_mass",
 )
 METHODS = ("ranked_native", "least_evidential", *CONTROL_METHODS)
-CURVE_ELIGIBILITY_RULE = "true_grade_gt_boundary_and_class_map_gt_boundary"
+CURVE_ELIGIBILITY_RULE = "true_grade_gt_boundary_or_class_map_gt_boundary"
 _THRESHOLD_SPECS = (
     ("min_delete_map_change", "deletion", "map", 0.0),
     ("min_delete_expected_drop_0p25", "deletion", "expected", 0.25),
@@ -704,6 +704,15 @@ def audit_image_ledger(
         map_range = int(full["map"][0]) - int(prior["map"][0])
         true_boundary_positive = int(true_grade) > boundary
         predicted_boundary_positive = predicted_grade > boundary
+        boundary_outcome = (
+            "true_positive"
+            if true_boundary_positive and predicted_boundary_positive
+            else "false_negative"
+            if true_boundary_positive
+            else "false_positive"
+            if predicted_boundary_positive
+            else "true_negative"
+        )
         curve_eligible = (
             True
             if curve_eligible_boundaries is None
@@ -716,17 +725,14 @@ def audit_image_ledger(
             "boundary": boundary,
             "true_boundary_positive": true_boundary_positive,
             "predicted_boundary_positive": predicted_boundary_positive,
+            "boundary_outcome": boundary_outcome,
             "curve_eligible": curve_eligible,
             "curve_eligibility_rule": CURVE_ELIGIBILITY_RULE,
             "curve_exclusion_reason": (
                 None
                 if curve_eligible
                 else (
-                    "true_and_predicted_boundary_not_positive"
-                    if not true_boundary_positive and not predicted_boundary_positive
-                    else "true_boundary_not_positive"
-                    if not true_boundary_positive
-                    else "predicted_boundary_not_positive"
+                    "neither_true_nor_predicted_boundary_positive"
                 )
             ),
             "valid_cell_count": len(vectors),
@@ -1037,6 +1043,9 @@ def audit_image_ledger(
                     "row_type": "image_boundary_curve_point",
                     **common_identity,
                     "boundary": boundary,
+                    "true_boundary_positive": true_boundary_positive,
+                    "predicted_boundary_positive": predicted_boundary_positive,
+                    "boundary_outcome": boundary_outcome,
                     "method": method,
                     "budget_index": budget_index,
                     "requested_cell_fraction": float(budget),

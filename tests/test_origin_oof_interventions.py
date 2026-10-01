@@ -219,6 +219,9 @@ def test_ineligible_boundaries_remain_in_census_without_intervention_curves() ->
     assert [row["curve_eligible"] for row in result["image_rows"]] == [
         False, True, False
     ]
+    assert result["image_rows"][1]["boundary_outcome"] in {
+        "true_positive", "false_positive", "false_negative", "true_negative"
+    }
     assert {row["boundary"] for row in result["curve_rows"]} == {1}
     assert all(
         row["min_delete_map_change_cell_count"] is None
