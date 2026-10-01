@@ -526,10 +526,11 @@ fine-only, and coarse-only variants; and a contemporaneously rerun full
 reimplementations of published CORAL or CORN systems.  Matched CLOC and
 sparse/additive local models were not part of that retrospective suite.  A
 separately frozen acceptance matrix now reserves comparisons against the
-same-ledger hazard, pooled continuation ratio, ordinal Additive MIL, and Sparse
-Activations/BagNet across matched folds and seeds; its results remain the
-explicit placeholder in \cref{tab:acceptance-placeholders} until the complete
-release gate passes.
+same-ledger hazard, pooled continuation ratio, and matched in-repo analogues of
+ordinal Additive MIL and Sparse BagNet across matched folds and seeds.  These
+are controlled architectural analogues, not claims of reproducing the original
+authors' training code; their results remain the explicit placeholder in
+\cref{tab:acceptance-placeholders} until the complete release gate passes.
 
 \subsection{Retrospective matched fold-9 mechanism study}
 \label{sec:ablation-protocol}
@@ -659,9 +660,9 @@ witnesses are local, useful, or semantically aligned.
 % RESULT PLACEHOLDERS: replace only from complete checksummed aggregates.
 \begin{table}[t]
   \centering
-  \caption{\textbf{Reserved acceptance-audit result slots.}  These rows are
-  explicitly pending and make no empirical claim in this draft.  They will be
-  replaced only by complete checksummed aggregates, never partial jobs.}
+  \caption{\textbf{Acceptance-audit status.} Pending rows make no empirical
+  claim and will be replaced only by complete checksummed aggregates, never
+  partial jobs.}
   \label{tab:acceptance-placeholders}
   \setlength{\tabcolsep}{3.2pt}
   \begin{tabular}{@{}>{\raggedright\arraybackslash}p{2.15cm}
@@ -677,10 +678,11 @@ witnesses are local, useful, or semantically aligned.
     performance. \\
     Matched intrinsic models & \textit{Pending:} multi-fold/seed grading and
     calibration for CTMC, same-ledger hazards, pooled continuation,
-    ordinal Additive MIL, and Sparse Activations/BagNet. \\
-    IDRiD semantics & \textit{Pending:} zero-shot lesion-bin AP/enrichment and
-    mask-guided internal deletion versus count-matched controls, with
-    patient/image bootstrap CIs \cite{porwal2020idrid}. \\
+    matched in-repo analogues of ordinal Additive MIL and Sparse BagNet. \\
+    IDRiD semantics & 81 images, averaged within image over 10 checkpoints:
+    fine-bin AP $0.186$ [0.164, 0.210] at prevalence $0.0815$; mask-guided
+    versus count-matched random internal-deletion lift in $E[Y]$ $0.171$
+    [0.149, 0.194] (image-cluster 95\% CIs) \cite{porwal2020idrid}. \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -756,22 +758,18 @@ atoms are severity-indexed, not clinical concepts; generalization beyond fundus
 grading requires new modalities and datasets.
 
 \paragraph{Potential impact.}
-Replay provides a substrate for testing shortcut reliance, but the controlled
-benchmark in \cref{tab:acceptance-placeholders} must establish utility.  It is
-not a substitute for ophthalmologist judgment.  Rare-grade errors can alter
-referral; deployment requires external validation, calibration and subgroup
-monitoring, and human oversight.
+Replay can audit shortcuts only if the pending controlled benchmark passes; it
+does not replace ophthalmologist judgment.  Rare-grade errors require external
+validation, calibration, subgroup monitoring, and human oversight.
 
 \section{Conclusion}
 \label{sec:conclusion}
 
-\method makes a conserved, boundary-indexed spatial ledger both the exclusive
-prediction input and an exactly replayable audit object; the CTMC is one
-declared decoder, not the source of replay exactness.  Complete APTOS and
-patient-grouped EyePACS CV show competitive grading, while a retrospective
-study finds no one-fold advantage over pooled heads and falsifies fine-only
-sufficiency.  Broader audit-utility claims await the reserved OOF, shortcut,
-matched-baseline, and IDRiD aggregates.
+\method makes a conserved boundary-indexed ledger both the exclusive prediction
+input and an exactly replayable audit object; the CTMC is a declared decoder,
+not the source of replay exactness.  Complete CV shows competitive grading, but
+a retrospective fold finds no pooled-head advantage and rejects fine-only
+sufficiency.  Claims beyond exact replay await the sealed pending audits.
 
 {\small
   \bibliographystyle{ieeenat_fullname}
