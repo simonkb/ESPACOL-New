@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 from pathlib import Path
 from statistics import mean, stdev
@@ -15,6 +16,8 @@ import numpy as np
 from scripts.origin_acceptance_baseline_common import (
     BASELINE_ORDER,
     DATASET_FOLDS,
+    PAIRED_BOOTSTRAP_SAMPLES,
+    PAIRED_BOOTSTRAP_SEED,
     PROTOCOL_ID,
     PROTOCOL_SHA256,
     REPLICATION_SEEDS,
@@ -25,7 +28,38 @@ from scripts.origin_acceptance_baseline_common import (
 from train_origin import write_json_atomic
 
 
-_METRICS = ("acc", "qwk", "mae", "balanced_acc", "macro_f1", "ece", "nll", "rps")
+_METRICS = (
+    "acc",
+    "qwk",
+    "mae",
+    "balanced_acc",
+    "macro_f1",
+    "ece",
+    "nll",
+    "rps",
+    "multiclass_brier",
+    "threshold_ece",
+)
+_BOUNDARY_ECE_METRICS = tuple(f"threshold_ece_boundary_{index}" for index in range(4))
+_SUMMARY_METRICS = _METRICS + _BOUNDARY_ECE_METRICS
+_BOOTSTRAP_METRICS = (
+    "acc",
+    "qwk",
+    "mae",
+    "nll",
+    "rps",
+    "multiclass_brier",
+    "threshold_ece",
+)
+_HIGHER_IS_BETTER = {
+    "acc": True,
+    "qwk": True,
+    "mae": False,
+    "nll": False,
+    "rps": False,
+    "multiclass_brier": False,
+    "threshold_ece": False,
+}
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -36,10 +70,298 @@ def _load_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _derived_seed(base: int, dataset: str, comparator: str) -> int:
+    material = f"{base}:{dataset}:{comparator}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(material).digest()[:8], "big") % (2**32)
+
+
+def _cluster_statistics(record: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Additive sufficient statistics for a patient/image cluster bootstrap."""
+
+    probs = record["class_probs"].astype(np.float64, copy=False)
+    cumulative = record["cumulative_probs"].astype(np.float64, copy=False)
+    labels = record["label"].astype(np.int64, copy=False)
+    predicted = record["prediction"].astype(np.int64, copy=False)
+    cluster_ids = record["cluster_id"].astype(str)
+    clusters = list(dict.fromkeys(cluster_ids.tolist()))
+    lookup = {cluster: index for index, cluster in enumerate(clusters)}
+    inverse = np.asarray([lookup[value] for value in cluster_ids], dtype=np.int64)
+    cluster_count = len(clusters)
+    classes = probs.shape[1]
+    boundaries = classes - 1
+    stats: dict[str, np.ndarray] = {
+        "cluster_ids": np.asarray(clusters, dtype=str),
+        "n": np.zeros(cluster_count),
+        "correct": np.zeros(cluster_count),
+        "absolute_error": np.zeros(cluster_count),
+        "nll": np.zeros(cluster_count),
+        "rps": np.zeros(cluster_count),
+        "multiclass_brier": np.zeros(cluster_count),
+        "confusion": np.zeros((cluster_count, classes, classes)),
+        "calibration_predicted": np.zeros((cluster_count, boundaries, 15)),
+        "calibration_observed": np.zeros((cluster_count, boundaries, 15)),
+    }
+    np.add.at(stats["n"], inverse, 1.0)
+    np.add.at(stats["correct"], inverse, (predicted == labels).astype(np.float64))
+    np.add.at(stats["absolute_error"], inverse, np.abs(predicted - labels))
+    selected = np.clip(probs[np.arange(len(labels)), labels], np.finfo(np.float64).tiny, 1.0)
+    np.add.at(stats["nll"], inverse, -np.log(selected))
+    thresholds = np.arange(boundaries)[None, :]
+    target_thresholds = labels[:, None] > thresholds
+    per_sample_rps = np.mean((cumulative - target_thresholds) ** 2, axis=1)
+    np.add.at(stats["rps"], inverse, per_sample_rps)
+    target_classes = np.eye(classes, dtype=np.float64)[labels]
+    np.add.at(
+        stats["multiclass_brier"],
+        inverse,
+        np.sum((probs - target_classes) ** 2, axis=1),
+    )
+    np.add.at(stats["confusion"], (inverse, labels, predicted), 1.0)
+    assignments = np.minimum((np.clip(cumulative, 0.0, 1.0) * 15).astype(int), 14)
+    for boundary in range(boundaries):
+        np.add.at(
+            stats["calibration_predicted"],
+            (inverse, np.full(len(labels), boundary), assignments[:, boundary]),
+            cumulative[:, boundary],
+        )
+        np.add.at(
+            stats["calibration_observed"],
+            (inverse, np.full(len(labels), boundary), assignments[:, boundary]),
+            target_thresholds[:, boundary].astype(np.float64),
+        )
+    return stats
+
+
+def _weighted_metrics(
+    weights: np.ndarray, stats: dict[str, np.ndarray]
+) -> dict[str, np.ndarray]:
+    """Vectorized metrics for rows of cluster multiplicity weights."""
+
+    total = weights @ stats["n"]
+    if np.any(total <= 0):
+        raise AssertionError("bootstrap draw contains no observations")
+    result = {
+        "acc": 100.0 * (weights @ stats["correct"]) / total,
+        "mae": (weights @ stats["absolute_error"]) / total,
+        "nll": (weights @ stats["nll"]) / total,
+        "rps": (weights @ stats["rps"]) / total,
+        "multiclass_brier": (weights @ stats["multiclass_brier"]) / total,
+    }
+    confusion = np.tensordot(weights, stats["confusion"], axes=(1, 0))
+    row = confusion.sum(axis=2)
+    column = confusion.sum(axis=1)
+    expected = row[:, :, None] * column[:, None, :] / total[:, None, None]
+    classes = confusion.shape[1]
+    coordinates = np.arange(classes, dtype=np.float64)
+    penalty = (coordinates[:, None] - coordinates[None, :]) ** 2
+    penalty /= max(1, (classes - 1) ** 2)
+    numerator = np.sum(confusion * penalty[None], axis=(1, 2))
+    denominator = np.sum(expected * penalty[None], axis=(1, 2))
+    qwk = np.zeros_like(denominator)
+    valid_qwk = denominator > 0.0
+    qwk[valid_qwk] = 1.0 - numerator[valid_qwk] / denominator[valid_qwk]
+    result["qwk"] = qwk
+    predicted_sum = np.tensordot(
+        weights, stats["calibration_predicted"], axes=(1, 0)
+    )
+    observed_sum = np.tensordot(
+        weights, stats["calibration_observed"], axes=(1, 0)
+    )
+    result["threshold_ece"] = (
+        np.abs(predicted_sum - observed_sum).sum(axis=2) / total[:, None]
+    ).mean(axis=1)
+    return result
+
+
+def _oof_threshold_reliability(
+    records: dict[tuple[str, int, str, int], dict[str, np.ndarray]],
+    *,
+    dataset: str,
+    variant: str,
+    training_seed: int,
+    bins: int = 15,
+) -> dict[str, Any]:
+    cumulative = np.concatenate(
+        [
+            records[(dataset, fold, variant, training_seed)]["cumulative_probs"]
+            for fold in DATASET_FOLDS[dataset]
+        ]
+    ).astype(np.float64, copy=False)
+    labels = np.concatenate(
+        [
+            records[(dataset, fold, variant, training_seed)]["label"]
+            for fold in DATASET_FOLDS[dataset]
+        ]
+    ).astype(np.int64, copy=False)
+    boundaries = cumulative.shape[1]
+    payload = []
+    eces = []
+    for boundary in range(boundaries):
+        predicted = np.clip(cumulative[:, boundary], 0.0, 1.0)
+        observed = (labels > boundary).astype(np.float64)
+        assignment = np.minimum((predicted * bins).astype(int), bins - 1)
+        bin_rows = []
+        ece = 0.0
+        for index in range(bins):
+            selected = assignment == index
+            count = int(selected.sum())
+            if count:
+                mean_predicted = float(predicted[selected].mean())
+                empirical = float(observed[selected].mean())
+                gap = abs(mean_predicted - empirical)
+                ece += count / len(labels) * gap
+            else:
+                mean_predicted = empirical = gap = None
+            bin_rows.append(
+                {
+                    "bin": index,
+                    "lower": index / bins,
+                    "upper": (index + 1) / bins,
+                    "count": count,
+                    "mean_predicted": mean_predicted,
+                    "empirical_frequency": empirical,
+                    "absolute_gap": gap,
+                }
+            )
+        eces.append(ece)
+        payload.append(
+            {"boundary": boundary, "event": f"Y>{boundary}", "ece": ece, "bins": bin_rows}
+        )
+    return {
+        "scope": "pooled_out_of_fold_predictions_for_one_training_seed",
+        "bin_count": bins,
+        "n": int(len(labels)),
+        "threshold_ece": float(np.mean(eces)),
+        "threshold_ece_by_boundary": eces,
+        "boundaries": payload,
+    }
+
+
+def paired_fold_seed_cluster_bootstrap(
+    records: dict[tuple[str, int, str, int], dict[str, np.ndarray]],
+    *,
+    dataset: str,
+    comparator: str,
+    samples: int,
+    seed: int,
+    chunk_size: int = 128,
+) -> dict[str, Any]:
+    """Paired clusters within fold, with each draw shared across three seeds."""
+
+    if samples < 1:
+        raise ValueError("bootstrap samples must be positive")
+    folds = DATASET_FOLDS[dataset]
+    statistics: dict[tuple[int, str, int], dict[str, np.ndarray]] = {}
+    for fold in folds:
+        reference_record = records[
+            (dataset, fold, "origin_ctmc", REPLICATION_SEEDS[0])
+        ]
+        for training_seed in REPLICATION_SEEDS:
+            for variant in ("origin_ctmc", comparator):
+                key = (dataset, fold, variant, training_seed)
+                record = records[key]
+                for identity_field in ("image_path", "label", "cluster_id"):
+                    if not np.array_equal(
+                        record[identity_field], reference_record[identity_field]
+                    ):
+                        raise AssertionError(
+                            f"unpaired {identity_field} for {dataset}/fold{fold}/"
+                            f"{variant}/seed{training_seed}"
+                        )
+                statistics[(fold, variant, training_seed)] = _cluster_statistics(record)
+        reference_clusters = statistics[(fold, "origin_ctmc", REPLICATION_SEEDS[0])][
+            "cluster_ids"
+        ]
+        for training_seed in REPLICATION_SEEDS:
+            for variant in ("origin_ctmc", comparator):
+                observed = statistics[(fold, variant, training_seed)]["cluster_ids"]
+                if not np.array_equal(observed, reference_clusters):
+                    raise AssertionError(
+                        f"cluster order is not paired for {dataset}/fold{fold}/{variant}"
+                    )
+
+    point = {metric: 0.0 for metric in _BOOTSTRAP_METRICS}
+    cell_count = len(folds) * len(REPLICATION_SEEDS)
+    for fold in folds:
+        clusters = len(statistics[(fold, "origin_ctmc", REPLICATION_SEEDS[0])]["cluster_ids"])
+        weights = np.ones((1, clusters), dtype=np.float64)
+        for training_seed in REPLICATION_SEEDS:
+            origin = _weighted_metrics(weights, statistics[(fold, "origin_ctmc", training_seed)])
+            control = _weighted_metrics(weights, statistics[(fold, comparator, training_seed)])
+            for metric in _BOOTSTRAP_METRICS:
+                point[metric] += float(origin[metric][0] - control[metric][0]) / cell_count
+
+    draws = {metric: np.empty(samples, dtype=np.float64) for metric in _BOOTSTRAP_METRICS}
+    rng = np.random.default_rng(_derived_seed(seed, dataset, comparator))
+    completed = 0
+    while completed < samples:
+        batch = min(chunk_size, samples - completed)
+        accumulated = {
+            metric: np.zeros(batch, dtype=np.float64)
+            for metric in _BOOTSTRAP_METRICS
+        }
+        for fold in folds:
+            clusters = len(
+                statistics[(fold, "origin_ctmc", REPLICATION_SEEDS[0])]["cluster_ids"]
+            )
+            weights = rng.multinomial(
+                clusters,
+                np.full(clusters, 1.0 / clusters),
+                size=batch,
+            ).astype(np.float64, copy=False)
+            for training_seed in REPLICATION_SEEDS:
+                origin = _weighted_metrics(
+                    weights, statistics[(fold, "origin_ctmc", training_seed)]
+                )
+                control = _weighted_metrics(
+                    weights, statistics[(fold, comparator, training_seed)]
+                )
+                for metric in _BOOTSTRAP_METRICS:
+                    accumulated[metric] += (
+                        origin[metric] - control[metric]
+                    ) / cell_count
+        for metric in _BOOTSTRAP_METRICS:
+            draws[metric][completed : completed + batch] = accumulated[metric]
+        completed += batch
+
+    comparison: dict[str, Any] = {}
+    for metric in _BOOTSTRAP_METRICS:
+        lower, upper = np.percentile(draws[metric], [2.5, 97.5])
+        comparison[metric] = {
+            "origin_minus_comparator": point[metric],
+            "bootstrap_mean_delta": float(draws[metric].mean()),
+            "ci95_percentile": [float(lower), float(upper)],
+            "higher_is_better": _HIGHER_IS_BETTER[metric],
+        }
+    return {
+        "method": "paired_within_fold_cluster_bootstrap_percentile",
+        "reference_variant": "origin_ctmc",
+        "comparator": comparator,
+        "dataset": dataset,
+        "cluster_unit": "patient_stem" if dataset == "dr" else "image",
+        "fold_pairing": "same cluster multiplicities for both arms and all seeds within fold",
+        "seed_pairing": "arm contrast within each training seed then mean across seeds",
+        "fold_aggregation": "unweighted mean of paired fold-seed contrasts",
+        "samples": samples,
+        "base_seed": seed,
+        "derived_seed": _derived_seed(seed, dataset, comparator),
+        "delta_orientation": "origin_ctmc_minus_comparator",
+        "comparisons": comparison,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--experiment_root", required=True)
+    parser.add_argument(
+        "--bootstrap_samples", type=int, default=PAIRED_BOOTSTRAP_SAMPLES
+    )
+    parser.add_argument("--bootstrap_seed", type=int, default=PAIRED_BOOTSTRAP_SEED)
     args = parser.parse_args()
+    if args.bootstrap_samples != PAIRED_BOOTSTRAP_SAMPLES:
+        raise ValueError("bootstrap sample count differs from the registered protocol")
+    if args.bootstrap_seed != PAIRED_BOOTSTRAP_SEED:
+        raise ValueError("bootstrap seed differs from the registered protocol")
     root = Path(args.experiment_root)
     output_dir = root / "full" / "outer_release"
     aggregate_targets = (
@@ -54,6 +376,7 @@ def main() -> None:
             + ", ".join(existing)
         )
     rows: list[dict[str, Any]] = []
+    records: dict[tuple[str, int, str, int], dict[str, np.ndarray]] = {}
     identity_by_fold: dict[tuple[str, int], tuple[tuple[str, ...], tuple[int, ...]]] = {}
     for task in full_tasks():
         directory = root / "full" / "outer_release" / task.key
@@ -80,11 +403,41 @@ def main() -> None:
         with np.load(predictions_path, allow_pickle=False) as archive:
             paths = tuple(str(value) for value in archive["image_path"].tolist())
             labels = tuple(int(value) for value in archive["label"].tolist())
+            required_arrays = {
+                "image_path",
+                "patient_id",
+                "cluster_id",
+                "label",
+                "prediction",
+                "expected_grade",
+                "class_probs",
+                "cumulative_probs",
+            }
+            missing = required_arrays - set(archive.files)
+            if missing:
+                raise ValueError(
+                    f"outer prediction archive lacks {sorted(missing)}: {predictions_path}"
+                )
+            record = {name: np.asarray(archive[name]).copy() for name in required_arrays}
         fold_key = (task.dataset, task.fold)
         identity = (paths, labels)
         previous = identity_by_fold.setdefault(fold_key, identity)
         if previous != identity:
             raise ValueError(f"outer item/order mismatch across comparators for {fold_key}")
+        expected_clusters = np.asarray(
+            [
+                Path(path).stem.rsplit("_", 1)[0]
+                if task.dataset == "dr"
+                else path
+                for path in paths
+            ],
+            dtype=str,
+        )
+        if not np.array_equal(record["cluster_id"].astype(str), expected_clusters):
+            raise ValueError(f"invalid patient/image cluster IDs in {predictions_path}")
+        records[
+            (task.dataset, task.fold, task.baseline_variant, task.training_seed)
+        ] = record
         metrics = payload["metrics"]
         rows.append(
             {
@@ -93,6 +446,12 @@ def main() -> None:
                 "baseline_variant": task.baseline_variant,
                 "training_seed": task.training_seed,
                 **{name: float(metrics[name]) for name in _METRICS},
+                **{
+                    f"threshold_ece_boundary_{index}": float(value)
+                    for index, value in enumerate(
+                        metrics["threshold_ece_by_boundary"]
+                    )
+                },
                 "n": int(metrics["n"]),
                 "best_epoch": int(payload["best_epoch"]),
             }
@@ -115,10 +474,10 @@ def main() -> None:
                     raise ValueError(f"missing folds for {dataset}/{variant}/seed{seed}")
                 seed_means[str(seed)] = {
                     metric: mean(float(row[metric]) for row in subset)
-                    for metric in _METRICS
+                    for metric in _SUMMARY_METRICS
                 }
             replication = {}
-            for metric in _METRICS:
+            for metric in _SUMMARY_METRICS:
                 values = [seed_means[str(seed)][metric] for seed in REPLICATION_SEEDS]
                 replication[metric] = {
                     "mean_of_seed_cv_means": mean(values),
@@ -128,7 +487,31 @@ def main() -> None:
             summary[dataset][variant] = {
                 "seed_cv_means": seed_means,
                 "replication_summary": replication,
+                "threshold_reliability_by_seed": {
+                    str(seed): _oof_threshold_reliability(
+                        records,
+                        dataset=dataset,
+                        variant=variant,
+                        training_seed=seed,
+                    )
+                    for seed in REPLICATION_SEEDS
+                },
             }
+
+    bootstrap = {
+        dataset: {
+            comparator: paired_fold_seed_cluster_bootstrap(
+                records,
+                dataset=dataset,
+                comparator=comparator,
+                samples=args.bootstrap_samples,
+                seed=args.bootstrap_seed,
+            )
+            for comparator in BASELINE_ORDER
+            if comparator != "origin_ctmc"
+        }
+        for dataset in DATASET_FOLDS
+    }
 
     payload: dict[str, Any] = {
         "schema": "origin-acceptance-outer-aggregate-v1",
@@ -137,7 +520,14 @@ def main() -> None:
         "status": "complete",
         "release_worker_count": len(rows),
         "aggregation_unit": "fold_mean_with_replication_seed_as_repeat",
+        "historical_origin_oof": {
+            "role": "external_sanity_reference_only",
+            "included_in_paired_contrasts": False,
+            "included_in_model_selection": False,
+            "note": "origin_ctmc is retrained in every registered fold/seed cell",
+        },
         "summary": summary,
+        "paired_cluster_bootstrap": bootstrap,
     }
     payload["content_checksum_sha256"] = canonical_sha256(payload)
     write_json_atomic(output_dir / "aggregate.json", payload)

@@ -114,24 +114,28 @@ class OriginAcceptanceBaselineTrainer(OriginAblationTrainer):
             raise ValueError(
                 f"baseline model/config mismatch: model={variant!r}, config={configured!r}"
             )
-        old_weights = getattr(self.criterion, "class_weights", None)
-        class_weights = (
-            None
-            if old_weights is None or int(old_weights.numel()) == 0
-            else old_weights.detach().clone()
-        )
-        self.criterion = OriginAcceptanceBaselineLoss(
-            self.num_classes,
-            baseline_variant=variant,
-            rps_weight=float(self._cfg("rps_weight", 0.25)),
-            sparse_l1_weight=float(self._cfg("sparse_l1_weight", 0.0)),
-            sparse_l1_delay_epochs=int(self._cfg("sparse_l1_delay_epochs", 0)),
-            class_weights=class_weights,
-        ).to(self.device)
-        self.population_objective_proper = (
-            self.criterion.configured_objective_is_proper
-            and not self.stratified_batches
-        )
+        if variant != "origin_ctmc":
+            old_weights = getattr(self.criterion, "class_weights", None)
+            class_weights = (
+                None
+                if old_weights is None or int(old_weights.numel()) == 0
+                else old_weights.detach().clone()
+            )
+            self.criterion = OriginAcceptanceBaselineLoss(
+                self.num_classes,
+                baseline_variant=variant,
+                rps_weight=float(self._cfg("rps_weight", 0.25)),
+                sparse_l1_weight=float(self._cfg("sparse_l1_weight", 0.0)),
+                sparse_l1_delay_epochs=int(self._cfg("sparse_l1_delay_epochs", 0)),
+                class_weights=class_weights,
+            ).to(self.device)
+            self.population_objective_proper = (
+                self.criterion.configured_objective_is_proper
+                and not self.stratified_batches
+            )
+        # origin_ctmc deliberately retains the ordinary OriginLoss constructed
+        # by OriginTrainer. Thus architecture, output and objective paths are
+        # the exact V3 implementation; only checkpoint names/provenance differ.
         self.baseline_variant = variant
         rate_applicable = bool(declared.get("rate_telemetry_applicable", True))
         if declared.get("control_family") == "multiscale_masked_global_pooling":
@@ -171,6 +175,12 @@ class OriginAcceptanceBaselineTrainer(OriginAblationTrainer):
 
     def _run_epoch(self, loader, *, train: bool, epoch: int) -> dict[str, Any]:
         metrics = super()._run_epoch(loader, train=train, epoch=epoch)
+        if self.baseline_variant == "origin_ctmc":
+            metrics["regularizer_kind"] = "origin_rate_budget_disabled"
+            metrics["sparse_activation_l1"] = 0.0
+            metrics["sparse_l1_active"] = False
+            metrics["evidence_budget_applicable"] = True
+            return metrics
         metrics["regularizer_kind"] = (
             "unpooled_valid_activation_l1"
             if self.baseline_variant == "sparse_bagnet"

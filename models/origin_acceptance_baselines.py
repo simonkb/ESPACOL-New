@@ -45,6 +45,7 @@ ACCEPTANCE_BASELINE_VARIANTS = (
     "pooled_conditional",
     "ordinal_additive_mil",
     "sparse_bagnet",
+    "origin_ctmc",
 )
 
 _ALL_SCALES = ("s4", "s8", "s16", "s32")
@@ -504,7 +505,7 @@ def build_origin_acceptance_baseline(
     pretrained: bool | None = None,
     encoder: Optional[nn.Module] = None,
 ) -> nn.Module:
-    """Build one of the four pre-registered matched comparators."""
+    """Build ORIGIN itself or one of four pre-registered matched comparators."""
 
     variant = str(
         _cfg_get(cfg, "baseline_variant", _cfg_get(cfg, "ablation_variant", ""))
@@ -518,6 +519,43 @@ def build_origin_acceptance_baseline(
         if pretrained is None
         else bool(pretrained)
     )
+    if variant == "origin_ctmc":
+        # OriginVariantModel is a metadata-only subclass of the ordinary V3
+        # OriginModel: it adds no parameter, buffer, module, or prediction
+        # path. This lets the common acceptance trainer identify the arm while
+        # retaining the exact standard CTMC architecture and output contract.
+        from .origin_ablation import OriginVariantModel
+
+        return OriginVariantModel(
+            ablation_variant="origin_ctmc",
+            num_classes=int(_cfg_get(cfg, "n_classes", 5)),
+            encoder_name=str(_cfg_get(cfg, "encoder", "convnext_tiny")),
+            pretrained=use_pretrained,
+            evidence_scales=tuple(_cfg_get(cfg, "evidence_scales", _ALL_SCALES)),
+            projection_dim=int(_cfg_get(cfg, "projection_dim", 128)),
+            reference_count=float(_cfg_get(cfg, "reference_count", 4096.0)),
+            atom_mode=str(_cfg_get(cfg, "atom_mode", "cumulative")),
+            hybrid_cumulative_init=float(
+                _cfg_get(cfg, "hybrid_cumulative_init", 0.9)
+            ),
+            atom_rate_init=float(_cfg_get(cfg, "atom_rate_init", 1e-6)),
+            prior_rate_init=float(_cfg_get(cfg, "prior_rate_init", 1e-4)),
+            boundary_scale_init=float(
+                _cfg_get(cfg, "boundary_scale_init", 1.0)
+            ),
+            total_rate_cap=float(_cfg_get(cfg, "total_rate_cap", 64.0)),
+            prior_rate_cap=float(_cfg_get(cfg, "prior_rate_cap", 1.0)),
+            boundary_scale_cap=float(
+                _cfg_get(cfg, "boundary_scale_cap", 2.0)
+            ),
+            rate_roundoff_margin=float(
+                _cfg_get(cfg, "rate_roundoff_margin", 1.0)
+            ),
+            evidence_dropout=float(_cfg_get(cfg, "evidence_dropout", 0.0)),
+            mask_valid_fraction=float(_cfg_get(cfg, "mask_valid_fraction", 0.5)),
+            grad_checkpoint=bool(_cfg_get(cfg, "grad_checkpoint", False)),
+            encoder=encoder,
+        )
     if variant in {"ledger_sequential_hazard", "pooled_conditional"}:
         if encoder is not None:
             raise ValueError("encoder injection is supported only by the new local heads")

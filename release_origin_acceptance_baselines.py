@@ -75,6 +75,86 @@ def _decision(output: object, rule: str, n_classes: int) -> torch.Tensor:
     return value.long().clamp(0, n_classes - 1)
 
 
+def multiclass_brier_score(
+    class_probs: torch.Tensor, labels: torch.Tensor
+) -> float:
+    """Mean unnormalized multiclass Brier score, sum over all classes."""
+
+    if class_probs.ndim != 2 or labels.shape != class_probs.shape[:1]:
+        raise ValueError("Brier inputs must have shapes (N,K) and (N,)")
+    target = torch.nn.functional.one_hot(
+        labels.long(), num_classes=class_probs.shape[1]
+    ).to(class_probs.dtype)
+    return float((class_probs - target).square().sum(dim=1).mean())
+
+
+def threshold_reliability(
+    cumulative_probs: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    bins: int = 15,
+) -> dict[str, Any]:
+    """Fixed-bin calibration for every ordinal event ``Y > k``."""
+
+    if cumulative_probs.ndim != 2 or labels.shape != cumulative_probs.shape[:1]:
+        raise ValueError("threshold calibration inputs have incompatible shapes")
+    if bins < 2:
+        raise ValueError("threshold calibration requires at least two bins")
+    n, boundaries = cumulative_probs.shape
+    if n < 1:
+        raise ValueError("threshold calibration requires at least one sample")
+    table: list[dict[str, Any]] = []
+    eces: list[float] = []
+    edges = torch.linspace(0.0, 1.0, bins + 1, dtype=torch.float64)
+    for boundary in range(boundaries):
+        predicted = cumulative_probs[:, boundary].double().clamp(0.0, 1.0)
+        observed = (labels.long() > boundary).double()
+        assignments = torch.clamp((predicted * bins).long(), max=bins - 1)
+        reliability_bins: list[dict[str, Any]] = []
+        ece = 0.0
+        for index in range(bins):
+            selected = assignments == index
+            count = int(selected.sum())
+            if count:
+                mean_predicted = float(predicted[selected].mean())
+                empirical = float(observed[selected].mean())
+                gap = abs(mean_predicted - empirical)
+                ece += count / n * gap
+            else:
+                mean_predicted = None
+                empirical = None
+                gap = None
+            reliability_bins.append(
+                {
+                    "bin": index,
+                    "lower": float(edges[index]),
+                    "upper": float(edges[index + 1]),
+                    "right_edge_inclusive": index == bins - 1,
+                    "count": count,
+                    "mean_predicted": mean_predicted,
+                    "empirical_frequency": empirical,
+                    "absolute_gap": gap,
+                }
+            )
+        eces.append(ece)
+        table.append(
+            {
+                "boundary": boundary,
+                "event": f"Y>{boundary}",
+                "ece": ece,
+                "bins": reliability_bins,
+            }
+        )
+    return {
+        "bin_count": bins,
+        "binning": "equal_width_[0,1]",
+        "aggregation": "unweighted_mean_across_ordinal_boundaries",
+        "threshold_ece": float(sum(eces) / len(eces)),
+        "threshold_ece_by_boundary": eces,
+        "boundaries": table,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--experiment_root", required=True)
@@ -207,19 +287,38 @@ def main() -> None:
             "rps": float(ranked_probability_score(cumulative, labels)),
             "expected_grade_mae": float((expected - labels).abs().mean()),
             "mean_expected_grade": float(expected.mean()),
+            "multiclass_brier": multiclass_brier_score(probs, labels),
             "n": int(len(labels)),
         }
     )
+    reliability = threshold_reliability(cumulative, labels, bins=15)
+    metrics["threshold_ece"] = reliability["threshold_ece"]
+    metrics["threshold_ece_by_boundary"] = reliability[
+        "threshold_ece_by_boundary"
+    ]
 
     output_dir.mkdir(parents=True, exist_ok=True)
     prediction_path = output_dir / "outer_predictions.npz"
     ordered_paths = np.asarray(
         [str(test_items[int(index)][0]) for index in indices.tolist()], dtype=str
     )
+    patient_ids = np.asarray(
+        [
+            Path(path).stem.rsplit("_", 1)[0] if task.dataset == "dr" else ""
+            for path in ordered_paths.tolist()
+        ],
+        dtype=str,
+    )
+    cluster_ids = np.asarray(
+        [patient if patient else path for patient, path in zip(patient_ids, ordered_paths)],
+        dtype=str,
+    )
     np.savez_compressed(
         prediction_path,
         sample_index=indices.numpy(),
         image_path=ordered_paths,
+        patient_id=patient_ids,
+        cluster_id=cluster_ids,
         label=labels.numpy(),
         prediction=predicted.numpy(),
         expected_grade=expected.numpy(),
@@ -237,6 +336,11 @@ def main() -> None:
         "best_epoch": int(checkpoint["epoch"]),
         "decision_rule": cfg.decision_rule,
         "metrics": metrics,
+        "posterior_quality": {
+            "multiclass_brier_definition": "mean_sum_k_(p_k-onehot_k)^2",
+            "threshold_reliability": reliability,
+            "exact_per_sample_probabilities": "outer_predictions.npz:class_probs",
+        },
         "test_evaluated": True,
         "selection_reopened": False,
         "predictions_sha256": file_sha256(prediction_path),

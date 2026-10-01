@@ -15,12 +15,15 @@ BASELINE_ORDER = (
     "pooled_conditional",
     "ordinal_additive_mil",
     "sparse_bagnet",
+    "origin_ctmc",
 )
 DATASET_FOLDS = {"aptos": tuple(range(5)), "dr": tuple(range(10))}
 REPLICATION_SEEDS = (42, 31415, 27182)
 SPLIT_SEED = 42
 SPARSE_L1_WEIGHT = 1e-4
 SPARSE_L1_DELAY_EPOCHS = 0
+PAIRED_BOOTSTRAP_SAMPLES = 10_000
+PAIRED_BOOTSTRAP_SEED = 20_261_001
 
 BASELINE_SPECS: Mapping[str, Mapping[str, Any]] = {
     "ledger_sequential_hazard": {
@@ -38,6 +41,10 @@ BASELINE_SPECS: Mapping[str, Mapping[str, Any]] = {
     "sparse_bagnet": {
         "description": "nonnegative multiclass local evidence with masked mean and activation L1",
         "sparse_l1_weight": SPARSE_L1_WEIGHT,
+    },
+    "origin_ctmc": {
+        "description": "standard ORIGIN-v3 conserved local ledger and FP64 pure-birth CTMC decoder",
+        "sparse_l1_weight": 0.0,
     },
 }
 
@@ -113,10 +120,16 @@ def protocol_payload() -> dict[str, Any]:
         "dataset_folds": {key: list(value) for key, value in DATASET_FOLDS.items()},
         "replication_seeds": list(REPLICATION_SEEDS),
         "split_seed": SPLIT_SEED,
+        "paired_cluster_bootstrap_samples": PAIRED_BOOTSTRAP_SAMPLES,
+        "paired_cluster_bootstrap_seed": PAIRED_BOOTSTRAP_SEED,
+        "paired_cluster_bootstrap_unit": "EyePACS_patient_stem_APTOS_image",
         "canary_tasks": [asdict(task) for task in canary_tasks()],
         "full_task_count": len(full_tasks()),
         "selection_scope": "inner_validation_only",
         "outer_release": "one_post_freeze_suite_level_pass",
+        "historical_origin_oof_role": (
+            "external_sanity_reference_only_not_a_paired_arm_or_selection_input"
+        ),
     }
 
 
@@ -179,6 +192,8 @@ __all__ = [
     "DATASET_FOLDS",
     "PROTOCOL_ID",
     "PROTOCOL_SHA256",
+    "PAIRED_BOOTSTRAP_SAMPLES",
+    "PAIRED_BOOTSTRAP_SEED",
     "REPLICATION_SEEDS",
     "SPLIT_SEED",
     "SPARSE_L1_DELAY_EPOCHS",

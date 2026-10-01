@@ -9,7 +9,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
 #SBATCH --time=1-00:00:00
-#SBATCH --array=0-179%12
+#SBATCH --array=0-224%12
 #SBATCH --output=/dpc/kuin0170/ESPACOL-New/origin_acceptance_logs/release_%A_%a.out
 #SBATCH --error=/dpc/kuin0170/ESPACOL-New/origin_acceptance_logs/release_%A_%a.err
 #SBATCH --account=kuin0170

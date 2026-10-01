@@ -19,4 +19,5 @@ set -u
 cd "${ORIGIN_REPO_ROOT:?ORIGIN_REPO_ROOT is required}"
 [[ "$(git rev-parse HEAD)" == "${ORIGIN_LAUNCH_COMMIT:?ORIGIN_LAUNCH_COMMIT is required}" ]] || exit 2
 python scripts/aggregate_origin_acceptance_release.py \
-  --experiment_root "${ORIGIN_ACCEPTANCE_ROOT:?ORIGIN_ACCEPTANCE_ROOT is required}"
+  --experiment_root "${ORIGIN_ACCEPTANCE_ROOT:?ORIGIN_ACCEPTANCE_ROOT is required}" \
+  --bootstrap_samples 10000 --bootstrap_seed 20261001

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Four-way APTOS fold-0 canary. This is the only training stage allowed before
+# Five-way APTOS fold-0 canary. This is the only training stage allowed before
 # its audit writes CANARY_PASSED.json.
 #SBATCH --job-name=oa_canary
 #SBATCH --partition=gpu
@@ -9,7 +9,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
 #SBATCH --time=2-00:00:00
-#SBATCH --array=0-3%4
+#SBATCH --array=0-4%5
 #SBATCH --output=/dpc/kuin0170/ESPACOL-New/origin_acceptance_logs/canary_%A_%a.out
 #SBATCH --error=/dpc/kuin0170/ESPACOL-New/origin_acceptance_logs/canary_%A_%a.err
 #SBATCH --account=kuin0170

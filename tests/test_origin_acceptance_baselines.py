@@ -15,6 +15,8 @@ from configs.origin_acceptance_baseline_config import (
     OriginAcceptanceBaselineConfig,
 )
 from losses.origin_acceptance_baselines import OriginAcceptanceBaselineLoss
+from losses.origin import OriginLoss
+from models.origin import OriginModel
 from models.origin_acceptance_baselines import (
     FixedCountLocalEvidenceModel,
     build_origin_acceptance_baseline,
@@ -30,6 +32,13 @@ from scripts.origin_acceptance_baseline_common import (
     canary_tasks,
     full_tasks,
     task_at,
+)
+from scripts.aggregate_origin_acceptance_release import (
+    paired_fold_seed_cluster_bootstrap,
+)
+from release_origin_acceptance_baselines import (
+    multiclass_brier_score,
+    threshold_reliability,
 )
 from training.origin_acceptance_baseline_trainer import (
     OriginAcceptanceBaselineTrainer,
@@ -256,6 +265,48 @@ def test_builder_delegates_the_two_existing_controls(monkeypatch) -> None:
     ]
 
 
+def test_origin_ctmc_is_the_unmodified_v3_architecture_and_loss(tmp_path: Path) -> None:
+    cfg = OriginAcceptanceBaselineConfig(
+        baseline_variant="origin_ctmc",
+        ablation_variant="origin_ctmc",
+        pretrained=False,
+        projection_dim=4,
+        reference_count=32.0,
+        atom_rate_init=1e-4,
+        prior_rate_init=2e-4,
+        n_folds=2,
+        img_size=32,
+        batch_size=2,
+        num_workers=0,
+        amp=False,
+    )
+    model = build_origin_acceptance_baseline(
+        cfg, pretrained=False, encoder=_TinyPyramid()
+    )
+    assert isinstance(model, OriginModel)
+    assert all(not name.startswith("origin.") for name in model.state_dict())
+    metadata = model.architecture_metadata()
+    assert metadata["ablation_variant"] == "origin_ctmc"
+    assert metadata["posterior_path"].endswith("pure_birth_matrix_exponential")
+    output = model(torch.randn(2, 3, 32, 32))
+    _assert_posterior(output)
+
+    loader = DataLoader(_ToyDataset(), batch_size=2, shuffle=False)
+    trainer = OriginAcceptanceBaselineTrainer(
+        model,
+        loader,
+        loader,
+        None,
+        cfg,
+        tmp_path,
+        fold=0,
+        split_signature="origin-paired-split",
+        device="cpu",
+    )
+    assert type(trainer.criterion) is OriginLoss
+    assert trainer._pooled_control is False
+
+
 def test_config_rejects_unmatched_or_unfair_controls() -> None:
     with pytest.raises(ValueError, match="must match"):
         OriginAcceptanceBaselineConfig(
@@ -285,10 +336,79 @@ def test_config_rejects_unmatched_or_unfair_controls() -> None:
 def test_protocol_task_map_is_stable_and_canary_first() -> None:
     assert tuple(task.baseline_variant for task in canary_tasks()) == BASELINE_ORDER
     assert all(task.dataset == "aptos" and task.fold == 0 for task in canary_tasks())
-    assert len(full_tasks()) == 180
+    assert len(full_tasks()) == 225
     assert task_at("full", 0).key == "aptos__fold0__ledger_sequential_hazard__seed42"
-    assert task_at("full", 179).key == "dr__fold9__sparse_bagnet__seed27182"
+    assert task_at("full", 224).key == "dr__fold9__origin_ctmc__seed27182"
     assert len(PROTOCOL_SHA256) == 64
+
+
+def test_release_reports_brier_and_threshold_reliability() -> None:
+    probs = torch.tensor(
+        [[0.7, 0.2, 0.1], [0.1, 0.2, 0.7]], dtype=torch.float64
+    )
+    labels = torch.tensor([0, 2])
+    expected_brier = ((probs - torch.eye(3, dtype=torch.float64)[labels]) ** 2).sum(1).mean()
+    assert multiclass_brier_score(probs, labels) == pytest.approx(float(expected_brier))
+    cumulative = probs[:, 1:].flip(1).cumsum(1).flip(1)
+    reliability = threshold_reliability(cumulative, labels, bins=15)
+    assert reliability["bin_count"] == 15
+    assert len(reliability["boundaries"]) == 2
+    assert reliability["threshold_ece"] == pytest.approx(
+        sum(reliability["threshold_ece_by_boundary"]) / 2
+    )
+    for boundary in reliability["boundaries"]:
+        assert sum(item["count"] for item in boundary["bins"]) == 2
+
+
+def _bootstrap_record() -> dict[str, object]:
+    labels = torch.arange(5)
+    probs = torch.full((5, 5), 0.05, dtype=torch.float64)
+    probs[torch.arange(5), labels] = 0.8
+    cumulative = probs[:, 1:].flip(1).cumsum(1).flip(1)
+    return {
+        "image_path": torch.arange(5).numpy().astype(str),
+        "patient_id": torch.arange(5).numpy().astype(str),
+        "cluster_id": torch.arange(5).numpy().astype(str),
+        "label": labels.numpy(),
+        "prediction": labels.numpy(),
+        "expected_grade": (probs * torch.arange(5)).sum(1).numpy(),
+        "class_probs": probs.numpy(),
+        "cumulative_probs": cumulative.numpy(),
+    }
+
+
+def test_paired_fold_seed_cluster_bootstrap_preserves_pairing() -> None:
+    records = {}
+    for fold in range(5):
+        for seed in (42, 31415, 27182):
+            for variant in ("origin_ctmc", "pooled_conditional"):
+                records[("aptos", fold, variant, seed)] = _bootstrap_record()
+    result = paired_fold_seed_cluster_bootstrap(
+        records,
+        dataset="aptos",
+        comparator="pooled_conditional",
+        samples=32,
+        seed=91,
+        chunk_size=8,
+    )
+    assert result["delta_orientation"] == "origin_ctmc_minus_comparator"
+    assert result["cluster_unit"] == "image"
+    for metric in result["comparisons"].values():
+        assert metric["origin_minus_comparator"] == pytest.approx(0.0)
+        assert metric["ci95_percentile"] == pytest.approx([0.0, 0.0])
+
+    bad = dict(records)
+    corrupted = dict(_bootstrap_record())
+    corrupted["image_path"] = corrupted["image_path"][::-1].copy()
+    bad[("aptos", 0, "pooled_conditional", 42)] = corrupted
+    with pytest.raises(AssertionError, match="unpaired image_path"):
+        paired_fold_seed_cluster_bootstrap(
+            bad,
+            dataset="aptos",
+            comparator="pooled_conditional",
+            samples=2,
+            seed=91,
+        )
 
 
 class _ToyDataset(Dataset):
@@ -379,6 +499,20 @@ def test_slurm_pipeline_is_fail_closed_and_test_locked() -> None:
     assert "TRAINING_FROZEN" in (
         root / "release_origin_acceptance_baselines.py"
     ).read_text()
-    assert "--array=0-179" in release_text
+    canary_text = (
+        root / "scripts/submit_origin_acceptance_aptos_f0_canary.sh"
+    ).read_text()
+    assert "--array=0-4" in canary_text
+    assert "--array=0-224" in train_text
+    assert "--array=0-224" in release_text
     assert "afterok:${CANARY_AUDIT_JOB}" in launch_text
     assert "afterok:${FULL_AUDIT_JOB}" in launch_text
+    assert 'EXPECTED_BRANCH="origin-acceptance-revision"' in launch_text
+    assert 'SOURCE_REPO="$(git rev-parse --show-toplevel)"' in launch_text
+    assert "git worktree add --detach" in launch_text
+    assert 'CONDA_ENV="${ORIGIN_CONDA_ENV:-G}"' in launch_text
+    assert "ORIGIN_REPO_ROOT=${SNAPSHOT_ROOT}" in launch_text
+    assert "${SOURCE_REPO}/Datasets/DR" in launch_text
+    assert "cd \"${SNAPSHOT_ROOT}\"" in launch_text
+    assert "python -m pytest -q tests/test_origin_acceptance_baselines.py" in launch_text
+    assert '"${SNAPSHOT_ROOT}/scripts/submit_origin_acceptance_aptos_f0_canary.sh"' in launch_text
