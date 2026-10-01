@@ -22,11 +22,12 @@ PROTOCOL="${ORIGIN_IDRID_STATISTICS_PROTOCOL:-$REPO_ROOT/scripts/protocols/origi
 
 cd "$REPO_ROOT"
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-set +u
-source /etc/profile.d/lmod.sh || exit 1
-module load miniconda/3 || exit 1
-source activate "${ORIGIN_CONDA_ENV:-G}" || exit 1
-set -u
+ENV_NAME="${ORIGIN_CONDA_ENV:-G}"
+ENV_PYTHON="${ORIGIN_PYTHON:-${HOME}/.conda/envs/${ENV_NAME}/bin/python}"
+[[ -x "$ENV_PYTHON" ]] || {
+  echo "Missing cluster Python environment: $ENV_PYTHON" >&2; exit 6;
+}
+export PATH="$(dirname "$ENV_PYTHON"):$PATH"
 
 if [[ -n "${ORIGIN_LAUNCH_COMMIT:-}" && "$(git rev-parse HEAD)" != "${ORIGIN_LAUNCH_COMMIT}" ]]; then
   echo "Immutable launch commit mismatch." >&2
