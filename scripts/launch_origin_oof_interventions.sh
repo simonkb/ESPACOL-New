@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-EXPECTED_BRANCH="origin-acceptance-revision"
+EXPECTED_BRANCH="origin-oof-runtime"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 LAUNCH_COMMIT="$(git rev-parse HEAD)"
