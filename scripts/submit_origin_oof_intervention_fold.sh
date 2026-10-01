@@ -65,6 +65,6 @@ python scripts/audit_origin_oof_interventions.py \
   --dataset "${DATASET}" --fold "${FOLD}" \
   --cv-root "${CV_ROOT}" --data-root "${DATA_ROOT}" \
   --cv-protocol "${CV_PROTOCOL}" --audit-protocol "${AUDIT_PROTOCOL}" \
-  --output-dir "${OUTPUT_DIR}" --batch-size 2 --num-workers 8 --device cuda
+  --output-dir "${OUTPUT_DIR}" --batch-size 8 --num-workers 8 --device cuda
 
 echo "Fold audit manifest: ${OUTPUT_DIR}/audit_manifest.json"
