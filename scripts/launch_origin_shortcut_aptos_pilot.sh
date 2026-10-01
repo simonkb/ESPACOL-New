@@ -45,8 +45,14 @@ else
   git worktree add --detach "${SNAPSHOT_ROOT}" "${LAUNCH_COMMIT}"
 fi
 
-python -m pytest -q "${SNAPSHOT_ROOT}/tests/test_origin_shortcut_benchmark.py"
-ORIGIN_PREFLIGHT_DATA="${DATA_ROOT}" python - <<'PY'
+# Every preflight import must resolve from the detached launch snapshot rather
+# than the mutable primary checkout.  This subshell also makes pytest's root
+# discovery unambiguous.
+(
+  cd "${SNAPSHOT_ROOT}"
+  export PYTHONPATH="${SNAPSHOT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+  python -m pytest -q tests/test_origin_shortcut_benchmark.py
+  ORIGIN_PREFLIGHT_DATA="${DATA_ROOT}" python - <<'PY'
 import os
 from Datasets.origin_data import load_aptos_items
 items = load_aptos_items(os.environ["ORIGIN_PREFLIGHT_DATA"])
@@ -54,6 +60,7 @@ if len(items) != 3662:
     raise RuntimeError(f"APTOS identity changed: {len(items)} images")
 print("APTOS preflight", len(items))
 PY
+)
 
 mkdir -p "${PILOT_ROOT}/workers" "${PILOT_ROOT}/locks" \
   "${REPO_ROOT}/origin_shortcut_logs"
@@ -63,9 +70,12 @@ ORIGIN_PROTOCOL_ROOT="${PILOT_ROOT}" \
 ORIGIN_PROTOCOL_DATA="${DATA_ROOT}" \
 ORIGIN_PROTOCOL_REPO="${SNAPSHOT_ROOT}" \
 ORIGIN_PROTOCOL_COMMIT="${LAUNCH_COMMIT}" python - <<'PY'
-import hashlib, json, os
+import hashlib, json, os, sys
 from datetime import datetime, timezone
 from pathlib import Path
+snapshot = Path(os.environ["ORIGIN_PROTOCOL_REPO"]).resolve()
+sys.path.insert(0, str(snapshot))
+from benchmarks.shortcut_metrics import GateBThresholds
 p = {
     "schema": "origin-ordinal-shortcut-pilot-protocol-v1",
     "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -90,6 +100,7 @@ p = {
     "factorial_marker_states": 16,
     "localization_permutations": 999,
     "effect_bootstrap_replicates": 2000,
+    "gate_b_thresholds": GateBThresholds().as_dict(),
 }
 p["content_checksum_sha256"] = hashlib.sha256(
     json.dumps(p, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()

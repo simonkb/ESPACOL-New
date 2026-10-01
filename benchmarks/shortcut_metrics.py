@@ -535,14 +535,70 @@ def rasterize_native_ledger(
     height, width = (int(value) for value in output_size)
     if height < 1 or width < 1:
         raise ValueError("output_size must be positive")
+
+    def overlap_transport(
+        source_size: int,
+        target_size: int,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Fraction of each source-cell mass assigned to every target cell.
+
+        Source and target lattices partition the same unit interval.  Entry
+        ``(o, i)`` is the exact fractional overlap of source cell ``i`` with
+        target cell ``o``.  Consequently every source column sums to one and
+        transport conserves ledger mass for arbitrary, including odd and
+        non-divisible, lattice sizes.
+        """
+
+        # Work in FP64 when constructing geometric boundaries.  Casting only
+        # after column normalization prevents cumulative coordinate roundoff
+        # from creating scale-dependent mass drift in FP32 evidence maps.
+        work_dtype = torch.float64
+        source_left = torch.arange(
+            source_size, dtype=work_dtype, device=device
+        )[None, :]
+        source_right = source_left + 1.0
+        target_left = (
+            torch.arange(target_size, dtype=work_dtype, device=device)[:, None]
+            * (float(source_size) / float(target_size))
+        )
+        target_right = target_left + float(source_size) / float(target_size)
+        overlap = (
+            torch.minimum(target_right, source_right)
+            - torch.maximum(target_left, source_left)
+        ).clamp_min(0.0)
+        overlap = overlap / overlap.sum(dim=0, keepdim=True).clamp_min(
+            torch.finfo(work_dtype).tiny
+        )
+        return overlap.to(dtype=dtype)
+
     combined: torch.Tensor | None = None
     for name in sorted(local_rate_maps):
         rates = torch.as_tensor(local_rate_maps[name])
         if rates.ndim != 4:
             raise ValueError(f"ledger {name!r} must have shape (N,B,H,W)")
+        if not rates.is_floating_point():
+            raise TypeError(f"ledger {name!r} must be floating point")
         source_height, source_width = rates.shape[-2:]
-        resized = F.interpolate(rates, size=(height, width), mode="nearest")
-        resized = resized * (source_height * source_width) / float(height * width)
+        row_transport = overlap_transport(
+            source_height,
+            height,
+            dtype=rates.dtype,
+            device=rates.device,
+        )
+        column_transport = overlap_transport(
+            source_width,
+            width,
+            dtype=rates.dtype,
+            device=rates.device,
+        )
+        # Each operation distributes source-cell mass along one dimension;
+        # unlike interpolation, no cell is sampled away and no density/mass
+        # conversion factor is implicit.
+        resized = torch.matmul(row_transport, rates)
+        resized = torch.matmul(resized, column_transport.transpose(0, 1))
         combined = resized if combined is None else combined + resized
     assert combined is not None
     return combined

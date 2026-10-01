@@ -68,6 +68,7 @@ ORIGIN_CHECK_DATA="${DATA_ROOT}" \
 ORIGIN_CHECK_COMMIT="${LAUNCH_COMMIT}" python - <<'PY'
 import hashlib, json, os
 from pathlib import Path
+from benchmarks.shortcut_metrics import GateBThresholds
 p = json.loads(Path(os.environ["ORIGIN_CHECK_PROTOCOL"]).read_text())
 recorded = p.pop("content_checksum_sha256")
 observed = hashlib.sha256(json.dumps(p, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
@@ -83,6 +84,7 @@ expected = {
     "training_seeds": [1701, 2603, 3907],
     "families": ["localized", "border", "diffuse"],
     "arms": ["shortcut", "cue_only", "clean"],
+    "gate_b_thresholds": GateBThresholds().as_dict(),
 }
 for key, value in expected.items():
     if p.get(key) != value:

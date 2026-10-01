@@ -8,6 +8,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from benchmarks.ordinal_shortcut import (
@@ -28,6 +30,13 @@ from benchmarks.shortcut_metrics import (
     rasterize_native_ledger,
     spearman_correlation,
 )
+from models.origin import OriginModel
+from models.origin_encoder import (
+    OriginEncoderOutput,
+    OriginEncoderScale,
+    OriginScaleMetadata,
+)
+from scripts.audit_origin_shortcut import _main_audit, _transform_parameter_hash
 
 
 class _CleanDataset(Dataset):
@@ -53,6 +62,52 @@ class _CleanDataset(Dataset):
         jitter = random.random() if self.stochastic else 0.0
         image = torch.full((3, self.size, self.size), index / 1000.0 + jitter)
         return image, valid, torch.tensor(self.labels[index]), index
+
+
+class _TinyPyramid(nn.Module):
+    """Small four-scale encoder for a full render/model/audit smoke test."""
+
+    STAGE_CHANNELS = {"s4": 4, "s8": 5, "s16": 6, "s32": 7}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.projections = nn.ModuleDict(
+            {
+                name: nn.Conv2d(3, channels, kernel_size=1)
+                for name, channels in self.STAGE_CHANNELS.items()
+            }
+        )
+
+    def forward(self, images: torch.Tensor, pixel_valid_mask=None) -> OriginEncoderOutput:
+        if pixel_valid_mask is None:
+            pixel_valid_mask = torch.ones(
+                images.shape[0], *images.shape[-2:], dtype=torch.bool,
+                device=images.device,
+            )
+        if pixel_valid_mask.ndim == 4:
+            pixel_valid_mask = pixel_valid_mask[:, 0]
+        sizes = {"s4": (8, 8), "s8": (4, 4), "s16": (2, 2), "s32": (1, 1)}
+        scales = {}
+        for index, name in enumerate(("s4", "s8", "s16", "s32")):
+            size = sizes[name]
+            features = self.projections[name](F.adaptive_avg_pool2d(images, size))
+            valid = F.adaptive_avg_pool2d(
+                pixel_valid_mask[:, None].float(), size
+            )[:, 0] >= 0.5
+            metadata = OriginScaleMetadata(
+                name=name,
+                feature_index=index,
+                channels=self.STAGE_CHANNELS[name],
+                output_stride=4 * 2**index,
+                receptive_field=7 + 8 * index,
+                center_offset=float(2 * 2**index),
+                input_size=tuple(images.shape[-2:]),
+                lattice_size=size,
+            )
+            scales[name] = OriginEncoderScale(
+                features.masked_fill(~valid[:, None], 0.0), valid, metadata
+            )
+        return OriginEncoderOutput(scales)
 
 
 def test_render_is_deterministic_and_does_not_advance_global_rngs() -> None:
@@ -217,6 +272,57 @@ def test_loader_preserves_four_field_training_contract() -> None:
     assert batch[2].dtype == torch.long
 
 
+def test_render_model_factorial_and_intervention_audit_smoke() -> None:
+    """Exercise the complete in-process benchmark path on a tiny model."""
+
+    torch.manual_seed(29)
+    protocol = OrdinalShortcutProtocol(seed=101, marker_radius_fraction=0.06)
+    dataset = OrdinalShortcutDataset(
+        _CleanDataset(count=3, size=48),
+        family="localized",
+        condition="aligned",
+        position_domain="unseen",
+        appearance_domain="unseen",
+        protocol=protocol,
+    )
+    model = OriginModel(
+        encoder=_TinyPyramid(),
+        pretrained=False,
+        projection_dim=8,
+        reference_count=64.0,
+        atom_rate_init=1e-4,
+        prior_rate_init=1e-4,
+    ).eval()
+    transform_hash = _transform_parameter_hash(
+        protocol=protocol,
+        image_size=48,
+        family="localized",
+        condition="aligned",
+        position_domain="unseen",
+        appearance_domain="unseen",
+    )
+    result = _main_audit(
+        model,
+        dataset,
+        [0, 1, 2],
+        device=torch.device("cpu"),
+        batch_size=2,
+        audit_grid=13,
+        audit_seed=17,
+        permutations=7,
+        bootstrap_replicates=7,
+        fold=0,
+        factorial_transform_sha256=transform_hash,
+        main_transform_sha256=transform_hash,
+        decision_rule="class_map",
+    )
+    assert result["factorial_states_per_sample"] == 16
+    assert len(result["factorial_prediction_records"]) == 3 * 16
+    assert len(result["internal_effect_records"]) == 3 * 4
+    assert np.asarray(result["boundary_response_matrix"]).shape == (4, 4)
+    assert result["localization_permutation"]["permutations"] == 7
+
+
 def _perfect_localization_fixture(samples: int = 12):
     masks = np.zeros((samples, 4, 12, 12), dtype=bool)
     for sample in range(samples):
@@ -269,6 +375,44 @@ def test_rasterization_preserves_ledger_mass_for_divisible_lattices() -> None:
     }
     raster = rasterize_native_ledger(maps, output_size=(8, 8))
     torch.testing.assert_close(raster.sum(dim=(-2, -1)), sum(value.sum(dim=(-2, -1)) for value in maps.values()))
+
+
+@pytest.mark.parametrize("source_size", [20, 40, 80, 160])
+def test_rasterization_cannot_drop_a_native_unit_witness(source_size: int) -> None:
+    maps = torch.zeros(1, 4, source_size, source_size, dtype=torch.float64)
+    # Deliberately choose a coordinate that nearest-neighbour downsampling from
+    # 160 to 64 used to skip completely.
+    maps[0, 0, 1, 1] = 1.0
+    maps[0, 1, source_size // 2, source_size - 2] = 2.0
+    raster = rasterize_native_ledger({"scale": maps}, output_size=(64, 64))
+    torch.testing.assert_close(
+        raster.sum(dim=(-2, -1)),
+        maps.sum(dim=(-2, -1)),
+        atol=1e-12,
+        rtol=1e-12,
+    )
+    assert float(raster[0, 0].sum()) == pytest.approx(1.0, abs=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("source_shape", "target_shape"),
+    [((3, 5), (7, 11)), ((7, 11), (3, 5)), ((13, 17), (19, 23))],
+)
+def test_rasterization_conserves_random_odd_lattices(
+    source_shape: tuple[int, int], target_shape: tuple[int, int]
+) -> None:
+    generator = torch.Generator().manual_seed(713)
+    values = torch.rand(
+        2, 4, *source_shape, generator=generator, dtype=torch.float64
+    )
+    raster = rasterize_native_ledger({"odd": values}, output_size=target_shape)
+    assert raster.shape == (2, 4, *target_shape)
+    torch.testing.assert_close(
+        raster.sum(dim=(-2, -1)),
+        values.sum(dim=(-2, -1)),
+        atol=2e-12,
+        rtol=2e-12,
+    )
 
 
 def _passing_seed_report(clean: bool = False):
