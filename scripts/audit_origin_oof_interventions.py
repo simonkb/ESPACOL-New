@@ -425,7 +425,7 @@ def audit_fold(
                     eligible_boundaries = {
                         boundary
                         for boundary in range(cfg.n_classes - 1)
-                        if label > boundary and predicted_grade > boundary
+                        if label > boundary or predicted_grade > boundary
                     }
                     result = audit_image_ledger(
                         rate_maps={name: value[row_index] for name, value in local_maps.items()},
@@ -485,7 +485,7 @@ def audit_fold(
             "n_image_boundaries": len(outer_items) * (cfg.n_classes - 1),
             "n_curve_eligible_image_boundaries": eligible_boundary_count,
             "curve_eligibility_rule": (
-                "true_grade > boundary and class_map_prediction > boundary; "
+                "true_grade > boundary or class_map_prediction > boundary; "
                 "fixed before interventions and independent of intervention outcomes"
             ),
             "decision_rule": "class_map",

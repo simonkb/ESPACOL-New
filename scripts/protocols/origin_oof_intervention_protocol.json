@@ -3,7 +3,7 @@
   "protocol_version": 1,
   "scope": "every_locked_outer_fold_image_after_checkpoint_selection",
   "baseline_census": "every_image_at_every_boundary",
-  "curve_eligibility": "true_grade_gt_boundary_and_class_map_gt_boundary",
+  "curve_eligibility": "true_grade_gt_boundary_or_class_map_gt_boundary",
   "curve_exclusions_remain_in_baseline_census": true,
   "ranking": "descending_native_local_rate_at_target_boundary",
   "ranking_excludes_intervention_outcomes": true,
@@ -50,5 +50,5 @@
     "decode_chunk_size": 8192
   },
   "config_sha256": "c53144c753467ce34581c0b5e6cd78d2e5d6f7ccaae765319fcc34ac28c81895",
-  "content_checksum_sha256": "d0a3409f73352d1151c40172416f11ef0bd12f9551180c90c1f45dd3bdbfcbe8"
+  "content_checksum_sha256": "512bc2e25ccf2ef8bfe730ae175dd5d740047ac278ba2888758a06b48181e0c5"
 }
