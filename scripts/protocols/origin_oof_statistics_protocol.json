@@ -1,0 +1,36 @@
+{
+  "schema": "origin-oof-statistics-protocol-v1",
+  "protocol_version": 1,
+  "input_scope": "checksum_sealed_complete_oof_intervention_aggregates",
+  "bootstrap_unit": "patient_cluster_for_dr_image_for_aptos",
+  "bootstrap_pairing": "intervention_methods_paired_within_image_and_boundary",
+  "grading_metrics": [
+    "accuracy_percent",
+    "mae",
+    "qwk",
+    "balanced_accuracy_percent",
+    "macro_f1",
+    "expected_grade_mae",
+    "nll",
+    "rps",
+    "multiclass_brier"
+  ],
+  "proper_score_definitions": {
+    "nll": "negative_natural_log_target_probability",
+    "rps": "mean_squared_cumulative_error_over_K_minus_1_boundaries",
+    "multiclass_brier": "unnormalized_sum_of_K_squared_class_probability_errors"
+  },
+  "calibration": "equal_width_boundary_reliability_for_each_P_Y_gt_k",
+  "intervention_contrast": "ranked_native_minus_each_paired_control_AUC",
+  "intervention_scope": "exact_stored_ledger_replay_not_causal_pixel_intervention",
+  "multiplicity_policy": "descriptive_intervals_no_multiplicity_adjusted_hypothesis_tests",
+  "config": {
+    "bootstrap_samples": 10000,
+    "bootstrap_seed": 20261002,
+    "bootstrap_chunk_size": 128,
+    "confidence_level": 0.95,
+    "reliability_bins": 15,
+    "nll_probability_floor": 1e-15
+  },
+  "content_checksum_sha256": "427fbfa71496387a737a4b9a9a72abebcd70deb5d6c1ad3d7902f6a166d4f6d9"
+}

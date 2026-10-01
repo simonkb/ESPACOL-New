@@ -1,0 +1,237 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from scripts.analyze_origin_oof_statistics import (
+    STATISTICS_MANIFEST_SCHEMA,
+    GRADING_METRICS,
+    GradeRow,
+    StatisticsConfig,
+    analyze_oof_statistics,
+    cluster_bootstrap_grading,
+    grading_metrics,
+    load_statistics_protocol,
+    paired_intervention_bootstrap,
+    threshold_reliability,
+)
+from scripts.audit_origin_oof_interventions import AtomicJsonlGzipWriter
+from scripts.origin_oof_intervention_common import AGGREGATE_SCHEMA, METHODS, ROW_SCHEMA
+from scripts.origin_v3_cv_common import canonical_sha256, file_sha256, write_json_atomic
+
+
+def _config(*, samples: int = 200) -> StatisticsConfig:
+    return StatisticsConfig(
+        bootstrap_samples=samples,
+        bootstrap_seed=1234,
+        bootstrap_chunk_size=31,
+        confidence_level=0.95,
+        reliability_bins=5,
+        nll_probability_floor=1e-15,
+    )
+
+
+def test_proper_scores_are_zero_for_a_perfect_deterministic_posterior() -> None:
+    probabilities = np.eye(5, dtype=np.float64)
+    labels = np.arange(5, dtype=np.int64)
+    metrics = grading_metrics(probabilities, labels, labels)
+    assert metrics["accuracy_percent"] == 100.0
+    assert metrics["qwk"] == 1.0
+    assert metrics["nll"] == pytest.approx(0.0)
+    assert metrics["rps"] == pytest.approx(0.0)
+    assert metrics["multiclass_brier"] == pytest.approx(0.0)
+    assert metrics["expected_grade_mae"] == pytest.approx(0.0)
+
+
+def test_ranked_probability_score_matches_manual_boundary_definition() -> None:
+    probabilities = np.asarray([[0.1, 0.2, 0.3, 0.25, 0.15]])
+    label = np.asarray([2])
+    prediction = np.asarray([2])
+    tails = np.asarray([0.9, 0.7, 0.4, 0.15])
+    target = np.asarray([1.0, 1.0, 0.0, 0.0])
+    expected = float(np.mean((tails - target) ** 2))
+    assert grading_metrics(probabilities, label, prediction)["rps"] == pytest.approx(expected)
+
+
+def test_threshold_reliability_reports_every_boundary_and_bin() -> None:
+    probabilities = np.asarray(
+        [
+            [0.8, 0.1, 0.05, 0.03, 0.02],
+            [0.1, 0.2, 0.4, 0.2, 0.1],
+            [0.01, 0.02, 0.07, 0.2, 0.7],
+        ]
+    )
+    metrics, rows = threshold_reliability(
+        probabilities, np.asarray([0, 2, 4]), bins=5
+    )
+    assert len(metrics) == 4
+    assert len(rows) == 4 * 5
+    assert all(0.0 <= record["ece"] <= 1.0 for record in metrics)
+    assert all(sum(row["n"] for row in rows if row["boundary"] == k) == 3 for k in range(4))
+
+
+def test_grading_bootstrap_clusters_both_eyes_and_is_deterministic() -> None:
+    rows = [
+        GradeRow("dr", "left", "patient-a", 0, 0, (0.9, 0.1, 0.0, 0.0, 0.0)),
+        GradeRow("dr", "right", "patient-a", 2, 2, (0.0, 0.1, 0.8, 0.1, 0.0)),
+        GradeRow("dr", "single", "patient-b", 4, 3, (0.0, 0.0, 0.1, 0.6, 0.3)),
+    ]
+    first = cluster_bootstrap_grading(rows, config=_config(), seed_label="unit")
+    second = cluster_bootstrap_grading(rows, config=_config(), seed_label="unit")
+    assert first == second
+    assert first["n_images"] == 3
+    assert first["n_clusters"] == 2
+    assert set(GRADING_METRICS).issubset(first["metrics"])
+    assert "threshold_ece_y_gt_3" in first["metrics"]
+
+
+def _summary_rows(delta: float = 0.2) -> list[dict]:
+    result = []
+    for image, cluster in (("left", "patient-a"), ("right", "patient-a"), ("x", "patient-b")):
+        for method_index, method in enumerate(METHODS):
+            value = 0.8 if method == "ranked_native" else 0.8 - delta - 0.01 * method_index
+            result.append(
+                {
+                    "schema": ROW_SCHEMA,
+                    "row_type": "image_boundary_curve_summary",
+                    "dataset": "dr",
+                    "image_key": image,
+                    "cluster_id": cluster,
+                    "boundary": 1,
+                    "method": method,
+                    "auc_deletion_tail_normalized_by_cells": value,
+                    "auc_retention_tail_normalized_by_cells": value - 0.1,
+                }
+            )
+    return result
+
+
+def test_paired_intervention_cluster_bootstrap_recovers_constant_difference() -> None:
+    records = paired_intervention_bootstrap(
+        _summary_rows(), config=_config(), seed_label="paired"
+    )
+    target = next(
+        row for row in records
+        if row["comparator"] == METHODS[1]
+        and row["metric"] == "auc_deletion_tail_normalized_by_cells"
+    )
+    expected = 0.2 + 0.01
+    assert target["n_paired_image_boundaries"] == 3
+    assert target["n_clusters"] == 2
+    assert target["ranked_minus_comparator"] == pytest.approx(expected)
+    assert target["ci_percentile"] == pytest.approx([expected, expected])
+    assert target["bootstrap_fraction_ranked_better"] == 1.0
+
+
+def test_paired_intervention_requires_every_method() -> None:
+    rows = [row for row in _summary_rows() if row["method"] != METHODS[-1]]
+    with pytest.raises(AssertionError, match="fully paired"):
+        paired_intervention_bootstrap(rows, config=_config(), seed_label="missing")
+
+
+def test_statistics_protocol_is_checksum_sealed() -> None:
+    path = Path("scripts/protocols/origin_oof_statistics_protocol.json")
+    payload, config = load_statistics_protocol(path)
+    assert config.bootstrap_samples == 10_000
+    assert config.reliability_bins == 15
+    corrupt = json.loads(path.read_text())
+    corrupt["config"]["bootstrap_seed"] += 1
+    temporary = path.parent / ".corrupt_statistics_protocol.json"
+    try:
+        temporary.write_text(json.dumps(corrupt))
+        with pytest.raises(ValueError, match="checksum"):
+            load_statistics_protocol(temporary)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def test_checksum_sealed_aggregate_runs_end_to_end(tmp_path: Path) -> None:
+    image_path = tmp_path / "images.jsonl.gz"
+    summary_path = tmp_path / "summaries.jsonl.gz"
+    image_specs = (
+        ("a", "patient-a", 0, (0.9, 0.1, 0.0, 0.0, 0.0)),
+        ("b", "patient-b", 2, (0.0, 0.1, 0.8, 0.1, 0.0)),
+    )
+    with AtomicJsonlGzipWriter(image_path) as writer:
+        for image_key, cluster, label, probabilities in image_specs:
+            for boundary in range(4):
+                writer.write(
+                    {
+                        "schema": ROW_SCHEMA,
+                        "row_type": "image_boundary_census",
+                        "dataset": "dr",
+                        "image_key": image_key,
+                        "cluster_id": cluster,
+                        "true_grade": label,
+                        "predicted_grade": label,
+                        "boundary": boundary,
+                        "full_class_probabilities": list(probabilities),
+                    }
+                )
+    with AtomicJsonlGzipWriter(summary_path) as writer:
+        for image_key, cluster, _, _ in image_specs:
+            for method_index, method in enumerate(METHODS):
+                writer.write(
+                    {
+                        "schema": ROW_SCHEMA,
+                        "row_type": "image_boundary_curve_summary",
+                        "dataset": "dr",
+                        "image_key": image_key,
+                        "cluster_id": cluster,
+                        "boundary": 0,
+                        "method": method,
+                        "auc_deletion_tail_normalized_by_cells": 1.0 - 0.1 * method_index,
+                    }
+                )
+    aggregate = {
+        "schema": AGGREGATE_SCHEMA,
+        "dataset": "dr",
+        "n_images": 2,
+        "artifacts": {
+            "image_rows": {
+                "path": str(image_path.resolve()),
+                "sha256": file_sha256(image_path),
+                "rows": 8,
+            },
+            "summary_rows": {
+                "path": str(summary_path.resolve()),
+                "sha256": file_sha256(summary_path),
+                "rows": 2 * len(METHODS),
+            },
+        },
+    }
+    aggregate["content_checksum_sha256"] = canonical_sha256(aggregate)
+    aggregate_path = tmp_path / "audit_manifest.json"
+    write_json_atomic(aggregate_path, aggregate)
+
+    protocol = json.loads(
+        Path("scripts/protocols/origin_oof_statistics_protocol.json").read_text()
+    )
+    protocol["config"]["bootstrap_samples"] = 1000
+    protocol["config"]["bootstrap_chunk_size"] = 97
+    protocol.pop("content_checksum_sha256")
+    protocol["content_checksum_sha256"] = canonical_sha256(protocol)
+    protocol_path = tmp_path / "protocol.json"
+    write_json_atomic(protocol_path, protocol)
+
+    output = tmp_path / "output"
+    manifest = analyze_oof_statistics(
+        aggregate_manifests={"dr": aggregate_path},
+        protocol_path=protocol_path,
+        output_dir=output,
+    )
+    assert manifest["schema"] == STATISTICS_MANIFEST_SCHEMA
+    assert set(manifest["artifacts"]) == {
+        "proper_score_calibration",
+        "grading_bootstrap",
+        "intervention_bootstrap",
+    }
+    unsigned = dict(manifest)
+    assert unsigned.pop("content_checksum_sha256") == canonical_sha256(unsigned)
+    for artifact in manifest["artifacts"].values():
+        path = Path(artifact["path"])
+        assert path.is_file()
+        assert file_sha256(path) == artifact["sha256"]
