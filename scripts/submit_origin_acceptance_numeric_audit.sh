@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=org_num_audit
 #SBATCH --partition=gpu
+#SBATCH --account=kuin0170
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
@@ -12,8 +15,12 @@ set -euo pipefail
 
 REPO_ROOT="${ORIGIN_REPO_ROOT:-/dpc/kuin0170/ESPACOL-New}"
 cd "$REPO_ROOT"
-source /home/kunet.ae/100067950/.conda/etc/profile.d/conda.sh
-conda activate G
+set +u
+source /etc/profile.d/lmod.sh || exit 1
+module load miniconda/3 || exit 1
+module load cuda/12.6 || exit 1
+source activate "${ORIGIN_CONDA_ENV:-G}" || exit 1
+set -u
 
 printf '=== ORIGIN independent decoder numerical audit ===\n'
 date --iso-8601=seconds
