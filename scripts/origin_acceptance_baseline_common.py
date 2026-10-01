@@ -24,6 +24,7 @@ SPARSE_L1_WEIGHT = 1e-4
 SPARSE_L1_DELAY_EPOCHS = 0
 PAIRED_BOOTSTRAP_SAMPLES = 10_000
 PAIRED_BOOTSTRAP_SEED = 20_261_001
+RELEASE_IDENTIFIER_SCHEMA = "origin-dataset-scoped-sha256-v1"
 
 BASELINE_SPECS: Mapping[str, Mapping[str, Any]] = {
     "ledger_sequential_hazard": {
@@ -140,6 +141,12 @@ def protocol_payload() -> dict[str, Any]:
         "full_task_count": len(full_tasks()),
         "selection_scope": "inner_validation_only",
         "outer_release": "one_post_freeze_suite_level_pass",
+        "outer_release_identifier_policy": {
+            "schema": RELEASE_IDENTIFIER_SCHEMA,
+            "image_identifier": "sha256(dataset,namespace,dataset_relative_path)",
+            "cluster_identifier": "sha256(dataset,namespace,raw_cluster_key)",
+            "raw_paths_or_patient_identifiers_exported": False,
+        },
         "comparator_implementation_scope": {
             "kind": "matched_in_repo_analogues",
             "official_author_implementations": False,
@@ -166,6 +173,46 @@ def canonical_sha256(payload: Any) -> str:
 
 
 PROTOCOL_SHA256 = canonical_sha256(protocol_payload())
+
+
+def dataset_scoped_identifier(dataset: str, namespace: str, raw_value: str) -> str:
+    """One-way identifier for public release artifacts.
+
+    Namespaces prevent the same raw token from linking image and cluster IDs;
+    dataset scoping prevents cross-dataset linkage.  Raw values remain only in
+    release-worker memory and are never serialized.
+    """
+
+    if dataset not in DATASET_FOLDS:
+        raise ValueError(f"unknown protocol dataset {dataset!r}")
+    namespace = str(namespace).strip()
+    raw_value = str(raw_value)
+    if not namespace or not raw_value:
+        raise ValueError("identifier namespace and raw value must be non-empty")
+    material = (
+        f"{RELEASE_IDENTIFIER_SCHEMA}\0{dataset}\0{namespace}\0{raw_value}"
+    ).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def release_identifier_policy(dataset: str) -> dict[str, Any]:
+    if dataset not in DATASET_FOLDS:
+        raise ValueError(f"unknown protocol dataset {dataset!r}")
+    return {
+        "schema": RELEASE_IDENTIFIER_SCHEMA,
+        "dataset_scope": dataset,
+        "algorithm": "sha256",
+        "image_namespace": "image",
+        "cluster_namespace": "patient_cluster" if dataset == "dr" else "image_cluster",
+        "image_raw_key": "dataset_relative_posix_path",
+        "cluster_raw_key": (
+            "EyePACS_filename_stem_without_eye_suffix"
+            if dataset == "dr"
+            else "dataset_relative_posix_path"
+        ),
+        "raw_image_paths_exported": False,
+        "raw_patient_or_cluster_identifiers_exported": False,
+    }
 
 
 def file_sha256(path: str | Path) -> str:
@@ -216,6 +263,7 @@ __all__ = [
     "PAIRED_BOOTSTRAP_SAMPLES",
     "PAIRED_BOOTSTRAP_SEED",
     "REPLICATION_SEEDS",
+    "RELEASE_IDENTIFIER_SCHEMA",
     "SPLIT_SEED",
     "SPARSE_L1_DELAY_EPOCHS",
     "SPARSE_L1_WEIGHT",
@@ -226,5 +274,7 @@ __all__ = [
     "full_tasks",
     "task_at",
     "tasks_for_scope",
+    "dataset_scoped_identifier",
+    "release_identifier_policy",
     "worker_run_dir",
 ]

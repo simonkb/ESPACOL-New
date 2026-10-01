@@ -31,6 +31,7 @@ from scripts.origin_acceptance_baseline_common import (
     BASELINE_ORDER,
     PROTOCOL_SHA256,
     canary_tasks,
+    dataset_scoped_identifier,
     full_tasks,
     protocol_payload,
     task_at,
@@ -40,7 +41,9 @@ from scripts.aggregate_origin_acceptance_release import (
 )
 from release_origin_acceptance_baselines import (
     multiclass_brier_score,
+    privacy_safe_release_identifiers,
     threshold_reliability,
+    write_privacy_safe_prediction_archive,
 )
 from training.origin_acceptance_baseline_trainer import (
     OriginAcceptanceBaselineTrainer,
@@ -346,6 +349,12 @@ def test_protocol_task_map_is_stable_and_canary_first() -> None:
     scope = protocol["comparator_implementation_scope"]
     assert scope["kind"] == "matched_in_repo_analogues"
     assert scope["official_author_implementations"] is False
+    assert (
+        protocol["outer_release_identifier_policy"][
+            "raw_paths_or_patient_identifiers_exported"
+        ]
+        is False
+    )
     for variant in BASELINE_ORDER[:-1]:
         assert (
             protocol["baseline_specs"][variant]["implementation_origin"]
@@ -377,8 +386,7 @@ def _bootstrap_record() -> dict[str, object]:
     probs[torch.arange(5), labels] = 0.8
     cumulative = probs[:, 1:].flip(1).cumsum(1).flip(1)
     return {
-        "image_path": torch.arange(5).numpy().astype(str),
-        "patient_id": torch.arange(5).numpy().astype(str),
+        "image_id": torch.arange(5).numpy().astype(str),
         "cluster_id": torch.arange(5).numpy().astype(str),
         "label": labels.numpy(),
         "prediction": labels.numpy(),
@@ -410,15 +418,57 @@ def test_paired_fold_seed_cluster_bootstrap_preserves_pairing() -> None:
 
     bad = dict(records)
     corrupted = dict(_bootstrap_record())
-    corrupted["image_path"] = corrupted["image_path"][::-1].copy()
+    corrupted["image_id"] = corrupted["image_id"][::-1].copy()
     bad[("aptos", 0, "pooled_conditional", 42)] = corrupted
-    with pytest.raises(AssertionError, match="unpaired image_path"):
+    with pytest.raises(AssertionError, match="unpaired image_id"):
         paired_fold_seed_cluster_bootstrap(
             bad,
             dataset="aptos",
             comparator="pooled_conditional",
             samples=2,
             seed=91,
+        )
+
+
+def test_public_release_identifiers_are_dataset_scoped_hashes(tmp_path: Path) -> None:
+    dr_root = tmp_path / "dr"
+    paths = [
+        dr_root / "train" / "100_left.jpeg",
+        dr_root / "train" / "100_right.jpeg",
+        dr_root / "train" / "200_left.jpeg",
+    ]
+    image_ids, cluster_ids = privacy_safe_release_identifiers(
+        "dr", [str(path) for path in paths], data_root=dr_root
+    )
+    assert len(set(image_ids.tolist())) == 3
+    assert cluster_ids[0] == cluster_ids[1]
+    assert cluster_ids[0] != cluster_ids[2]
+    assert all(len(value) == 64 for value in image_ids.tolist() + cluster_ids.tolist())
+    serialized = " ".join(image_ids.tolist() + cluster_ids.tolist())
+    assert "100" not in serialized and "left" not in serialized
+    assert dataset_scoped_identifier("aptos", "image", "train/100_left.jpeg") != (
+        dataset_scoped_identifier("dr", "image", "train/100_left.jpeg")
+    )
+    archive = tmp_path / "public_predictions.npz"
+    write_privacy_safe_prediction_archive(
+        archive,
+        sample_index=np.arange(3),
+        image_ids=image_ids,
+        cluster_ids=cluster_ids,
+        labels=np.asarray([0, 1, 2]),
+        predictions=np.asarray([0, 1, 2]),
+        expected_grade=np.asarray([0.1, 1.1, 2.1]),
+        class_probs=np.full((3, 5), 0.2),
+        cumulative_probs=np.full((3, 4), 0.5),
+    )
+    with np.load(archive, allow_pickle=False) as exported:
+        assert "image_id" in exported.files and "cluster_id" in exported.files
+        assert "image_path" not in exported.files
+        assert "patient_id" not in exported.files
+        assert exported["image_id"].tolist() == image_ids.tolist()
+    with pytest.raises(ValueError, match="outside its declared dataset root"):
+        privacy_safe_release_identifiers(
+            "dr", [str(tmp_path / "outside.jpeg")], data_root=dr_root
         )
 
 

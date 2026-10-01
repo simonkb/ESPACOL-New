@@ -29,7 +29,9 @@ from scripts.origin_acceptance_baseline_common import (
     PROTOCOL_ID,
     PROTOCOL_SHA256,
     canonical_sha256,
+    dataset_scoped_identifier,
     file_sha256,
+    release_identifier_policy,
     task_at,
     worker_run_dir,
 )
@@ -153,6 +155,80 @@ def threshold_reliability(
         "threshold_ece_by_boundary": eces,
         "boundaries": table,
     }
+
+
+def privacy_safe_release_identifiers(
+    dataset: str,
+    ordered_paths: list[str] | np.ndarray,
+    *,
+    data_root: str | Path,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Hash dataset-relative image and cluster keys for public artifacts."""
+
+    root = Path(data_root).expanduser().resolve()
+    relative_keys: list[str] = []
+    raw_cluster_keys: list[str] = []
+    for value in ordered_paths:
+        path = Path(str(value)).expanduser().resolve()
+        try:
+            relative = path.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise ValueError(
+                f"release image is outside its declared dataset root: {path}"
+            ) from exc
+        relative_keys.append(relative)
+        raw_cluster_keys.append(
+            path.stem.rsplit("_", 1)[0] if dataset == "dr" else relative
+        )
+    image_ids = np.asarray(
+        [dataset_scoped_identifier(dataset, "image", key) for key in relative_keys],
+        dtype=str,
+    )
+    cluster_namespace = "patient_cluster" if dataset == "dr" else "image_cluster"
+    cluster_ids = np.asarray(
+        [
+            dataset_scoped_identifier(dataset, cluster_namespace, key)
+            for key in raw_cluster_keys
+        ],
+        dtype=str,
+    )
+    if len(set(image_ids.tolist())) != len(image_ids):
+        raise ValueError("dataset-relative image identifiers are not unique")
+    return image_ids, cluster_ids
+
+
+def write_privacy_safe_prediction_archive(
+    path: str | Path,
+    *,
+    sample_index: np.ndarray,
+    image_ids: np.ndarray,
+    cluster_ids: np.ndarray,
+    labels: np.ndarray,
+    predictions: np.ndarray,
+    expected_grade: np.ndarray,
+    class_probs: np.ndarray,
+    cumulative_probs: np.ndarray,
+) -> None:
+    """Write the fixed public schema without paths or raw patient identifiers."""
+
+    hexadecimal = set("0123456789abcdef")
+    for name, values in (("image_id", image_ids), ("cluster_id", cluster_ids)):
+        strings = np.asarray(values).astype(str)
+        if strings.ndim != 1 or any(
+            len(value) != 64 or not set(value) <= hexadecimal for value in strings
+        ):
+            raise ValueError(f"{name} must contain dataset-scoped SHA-256 identifiers")
+    np.savez_compressed(
+        path,
+        sample_index=sample_index,
+        image_id=image_ids,
+        cluster_id=cluster_ids,
+        label=labels,
+        prediction=predictions,
+        expected_grade=expected_grade,
+        class_probs=class_probs,
+        cumulative_probs=cumulative_probs,
+    )
 
 
 def main() -> None:
@@ -299,28 +375,19 @@ def main() -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     prediction_path = output_dir / "outer_predictions.npz"
-    ordered_paths = np.asarray(
-        [str(test_items[int(index)][0]) for index in indices.tolist()], dtype=str
+    ordered_paths = [str(test_items[int(index)][0]) for index in indices.tolist()]
+    image_ids, cluster_ids = privacy_safe_release_identifiers(
+        task.dataset,
+        ordered_paths,
+        data_root=data_root,
     )
-    patient_ids = np.asarray(
-        [
-            Path(path).stem.rsplit("_", 1)[0] if task.dataset == "dr" else ""
-            for path in ordered_paths.tolist()
-        ],
-        dtype=str,
-    )
-    cluster_ids = np.asarray(
-        [patient if patient else path for patient, path in zip(patient_ids, ordered_paths)],
-        dtype=str,
-    )
-    np.savez_compressed(
+    write_privacy_safe_prediction_archive(
         prediction_path,
         sample_index=indices.numpy(),
-        image_path=ordered_paths,
-        patient_id=patient_ids,
-        cluster_id=cluster_ids,
-        label=labels.numpy(),
-        prediction=predicted.numpy(),
+        image_ids=image_ids,
+        cluster_ids=cluster_ids,
+        labels=labels.numpy(),
+        predictions=predicted.numpy(),
         expected_grade=expected.numpy(),
         class_probs=probs.numpy(),
         cumulative_probs=cumulative.numpy(),
@@ -341,6 +408,7 @@ def main() -> None:
             "threshold_reliability": reliability,
             "exact_per_sample_probabilities": "outer_predictions.npz:class_probs",
         },
+        "identifier_privacy": release_identifier_policy(task.dataset),
         "test_evaluated": True,
         "selection_reopened": False,
         "predictions_sha256": file_sha256(prediction_path),

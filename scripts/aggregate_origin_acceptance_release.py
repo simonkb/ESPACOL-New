@@ -25,6 +25,7 @@ from scripts.origin_acceptance_baseline_common import (
     canonical_sha256,
     file_sha256,
     full_tasks,
+    release_identifier_policy,
 )
 from train_origin import write_json_atomic
 
@@ -78,6 +79,15 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TypeError(f"expected object at {path}")
     return value
+
+
+def _validate_sha256_identifiers(values: np.ndarray, *, field: str) -> None:
+    values = np.asarray(values).astype(str)
+    if values.ndim != 1 or len(values) < 1:
+        raise ValueError(f"{field} must be a non-empty vector")
+    hexadecimal = set("0123456789abcdef")
+    if any(len(value) != 64 or not set(value) <= hexadecimal for value in values):
+        raise ValueError(f"{field} must contain lowercase SHA-256 identifiers")
 
 
 def _derived_seed(base: int, dataset: str, comparator: str) -> int:
@@ -302,7 +312,7 @@ def paired_fold_seed_cluster_bootstrap(
             for variant in ("origin_ctmc", comparator):
                 key = (dataset, fold, variant, training_seed)
                 record = records[key]
-                for identity_field in ("image_path", "label", "cluster_id"):
+                for identity_field in ("image_id", "label", "cluster_id"):
                     if not np.array_equal(
                         record[identity_field], reference_record[identity_field]
                     ):
@@ -439,15 +449,14 @@ def main() -> None:
             raise ValueError(f"invalid outer-release semantics: {metrics_path}")
         if payload.get("predictions_sha256") != file_sha256(predictions_path):
             raise ValueError(f"prediction hash mismatch: {predictions_path}")
+        if payload.get("identifier_privacy") != release_identifier_policy(task.dataset):
+            raise ValueError(f"identifier privacy contract mismatch: {metrics_path}")
         complete = _load_json(complete_path)
         if complete.get("outer_metrics_sha256") != file_sha256(metrics_path):
             raise ValueError(f"completion hash mismatch: {complete_path}")
         with np.load(predictions_path, allow_pickle=False) as archive:
-            paths = tuple(str(value) for value in archive["image_path"].tolist())
-            labels = tuple(int(value) for value in archive["label"].tolist())
             required_arrays = {
-                "image_path",
-                "patient_id",
+                "image_id",
                 "cluster_id",
                 "label",
                 "prediction",
@@ -460,23 +469,26 @@ def main() -> None:
                 raise ValueError(
                     f"outer prediction archive lacks {sorted(missing)}: {predictions_path}"
                 )
+            forbidden = {"image_path", "patient_id", "raw_cluster_id"} & set(
+                archive.files
+            )
+            if forbidden:
+                raise ValueError(
+                    f"outer prediction archive exposes raw identifiers {sorted(forbidden)}: "
+                    f"{predictions_path}"
+                )
+            image_ids = tuple(str(value) for value in archive["image_id"].tolist())
+            labels = tuple(int(value) for value in archive["label"].tolist())
             record = {name: np.asarray(archive[name]).copy() for name in required_arrays}
+        _validate_sha256_identifiers(record["image_id"], field="image_id")
+        _validate_sha256_identifiers(record["cluster_id"], field="cluster_id")
+        if len(set(record["image_id"].astype(str).tolist())) != len(record["image_id"]):
+            raise ValueError(f"duplicate image_id in {predictions_path}")
         fold_key = (task.dataset, task.fold)
-        identity = (paths, labels)
+        identity = (image_ids, labels)
         previous = identity_by_fold.setdefault(fold_key, identity)
         if previous != identity:
             raise ValueError(f"outer item/order mismatch across comparators for {fold_key}")
-        expected_clusters = np.asarray(
-            [
-                Path(path).stem.rsplit("_", 1)[0]
-                if task.dataset == "dr"
-                else path
-                for path in paths
-            ],
-            dtype=str,
-        )
-        if not np.array_equal(record["cluster_id"].astype(str), expected_clusters):
-            raise ValueError(f"invalid patient/image cluster IDs in {predictions_path}")
         records[
             (task.dataset, task.fold, task.baseline_variant, task.training_seed)
         ] = record
