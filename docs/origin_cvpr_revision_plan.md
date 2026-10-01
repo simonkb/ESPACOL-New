@@ -332,6 +332,27 @@ Before submission, release within the anonymous supplementary package:
 
 Validate the FP64 matrix exponential against an independent SciPy or high-precision reference over random and adversarial rate vectors in \([0,64]^4\). Test normalization, nonnegativity, absolute/relative posterior error, and finite-difference gradients. State the Taylor degree and scaling rule explicitly.
 
+### 8.1 Fail-closed top-level package
+
+`tools/assemble_origin_acceptance_package.py` is the final release barrier. It
+validates, in place, the numerical decoder audit, decoder-contract audit,
+checkpoint/split manifest, IDRiD image-cluster statistics, OOF Gate A,
+controlled-shortcut Gate B, and the matched multi-fold/multi-seed outer
+release. It verifies canonical and file digests, nested artifact digests,
+registered protocols, complete fold/seed/model censuses, clean Git provenance,
+and the privacy contract before writing anything. Missing, incomplete, dirty,
+or checksum-inconsistent inputs prevent both outputs.
+
+The exported manifest contains only schemas, digests, commit identifiers,
+aggregate censuses, and gate statuses. It never embeds licensed pixels,
+checkpoints, predictions, filesystem locations, or raw image/patient
+identifiers. A scientifically failed Gate A or B is retained as a negative
+result: the reproducibility package is complete, while
+`scientific_claims_authorized` is false. The optional submission-readiness mode
+requires both gates to pass. The Slurm launcher lists all seven upstream job
+IDs in one `afterok` dependency and executes the assembler from a clean,
+detached commit snapshot.
+
 ## 9. Architecture decision gate
 
 Do **not** introduce another trainable architecture before Gates A and B. The review identifies missing utility evidence, not insufficient module count.
