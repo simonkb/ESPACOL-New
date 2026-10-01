@@ -40,6 +40,7 @@ from scripts.aggregate_origin_acceptance_release import (
     paired_fold_seed_cluster_bootstrap,
 )
 from release_origin_acceptance_baselines import (
+    classwise_reliability,
     multiclass_brier_score,
     privacy_safe_release_identifiers,
     threshold_reliability,
@@ -346,6 +347,11 @@ def test_protocol_task_map_is_stable_and_canary_first() -> None:
     assert task_at("full", 224).key == "dr__fold9__origin_ctmc__seed27182"
     assert len(PROTOCOL_SHA256) == 64
     protocol = protocol_payload()
+    quality = protocol["posterior_quality_contract"]
+    assert quality["reliability_bins"] == 15
+    assert "per_boundary" in quality["threshold_binary_brier"]
+    assert "one_vs_rest" in quality["classwise_ece"]
+    assert protocol["outer_release_result_schema"].endswith("-v2")
     scope = protocol["comparator_implementation_scope"]
     assert scope["kind"] == "matched_in_repo_analogues"
     assert scope["official_author_implementations"] is False
@@ -362,7 +368,7 @@ def test_protocol_task_map_is_stable_and_canary_first() -> None:
         )
 
 
-def test_release_reports_brier_and_threshold_reliability() -> None:
+def test_release_reports_boundary_brier_and_classwise_reliability() -> None:
     probs = torch.tensor(
         [[0.7, 0.2, 0.1], [0.1, 0.2, 0.7]], dtype=torch.float64
     )
@@ -376,8 +382,31 @@ def test_release_reports_brier_and_threshold_reliability() -> None:
     assert reliability["threshold_ece"] == pytest.approx(
         sum(reliability["threshold_ece_by_boundary"]) / 2
     )
+    target_thresholds = labels[:, None] > torch.arange(2)[None]
+    expected_threshold_briers = (
+        (cumulative - target_thresholds.to(cumulative.dtype)).square().mean(0)
+    )
+    assert reliability["threshold_binary_brier_by_boundary"] == pytest.approx(
+        expected_threshold_briers.tolist()
+    )
+    assert reliability["threshold_binary_brier"] == pytest.approx(
+        float(expected_threshold_briers.mean())
+    )
     for boundary in reliability["boundaries"]:
         assert sum(item["count"] for item in boundary["bins"]) == 2
+        assert boundary["binary_brier"] == pytest.approx(
+            reliability["threshold_binary_brier_by_boundary"][
+                boundary["boundary"]
+            ]
+        )
+
+    perfect = torch.eye(3, dtype=torch.float64)[labels]
+    classwise = classwise_reliability(perfect, labels, bins=15)
+    assert classwise["definition"] == "one_vs_rest_per_class"
+    assert classwise["classwise_ece"] == pytest.approx(0.0)
+    assert classwise["classwise_ece_by_class"] == pytest.approx([0.0, 0.0, 0.0])
+    for class_row in classwise["classes"]:
+        assert sum(item["count"] for item in class_row["bins"]) == 2
 
 
 def _bootstrap_record() -> dict[str, object]:
@@ -514,6 +543,14 @@ def test_paired_bootstrap_reports_all_grading_metrics_with_origin_orientation() 
         "rps",
         "multiclass_brier",
         "threshold_ece",
+        "threshold_binary_brier",
+        "classwise_ece",
+        *(f"threshold_ece_boundary_{boundary}" for boundary in range(4)),
+        *(
+            f"threshold_binary_brier_boundary_{boundary}"
+            for boundary in range(4)
+        ),
+        *(f"classwise_ece_class_{grade}" for grade in range(5)),
         *(f"per_grade_recall_{grade}" for grade in range(5)),
     }
     assert set(comparisons) == expected
@@ -528,6 +565,8 @@ def test_paired_bootstrap_reports_all_grading_metrics_with_origin_orientation() 
         assert comparisons[f"per_grade_recall_{grade}"]["origin_minus_comparator"] > 0.0
     assert comparisons["acc"]["higher_is_better"] is True
     assert comparisons["expected_grade_mae"]["higher_is_better"] is False
+    assert comparisons["threshold_binary_brier"]["higher_is_better"] is False
+    assert comparisons["classwise_ece"]["higher_is_better"] is False
 
 
 class _ToyDataset(Dataset):

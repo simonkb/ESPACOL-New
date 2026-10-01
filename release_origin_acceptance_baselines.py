@@ -107,10 +107,88 @@ def threshold_reliability(
         raise ValueError("threshold calibration requires at least one sample")
     table: list[dict[str, Any]] = []
     eces: list[float] = []
+    briers: list[float] = []
     edges = torch.linspace(0.0, 1.0, bins + 1, dtype=torch.float64)
     for boundary in range(boundaries):
         predicted = cumulative_probs[:, boundary].double().clamp(0.0, 1.0)
         observed = (labels.long() > boundary).double()
+        binary_brier = float((predicted - observed).square().mean())
+        assignments = torch.clamp((predicted * bins).long(), max=bins - 1)
+        reliability_bins: list[dict[str, Any]] = []
+        ece = 0.0
+        for index in range(bins):
+            selected = assignments == index
+            count = int(selected.sum())
+            if count:
+                mean_predicted = float(predicted[selected].mean())
+                empirical = float(observed[selected].mean())
+                gap = abs(mean_predicted - empirical)
+                ece += count / n * gap
+            else:
+                mean_predicted = None
+                empirical = None
+                gap = None
+            reliability_bins.append(
+                {
+                    "bin": index,
+                    "lower": float(edges[index]),
+                    "upper": float(edges[index + 1]),
+                    "right_edge_inclusive": index == bins - 1,
+                    "count": count,
+                    "mean_predicted": mean_predicted,
+                    "empirical_frequency": empirical,
+                    "absolute_gap": gap,
+                }
+            )
+        eces.append(ece)
+        briers.append(binary_brier)
+        table.append(
+            {
+                "boundary": boundary,
+                "event": f"Y>{boundary}",
+                "ece": ece,
+                "binary_brier": binary_brier,
+                "bins": reliability_bins,
+            }
+        )
+    return {
+        "bin_count": bins,
+        "binning": "equal_width_[0,1]",
+        "aggregation": "unweighted_mean_across_ordinal_boundaries",
+        "threshold_ece": float(sum(eces) / len(eces)),
+        "threshold_ece_by_boundary": eces,
+        "threshold_binary_brier": float(sum(briers) / len(briers)),
+        "threshold_binary_brier_by_boundary": briers,
+        "boundaries": table,
+    }
+
+
+def classwise_reliability(
+    class_probs: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    bins: int = 15,
+) -> dict[str, Any]:
+    """Fixed-bin one-vs-rest reliability for every mutually exclusive class.
+
+    This is deliberately distinct from top-label ECE: every class contributes
+    one binary calibration problem, including all negative examples, and the
+    reported scalar is the unweighted mean of the per-class ECEs.
+    """
+
+    if class_probs.ndim != 2 or labels.shape != class_probs.shape[:1]:
+        raise ValueError("classwise calibration inputs have incompatible shapes")
+    if bins < 2:
+        raise ValueError("classwise calibration requires at least two bins")
+    n, classes = class_probs.shape
+    if n < 1 or classes < 2:
+        raise ValueError("classwise calibration requires samples and two classes")
+    edges = torch.linspace(0.0, 1.0, bins + 1, dtype=torch.float64)
+    table: list[dict[str, Any]] = []
+    eces: list[float] = []
+    for class_index in range(classes):
+        predicted = class_probs[:, class_index].double().clamp(0.0, 1.0)
+        observed = (labels.long() == class_index).double()
         assignments = torch.clamp((predicted * bins).long(), max=bins - 1)
         reliability_bins: list[dict[str, Any]] = []
         ece = 0.0
@@ -141,8 +219,9 @@ def threshold_reliability(
         eces.append(ece)
         table.append(
             {
-                "boundary": boundary,
-                "event": f"Y>{boundary}",
+                "class": class_index,
+                "event": f"Y={class_index}",
+                "prevalence": float(observed.mean()),
                 "ece": ece,
                 "bins": reliability_bins,
             }
@@ -150,10 +229,11 @@ def threshold_reliability(
     return {
         "bin_count": bins,
         "binning": "equal_width_[0,1]",
-        "aggregation": "unweighted_mean_across_ordinal_boundaries",
-        "threshold_ece": float(sum(eces) / len(eces)),
-        "threshold_ece_by_boundary": eces,
-        "boundaries": table,
+        "definition": "one_vs_rest_per_class",
+        "aggregation": "unweighted_mean_across_classes",
+        "classwise_ece": float(sum(eces) / len(eces)),
+        "classwise_ece_by_class": eces,
+        "classes": table,
     }
 
 
@@ -367,10 +447,21 @@ def main() -> None:
             "n": int(len(labels)),
         }
     )
-    reliability = threshold_reliability(cumulative, labels, bins=15)
-    metrics["threshold_ece"] = reliability["threshold_ece"]
-    metrics["threshold_ece_by_boundary"] = reliability[
+    threshold_calibration = threshold_reliability(cumulative, labels, bins=15)
+    classwise_calibration = classwise_reliability(probs, labels, bins=15)
+    metrics["threshold_ece"] = threshold_calibration["threshold_ece"]
+    metrics["threshold_ece_by_boundary"] = threshold_calibration[
         "threshold_ece_by_boundary"
+    ]
+    metrics["threshold_binary_brier"] = threshold_calibration[
+        "threshold_binary_brier"
+    ]
+    metrics["threshold_binary_brier_by_boundary"] = threshold_calibration[
+        "threshold_binary_brier_by_boundary"
+    ]
+    metrics["classwise_ece"] = classwise_calibration["classwise_ece"]
+    metrics["classwise_ece_by_class"] = classwise_calibration[
+        "classwise_ece_by_class"
     ]
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -393,7 +484,7 @@ def main() -> None:
         cumulative_probs=cumulative.numpy(),
     )
     payload: dict[str, Any] = {
-        "schema": "origin-acceptance-outer-result-v1",
+        "schema": "origin-acceptance-outer-result-v2",
         "protocol_id": PROTOCOL_ID,
         "protocol_sha256": PROTOCOL_SHA256,
         "task": asdict(task),
@@ -405,7 +496,12 @@ def main() -> None:
         "metrics": metrics,
         "posterior_quality": {
             "multiclass_brier_definition": "mean_sum_k_(p_k-onehot_k)^2",
-            "threshold_reliability": reliability,
+            "threshold_binary_brier_definition": "mean_(P(Y>k)-1[Y>k])^2",
+            "threshold_reliability": threshold_calibration,
+            "classwise_ece_definition": (
+                "15_equal_width_bins_one_vs_rest_per_class_then_unweighted_class_mean"
+            ),
+            "classwise_reliability": classwise_calibration,
             "exact_per_sample_probabilities": "outer_predictions.npz:class_probs",
         },
         "identifier_privacy": release_identifier_policy(task.dataset),
@@ -416,7 +512,7 @@ def main() -> None:
     payload["content_checksum_sha256"] = canonical_sha256(payload)
     write_json_atomic(output_dir / "outer_metrics.json", payload)
     complete = {
-        "schema": "origin-acceptance-outer-complete-v1",
+        "schema": "origin-acceptance-outer-complete-v2",
         "protocol_sha256": PROTOCOL_SHA256,
         "task": asdict(task),
         "outer_metrics_sha256": file_sha256(output_dir / "outer_metrics.json"),

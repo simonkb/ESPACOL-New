@@ -42,10 +42,22 @@ _METRICS = (
     "rps",
     "multiclass_brier",
     "threshold_ece",
+    "threshold_binary_brier",
+    "classwise_ece",
 )
 _BOUNDARY_ECE_METRICS = tuple(f"threshold_ece_boundary_{index}" for index in range(4))
+_BOUNDARY_BRIER_METRICS = tuple(
+    f"threshold_binary_brier_boundary_{index}" for index in range(4)
+)
+_CLASSWISE_ECE_METRICS = tuple(f"classwise_ece_class_{index}" for index in range(5))
 _PER_GRADE_RECALL_METRICS = tuple(f"per_grade_recall_{index}" for index in range(5))
-_SUMMARY_METRICS = _METRICS + _BOUNDARY_ECE_METRICS + _PER_GRADE_RECALL_METRICS
+_SUMMARY_METRICS = (
+    _METRICS
+    + _BOUNDARY_ECE_METRICS
+    + _BOUNDARY_BRIER_METRICS
+    + _CLASSWISE_ECE_METRICS
+    + _PER_GRADE_RECALL_METRICS
+)
 _BOOTSTRAP_METRICS = (
     "acc",
     "qwk",
@@ -57,7 +69,14 @@ _BOOTSTRAP_METRICS = (
     "rps",
     "multiclass_brier",
     "threshold_ece",
-) + _PER_GRADE_RECALL_METRICS
+    "threshold_binary_brier",
+    "classwise_ece",
+) + (
+    _BOUNDARY_ECE_METRICS
+    + _BOUNDARY_BRIER_METRICS
+    + _CLASSWISE_ECE_METRICS
+    + _PER_GRADE_RECALL_METRICS
+)
 _HIGHER_IS_BETTER = {
     "acc": True,
     "qwk": True,
@@ -69,6 +88,11 @@ _HIGHER_IS_BETTER = {
     "rps": False,
     "multiclass_brier": False,
     "threshold_ece": False,
+    "threshold_binary_brier": False,
+    "classwise_ece": False,
+    **{metric: False for metric in _BOUNDARY_ECE_METRICS},
+    **{metric: False for metric in _BOUNDARY_BRIER_METRICS},
+    **{metric: False for metric in _CLASSWISE_ECE_METRICS},
     **{metric: True for metric in _PER_GRADE_RECALL_METRICS},
 }
 
@@ -119,9 +143,16 @@ def _cluster_statistics(record: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         "nll": np.zeros(cluster_count),
         "rps": np.zeros(cluster_count),
         "multiclass_brier": np.zeros(cluster_count),
+        "threshold_binary_brier": np.zeros((cluster_count, boundaries)),
         "confusion": np.zeros((cluster_count, classes, classes)),
         "calibration_predicted": np.zeros((cluster_count, boundaries, 15)),
         "calibration_observed": np.zeros((cluster_count, boundaries, 15)),
+        "classwise_calibration_predicted": np.zeros(
+            (cluster_count, classes, 15)
+        ),
+        "classwise_calibration_observed": np.zeros(
+            (cluster_count, classes, 15)
+        ),
     }
     np.add.at(stats["n"], inverse, 1.0)
     np.add.at(stats["correct"], inverse, (predicted == labels).astype(np.float64))
@@ -133,6 +164,11 @@ def _cluster_statistics(record: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     np.add.at(stats["nll"], inverse, -np.log(selected))
     thresholds = np.arange(boundaries)[None, :]
     target_thresholds = labels[:, None] > thresholds
+    np.add.at(
+        stats["threshold_binary_brier"],
+        inverse,
+        (cumulative - target_thresholds) ** 2,
+    )
     per_sample_rps = np.mean((cumulative - target_thresholds) ** 2, axis=1)
     np.add.at(stats["rps"], inverse, per_sample_rps)
     target_classes = np.eye(classes, dtype=np.float64)[labels]
@@ -153,6 +189,28 @@ def _cluster_statistics(record: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
             stats["calibration_observed"],
             (inverse, np.full(len(labels), boundary), assignments[:, boundary]),
             target_thresholds[:, boundary].astype(np.float64),
+        )
+    class_assignments = np.minimum(
+        (np.clip(probs, 0.0, 1.0) * 15).astype(int), 14
+    )
+    for class_index in range(classes):
+        np.add.at(
+            stats["classwise_calibration_predicted"],
+            (
+                inverse,
+                np.full(len(labels), class_index),
+                class_assignments[:, class_index],
+            ),
+            probs[:, class_index],
+        )
+        np.add.at(
+            stats["classwise_calibration_observed"],
+            (
+                inverse,
+                np.full(len(labels), class_index),
+                class_assignments[:, class_index],
+            ),
+            (labels == class_index).astype(np.float64),
         )
     return stats
 
@@ -219,9 +277,37 @@ def _weighted_metrics(
     observed_sum = np.tensordot(
         weights, stats["calibration_observed"], axes=(1, 0)
     )
-    result["threshold_ece"] = (
+    threshold_ece_by_boundary = (
         np.abs(predicted_sum - observed_sum).sum(axis=2) / total[:, None]
-    ).mean(axis=1)
+    )
+    result["threshold_ece"] = threshold_ece_by_boundary.mean(axis=1)
+    threshold_brier_by_boundary = (
+        np.tensordot(weights, stats["threshold_binary_brier"], axes=(1, 0))
+        / total[:, None]
+    )
+    result["threshold_binary_brier"] = threshold_brier_by_boundary.mean(axis=1)
+    for boundary in range(threshold_ece_by_boundary.shape[1]):
+        result[f"threshold_ece_boundary_{boundary}"] = threshold_ece_by_boundary[
+            :, boundary
+        ]
+        result[f"threshold_binary_brier_boundary_{boundary}"] = (
+            threshold_brier_by_boundary[:, boundary]
+        )
+    classwise_predicted_sum = np.tensordot(
+        weights, stats["classwise_calibration_predicted"], axes=(1, 0)
+    )
+    classwise_observed_sum = np.tensordot(
+        weights, stats["classwise_calibration_observed"], axes=(1, 0)
+    )
+    classwise_ece_by_class = (
+        np.abs(classwise_predicted_sum - classwise_observed_sum).sum(axis=2)
+        / total[:, None]
+    )
+    result["classwise_ece"] = classwise_ece_by_class.mean(axis=1)
+    for class_index in range(classwise_ece_by_class.shape[1]):
+        result[f"classwise_ece_class_{class_index}"] = classwise_ece_by_class[
+            :, class_index
+        ]
     return result
 
 
@@ -248,9 +334,11 @@ def _oof_threshold_reliability(
     boundaries = cumulative.shape[1]
     payload = []
     eces = []
+    briers = []
     for boundary in range(boundaries):
         predicted = np.clip(cumulative[:, boundary], 0.0, 1.0)
         observed = (labels > boundary).astype(np.float64)
+        binary_brier = float(np.mean((predicted - observed) ** 2))
         assignment = np.minimum((predicted * bins).astype(int), bins - 1)
         bin_rows = []
         ece = 0.0
@@ -276,8 +364,15 @@ def _oof_threshold_reliability(
                 }
             )
         eces.append(ece)
+        briers.append(binary_brier)
         payload.append(
-            {"boundary": boundary, "event": f"Y>{boundary}", "ece": ece, "bins": bin_rows}
+            {
+                "boundary": boundary,
+                "event": f"Y>{boundary}",
+                "ece": ece,
+                "binary_brier": binary_brier,
+                "bins": bin_rows,
+            }
         )
     return {
         "scope": "pooled_out_of_fold_predictions_for_one_training_seed",
@@ -285,7 +380,82 @@ def _oof_threshold_reliability(
         "n": int(len(labels)),
         "threshold_ece": float(np.mean(eces)),
         "threshold_ece_by_boundary": eces,
+        "threshold_binary_brier": float(np.mean(briers)),
+        "threshold_binary_brier_by_boundary": briers,
         "boundaries": payload,
+    }
+
+
+def _oof_classwise_reliability(
+    records: dict[tuple[str, int, str, int], dict[str, np.ndarray]],
+    *,
+    dataset: str,
+    variant: str,
+    training_seed: int,
+    bins: int = 15,
+) -> dict[str, Any]:
+    probabilities = np.concatenate(
+        [
+            records[(dataset, fold, variant, training_seed)]["class_probs"]
+            for fold in DATASET_FOLDS[dataset]
+        ]
+    ).astype(np.float64, copy=False)
+    labels = np.concatenate(
+        [
+            records[(dataset, fold, variant, training_seed)]["label"]
+            for fold in DATASET_FOLDS[dataset]
+        ]
+    ).astype(np.int64, copy=False)
+    classes = probabilities.shape[1]
+    payload = []
+    eces = []
+    for class_index in range(classes):
+        predicted = np.clip(probabilities[:, class_index], 0.0, 1.0)
+        observed = (labels == class_index).astype(np.float64)
+        assignment = np.minimum((predicted * bins).astype(int), bins - 1)
+        bin_rows = []
+        ece = 0.0
+        for index in range(bins):
+            selected = assignment == index
+            count = int(selected.sum())
+            if count:
+                mean_predicted = float(predicted[selected].mean())
+                empirical = float(observed[selected].mean())
+                gap = abs(mean_predicted - empirical)
+                ece += count / len(labels) * gap
+            else:
+                mean_predicted = empirical = gap = None
+            bin_rows.append(
+                {
+                    "bin": index,
+                    "lower": index / bins,
+                    "upper": (index + 1) / bins,
+                    "right_edge_inclusive": index == bins - 1,
+                    "count": count,
+                    "mean_predicted": mean_predicted,
+                    "empirical_frequency": empirical,
+                    "absolute_gap": gap,
+                }
+            )
+        eces.append(ece)
+        payload.append(
+            {
+                "class": class_index,
+                "event": f"Y={class_index}",
+                "prevalence": float(observed.mean()),
+                "ece": ece,
+                "bins": bin_rows,
+            }
+        )
+    return {
+        "scope": "pooled_out_of_fold_predictions_for_one_training_seed",
+        "bin_count": bins,
+        "n": int(len(labels)),
+        "definition": "one_vs_rest_per_class",
+        "aggregation": "unweighted_mean_across_classes",
+        "classwise_ece": float(np.mean(eces)),
+        "classwise_ece_by_class": eces,
+        "classes": payload,
     }
 
 
@@ -438,6 +608,8 @@ def main() -> None:
         if not all(path.is_file() for path in (metrics_path, predictions_path, complete_path)):
             raise FileNotFoundError(f"incomplete outer release: {directory}")
         payload = _load_json(metrics_path)
+        if payload.get("schema") != "origin-acceptance-outer-result-v2":
+            raise ValueError(f"outer metrics schema mismatch: {metrics_path}")
         checksum = payload.get("content_checksum_sha256")
         unsigned = dict(payload)
         unsigned.pop("content_checksum_sha256", None)
@@ -452,6 +624,8 @@ def main() -> None:
         if payload.get("identifier_privacy") != release_identifier_policy(task.dataset):
             raise ValueError(f"identifier privacy contract mismatch: {metrics_path}")
         complete = _load_json(complete_path)
+        if complete.get("schema") != "origin-acceptance-outer-complete-v2":
+            raise ValueError(f"outer completion schema mismatch: {complete_path}")
         if complete.get("outer_metrics_sha256") != file_sha256(metrics_path):
             raise ValueError(f"completion hash mismatch: {complete_path}")
         with np.load(predictions_path, allow_pickle=False) as archive:
@@ -498,6 +672,31 @@ def main() -> None:
             raise ValueError(
                 f"outer metrics must contain recalls for grades 0--4: {metrics_path}"
             )
+        threshold_ece_by_boundary = metrics.get("threshold_ece_by_boundary")
+        threshold_brier_by_boundary = metrics.get(
+            "threshold_binary_brier_by_boundary"
+        )
+        classwise_ece_by_class = metrics.get("classwise_ece_by_class")
+        if not isinstance(threshold_ece_by_boundary, list) or len(
+            threshold_ece_by_boundary
+        ) != 4:
+            raise ValueError(
+                f"outer metrics must contain ECE for four boundaries: {metrics_path}"
+            )
+        if not isinstance(threshold_brier_by_boundary, list) or len(
+            threshold_brier_by_boundary
+        ) != 4:
+            raise ValueError(
+                f"outer metrics must contain binary Brier for four boundaries: "
+                f"{metrics_path}"
+            )
+        if not isinstance(classwise_ece_by_class, list) or len(
+            classwise_ece_by_class
+        ) != 5:
+            raise ValueError(
+                f"outer metrics must contain one-vs-rest ECE for grades 0--4: "
+                f"{metrics_path}"
+            )
         rows.append(
             {
                 "dataset": task.dataset,
@@ -507,9 +706,15 @@ def main() -> None:
                 **{name: float(metrics[name]) for name in _METRICS},
                 **{
                     f"threshold_ece_boundary_{index}": float(value)
-                    for index, value in enumerate(
-                        metrics["threshold_ece_by_boundary"]
-                    )
+                    for index, value in enumerate(threshold_ece_by_boundary)
+                },
+                **{
+                    f"threshold_binary_brier_boundary_{index}": float(value)
+                    for index, value in enumerate(threshold_brier_by_boundary)
+                },
+                **{
+                    f"classwise_ece_class_{index}": float(value)
+                    for index, value in enumerate(classwise_ece_by_class)
                 },
                 **{
                     f"per_grade_recall_{index}": float(value)
@@ -559,6 +764,15 @@ def main() -> None:
                     )
                     for seed in REPLICATION_SEEDS
                 },
+                "classwise_reliability_by_seed": {
+                    str(seed): _oof_classwise_reliability(
+                        records,
+                        dataset=dataset,
+                        variant=variant,
+                        training_seed=seed,
+                    )
+                    for seed in REPLICATION_SEEDS
+                },
             }
 
     bootstrap = {
@@ -577,7 +791,7 @@ def main() -> None:
     }
 
     payload: dict[str, Any] = {
-        "schema": "origin-acceptance-outer-aggregate-v1",
+        "schema": "origin-acceptance-outer-aggregate-v2",
         "protocol_id": PROTOCOL_ID,
         "protocol_sha256": PROTOCOL_SHA256,
         "status": "complete",
@@ -604,6 +818,19 @@ def main() -> None:
                 "not results from official author implementations."
             ),
         },
+        "posterior_quality_contract": {
+            "multiclass_brier": "mean_sum_k_(p_k-onehot_k)^2",
+            "threshold_binary_brier": (
+                "per_boundary_mean_(P(Y>k)-1[Y>k])^2_then_unweighted_boundary_mean"
+            ),
+            "threshold_ece": (
+                "15_equal_width_bins_per_boundary_then_unweighted_boundary_mean"
+            ),
+            "classwise_ece": (
+                "15_equal_width_bins_one_vs_rest_per_class_then_unweighted_class_mean"
+            ),
+            "reliability_scope": "pooled_out_of_fold_predictions_per_training_seed",
+        },
         "summary": summary,
         "paired_cluster_bootstrap": bootstrap,
     }
@@ -614,7 +841,7 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
     marker = {
-        "schema": "origin-acceptance-outer-release-complete-v1",
+        "schema": "origin-acceptance-outer-release-complete-v2",
         "protocol_sha256": PROTOCOL_SHA256,
         "aggregate_sha256": file_sha256(output_dir / "aggregate.json"),
         "fold_metrics_sha256": file_sha256(output_dir / "fold_metrics.csv"),
