@@ -12,11 +12,14 @@
 #SBATCH --account=kuin0170
 
 set -euo pipefail
-set +u
-source /etc/profile.d/lmod.sh || exit 1
-module load miniconda/3 || exit 1
-source activate "${ORIGIN_CONDA_ENV:-G}" || exit 1
-set -u
+
+ENV_NAME="${ORIGIN_CONDA_ENV:-G}"
+ENV_PYTHON="${ORIGIN_PYTHON:-${HOME}/.conda/envs/${ENV_NAME}/bin/python}"
+[[ -x "${ENV_PYTHON}" ]] || {
+  echo "Conda environment Python is missing or not executable: ${ENV_PYTHON}" >&2
+  exit 7
+}
+export PATH="$(dirname "${ENV_PYTHON}"):${PATH}"
 
 REPO_ROOT="${ORIGIN_REPO_ROOT:?ORIGIN_REPO_ROOT is required}"
 PROTOCOL="${ORIGIN_SHORTCUT_COMPARATOR_PROTOCOL:?ORIGIN_SHORTCUT_COMPARATOR_PROTOCOL is required}"
@@ -26,7 +29,7 @@ cd "${REPO_ROOT}"
 [[ "$(git rev-parse HEAD)" == "${LAUNCH_COMMIT}" ]] || exit 2
 [[ -z "$(git status --porcelain --untracked-files=no)" ]] || exit 3
 
-python - "${PROTOCOL}" "${REFERENCE_ROOT}" "${LAUNCH_COMMIT}" <<'PY'
+"${ENV_PYTHON}" - "${PROTOCOL}" "${REFERENCE_ROOT}" "${LAUNCH_COMMIT}" <<'PY'
 import hashlib
 import json
 import sys
@@ -68,7 +71,7 @@ for filename, key in (
 print("Comparator protocol and sealed ORIGIN-v1 reference verified.")
 PY
 
-python -m pytest -q \
+"${ENV_PYTHON}" -m pytest -q \
   tests/test_origin_shortcut_benchmark.py \
   tests/test_origin_acceptance_baselines.py
 echo "Shortcut comparator v2 preflight passed."

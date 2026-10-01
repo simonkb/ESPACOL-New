@@ -12,11 +12,14 @@
 #SBATCH --account=kuin0170
 
 set -euo pipefail
-set +u
-source /etc/profile.d/lmod.sh || exit 1
-module load miniconda/3 || exit 1
-source activate "${ORIGIN_CONDA_ENV:-G}" || exit 1
-set -u
+
+ENV_NAME="${ORIGIN_CONDA_ENV:-G}"
+ENV_PYTHON="${ORIGIN_PYTHON:-${HOME}/.conda/envs/${ENV_NAME}/bin/python}"
+[[ -x "${ENV_PYTHON}" ]] || {
+  echo "Conda environment Python is missing or not executable: ${ENV_PYTHON}" >&2
+  exit 7
+}
+export PATH="$(dirname "${ENV_PYTHON}"):${PATH}"
 
 REPO_ROOT="${ORIGIN_REPO_ROOT:?ORIGIN_REPO_ROOT is required}"
 SUITE_ROOT="${ORIGIN_SHORTCUT_COMPARATOR_ROOT:?ORIGIN_SHORTCUT_COMPARATOR_ROOT is required}"
@@ -26,10 +29,10 @@ cd "${REPO_ROOT}"
 [[ "$(git rev-parse HEAD)" == "${LAUNCH_COMMIT}" ]] || exit 2
 [[ -z "$(git status --porcelain --untracked-files=no)" ]] || exit 3
 
-python -m pytest -q tests/test_origin_shortcut_benchmark.py
+"${ENV_PYTHON}" -m pytest -q tests/test_origin_shortcut_benchmark.py
 OUTPUT="${SUITE_ROOT}/COMPARATOR_SHORTCUT_RESULTS_V2.json"
 [[ ! -e "${OUTPUT}" ]] || { echo "Refusing to overwrite ${OUTPUT}." >&2; exit 4; }
-python scripts/aggregate_origin_shortcut_pilot.py \
+"${ENV_PYTHON}" scripts/aggregate_origin_shortcut_pilot.py \
   --audit-root "${SUITE_ROOT}/workers" \
   --reference-root "${REFERENCE_ROOT}/workers" \
   --output "${OUTPUT}" --seeds 1701,2603,3907
