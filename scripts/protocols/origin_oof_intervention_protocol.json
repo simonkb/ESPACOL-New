@@ -1,0 +1,51 @@
+{
+  "schema": "origin-oof-intervention-protocol-v1",
+  "protocol_version": 1,
+  "scope": "every_locked_outer_fold_image_after_checkpoint_selection",
+  "ranking": "descending_native_local_rate_at_target_boundary",
+  "ranking_excludes_intervention_outcomes": true,
+  "interventions": [
+    "deletion",
+    "retention"
+  ],
+  "budget_reporting": [
+    "fraction_of_valid_ledger_cells",
+    "fraction_of_nominal_stride_squared_addressable_area",
+    "fraction_of_target_boundary_evidence_mass"
+  ],
+  "controls": [
+    "coordinate_permuted",
+    "random_scale_count_stride_area",
+    "random_scale_footprint",
+    "random_boundary_mass"
+  ],
+  "deterministic_control": "least_evidential",
+  "decoder_replay": "models.origin.decode_pure_birth_rates_force_fp64",
+  "normalization": "image_local_full_minus_prior_range",
+  "near_zero_denominators_are_flagged": true,
+  "random_repeat_storage": "deterministic_within_image_mean_sd_q025_q975",
+  "bootstrap_unit": "image_with_patient_cluster_id_when_available",
+  "config": {
+    "cell_budget_fractions": [
+      0.0,
+      0.005,
+      0.01,
+      0.02,
+      0.05,
+      0.1,
+      0.2,
+      0.4,
+      0.6,
+      0.8,
+      1.0
+    ],
+    "random_repeats": 50,
+    "random_seed": 20261001,
+    "denominator_epsilon": 1e-08,
+    "footprint_bin_fraction": 0.01,
+    "mass_match_relative_tolerance": 0.05,
+    "decode_chunk_size": 8192
+  },
+  "config_sha256": "c53144c753467ce34581c0b5e6cd78d2e5d6f7ccaae765319fcc34ac28c81895",
+  "content_checksum_sha256": "373a8967fea4bcc8dbe2924c4ad3abc7cac1763ba27ba529d74ee3a51d5b3958"
+}
