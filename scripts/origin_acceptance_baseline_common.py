@@ -141,6 +141,30 @@ def protocol_payload() -> dict[str, Any]:
         "full_task_count": len(full_tasks()),
         "selection_scope": "inner_validation_only",
         "outer_release": "one_post_freeze_suite_level_pass",
+        "outer_release_result_schema": "origin-acceptance-outer-result-v2",
+        "posterior_quality_contract": {
+            "reliability_bins": 15,
+            "reliability_binning": "equal_width_[0,1]",
+            "multiclass_brier": "mean_sum_k_(p_k-onehot_k)^2",
+            "threshold_binary_brier": (
+                "per_boundary_mean_(P(Y>k)-1[Y>k])^2_then_unweighted_boundary_mean"
+            ),
+            "threshold_binary_brier_identity": (
+                "unweighted_boundary_mean_equals_reported_ranked_probability_score"
+            ),
+            "threshold_ece": (
+                "per_boundary_binary_ECE_then_unweighted_boundary_mean"
+            ),
+            "classwise_ece": (
+                "one_vs_rest_per_class_ECE_then_unweighted_class_mean"
+            ),
+            "aggregate_reliability_scope": (
+                "pooled_out_of_fold_predictions_per_training_seed"
+            ),
+            "bootstrap": (
+                "paired_cluster_bootstrap_for_each_boundary_brier_ECE_and_class_ECE"
+            ),
+        },
         "outer_release_identifier_policy": {
             "schema": RELEASE_IDENTIFIER_SCHEMA,
             "image_identifier": "sha256(dataset,namespace,dataset_relative_path)",
