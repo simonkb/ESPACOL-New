@@ -17,6 +17,7 @@ REPO_ROOT="${ORIGIN_REPO_ROOT:-/dpc/kuin0170/ESPACOL-New}"
 CV_ROOT="${ORIGIN_V3_CV_ROOT:-$REPO_ROOT/runs/origin_v3_full_cv_20260922T084547Z}"
 OUTPUT_ROOT="${ORIGIN_ACCEPTANCE_ROOT:-$REPO_ROOT/runs/origin_acceptance}"
 cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 set +u
 source /etc/profile.d/lmod.sh || exit 1
 module load miniconda/3 || exit 1

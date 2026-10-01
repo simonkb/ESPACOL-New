@@ -15,6 +15,7 @@ set -euo pipefail
 
 REPO_ROOT="${ORIGIN_REPO_ROOT:-/dpc/kuin0170/ESPACOL-New}"
 cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 set +u
 source /etc/profile.d/lmod.sh || exit 1
 module load miniconda/3 || exit 1
