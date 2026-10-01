@@ -15,11 +15,14 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import sys
 from typing import Any, Iterable, Sequence
 
 import mpmath as mp
 import numpy as np
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from models.origin import decode_pure_birth_rates
 

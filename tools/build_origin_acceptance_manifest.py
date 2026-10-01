@@ -10,9 +10,12 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import sys
 from typing import Any, Iterable
 
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from Datasets.origin_data import load_origin_items, split_origin_items
 
@@ -226,4 +229,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

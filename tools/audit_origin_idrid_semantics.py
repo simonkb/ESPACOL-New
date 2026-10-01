@@ -18,6 +18,7 @@ import json
 import math
 from pathlib import Path
 import random
+import sys
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -25,6 +26,8 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 from torchvision.transforms import functional as TF
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from configs.origin_config import OriginConfig
 from Datasets.dataloaders import _IMAGENET_MEAN, _IMAGENET_STD
@@ -561,4 +564,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
