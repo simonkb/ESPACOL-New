@@ -30,6 +30,7 @@ date --iso-8601=seconds
 git rev-parse HEAD
 python -m pytest -q tests/test_origin_acceptance_manifest.py tests/test_origin_v3_cv_protocol.py
 python tools/build_origin_acceptance_manifest.py \
+  --repo-root "$REPO_ROOT" \
   --cv-root "$CV_ROOT" \
   --dr-root "$REPO_ROOT/Datasets/DR" \
   --aptos-root "$REPO_ROOT/Datasets/aptos2019-blindness-detection" \

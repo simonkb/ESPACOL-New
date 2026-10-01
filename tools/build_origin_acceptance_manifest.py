@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import subprocess
 import sys
 from typing import Any, Iterable
 
@@ -44,6 +45,54 @@ def _canonical_sha256(value: Any) -> str:
             allow_nan=False,
         ).encode("utf-8")
     )
+
+
+def _validated_cv_submission(cv_root: Path) -> dict[str, Any]:
+    path = cv_root / "SUBMISSION.json"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    submission = json.loads(path.read_text(encoding="utf-8"))
+    if submission.get("schema") != "origin-v3-full-cv-submission-v1":
+        raise ValueError("unexpected full-CV submission schema")
+    expected = submission.get("content_checksum_sha256")
+    checksum_payload = dict(submission)
+    checksum_payload.pop("content_checksum_sha256", None)
+    observed = _canonical_sha256(checksum_payload)
+    if expected != observed:
+        raise ValueError("full-CV submission content checksum mismatch")
+    commit = str(submission.get("launch_commit", ""))
+    if len(commit) != 40:
+        raise ValueError("full-CV submission launch commit is missing")
+    return {
+        "relative_path": str(path.relative_to(cv_root)),
+        "sha256": _file_sha256(path),
+        "content_checksum_sha256": expected,
+        "training_launch_commit": commit,
+        "tag": submission.get("tag"),
+    }
+
+
+def _audit_source_provenance(repo_root: Path) -> dict[str, Any]:
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if len(commit) != 40:
+        raise ValueError("artifact-audit source commit is invalid")
+    return {
+        "audit_source_commit": commit,
+        "tracked_tree_dirty": bool(status),
+    }
 
 
 def _anonymous_id(dataset: str, value: str) -> str:
@@ -120,7 +169,14 @@ def build_manifest(
     dr_root: Path,
     aptos_root: Path,
     output_dir: Path,
+    repo_root: Path | None = None,
 ) -> dict[str, Any]:
+    if repo_root is None:
+        repo_root = Path(__file__).resolve().parents[1]
+    source_provenance = _audit_source_provenance(repo_root)
+    if source_provenance["tracked_tree_dirty"]:
+        raise RuntimeError("artifact audit requires a clean tracked source tree")
+    cv_submission = _validated_cv_submission(cv_root)
     output_dir.mkdir(parents=True, exist_ok=True)
     datasets = {
         "dr": {"root": dr_root, "folds": 10, "val_fraction": 0.1, "seed": 42},
@@ -180,6 +236,8 @@ def build_manifest(
     payload: dict[str, Any] = {
         "schema": SCHEMA,
         "cv_root": str(cv_root),
+        "source_provenance": source_provenance,
+        "full_cv_submission": cv_submission,
         "raw_patient_data_redistributed": False,
         "identifier_contract": (
             "SHA256(dataset + NUL + image basename/patient key); labels and split roles retained"
@@ -203,6 +261,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dr-root", type=Path, required=True)
     parser.add_argument("--aptos-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=Path(__file__).resolve().parents[1],
+    )
     return parser
 
 
@@ -213,6 +276,7 @@ def main() -> None:
         dr_root=args.dr_root,
         aptos_root=args.aptos_root,
         output_dir=args.output_dir,
+        repo_root=args.repo_root,
     )
     print(
         json.dumps(
