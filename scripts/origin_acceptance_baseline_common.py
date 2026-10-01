@@ -149,6 +149,9 @@ def protocol_payload() -> dict[str, Any]:
             "threshold_binary_brier": (
                 "per_boundary_mean_(P(Y>k)-1[Y>k])^2_then_unweighted_boundary_mean"
             ),
+            "threshold_binary_brier_identity": (
+                "unweighted_boundary_mean_equals_reported_ranked_probability_score"
+            ),
             "threshold_ece": (
                 "per_boundary_binary_ECE_then_unweighted_boundary_mean"
             ),

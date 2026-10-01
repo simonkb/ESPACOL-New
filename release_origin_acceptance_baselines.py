@@ -155,6 +155,9 @@ def threshold_reliability(
         "bin_count": bins,
         "binning": "equal_width_[0,1]",
         "aggregation": "unweighted_mean_across_ordinal_boundaries",
+        "mean_binary_brier_identity": (
+            "equals_ranked_probability_score_for_this_boundary_mean_definition"
+        ),
         "threshold_ece": float(sum(eces) / len(eces)),
         "threshold_ece_by_boundary": eces,
         "threshold_binary_brier": float(sum(briers) / len(briers)),
@@ -497,6 +500,9 @@ def main() -> None:
         "posterior_quality": {
             "multiclass_brier_definition": "mean_sum_k_(p_k-onehot_k)^2",
             "threshold_binary_brier_definition": "mean_(P(Y>k)-1[Y>k])^2",
+            "threshold_binary_brier_identity": (
+                "unweighted_boundary_mean_equals_reported_ranked_probability_score"
+            ),
             "threshold_reliability": threshold_calibration,
             "classwise_ece_definition": (
                 "15_equal_width_bins_one_vs_rest_per_class_then_unweighted_class_mean"

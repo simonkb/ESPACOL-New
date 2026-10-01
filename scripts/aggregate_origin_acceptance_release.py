@@ -382,6 +382,9 @@ def _oof_threshold_reliability(
         "threshold_ece_by_boundary": eces,
         "threshold_binary_brier": float(np.mean(briers)),
         "threshold_binary_brier_by_boundary": briers,
+        "mean_binary_brier_identity": (
+            "equals_ranked_probability_score_for_this_boundary_mean_definition"
+        ),
         "boundaries": payload,
     }
 
@@ -822,6 +825,9 @@ def main() -> None:
             "multiclass_brier": "mean_sum_k_(p_k-onehot_k)^2",
             "threshold_binary_brier": (
                 "per_boundary_mean_(P(Y>k)-1[Y>k])^2_then_unweighted_boundary_mean"
+            ),
+            "threshold_binary_brier_identity": (
+                "unweighted_boundary_mean_equals_reported_ranked_probability_score"
             ),
             "threshold_ece": (
                 "15_equal_width_bins_per_boundary_then_unweighted_boundary_mean"

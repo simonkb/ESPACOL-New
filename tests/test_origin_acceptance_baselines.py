@@ -350,6 +350,9 @@ def test_protocol_task_map_is_stable_and_canary_first() -> None:
     quality = protocol["posterior_quality_contract"]
     assert quality["reliability_bins"] == 15
     assert "per_boundary" in quality["threshold_binary_brier"]
+    assert "equals_reported_ranked_probability_score" in quality[
+        "threshold_binary_brier_identity"
+    ]
     assert "one_vs_rest" in quality["classwise_ece"]
     assert protocol["outer_release_result_schema"].endswith("-v2")
     scope = protocol["comparator_implementation_scope"]
