@@ -2,7 +2,9 @@
 # Assemble the final ORIGIN evidence package after every prerequisite succeeds.
 # This is a CPU-only validation/manifest job and must run from an immutable
 # detached worktree.  No raw image, checkpoint, prediction, or identifier is
-# copied into the resulting package.
+# copied into the resulting package. Privacy-safe outer predictions and
+# anonymous memberships are bundled; checkpoint tensors require an external
+# stable archive reference before public reproducibility can be claimed.
 #SBATCH --job-name=origin_pkg
 #SBATCH --partition=prod
 #SBATCH --account=kuin0170
@@ -26,6 +28,12 @@ IDRID="${ORIGIN_IDRID_STATISTICS_MANIFEST:?ORIGIN_IDRID_STATISTICS_MANIFEST is r
 OOF="${ORIGIN_OOF_STATISTICS_MANIFEST:?ORIGIN_OOF_STATISTICS_MANIFEST is required}"
 SHORTCUT="${ORIGIN_SHORTCUT_AGGREGATE:?ORIGIN_SHORTCUT_AGGREGATE is required}"
 BASELINES="${ORIGIN_BASELINE_AGGREGATE:?ORIGIN_BASELINE_AGGREGATE is required}"
+CHECKPOINT_ARCHIVE_URI="${ORIGIN_CHECKPOINT_ARCHIVE_URI:-}"
+CHECKPOINT_ARCHIVE_SHA256="${ORIGIN_CHECKPOINT_ARCHIVE_SHA256:-}"
+CHECKPOINT_ARCHIVE_BYTES="${ORIGIN_CHECKPOINT_ARCHIVE_BYTES:-}"
+EVIDENCE_ARCHIVE_URI="${ORIGIN_EVIDENCE_ARCHIVE_URI:-}"
+EVIDENCE_ARCHIVE_SHA256="${ORIGIN_EVIDENCE_ARCHIVE_SHA256:-}"
+EVIDENCE_ARCHIVE_BYTES="${ORIGIN_EVIDENCE_ARCHIVE_BYTES:-}"
 # A negative scientific gate remains a reproducible result and is packaged
 # with claims explicitly withheld.  Set this to 1 only for a stricter
 # submission-readiness marker that requires both gates to pass.
@@ -60,7 +68,7 @@ done
 echo "=== ORIGIN fail-closed acceptance package assembly ==="
 date --iso-8601=seconds
 git rev-parse HEAD
-python -m pytest -q tests/test_origin_acceptance_package.py
+"${ENV_PYTHON}" -m pytest -q tests/test_origin_acceptance_package.py
 
 ARGS=(
   --repo-root "${REPO_ROOT}"
@@ -79,8 +87,32 @@ case "${REQUIRE_GATES}" in
   0|false|FALSE|no|NO) ;;
   *) echo "ORIGIN_REQUIRE_GATES_PASS must be a boolean." >&2; exit 6 ;;
 esac
+if [[ -n "${CHECKPOINT_ARCHIVE_URI}" || -n "${CHECKPOINT_ARCHIVE_SHA256}" || -n "${CHECKPOINT_ARCHIVE_BYTES}" ]]; then
+  [[ -n "${CHECKPOINT_ARCHIVE_URI}" && -n "${CHECKPOINT_ARCHIVE_SHA256}" ]] || {
+    echo "Checkpoint archive URI and SHA-256 must be supplied together." >&2; exit 8;
+  }
+  ARGS+=(
+    --checkpoint-archive-uri "${CHECKPOINT_ARCHIVE_URI}"
+    --checkpoint-archive-sha256 "${CHECKPOINT_ARCHIVE_SHA256}"
+  )
+  [[ -z "${CHECKPOINT_ARCHIVE_BYTES}" ]] || ARGS+=(
+    --checkpoint-archive-bytes "${CHECKPOINT_ARCHIVE_BYTES}"
+  )
+fi
+if [[ -n "${EVIDENCE_ARCHIVE_URI}" || -n "${EVIDENCE_ARCHIVE_SHA256}" || -n "${EVIDENCE_ARCHIVE_BYTES}" ]]; then
+  [[ -n "${EVIDENCE_ARCHIVE_URI}" && -n "${EVIDENCE_ARCHIVE_SHA256}" ]] || {
+    echo "Per-image evidence archive URI and SHA-256 must be supplied together." >&2; exit 9;
+  }
+  ARGS+=(
+    --evidence-archive-uri "${EVIDENCE_ARCHIVE_URI}"
+    --evidence-archive-sha256 "${EVIDENCE_ARCHIVE_SHA256}"
+  )
+  [[ -z "${EVIDENCE_ARCHIVE_BYTES}" ]] || ARGS+=(
+    --evidence-archive-bytes "${EVIDENCE_ARCHIVE_BYTES}"
+  )
+fi
 
-python tools/assemble_origin_acceptance_package.py "${ARGS[@]}"
+"${ENV_PYTHON}" tools/assemble_origin_acceptance_package.py "${ARGS[@]}"
 sha256sum \
   "${OUTPUT_DIR}/ORIGIN_ACCEPTANCE_PACKAGE_MANIFEST.json" \
   "${OUTPUT_DIR}/ORIGIN_ACCEPTANCE_PACKAGE_COMPLETE.json"

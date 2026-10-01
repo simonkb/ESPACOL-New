@@ -8,16 +8,20 @@ import json
 from pathlib import Path
 import subprocess
 
+import numpy as np
 import pytest
 
 from tools.assemble_origin_acceptance_package import (
     COMPLETION_FILENAME,
     MANIFEST_FILENAME,
     EXPECTED_SHORTCUT_VARIANTS,
+    BASELINE_BOOTSTRAP_METRICS,
+    BASELINE_SUMMARY_METRICS,
     _assert_privacy_safe_release,
     assemble_package,
     canonical_sha256,
     file_sha256,
+    validate_baseline_aggregate,
     validate_numerical,
 )
 
@@ -51,6 +55,9 @@ def _git_repo(path: Path) -> tuple[Path, str]:
     )
     (path / "tools" / "analyze_origin_idrid_semantics.py").write_text("# idrid\n")
     (path / "scripts" / "analyze_origin_oof_statistics.py").write_text("# oof\n")
+    (path / "scripts" / "origin_acceptance_baseline_common.py").write_text(
+        "# executable protocol\n"
+    )
     _write_sealed(
         path / "scripts" / "protocols" / "origin_idrid_semantic_statistics_protocol.json",
         {"schema": "origin-idrid-semantic-statistics-protocol-v1"},
@@ -144,6 +151,11 @@ def _artifact_manifest(root: Path, repo: Path, commit: str) -> Path:
                     "relative_path": str(checkpoint),
                     "bytes": checkpoint.stat().st_size,
                     "sha256": file_sha256(checkpoint),
+                    "checkpoint_schema": "origin-checkpoint-v3",
+                    "split_signature": "1" * 64,
+                    "implementation_signature": "2" * 64,
+                    "architecture_signature": "3" * 64,
+                    "config_signature": "4" * 64,
                 }
             )
             memberships.append(
@@ -344,6 +356,35 @@ def _shortcut(root: Path, commit: str, *, passed: bool) -> Path:
             "additional_training_workers": 84,
         },
     )
+    focal_checks = {
+        name: passed
+        for name in (
+            "cue_only_positive_control", "cue_learned_all_seeds",
+            "localization_seed_requirement", "deletion_all_seeds",
+            "internal_pixel_correlation_all_seeds", "boundary_response_selectivity",
+            "clean_negative_control",
+        )
+    }
+    diffuse_checks = {
+        name: passed
+        for name in (
+            "cue_only_positive_control", "cue_learned_all_seeds",
+            "boundary_response_selectivity", "diffuse_nonfocal_support",
+        )
+    }
+    families = {
+        "localized": {"gate_b": {"checks": focal_checks, "passed": passed}},
+        "border": {"gate_b": {"checks": focal_checks, "passed": passed}},
+        "diffuse": {
+            "gate_b": {
+                "checks": diffuse_checks,
+                "passed": passed,
+                "gate_kind": "diffuse_nonfocal_negative_locality",
+                "localization_gate_applicable": False,
+                "must_not_be_reported_as_focal_lesion": True,
+            }
+        },
+    }
     return _write_sealed(
         suite / "COMPARATOR_SHORTCUT_RESULTS_V2.json",
         {
@@ -352,36 +393,264 @@ def _shortcut(root: Path, commit: str, *, passed: bool) -> Path:
             "model_variants": {
                 variant: {
                     "official_author_implementation": False,
-                    "families": {name: {} for name in ("localized", "border", "diffuse")},
+                    "families": families if variant == "origin_ctmc" else {
+                        name: {} for name in ("localized", "border", "diffuse")
+                    },
                 }
                 for variant in EXPECTED_SHORTCUT_VARIANTS
             },
             "audit_files": audits,
-            "localized_family_gates_passed": [passed, passed],
+            "origin_family_gates_passed": [passed, passed, passed],
             "passed": passed,
         },
     )
 
 
+def _reliability_bins(n: int) -> list[dict]:
+    return [
+        {
+            "bin": index,
+            "lower": index / 15,
+            "upper": (index + 1) / 15,
+            "right_edge_inclusive": index == 14,
+            "count": n if index == 0 else 0,
+            "mean_predicted": 0.0 if index == 0 else None,
+            "empirical_frequency": 0.0 if index == 0 else None,
+            "absolute_gap": 0.0 if index == 0 else None,
+        }
+        for index in range(15)
+    ]
+
+
+def _threshold_reliability(n: int, *, include_n: bool) -> dict:
+    payload = {
+        "bin_count": 15,
+        "threshold_ece": 0.0,
+        "threshold_ece_by_boundary": [0.0] * 4,
+        "threshold_binary_brier": 0.0,
+        "threshold_binary_brier_by_boundary": [0.0] * 4,
+        "boundaries": [
+            {
+                "boundary": boundary,
+                "event": f"Y>{boundary}",
+                "ece": 0.0,
+                "binary_brier": 0.0,
+                "bins": _reliability_bins(n),
+            }
+            for boundary in range(4)
+        ],
+    }
+    if include_n:
+        payload["n"] = n
+        payload["scope"] = "pooled_out_of_fold_predictions_for_one_training_seed"
+    return payload
+
+
+def _classwise_reliability(n: int, *, include_n: bool) -> dict:
+    payload = {
+        "bin_count": 15,
+        "classwise_ece": 0.0,
+        "classwise_ece_by_class": [0.0] * 5,
+        "classes": [
+            {
+                "class": grade,
+                "event": f"Y={grade}",
+                "prevalence": 0.0,
+                "ece": 0.0,
+                "bins": _reliability_bins(n),
+            }
+            for grade in range(5)
+        ],
+    }
+    if include_n:
+        payload["n"] = n
+        payload["scope"] = "pooled_out_of_fold_predictions_for_one_training_seed"
+    return payload
+
+
 def _baseline(root: Path, commit: str) -> Path:
     experiment = root / "baselines"
     release = experiment / "full" / "outer_release"
+    protocol_sha = "a" * 64
+    summary_metrics = {name: 0.0 for name in BASELINE_SUMMARY_METRICS}
     summary = {
         dataset: {
-            variant: {"seed_cv_means": {str(seed): {} for seed in (42, 31415, 27182)}}
+            variant: {
+                "seed_cv_means": {
+                    str(seed): dict(summary_metrics) for seed in (42, 31415, 27182)
+                },
+                "replication_summary": {
+                    name: {
+                        "mean_of_seed_cv_means": 0.0,
+                        "sd_across_seed_cv_means": 0.0,
+                        "values": [0.0, 0.0, 0.0],
+                    }
+                    for name in BASELINE_SUMMARY_METRICS
+                },
+                "threshold_reliability_by_seed": {
+                    str(seed): _threshold_reliability(
+                        3662 if dataset == "aptos" else 35126, include_n=True
+                    )
+                    for seed in (42, 31415, 27182)
+                },
+                "classwise_reliability_by_seed": {
+                    str(seed): _classwise_reliability(
+                        3662 if dataset == "aptos" else 35126, include_n=True
+                    )
+                    for seed in (42, 31415, 27182)
+                },
+            }
             for variant in EXPECTED_SHORTCUT_VARIANTS
         }
         for dataset in ("aptos", "dr")
     }
+    bootstrap = {
+        dataset: {
+            comparator: {
+                "reference_variant": "origin_ctmc",
+                "comparator": comparator,
+                "dataset": dataset,
+                "comparisons": {
+                    name: {
+                        "origin_minus_comparator": 0.0,
+                        "bootstrap_mean_delta": 0.0,
+                        "ci95_percentile": [0.0, 0.0],
+                        "higher_is_better": name in {
+                            "acc", "qwk", "balanced_acc", "macro_f1"
+                        } or name.startswith("per_grade_recall_"),
+                    }
+                    for name in BASELINE_BOOTSTRAP_METRICS
+                },
+            }
+            for comparator in EXPECTED_SHORTCUT_VARIANTS
+            if comparator != "origin_ctmc"
+        }
+        for dataset in ("aptos", "dr")
+    }
+    frozen_workers = []
+    for dataset, folds in (("aptos", 5), ("dr", 10)):
+        for fold in range(folds):
+            for seed in (42, 31415, 27182):
+                for variant in EXPECTED_SHORTCUT_VARIANTS:
+                    key = f"{dataset}__fold{fold}__{variant}__seed{seed}"
+                    task = {
+                        "dataset": dataset,
+                        "fold": fold,
+                        "baseline_variant": variant,
+                        "training_seed": seed,
+                    }
+                    fold_dir = experiment / "full" / "training" / key / f"fold{fold}"
+                    checkpoint = fold_dir / "best_learned.pth"
+                    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+                    checkpoint.write_bytes(key.encode())
+                    frozen_workers.append({
+                        "task": task,
+                        "fold_dir": str(fold_dir),
+                        "best_learned_sha256": file_sha256(checkpoint),
+                        "split_signature": hashlib.sha256(
+                            f"{dataset}-{fold}".encode()
+                        ).hexdigest(),
+                    })
+
+                    worker = release / key
+                    identifier = hashlib.sha256(key.encode()).hexdigest()
+                    predictions = worker / "outer_predictions.npz"
+                    predictions.parent.mkdir(parents=True, exist_ok=True)
+                    np.savez_compressed(
+                        predictions,
+                        sample_index=np.asarray([0]),
+                        image_id=np.asarray([identifier]),
+                        cluster_id=np.asarray([identifier]),
+                        label=np.asarray([0]),
+                        prediction=np.asarray([0]),
+                        expected_grade=np.asarray([0.0]),
+                        class_probs=np.asarray([[1.0, 0.0, 0.0, 0.0, 0.0]]),
+                        cumulative_probs=np.asarray([[0.0, 0.0, 0.0, 0.0]]),
+                    )
+                    scalar_metrics = {
+                        name: 0.0
+                        for name in (
+                            "acc", "qwk", "mae", "expected_grade_mae",
+                            "balanced_acc", "macro_f1", "ece", "nll", "rps",
+                            "multiclass_brier", "threshold_ece",
+                            "threshold_binary_brier", "classwise_ece",
+                        )
+                    }
+                    scalar_metrics.update({
+                        "n": 1,
+                        "threshold_ece_by_boundary": [0.0] * 4,
+                        "threshold_binary_brier_by_boundary": [0.0] * 4,
+                        "classwise_ece_by_class": [0.0] * 5,
+                        "per_grade_recall": [0.0] * 5,
+                    })
+                    metrics = _write_sealed(
+                        worker / "outer_metrics.json",
+                        {
+                            "schema": "origin-acceptance-outer-result-v2",
+                            "protocol_sha256": protocol_sha,
+                            "task": task,
+                            "best_learned_checkpoint_sha256": file_sha256(checkpoint),
+                            "test_evaluated": True,
+                            "selection_reopened": False,
+                            "predictions_sha256": file_sha256(predictions),
+                            "identifier_privacy": {
+                                "dataset_scope": dataset,
+                                "algorithm": "sha256",
+                                "raw_image_paths_exported": False,
+                                "raw_patient_or_cluster_identifiers_exported": False,
+                            },
+                            "metrics": scalar_metrics,
+                            "posterior_quality": {
+                                "threshold_reliability": _threshold_reliability(
+                                    1, include_n=False
+                                ),
+                                "classwise_reliability": _classwise_reliability(
+                                    1, include_n=False
+                                ),
+                                "exact_per_sample_probabilities": (
+                                    "outer_predictions.npz:class_probs"
+                                ),
+                            },
+                        },
+                    )
+                    _write_json(
+                        worker / "OUTER_COMPLETE.json",
+                        {
+                            "schema": "origin-acceptance-outer-complete-v2",
+                            "protocol_sha256": protocol_sha,
+                            "task": task,
+                            "outer_metrics_sha256": file_sha256(metrics),
+                            "predictions_sha256": file_sha256(predictions),
+                        },
+                    )
     aggregate = _write_sealed(
         release / "aggregate.json",
         {
-            "schema": "origin-acceptance-outer-aggregate-v1",
+            "schema": "origin-acceptance-outer-aggregate-v2",
             "status": "complete",
             "release_worker_count": 225,
-            "protocol_sha256": "a" * 64,
+            "protocol_sha256": protocol_sha,
             "comparator_implementation_scope": {"kind": "matched_in_repo_analogues"},
+            "posterior_quality_contract": {
+                "multiclass_brier": "mean_sum_k_(p_k-onehot_k)^2",
+                "threshold_binary_brier": (
+                    "per_boundary_mean_(P(Y>k)-1[Y>k])^2_then_unweighted_boundary_mean"
+                ),
+                "threshold_binary_brier_identity": (
+                    "unweighted_boundary_mean_equals_reported_ranked_probability_score"
+                ),
+                "threshold_ece": (
+                    "15_equal_width_bins_per_boundary_then_unweighted_boundary_mean"
+                ),
+                "classwise_ece": (
+                    "15_equal_width_bins_one_vs_rest_per_class_then_unweighted_class_mean"
+                ),
+                "reliability_scope": (
+                    "pooled_out_of_fold_predictions_per_training_seed"
+                ),
+            },
             "summary": summary,
+            "paired_cluster_bootstrap": bootstrap,
         },
     )
     metrics = release / "fold_metrics.csv"
@@ -389,7 +658,7 @@ def _baseline(root: Path, commit: str) -> Path:
     _write_json(
         release / "OUTER_RELEASE_COMPLETE.json",
         {
-            "schema": "origin-acceptance-outer-release-complete-v1",
+            "schema": "origin-acceptance-outer-release-complete-v2",
             "aggregate_sha256": file_sha256(aggregate),
             "fold_metrics_sha256": file_sha256(metrics),
             "worker_count": 225,
@@ -399,7 +668,7 @@ def _baseline(root: Path, commit: str) -> Path:
         experiment / "SUBMISSION.json",
         {
             "schema": "origin-acceptance-submission-v1",
-            "protocol_sha256": "a" * 64,
+            "protocol_sha256": protocol_sha,
             "launch_commit": commit,
         },
     )
@@ -407,9 +676,10 @@ def _baseline(root: Path, commit: str) -> Path:
         experiment / "full" / "TRAINING_FROZEN.json",
         {
             "schema": "origin-acceptance-training-audit-v1",
-            "protocol_sha256": "a" * 64,
+            "protocol_sha256": protocol_sha,
             "status": "passed",
             "worker_count": 225,
+            "workers": frozen_workers,
         },
     )
     return aggregate
@@ -445,7 +715,44 @@ def test_complete_package_is_checksum_sealed_and_exports_no_locations_or_ids(
     assert str(tmp_path) not in exported
     assert "private-0" not in exported
     assert "licensed_pixels_copied\": false" in exported
+    assert payload["artifact_availability"]["status"] == (
+        "incomplete_external_archives"
+    )
+    assert payload["artifact_availability"][
+        "independent_reproduction_claim_authorized"
+    ] is False
+    bundle = inputs["output_dir"] / "bundle"
+    assert (bundle / "BUNDLE_INDEX.json").is_file()
+    assert len(list(bundle.glob("matched_baselines/workers/*/outer_predictions.npz"))) == 225
+    assert len(list(bundle.glob("memberships/*.csv.gz"))) == 15
+    for json_file in bundle.rglob("*.json"):
+        text = json_file.read_text()
+        assert str(tmp_path) not in text
+        assert "private-0" not in text
+        _assert_privacy_safe_release(json.loads(text))
     _assert_privacy_safe_release(json.loads(manifest.read_text()))
+
+
+def test_stable_checkpoint_archive_authorizes_independent_reproduction(
+    tmp_path: Path,
+) -> None:
+    inputs = _inputs(tmp_path)
+    payload = assemble_package(
+        **inputs,
+        checkpoint_archive_uri="https://example.invalid/origin-checkpoints.tar.zst",
+        checkpoint_archive_sha256="b" * 64,
+        checkpoint_archive_bytes=12345,
+        evidence_archive_uri="https://example.invalid/origin-evidence.tar.zst",
+        evidence_archive_sha256="c" * 64,
+        evidence_archive_bytes=67890,
+    )
+    availability = payload["artifact_availability"]
+    assert availability["status"] == "complete_with_external_archives"
+    assert availability["independent_reproduction_claim_authorized"] is True
+    completion = json.loads(
+        (inputs["output_dir"] / COMPLETION_FILENAME).read_text()
+    )
+    assert completion["independent_reproduction_claim_authorized"] is True
 
 
 def test_scientific_failure_is_recorded_but_submission_ready_mode_refuses(
@@ -458,6 +765,15 @@ def test_scientific_failure_is_recorded_but_submission_ready_mode_refuses(
     payload = assemble_package(**inputs, require_gates_pass=False)
     assert payload["status"] == "verified_complete"
     assert payload["scientific_gates"]["claims_authorized"] is False
+
+
+def test_failed_gate_b_is_preserved_and_withholds_claim(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path, gate_a="pass", gate_b=False)
+    payload = assemble_package(**inputs, require_gates_pass=False)
+    assert payload["status"] == "verified_complete"
+    assert payload["scientific_gates"]["gate_b"] == "fail"
+    assert payload["scientific_gates"]["claims_authorized"] is False
+    assert payload["claim_authorized"] is False
 
 
 def test_missing_gate_artifact_prevents_completion(tmp_path: Path) -> None:
@@ -505,3 +821,42 @@ def test_numerical_validator_rejects_a_failed_audit(tmp_path: Path) -> None:
     _write_sealed(path, payload)
     with pytest.raises(ValueError, match="did not pass"):
         validate_numerical(path)
+
+
+def test_baseline_v1_contract_is_rejected(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    path = inputs["baseline_aggregate"]
+    payload = json.loads(path.read_text())
+    payload["schema"] = "origin-acceptance-outer-aggregate-v1"
+    payload.pop("content_checksum_sha256")
+    _write_sealed(path, payload)
+    with pytest.raises(ValueError, match="outer-aggregate-v2"):
+        validate_baseline_aggregate(path, inputs["repo_root"])
+
+
+def test_missing_posterior_reliability_prevents_completion(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    path = inputs["baseline_aggregate"]
+    payload = json.loads(path.read_text())
+    del payload["summary"]["dr"]["origin_ctmc"][
+        "classwise_reliability_by_seed"
+    ]
+    payload.pop("content_checksum_sha256")
+    _write_sealed(path, payload)
+    with pytest.raises(ValueError, match="classwise reliability"):
+        assemble_package(**inputs)
+    assert not inputs["output_dir"].exists()
+
+
+def test_baseline_prediction_checksum_mismatch_prevents_completion(
+    tmp_path: Path,
+) -> None:
+    inputs = _inputs(tmp_path)
+    worker = inputs["baseline_aggregate"].parent / (
+        "aptos__fold0__origin_ctmc__seed42"
+    )
+    with (worker / "outer_predictions.npz").open("ab") as stream:
+        stream.write(b"tampered")
+    with pytest.raises(ValueError, match="predictions SHA-256 mismatch"):
+        assemble_package(**inputs)
+    assert not inputs["output_dir"].exists()

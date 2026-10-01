@@ -343,15 +343,22 @@ registered protocols, complete fold/seed/model censuses, clean Git provenance,
 and the privacy contract before writing anything. Missing, incomplete, dirty,
 or checksum-inconsistent inputs prevent both outputs.
 
-The exported manifest contains only schemas, digests, commit identifiers,
-aggregate censuses, and gate statuses. It never embeds licensed pixels,
-checkpoints, predictions, filesystem locations, or raw image/patient
-identifiers. A scientifically failed Gate A or B is retained as a negative
-result: the reproducibility package is complete, while
+The package embeds a deterministic, checksummed, independently inspectable
+bundle: sanitized audit outputs and protocols, all 15 anonymous split
+memberships, the calibrated matched-baseline aggregate, and all 225
+privacy-safe per-image outer posterior archives. It also exports a 240-entry
+checkpoint inventory (dataset/fold/model/seed alias, size, and SHA-256). It
+never embeds licensed pixels, filesystem locations, or raw image/patient
+identifiers. Checkpoint tensors and privacy-sensitive per-image OOF/shortcut
+records are not silently represented by hashes alone: unless stable external
+archive URIs and archive SHA-256 digests are supplied for both groups,
+`artifact_availability.status` is `incomplete_external_archives` and the
+independent-reproduction claim is explicitly withheld. A scientifically failed
+Gate A or B is retained as a negative result: the package is complete, while
 `scientific_claims_authorized` is false. The optional submission-readiness mode
 requires both gates to pass. The Slurm launcher lists all seven upstream job
-IDs in one `afterok` dependency and executes the assembler from a clean,
-detached commit snapshot.
+IDs in one `afterok` dependency and executes the assembler with an explicit
+conda-environment Python from a clean, detached commit snapshot.
 
 ## 9. Architecture decision gate
 

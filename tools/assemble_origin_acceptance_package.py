@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Assemble a fail-closed, privacy-safe ORIGIN acceptance manifest.
 
-The assembler does not copy source images, checkpoints, per-image predictions,
-patient identifiers, or filesystem locations.  It validates the authoritative
-artifacts in place and exports only schemas, cryptographic digests, protocol
-identifiers, aggregate census values, and the two preregistered gate outcomes.
+The assembler never copies source images, raw identifiers, filesystem
+locations, or unreferenced checkpoint tensors.  It does copy the registered
+anonymous split memberships and privacy-safe per-image outer posteriors, plus
+sanitized audits and protocols, into a deterministic inspectable bundle.
+Checkpoint hashes are accompanied by dataset/fold aliases and sizes; an
+independent-reproduction claim additionally requires a stable external archive
+URI and archive SHA-256.
 
 Scientific failure is not artifact corruption: a complete package may record a
 failed Gate A or Gate B, but its claims are then explicitly withheld.  Pass
@@ -20,17 +23,23 @@ import gzip
 import hashlib
 import json
 from pathlib import Path
+import math
 import re
+import shutil
 import subprocess
 import sys
 from typing import Any, Iterable, Mapping, Sequence
 
+import numpy as np
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PACKAGE_SCHEMA = "origin-acceptance-reproducibility-package-v1"
-COMPLETION_SCHEMA = "origin-acceptance-reproducibility-complete-v1"
+PACKAGE_SCHEMA = "origin-acceptance-reproducibility-package-v2"
+COMPLETION_SCHEMA = "origin-acceptance-reproducibility-complete-v2"
 MANIFEST_FILENAME = "ORIGIN_ACCEPTANCE_PACKAGE_MANIFEST.json"
 COMPLETION_FILENAME = "ORIGIN_ACCEPTANCE_PACKAGE_COMPLETE.json"
+BUNDLE_DIRECTORY = "bundle"
+BUNDLE_INDEX_FILENAME = "BUNDLE_INDEX.json"
 
 EXPECTED_SHORTCUT_VARIANTS = (
     "ledger_sequential_hazard",
@@ -42,6 +51,58 @@ EXPECTED_SHORTCUT_VARIANTS = (
 EXPECTED_DATASET_IMAGES = {"aptos": 3662, "dr": 35126}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
+
+BASELINE_SCALAR_METRICS = (
+    "acc", "qwk", "mae", "expected_grade_mae", "balanced_acc", "macro_f1",
+    "ece", "nll", "rps", "multiclass_brier", "threshold_ece",
+    "threshold_binary_brier", "classwise_ece",
+)
+BASELINE_THRESHOLD_ECE_METRICS = tuple(
+    f"threshold_ece_boundary_{boundary}" for boundary in range(4)
+)
+BASELINE_THRESHOLD_BRIER_METRICS = tuple(
+    f"threshold_binary_brier_boundary_{boundary}" for boundary in range(4)
+)
+BASELINE_CLASSWISE_ECE_METRICS = tuple(
+    f"classwise_ece_class_{grade}" for grade in range(5)
+)
+BASELINE_RECALL_METRICS = tuple(f"per_grade_recall_{grade}" for grade in range(5))
+BASELINE_SUMMARY_METRICS = (
+    BASELINE_SCALAR_METRICS
+    + BASELINE_THRESHOLD_ECE_METRICS
+    + BASELINE_THRESHOLD_BRIER_METRICS
+    + BASELINE_CLASSWISE_ECE_METRICS
+    + BASELINE_RECALL_METRICS
+)
+BASELINE_BOOTSTRAP_METRICS = (
+    "acc", "qwk", "mae", "expected_grade_mae", "balanced_acc", "macro_f1",
+    "nll", "rps", "multiclass_brier", "threshold_ece",
+    "threshold_binary_brier", "classwise_ece",
+) + (
+    BASELINE_THRESHOLD_ECE_METRICS
+    + BASELINE_THRESHOLD_BRIER_METRICS
+    + BASELINE_CLASSWISE_ECE_METRICS
+    + BASELINE_RECALL_METRICS
+)
+
+BASELINE_DATASET_FOLDS = {"aptos": tuple(range(5)), "dr": tuple(range(10))}
+BASELINE_TRAINING_SEEDS = (42, 31415, 27182)
+BASELINE_POSTERIOR_CONTRACT = {
+    "multiclass_brier": "mean_sum_k_(p_k-onehot_k)^2",
+    "threshold_binary_brier": (
+        "per_boundary_mean_(P(Y>k)-1[Y>k])^2_then_unweighted_boundary_mean"
+    ),
+    "threshold_binary_brier_identity": (
+        "unweighted_boundary_mean_equals_reported_ranked_probability_score"
+    ),
+    "threshold_ece": (
+        "15_equal_width_bins_per_boundary_then_unweighted_boundary_mean"
+    ),
+    "classwise_ece": (
+        "15_equal_width_bins_one_vs_rest_per_class_then_unweighted_class_mean"
+    ),
+    "reliability_scope": "pooled_out_of_fold_predictions_per_training_seed",
+}
 
 
 def canonical_sha256(value: Any) -> str:
@@ -58,6 +119,37 @@ def file_sha256(path: str | Path) -> str:
         for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _finite_number(value: Any, *, label: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label} is not numeric") from error
+    if not math.isfinite(number):
+        raise ValueError(f"{label} is not finite")
+    return number
+
+
+def _require_numeric_vector(
+    value: Any, *, length: int, label: str
+) -> list[float]:
+    if not isinstance(value, list) or len(value) != length:
+        raise ValueError(f"{label} must contain exactly {length} values")
+    return [
+        _finite_number(item, label=f"{label}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+
+def _expected_baseline_task_keys() -> set[str]:
+    return {
+        f"{dataset}__fold{fold}__{variant}__seed{seed}"
+        for dataset, folds in BASELINE_DATASET_FOLDS.items()
+        for fold in folds
+        for variant in EXPECTED_SHORTCUT_VARIANTS
+        for seed in BASELINE_TRAINING_SEEDS
+    }
 
 
 def read_json(path: str | Path) -> dict[str, Any]:
@@ -307,6 +399,14 @@ def validate_artifact_manifest(path: Path, repo_root: Path) -> dict[str, Any]:
         _verify_declared_hash(checkpoint, record.get("sha256"), label="selected checkpoint")
         if checkpoint.stat().st_size != int(record.get("bytes", -1)):
             raise ValueError("selected checkpoint size mismatch")
+        if record.get("checkpoint_schema") != "origin-checkpoint-v3":
+            raise ValueError("selected checkpoint schema mismatch")
+        for signature in (
+            "split_signature", "implementation_signature", "architecture_signature",
+            "config_signature",
+        ):
+            if not HEX64.fullmatch(str(record.get(signature, ""))):
+                raise ValueError(f"selected checkpoint {signature} is invalid")
         seen_checkpoints[dataset].add(fold)
     for record in memberships:
         dataset, fold = str(record.get("dataset")), int(record.get("fold", -1))
@@ -556,10 +656,42 @@ def validate_shortcut_aggregate(
         raise ValueError("shortcut protocol/submission launch commits differ")
     if protocol.get("additional_training_workers") != 84:
         raise ValueError("shortcut comparator protocol worker census changed")
+    origin_families = model_reports["origin_ctmc"]["families"]
+    origin_gate_results: list[bool] = []
+    focal_checks = {
+        "cue_only_positive_control", "cue_learned_all_seeds",
+        "localization_seed_requirement", "deletion_all_seeds",
+        "internal_pixel_correlation_all_seeds", "boundary_response_selectivity",
+        "clean_negative_control",
+    }
+    diffuse_checks = {
+        "cue_only_positive_control", "cue_learned_all_seeds",
+        "boundary_response_selectivity", "diffuse_nonfocal_support",
+    }
+    for family in ("localized", "border", "diffuse"):
+        gate = origin_families[family].get("gate_b")
+        if not isinstance(gate, Mapping):
+            raise ValueError(f"shortcut Gate-B result is missing for {family}")
+        checks = gate.get("checks")
+        expected_checks = diffuse_checks if family == "diffuse" else focal_checks
+        if not isinstance(checks, Mapping) or set(checks) != expected_checks:
+            raise ValueError(f"shortcut Gate-B clauses changed for {family}")
+        gate_value = gate.get("passed") is True
+        if gate_value != all(value is True for value in checks.values()):
+            raise ValueError(f"shortcut Gate-B clause/status mismatch for {family}")
+        if family == "diffuse":
+            if gate.get("gate_kind") != "diffuse_nonfocal_negative_locality":
+                raise ValueError("diffuse Gate-B is not the registered non-focal gate")
+            if gate.get("localization_gate_applicable") is not False:
+                raise ValueError("diffuse Gate-B is incorrectly treated as focal")
+            if gate.get("must_not_be_reported_as_focal_lesion") is not True:
+                raise ValueError("diffuse Gate-B lacks its non-focal claim restriction")
+        origin_gate_results.append(gate_value)
+
     gate_passed = payload.get("passed") is True
-    gates = payload.get("localized_family_gates_passed")
-    if not isinstance(gates, list) or len(gates) != 2 or gate_passed != all(
-        value is True for value in gates
+    gates = payload.get("origin_family_gates_passed")
+    if gates != origin_gate_results or len(origin_gate_results) != 3 or gate_passed != all(
+        origin_gate_results
     ):
         raise ValueError("shortcut Gate-B aggregate is internally inconsistent")
     return ({
@@ -570,21 +702,187 @@ def validate_shortcut_aggregate(
         "training_seeds": [1701, 2603, 3907],
         "model_variants": list(EXPECTED_SHORTCUT_VARIANTS),
         "audit_files_verified": 135,
+        "registered_gate_families": ["localized", "border", "diffuse"],
+        "boundary_response_selectivity_verified": True,
+        "diffuse_nonfocal_clause_verified": True,
         "gate_status": "pass" if gate_passed else "fail",
         "claim_authorized": gate_passed,
     }, gate_passed)
 
 
-def validate_baseline_aggregate(path: Path, repo_root: Path) -> dict[str, Any]:
-    payload = verify_checksummed_payload(
-        path, schema="origin-acceptance-outer-aggregate-v1"
+def _validate_reliability_bins(
+    rows: Any, *, expected_n: int, label: str
+) -> None:
+    if not isinstance(rows, list) or len(rows) != 15:
+        raise ValueError(f"{label} must contain 15 reliability bins")
+    total = 0
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping) or int(row.get("bin", -1)) != index:
+            raise ValueError(f"{label} has an invalid bin index")
+        count = int(row.get("count", -1))
+        if count < 0:
+            raise ValueError(f"{label} contains a negative bin count")
+        total += count
+        _finite_number(row.get("lower"), label=f"{label}.lower")
+        _finite_number(row.get("upper"), label=f"{label}.upper")
+        for key in ("mean_predicted", "empirical_frequency", "absolute_gap"):
+            if count == 0:
+                if row.get(key) is not None:
+                    raise ValueError(f"{label} empty bin has a non-null {key}")
+            else:
+                _finite_number(row.get(key), label=f"{label}.{key}")
+    if total != expected_n:
+        raise ValueError(f"{label} bin census {total} differs from n={expected_n}")
+
+
+def _validate_threshold_reliability(
+    value: Any, *, label: str, expected_n: int | None = None
+) -> None:
+    if not isinstance(value, Mapping) or int(value.get("bin_count", 0)) != 15:
+        raise ValueError(f"{label} lacks the registered 15-bin contract")
+    n = int(value.get("n", expected_n if expected_n is not None else -1))
+    if n < 1:
+        raise ValueError(f"{label} has no observations")
+    _finite_number(value.get("threshold_ece"), label=f"{label}.threshold_ece")
+    _finite_number(
+        value.get("threshold_binary_brier"),
+        label=f"{label}.threshold_binary_brier",
     )
-    if payload.get("status") != "complete" or int(payload.get("release_worker_count", 0)) != 225:
-        raise ValueError("matched outer-release aggregate is incomplete")
-    if payload.get("comparator_implementation_scope", {}).get("kind") != (
-        "matched_in_repo_analogues"
+    _require_numeric_vector(
+        value.get("threshold_ece_by_boundary"), length=4,
+        label=f"{label}.threshold_ece_by_boundary",
+    )
+    _require_numeric_vector(
+        value.get("threshold_binary_brier_by_boundary"), length=4,
+        label=f"{label}.threshold_binary_brier_by_boundary",
+    )
+    boundaries = value.get("boundaries")
+    if not isinstance(boundaries, list) or len(boundaries) != 4:
+        raise ValueError(f"{label} must contain four ordinal boundaries")
+    for boundary, row in enumerate(boundaries):
+        if not isinstance(row, Mapping) or int(row.get("boundary", -1)) != boundary:
+            raise ValueError(f"{label} boundary ordering changed")
+        _finite_number(row.get("ece"), label=f"{label}.boundary[{boundary}].ece")
+        _finite_number(
+            row.get("binary_brier"),
+            label=f"{label}.boundary[{boundary}].binary_brier",
+        )
+        _validate_reliability_bins(
+            row.get("bins"), expected_n=n,
+            label=f"{label}.boundary[{boundary}].bins",
+        )
+
+
+def _validate_classwise_reliability(
+    value: Any, *, label: str, expected_n: int | None = None
+) -> None:
+    if not isinstance(value, Mapping) or int(value.get("bin_count", 0)) != 15:
+        raise ValueError(f"{label} lacks the registered 15-bin contract")
+    n = int(value.get("n", expected_n if expected_n is not None else -1))
+    if n < 1:
+        raise ValueError(f"{label} has no observations")
+    _finite_number(value.get("classwise_ece"), label=f"{label}.classwise_ece")
+    _require_numeric_vector(
+        value.get("classwise_ece_by_class"), length=5,
+        label=f"{label}.classwise_ece_by_class",
+    )
+    classes = value.get("classes")
+    if not isinstance(classes, list) or len(classes) != 5:
+        raise ValueError(f"{label} must contain five classwise reliability tables")
+    for grade, row in enumerate(classes):
+        if not isinstance(row, Mapping) or int(row.get("class", -1)) != grade:
+            raise ValueError(f"{label} class ordering changed")
+        _finite_number(row.get("ece"), label=f"{label}.class[{grade}].ece")
+        _finite_number(
+            row.get("prevalence"), label=f"{label}.class[{grade}].prevalence"
+        )
+        _validate_reliability_bins(
+            row.get("bins"), expected_n=n,
+            label=f"{label}.class[{grade}].bins",
+        )
+
+
+def _validate_outer_prediction_archive(path: Path, *, expected_n: int) -> None:
+    required = {
+        "sample_index", "image_id", "cluster_id", "label", "prediction",
+        "expected_grade", "class_probs", "cumulative_probs",
+    }
+    forbidden = {"image_path", "patient_id", "raw_cluster_id", "sample_id"}
+    with np.load(path, allow_pickle=False) as archive:
+        if set(archive.files) != required:
+            missing = required - set(archive.files)
+            unexpected = set(archive.files) - required
+            raise ValueError(
+                f"outer prediction archive columns changed; missing={sorted(missing)}, "
+                f"unexpected={sorted(unexpected)}"
+            )
+        if forbidden & set(archive.files):
+            raise ValueError("outer prediction archive exposes raw identifiers")
+        lengths = {name: len(np.asarray(archive[name])) for name in required}
+        if set(lengths.values()) != {expected_n}:
+            raise ValueError("outer prediction archive row census changed")
+        image_ids = np.asarray(archive["image_id"]).astype(str)
+        cluster_ids = np.asarray(archive["cluster_id"]).astype(str)
+        for name, values in (("image_id", image_ids), ("cluster_id", cluster_ids)):
+            if values.ndim != 1 or any(not HEX64.fullmatch(value) for value in values):
+                raise ValueError(f"{name} must contain dataset-scoped SHA-256 identifiers")
+        if len(set(image_ids.tolist())) != expected_n:
+            raise ValueError("outer prediction archive contains duplicate image identifiers")
+        if np.asarray(archive["class_probs"]).shape != (expected_n, 5):
+            raise ValueError("outer class probability matrix must have shape (N,5)")
+        if np.asarray(archive["cumulative_probs"]).shape != (expected_n, 4):
+            raise ValueError("outer cumulative probability matrix must have shape (N,4)")
+
+
+def _validate_worker_posterior_quality(
+    payload: Mapping[str, Any], *, label: str
+) -> None:
+    metrics = payload.get("metrics")
+    if not isinstance(metrics, Mapping):
+        raise ValueError(f"{label} lacks metrics")
+    for name in BASELINE_SCALAR_METRICS:
+        _finite_number(metrics.get(name), label=f"{label}.metrics.{name}")
+    _require_numeric_vector(
+        metrics.get("threshold_ece_by_boundary"), length=4,
+        label=f"{label}.metrics.threshold_ece_by_boundary",
+    )
+    _require_numeric_vector(
+        metrics.get("threshold_binary_brier_by_boundary"), length=4,
+        label=f"{label}.metrics.threshold_binary_brier_by_boundary",
+    )
+    _require_numeric_vector(
+        metrics.get("classwise_ece_by_class"), length=5,
+        label=f"{label}.metrics.classwise_ece_by_class",
+    )
+    _require_numeric_vector(
+        metrics.get("per_grade_recall"), length=5,
+        label=f"{label}.metrics.per_grade_recall",
+    )
+    expected_n = int(metrics.get("n", -1))
+    if expected_n < 1:
+        raise ValueError(f"{label} has no posterior-quality samples")
+    quality = payload.get("posterior_quality")
+    if not isinstance(quality, Mapping):
+        raise ValueError(f"{label} lacks posterior_quality")
+    _validate_threshold_reliability(
+        quality.get("threshold_reliability"),
+        label=f"{label}.posterior_quality.threshold_reliability",
+        expected_n=expected_n,
+    )
+    _validate_classwise_reliability(
+        quality.get("classwise_reliability"),
+        label=f"{label}.posterior_quality.classwise_reliability",
+        expected_n=expected_n,
+    )
+    if quality.get("exact_per_sample_probabilities") != (
+        "outer_predictions.npz:class_probs"
     ):
-        raise ValueError("matched-baseline implementation scope changed")
+        raise ValueError(f"{label} no longer binds exact per-sample probabilities")
+
+
+def _validate_aggregate_posterior_quality(payload: Mapping[str, Any]) -> None:
+    if payload.get("posterior_quality_contract") != BASELINE_POSTERIOR_CONTRACT:
+        raise ValueError("matched-baseline posterior-quality contract changed")
     summary = payload.get("summary")
     if not isinstance(summary, Mapping) or set(summary) != {"aptos", "dr"}:
         raise ValueError("matched-baseline dataset coverage is incomplete")
@@ -592,14 +890,103 @@ def validate_baseline_aggregate(path: Path, repo_root: Path) -> dict[str, Any]:
         if set(summary[dataset]) != set(EXPECTED_SHORTCUT_VARIANTS):
             raise ValueError(f"matched-baseline model coverage is incomplete for {dataset}")
         for model in EXPECTED_SHORTCUT_VARIANTS:
-            seed_means = summary[dataset][model].get("seed_cv_means", {})
-            if set(seed_means) != {"42", "31415", "27182"}:
+            record = summary[dataset][model]
+            seed_means = record.get("seed_cv_means", {})
+            expected_seeds = {str(seed) for seed in BASELINE_TRAINING_SEEDS}
+            if set(seed_means) != expected_seeds:
                 raise ValueError("matched-baseline replication seed coverage is incomplete")
+            for seed, metrics in seed_means.items():
+                if not isinstance(metrics, Mapping) or set(metrics) != set(
+                    BASELINE_SUMMARY_METRICS
+                ):
+                    raise ValueError(f"seed summary metrics changed for {dataset}/{model}/{seed}")
+                for name, value in metrics.items():
+                    _finite_number(value, label=f"{dataset}/{model}/{seed}/{name}")
+            replication = record.get("replication_summary")
+            if not isinstance(replication, Mapping) or set(replication) != set(
+                BASELINE_SUMMARY_METRICS
+            ):
+                raise ValueError(f"replication summary metrics changed for {dataset}/{model}")
+            for name, metric in replication.items():
+                if not isinstance(metric, Mapping):
+                    raise ValueError(f"replication summary {name} is malformed")
+                _finite_number(
+                    metric.get("mean_of_seed_cv_means"), label=f"{name}.mean"
+                )
+                _finite_number(
+                    metric.get("sd_across_seed_cv_means"), label=f"{name}.sd"
+                )
+                _require_numeric_vector(
+                    metric.get("values"), length=3, label=f"{name}.values"
+                )
+            threshold = record.get("threshold_reliability_by_seed")
+            classwise = record.get("classwise_reliability_by_seed")
+            if not isinstance(threshold, Mapping) or set(threshold) != expected_seeds:
+                raise ValueError("pooled threshold reliability seed coverage is incomplete")
+            if not isinstance(classwise, Mapping) or set(classwise) != expected_seeds:
+                raise ValueError("pooled classwise reliability seed coverage is incomplete")
+            for seed in expected_seeds:
+                _validate_threshold_reliability(
+                    threshold[seed], label=f"{dataset}/{model}/seed{seed}/threshold"
+                )
+                _validate_classwise_reliability(
+                    classwise[seed], label=f"{dataset}/{model}/seed{seed}/classwise"
+                )
+                if int(threshold[seed].get("n", -1)) != EXPECTED_DATASET_IMAGES[dataset]:
+                    raise ValueError(f"{dataset} pooled threshold reliability census changed")
+                if int(classwise[seed].get("n", -1)) != EXPECTED_DATASET_IMAGES[dataset]:
+                    raise ValueError(f"{dataset} pooled classwise reliability census changed")
+
+    bootstrap = payload.get("paired_cluster_bootstrap")
+    if not isinstance(bootstrap, Mapping) or set(bootstrap) != {"aptos", "dr"}:
+        raise ValueError("paired cluster-bootstrap dataset coverage is incomplete")
+    comparators = set(EXPECTED_SHORTCUT_VARIANTS) - {"origin_ctmc"}
+    for dataset in ("aptos", "dr"):
+        if not isinstance(bootstrap[dataset], Mapping) or set(bootstrap[dataset]) != comparators:
+            raise ValueError(f"paired comparator coverage is incomplete for {dataset}")
+        for comparator, result in bootstrap[dataset].items():
+            if not isinstance(result, Mapping) or result.get("reference_variant") != "origin_ctmc":
+                raise ValueError("paired bootstrap reference changed")
+            if result.get("comparator") != comparator or result.get("dataset") != dataset:
+                raise ValueError("paired bootstrap identity changed")
+            comparisons = result.get("comparisons")
+            if not isinstance(comparisons, Mapping) or set(comparisons) != set(
+                BASELINE_BOOTSTRAP_METRICS
+            ):
+                raise ValueError("paired bootstrap posterior-quality metrics are incomplete")
+            for name, comparison in comparisons.items():
+                if not isinstance(comparison, Mapping):
+                    raise ValueError(f"paired bootstrap {name} is malformed")
+                _finite_number(
+                    comparison.get("origin_minus_comparator"), label=f"{name}.delta"
+                )
+                _finite_number(
+                    comparison.get("bootstrap_mean_delta"), label=f"{name}.bootstrap_mean"
+                )
+                _require_numeric_vector(
+                    comparison.get("ci95_percentile"), length=2,
+                    label=f"{name}.ci95_percentile",
+                )
+                if not isinstance(comparison.get("higher_is_better"), bool):
+                    raise ValueError(f"paired bootstrap {name} direction is missing")
+
+
+def validate_baseline_aggregate(path: Path, repo_root: Path) -> dict[str, Any]:
+    payload = verify_checksummed_payload(
+        path, schema="origin-acceptance-outer-aggregate-v2"
+    )
+    if payload.get("status") != "complete" or int(payload.get("release_worker_count", 0)) != 225:
+        raise ValueError("matched outer-release aggregate is incomplete")
+    if payload.get("comparator_implementation_scope", {}).get("kind") != (
+        "matched_in_repo_analogues"
+    ):
+        raise ValueError("matched-baseline implementation scope changed")
+    _validate_aggregate_posterior_quality(payload)
 
     release_root = path.parent
     marker_path = release_root / "OUTER_RELEASE_COMPLETE.json"
     marker = read_json(marker_path)
-    if marker.get("schema") != "origin-acceptance-outer-release-complete-v1":
+    if marker.get("schema") != "origin-acceptance-outer-release-complete-v2":
         raise ValueError("outer-release completion marker schema changed")
     if marker.get("aggregate_sha256") != file_sha256(path):
         raise ValueError("outer-release marker does not bind the aggregate")
@@ -627,6 +1014,85 @@ def validate_baseline_aggregate(path: Path, repo_root: Path) -> dict[str, Any]:
         raise ValueError("matched-baseline training freeze audit is incomplete")
     if frozen.get("protocol_sha256") != payload.get("protocol_sha256"):
         raise ValueError("matched-baseline freeze/aggregate protocol mismatch")
+
+    workers = frozen.get("workers")
+    if not isinstance(workers, list) or len(workers) != 225:
+        raise ValueError("matched-baseline checkpoint inventory is incomplete")
+    expected_keys = _expected_baseline_task_keys()
+    frozen_by_key: dict[str, Mapping[str, Any]] = {}
+    for worker in workers:
+        task = worker.get("task") if isinstance(worker, Mapping) else None
+        if not isinstance(task, Mapping):
+            raise ValueError("matched-baseline frozen worker lacks its task identity")
+        key = (
+            f"{task.get('dataset')}__fold{int(task.get('fold', -1))}__"
+            f"{task.get('baseline_variant')}__seed{int(task.get('training_seed', -1))}"
+        )
+        if key not in expected_keys or key in frozen_by_key:
+            raise ValueError(f"matched-baseline frozen task identity is invalid: {key}")
+        digest = str(worker.get("best_learned_sha256"))
+        if not HEX64.fullmatch(digest):
+            raise ValueError(f"matched-baseline checkpoint digest is invalid: {key}")
+        fold_dir = Path(str(worker.get("fold_dir", ""))).resolve()
+        if not fold_dir.is_relative_to(experiment_root.resolve()):
+            raise ValueError(f"matched-baseline checkpoint escapes experiment root: {key}")
+        checkpoint = fold_dir / "best_learned.pth"
+        _verify_declared_hash(checkpoint, digest, label=f"{key} checkpoint")
+        if not HEX64.fullmatch(str(worker.get("split_signature", ""))):
+            raise ValueError(f"matched-baseline split signature is invalid: {key}")
+        frozen_by_key[key] = worker
+    if set(frozen_by_key) != expected_keys:
+        raise ValueError("matched-baseline frozen task coverage is incomplete")
+
+    for key in sorted(expected_keys):
+        directory = release_root / key
+        metrics_file = directory / "outer_metrics.json"
+        predictions_file = directory / "outer_predictions.npz"
+        complete_file = directory / "OUTER_COMPLETE.json"
+        metrics_payload = verify_checksummed_payload(
+            metrics_file, schema="origin-acceptance-outer-result-v2"
+        )
+        if metrics_payload.get("task") != frozen_by_key[key].get("task"):
+            raise ValueError(f"matched-baseline worker task identity mismatch: {key}")
+        if metrics_payload.get("best_learned_checkpoint_sha256") != (
+            frozen_by_key[key].get("best_learned_sha256")
+        ):
+            raise ValueError(f"matched-baseline worker checkpoint provenance mismatch: {key}")
+        if metrics_payload.get("protocol_sha256") != payload.get("protocol_sha256"):
+            raise ValueError(f"matched-baseline worker protocol mismatch: {key}")
+        if metrics_payload.get("test_evaluated") is not True or metrics_payload.get(
+            "selection_reopened"
+        ) is not False:
+            raise ValueError(f"matched-baseline outer-test semantics changed: {key}")
+        privacy = metrics_payload.get("identifier_privacy")
+        if (
+            not isinstance(privacy, Mapping)
+            or privacy.get("dataset_scope") != frozen_by_key[key]["task"]["dataset"]
+            or privacy.get("algorithm") != "sha256"
+            or privacy.get("raw_image_paths_exported") is not False
+            or privacy.get("raw_patient_or_cluster_identifiers_exported") is not False
+        ):
+            raise ValueError(f"matched-baseline identifier privacy contract changed: {key}")
+        _validate_worker_posterior_quality(metrics_payload, label=key)
+        n = int(metrics_payload.get("metrics", {}).get("n", -1))
+        if n < 1:
+            raise ValueError(f"matched-baseline worker has no outer-test records: {key}")
+        _verify_declared_hash(
+            predictions_file, metrics_payload.get("predictions_sha256"),
+            label=f"{key} predictions",
+        )
+        _validate_outer_prediction_archive(predictions_file, expected_n=n)
+        complete = read_json(complete_file)
+        if complete.get("schema") != "origin-acceptance-outer-complete-v2":
+            raise ValueError(f"matched-baseline worker completion schema changed: {key}")
+        if complete.get("outer_metrics_sha256") != file_sha256(metrics_file):
+            raise ValueError(f"matched-baseline worker completion hash mismatch: {key}")
+        if complete.get("predictions_sha256") != file_sha256(predictions_file):
+            raise ValueError(f"matched-baseline prediction completion hash mismatch: {key}")
+        if complete.get("protocol_sha256") != payload.get("protocol_sha256"):
+            raise ValueError(f"matched-baseline worker completion protocol mismatch: {key}")
+        if complete.get("task") != frozen_by_key[key].get("task"):
+            raise ValueError(f"matched-baseline worker completion task mismatch: {key}")
     return {
         "schema": payload["schema"],
         "file_sha256": file_sha256(path),
@@ -638,26 +1104,451 @@ def validate_baseline_aggregate(path: Path, repo_root: Path) -> dict[str, Any]:
         "training_seeds": [42, 31415, 27182],
         "model_variants": list(EXPECTED_SHORTCUT_VARIANTS),
         "identifier_contract": "dataset_scoped_sha256_no_raw_paths_or_patient_ids",
+        "posterior_quality_contract_verified": True,
+        "per_worker_prediction_archives_verified": 225,
     }
 
 
 def _assert_privacy_safe_release(payload: Any, *, trail: tuple[str, ...] = ()) -> None:
-    """Refuse filesystem locations and individual identifiers in exported JSON."""
+    """Refuse absolute locations and raw individual identifiers in exported JSON."""
 
     if isinstance(payload, Mapping):
         for key, value in payload.items():
             lower = str(key).lower()
-            if lower == "path" or lower.endswith("_path") or lower.endswith("_paths"):
+            allowed_location_keys = {
+                "bundle_relative_path", "relative_path", "manifest_filename",
+                "archive_uri", "filename",
+            }
+            if (
+                lower not in allowed_location_keys
+                and (lower == "path" or lower.endswith("_path") or lower.endswith("_paths"))
+            ):
                 raise ValueError(f"release payload exposes a filesystem field: {'.'.join(trail + (str(key),))}")
-            if lower in {"image_id", "patient_id", "cluster_id", "sample_id"}:
+            if lower in {
+                "image_id", "patient_id", "cluster_id", "sample_id", "subject_id",
+                "case_id", "image_key", "patient_key", "raw_cluster_id",
+            }:
                 raise ValueError(f"release payload exposes an individual identifier: {lower}")
             _assert_privacy_safe_release(value, trail=trail + (str(key),))
     elif isinstance(payload, (list, tuple)):
         for index, value in enumerate(payload):
             _assert_privacy_safe_release(value, trail=trail + (str(index),))
     elif isinstance(payload, str):
-        if "/" in payload or "\\" in payload or payload.startswith("file:"):
+        if (
+            payload.startswith("file:")
+            or payload.startswith("/")
+            or bool(re.match(r"^[A-Za-z]:[\\/]", payload))
+            or "\\" in payload
+        ):
             raise ValueError(f"release payload exposes a filesystem location at {'.'.join(trail)}")
+
+
+_DROP_FROM_PUBLIC_JSON = {
+    "path", "paths", "audit_root", "audit_files", "cv_root", "fold_dir",
+    "input_summary_path", "input_records_path", "prediction_artifact", "checkpoint",
+    "image_id", "patient_id", "cluster_id", "sample_id", "raw_cluster_id",
+    "subject_id", "case_id", "image_key", "patient_key", "image_path",
+    "filename", "images",
+}
+
+
+def _sanitize_public_json(value: Any) -> Any:
+    """Remove local locations and row identifiers while retaining negative results."""
+
+    if isinstance(value, Mapping):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            lower = str(key).lower()
+            if (
+                lower in _DROP_FROM_PUBLIC_JSON
+                or lower.endswith("_path")
+                or lower.endswith("_paths")
+            ):
+                continue
+            sanitized[str(key)] = _sanitize_public_json(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_public_json(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_public_json(item) for item in value]
+    if isinstance(value, str) and (
+        value.startswith("/")
+        or value.startswith("file:")
+        or bool(re.match(r"^[A-Za-z]:[\\/]", value))
+        or "\\" in value
+    ):
+        return "[local-location-withheld]"
+    return value
+
+
+def _write_sanitized_json_copy(
+    source: Path, destination: Path, *, role: str
+) -> None:
+    source_payload = read_json(source)
+    envelope: dict[str, Any] = {
+        "schema": "origin-acceptance-sanitized-artifact-v1",
+        "role": role,
+        "source_schema": source_payload.get("schema"),
+        "source_file_sha256": file_sha256(source),
+        "source_content_checksum_sha256": source_payload.get(
+            "content_checksum_sha256"
+        ),
+        "sanitized_payload": _sanitize_public_json(source_payload),
+        "privacy_transform": (
+            "absolute filesystem fields and individual identifiers removed; "
+            "scientific pass/fail values retained"
+        ),
+    }
+    envelope["content_checksum_sha256"] = canonical_sha256(envelope)
+    _assert_privacy_safe_release(envelope)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_json(destination, envelope)
+
+
+class _BundleBuilder:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.entries: list[dict[str, Any]] = []
+
+    def _destination(self, relative: str) -> Path:
+        destination = (self.root / relative).resolve()
+        if not destination.is_relative_to(self.root.resolve()):
+            raise ValueError("bundle destination escapes bundle root")
+        if destination.exists():
+            raise FileExistsError(f"duplicate bundle destination: {relative}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        return destination
+
+    def copy(self, source: Path, relative: str, *, role: str) -> None:
+        destination = self._destination(relative)
+        shutil.copyfile(source, destination)
+        self.entries.append({
+            "bundle_relative_path": relative,
+            "role": role,
+            "sha256": file_sha256(destination),
+            "bytes": destination.stat().st_size,
+        })
+
+    def sanitized_json(self, source: Path, relative: str, *, role: str) -> None:
+        destination = self._destination(relative)
+        _write_sanitized_json_copy(source, destination, role=role)
+        self.entries.append({
+            "bundle_relative_path": relative,
+            "role": role,
+            "sha256": file_sha256(destination),
+            "bytes": destination.stat().st_size,
+        })
+
+    def json(self, payload: Mapping[str, Any], relative: str, *, role: str) -> None:
+        destination = self._destination(relative)
+        value = dict(payload)
+        value["content_checksum_sha256"] = canonical_sha256(value)
+        _assert_privacy_safe_release(value)
+        _atomic_json(destination, value)
+        self.entries.append({
+            "bundle_relative_path": relative,
+            "role": role,
+            "sha256": file_sha256(destination),
+            "bytes": destination.stat().st_size,
+        })
+
+
+def _stable_archive_reference(
+    uri: str | None, sha256: str | None, size_bytes: int | None, *, kind: str
+) -> dict[str, Any]:
+    if uri is None and sha256 is None and size_bytes is None:
+        return {
+            "status": "not_supplied",
+            "archive_uri": None,
+            "archive_sha256": None,
+            "archive_bytes": None,
+        }
+    if uri is None or sha256 is None:
+        raise ValueError(f"{kind} archive URI and SHA-256 must be supplied together")
+    if not (
+        uri.startswith("https://") or uri.startswith("doi:") or uri.startswith("zenodo:")
+    ):
+        raise ValueError(
+            f"{kind} archive URI must be a stable https/doi/zenodo reference"
+        )
+    if not HEX64.fullmatch(sha256):
+        raise ValueError(f"{kind} archive SHA-256 is invalid")
+    if size_bytes is not None and size_bytes < 1:
+        raise ValueError(f"{kind} archive byte count must be positive")
+    return {
+        "status": "externally_archived",
+        "archive_uri": uri,
+        "archive_sha256": sha256,
+        "archive_bytes": size_bytes,
+    }
+
+
+def _artifact_release_sources(
+    artifact_manifest: Path,
+) -> tuple[list[dict[str, Any]], list[tuple[Path, str]], list[dict[str, Any]]]:
+    payload = read_json(artifact_manifest)
+    cv_root = Path(str(payload["cv_root"])).resolve()
+    checkpoint_inventory: list[dict[str, Any]] = []
+    membership_sources: list[tuple[Path, str]] = []
+    membership_inventory: list[dict[str, Any]] = []
+    for record in sorted(payload["checkpoints"], key=lambda row: (row["dataset"], row["fold"])):
+        dataset, fold = str(record["dataset"]), int(record["fold"])
+        checkpoint = _resolve_declared_file(
+            record["relative_path"], relative_to=cv_root, allowed_roots=(cv_root,)
+        )
+        checkpoint_inventory.append({
+            "alias": f"v3/{dataset}/fold{fold}",
+            "dataset": dataset,
+            "fold": fold,
+            "model_variant": "origin_ctmc",
+            "training_seed": None,
+            "sha256": file_sha256(checkpoint),
+            "bytes": checkpoint.stat().st_size,
+            "checkpoint_schema": record.get("checkpoint_schema"),
+            "split_signature": record.get("split_signature"),
+            "implementation_signature": record.get("implementation_signature"),
+            "architecture_signature": record.get("architecture_signature"),
+            "config_signature": record.get("config_signature"),
+            "tensor_location": "checkpoint_archive",
+        })
+    for record in sorted(payload["split_memberships"], key=lambda row: (row["dataset"], row["fold"])):
+        dataset, fold = str(record["dataset"]), int(record["fold"])
+        source = _resolve_declared_file(
+            record["relative_path"], relative_to=artifact_manifest.parent,
+            allowed_roots=(artifact_manifest.parent,),
+        )
+        relative = f"memberships/{dataset}_fold{fold}.csv.gz"
+        membership_sources.append((source, relative))
+        membership_inventory.append({
+            "alias": f"v3/{dataset}/fold{fold}",
+            "dataset": dataset,
+            "fold": fold,
+            "rows": int(record["rows"]),
+            "sha256": file_sha256(source),
+            "bundle_relative_path": relative,
+        })
+    return checkpoint_inventory, membership_sources, membership_inventory
+
+
+def _baseline_release_sources(
+    aggregate_path: Path,
+) -> tuple[list[dict[str, Any]], list[tuple[Path, str, str]]]:
+    release_root = aggregate_path.parent
+    experiment_root = aggregate_path.parents[2]
+    frozen = read_json(experiment_root / "full" / "TRAINING_FROZEN.json")
+    checkpoint_inventory: list[dict[str, Any]] = []
+    for worker in frozen["workers"]:
+        task = worker["task"]
+        key = (
+            f"{task['dataset']}__fold{int(task['fold'])}__"
+            f"{task['baseline_variant']}__seed{int(task['training_seed'])}"
+        )
+        checkpoint = Path(str(worker["fold_dir"])).resolve() / "best_learned.pth"
+        checkpoint_inventory.append({
+            "alias": f"baseline/{key}",
+            "dataset": task["dataset"],
+            "fold": int(task["fold"]),
+            "model_variant": task["baseline_variant"],
+            "training_seed": int(task["training_seed"]),
+            "sha256": file_sha256(checkpoint),
+            "bytes": checkpoint.stat().st_size,
+            "split_signature": worker.get("split_signature"),
+            "tensor_location": "checkpoint_archive",
+        })
+    sources: list[tuple[Path, str, str]] = []
+    for key in sorted(_expected_baseline_task_keys()):
+        directory = release_root / key
+        sources.extend((
+            (
+                directory / "outer_metrics.json",
+                f"matched_baselines/workers/{key}/outer_metrics.json",
+                "matched_baseline_outer_metrics",
+            ),
+            (
+                directory / "outer_predictions.npz",
+                f"matched_baselines/workers/{key}/outer_predictions.npz",
+                "matched_baseline_privacy_safe_per_image_probabilities",
+            ),
+        ))
+    return checkpoint_inventory, sources
+
+
+def _build_release_bundle(
+    *, repo_root: Path, bundle_root: Path, numerical_audit: Path,
+    decoder_contract_audit: Path,
+    artifact_manifest: Path, idrid_manifest: Path, oof_manifest: Path,
+    shortcut_aggregate: Path, baseline_aggregate: Path,
+    checkpoint_archive: Mapping[str, Any],
+) -> dict[str, Any]:
+    builder = _BundleBuilder(bundle_root)
+    builder.copy(numerical_audit, "audits/decoder_numeric.json", role="decoder_numeric_audit")
+    builder.copy(
+        decoder_contract_audit, "audits/decoder_contract.json",
+        role="decoder_contract_audit",
+    )
+
+    checkpoint_inventory, memberships, membership_inventory = (
+        _artifact_release_sources(artifact_manifest)
+    )
+    for source, relative in memberships:
+        builder.copy(source, relative, role="anonymous_split_membership")
+
+    idrid = read_json(idrid_manifest)
+    builder.sanitized_json(
+        idrid_manifest, "idrid/manifest_sanitized.json", role="idrid_manifest"
+    )
+    for name in ("alignment_statistics", "deletion_statistics"):
+        record = idrid["artifacts"][name]
+        source = _resolve_declared_file(
+            record["path"], relative_to=idrid_manifest.parent,
+            allowed_roots=(idrid_manifest.parent,),
+        )
+        builder.sanitized_json(
+            source, f"idrid/{name}.json", role=f"idrid_{name}"
+        )
+
+    oof = read_json(oof_manifest)
+    builder.sanitized_json(oof_manifest, "oof/manifest_sanitized.json", role="oof_manifest")
+    for name, record in sorted(oof["artifacts"].items()):
+        source = _resolve_declared_file(
+            record["path"], relative_to=oof_manifest.parent,
+            allowed_roots=(oof_manifest.parent,),
+        )
+        builder.sanitized_json(source, f"oof/{name}.json", role=f"oof_{name}")
+    builder.copy(
+        repo_root / "scripts" / "protocols" / "origin_oof_statistics_protocol.json",
+        "protocols/origin_oof_statistics_protocol.json", role="oof_protocol",
+    )
+    builder.copy(
+        repo_root / "scripts" / "protocols" / "origin_idrid_semantic_statistics_protocol.json",
+        "protocols/origin_idrid_semantic_statistics_protocol.json", role="idrid_protocol",
+    )
+
+    builder.sanitized_json(
+        shortcut_aggregate, "shortcut/gate_b_aggregate_sanitized.json",
+        role="shortcut_gate_b_aggregate",
+    )
+    for sibling, relative, role in (
+        (shortcut_aggregate.parent / "PROTOCOL_V2.json", "shortcut/PROTOCOL_V2.json", "shortcut_protocol"),
+        (shortcut_aggregate.parent / "SUBMISSION.json", "shortcut/SUBMISSION.json", "shortcut_submission"),
+    ):
+        builder.sanitized_json(sibling, relative, role=role)
+
+    builder.copy(
+        baseline_aggregate, "matched_baselines/aggregate.json",
+        role="matched_baseline_aggregate",
+    )
+    builder.copy(
+        baseline_aggregate.parent / "fold_metrics.csv",
+        "matched_baselines/fold_metrics.csv", role="matched_baseline_fold_metrics",
+    )
+    baseline_experiment = baseline_aggregate.parents[2]
+    builder.sanitized_json(
+        baseline_experiment / "SUBMISSION.json",
+        "matched_baselines/SUBMISSION_sanitized.json",
+        role="matched_baseline_submission_protocol_binding",
+    )
+    builder.sanitized_json(
+        baseline_experiment / "full" / "TRAINING_FROZEN.json",
+        "matched_baselines/TRAINING_FROZEN_sanitized.json",
+        role="matched_baseline_training_freeze_inventory",
+    )
+    builder.copy(
+        repo_root / "scripts" / "origin_acceptance_baseline_common.py",
+        "protocols/origin_acceptance_baseline_common.py",
+        role="matched_baseline_executable_protocol",
+    )
+    baseline_checkpoints, baseline_sources = _baseline_release_sources(
+        baseline_aggregate
+    )
+    checkpoint_inventory.extend(baseline_checkpoints)
+    tensor_location = (
+        "external_checkpoint_archive"
+        if checkpoint_archive.get("status") == "externally_archived"
+        else "not_available_in_public_package"
+    )
+    for record in checkpoint_inventory:
+        record["tensor_location"] = tensor_location
+    for source, relative, role in baseline_sources:
+        builder.copy(source, relative, role=role)
+
+    checkpoint_inventory_payload = {
+        "schema": "origin-acceptance-checkpoint-inventory-v1",
+        "count": len(checkpoint_inventory),
+        "archive_reference": dict(checkpoint_archive),
+        "checkpoints": checkpoint_inventory,
+    }
+    builder.json(
+        checkpoint_inventory_payload, "inventories/checkpoints.json",
+        role="checkpoint_inventory",
+    )
+    builder.json(
+        {
+            "schema": "origin-acceptance-membership-inventory-v1",
+            "count": len(membership_inventory),
+            "memberships": membership_inventory,
+        },
+        "inventories/split_memberships.json", role="split_membership_inventory",
+    )
+
+    index_payload: dict[str, Any] = {
+        "schema": "origin-acceptance-inspectable-bundle-v1",
+        "entry_count": len(builder.entries),
+        "entries": sorted(builder.entries, key=lambda row: row["bundle_relative_path"]),
+        "licensed_pixels_copied": False,
+        "raw_image_or_patient_identifiers_copied": False,
+        "baseline_per_image_archives": 225,
+        "oof_and_shortcut_per_image_archives": 0,
+        "oof_and_shortcut_per_image_availability": (
+            "external_privacy_safe_evidence_archive_required"
+        ),
+        "anonymous_split_memberships": 15,
+        "checkpoint_tensors_embedded": False,
+    }
+    index_payload["content_checksum_sha256"] = canonical_sha256(index_payload)
+    _assert_privacy_safe_release(index_payload)
+    index_path = bundle_root / BUNDLE_INDEX_FILENAME
+    _atomic_json(index_path, index_payload)
+    return {
+        "schema": index_payload["schema"],
+        "bundle_relative_path": f"{BUNDLE_DIRECTORY}/{BUNDLE_INDEX_FILENAME}",
+        "file_sha256": file_sha256(index_path),
+        "content_checksum_sha256": index_payload["content_checksum_sha256"],
+        "entry_count": index_payload["entry_count"],
+        "bytes": sum(int(row["bytes"]) for row in builder.entries),
+    }
+
+
+def _assert_bundle_privacy(bundle_root: Path) -> None:
+    """Fail closed on location/identifier leakage in every exported artifact."""
+
+    for path in sorted(bundle_root.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix == ".json":
+            _assert_privacy_safe_release(read_json(path))
+        elif path.suffix == ".npz":
+            with np.load(path, allow_pickle=False) as archive:
+                if "label" not in archive.files:
+                    raise ValueError(f"bundled prediction archive has no labels: {path.name}")
+                expected_n = len(np.asarray(archive["label"]))
+            _validate_outer_prediction_archive(path, expected_n=expected_n)
+        elif path.name.endswith(".csv.gz"):
+            with gzip.open(path, "rt", encoding="utf-8", newline="") as stream:
+                reader = csv.DictReader(stream)
+                if reader.fieldnames != [
+                    "image_id_sha256", "patient_cluster_sha256", "label", "split"
+                ]:
+                    raise ValueError("bundled membership is not anonymized")
+                for row in reader:
+                    if not HEX64.fullmatch(str(row["image_id_sha256"])):
+                        raise ValueError("bundled membership exposes an image identifier")
+                    if not HEX64.fullmatch(str(row["patient_cluster_sha256"])):
+                        raise ValueError("bundled membership exposes a patient identifier")
+        elif path.suffix == ".csv":
+            text = path.read_text(encoding="utf-8")
+            if re.search(r"(?:^|[,\n])(?:/|[A-Za-z]:[\\/])", text):
+                raise ValueError(f"bundled CSV exposes an absolute filesystem location: {path.name}")
 
 
 def assemble_package(
@@ -666,12 +1557,18 @@ def assemble_package(
     idrid_manifest: Path, oof_manifest: Path, shortcut_aggregate: Path,
     baseline_aggregate: Path, expected_commit: str | None = None,
     require_gates_pass: bool = False,
+    checkpoint_archive_uri: str | None = None,
+    checkpoint_archive_sha256: str | None = None,
+    checkpoint_archive_bytes: int | None = None,
+    evidence_archive_uri: str | None = None,
+    evidence_archive_sha256: str | None = None,
+    evidence_archive_bytes: int | None = None,
 ) -> dict[str, Any]:
     repo_root = repo_root.resolve()
     output_dir = output_dir.resolve()
     manifest_path = output_dir / MANIFEST_FILENAME
     completion_path = output_dir / COMPLETION_FILENAME
-    if manifest_path.exists() or completion_path.exists():
+    if output_dir.exists():
         raise FileExistsError("refusing to overwrite an existing acceptance package")
     provenance = runtime_provenance(repo_root, expected_commit)
     components: dict[str, Any] = {
@@ -699,6 +1596,39 @@ def assemble_package(
             f"submission-readiness withheld: Gate A={gate_a}, "
             f"Gate B={'pass' if gate_b_passed else 'fail'}"
         )
+    checkpoint_archive = _stable_archive_reference(
+        checkpoint_archive_uri, checkpoint_archive_sha256,
+        checkpoint_archive_bytes, kind="checkpoint",
+    )
+    evidence_archive = _stable_archive_reference(
+        evidence_archive_uri, evidence_archive_sha256,
+        evidence_archive_bytes, kind="per-image evidence",
+    )
+    reproduction_authorized = (
+        checkpoint_archive["status"] == "externally_archived"
+        and evidence_archive["status"] == "externally_archived"
+    )
+    temporary_dir = output_dir.with_name(f".{output_dir.name}.building")
+    if temporary_dir.exists():
+        raise FileExistsError(f"stale package staging directory exists: {temporary_dir.name}")
+    temporary_dir.mkdir(parents=True)
+    try:
+        bundle = _build_release_bundle(
+            repo_root=repo_root,
+            bundle_root=temporary_dir / BUNDLE_DIRECTORY,
+            numerical_audit=numerical_audit,
+            decoder_contract_audit=decoder_contract_audit,
+            artifact_manifest=artifact_manifest,
+            idrid_manifest=idrid_manifest,
+            oof_manifest=oof_manifest,
+            shortcut_aggregate=shortcut_aggregate,
+            baseline_aggregate=baseline_aggregate,
+            checkpoint_archive=checkpoint_archive,
+        )
+        _assert_bundle_privacy(temporary_dir / BUNDLE_DIRECTORY)
+    except Exception:
+        shutil.rmtree(temporary_dir, ignore_errors=True)
+        raise
     payload: dict[str, Any] = {
         "schema": PACKAGE_SCHEMA,
         "status": "verified_complete",
@@ -714,33 +1644,70 @@ def assemble_package(
                 "auditability claims are withheld unless both preregistered gates pass"
             ),
         },
+        "claim_authorized": gates_pass,
+        "inspectable_bundle": bundle,
+        "artifact_availability": {
+            "status": (
+                "complete_with_external_archives"
+                if reproduction_authorized
+                else "incomplete_external_archives"
+            ),
+            "checkpoint_tensors": checkpoint_archive,
+            "remaining_per_image_evidence": evidence_archive,
+            "checkpoint_inventory_count": 240,
+            "privacy_safe_baseline_prediction_archives_bundled": 225,
+            "anonymous_split_memberships_bundled": 15,
+            "licensed_input_pixels_required_but_not_redistributed": True,
+            "independent_reproduction_claim_authorized": reproduction_authorized,
+            "withheld_for_privacy_or_licensing": [
+                "licensed retinal image pixels",
+                "raw IDRiD image-level identifiers",
+                "raw OOF intervention rows and shortcut worker records pending a "
+                "privacy-safe evidence archive",
+            ],
+        },
         "release_contract": {
-            "input_artifacts_embedded": False,
+            "input_artifacts_embedded": True,
             "licensed_pixels_copied": False,
             "checkpoints_copied": False,
             "raw_filesystem_locations_exported": False,
             "raw_image_or_patient_identifiers_exported": False,
-            "exported_content": "schemas_digests_protocols_census_and_gate_status_only",
+            "exported_content": (
+                "sanitized audits, protocols, anonymous split memberships, matched "
+                "baseline per-image probabilities, reliability tables, and inventories"
+            ),
+            "public_reproducibility_policy": (
+                "independent reproduction is authorized only when checkpoint tensors "
+                "and remaining privacy-safe per-image evidence are each backed by a "
+                "stable archive URI and SHA-256"
+            ),
         },
     }
     payload["content_checksum_sha256"] = canonical_sha256(payload)
     _assert_privacy_safe_release(payload)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    _atomic_json(manifest_path, payload)
+    staged_manifest = temporary_dir / MANIFEST_FILENAME
+    staged_completion = temporary_dir / COMPLETION_FILENAME
+    _atomic_json(staged_manifest, payload)
     completion: dict[str, Any] = {
         "schema": COMPLETION_SCHEMA,
         "status": "verified_complete",
         "manifest_filename": MANIFEST_FILENAME,
-        "manifest_sha256": file_sha256(manifest_path),
+        "manifest_sha256": file_sha256(staged_manifest),
         "manifest_content_checksum_sha256": payload["content_checksum_sha256"],
         "all_required_components_verified": True,
         "scientific_gates_passed": gates_pass,
         "scientific_claims_authorized": gates_pass,
+        "independent_reproduction_claim_authorized": reproduction_authorized,
+        "artifact_availability_status": payload["artifact_availability"]["status"],
+        "bundle_index_sha256": bundle["file_sha256"],
     }
     completion["content_checksum_sha256"] = canonical_sha256(completion)
     _assert_privacy_safe_release(completion)
-    _atomic_json(completion_path, completion)
+    _atomic_json(staged_completion, completion)
+    _assert_privacy_safe_release(read_json(staged_manifest))
+    _assert_privacy_safe_release(read_json(staged_completion))
+    temporary_dir.replace(output_dir)
     return payload
 
 
@@ -757,6 +1724,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--baseline-aggregate", type=Path, required=True)
     parser.add_argument("--expected-commit")
     parser.add_argument("--require-gates-pass", action="store_true")
+    parser.add_argument("--checkpoint-archive-uri")
+    parser.add_argument("--checkpoint-archive-sha256")
+    parser.add_argument("--checkpoint-archive-bytes", type=int)
+    parser.add_argument("--evidence-archive-uri")
+    parser.add_argument("--evidence-archive-sha256")
+    parser.add_argument("--evidence-archive-bytes", type=int)
     return parser
 
 
@@ -774,6 +1747,12 @@ def main() -> None:
         baseline_aggregate=args.baseline_aggregate,
         expected_commit=args.expected_commit,
         require_gates_pass=args.require_gates_pass,
+        checkpoint_archive_uri=args.checkpoint_archive_uri,
+        checkpoint_archive_sha256=args.checkpoint_archive_sha256,
+        checkpoint_archive_bytes=args.checkpoint_archive_bytes,
+        evidence_archive_uri=args.evidence_archive_uri,
+        evidence_archive_sha256=args.evidence_archive_sha256,
+        evidence_archive_bytes=args.evidence_archive_bytes,
     )
     print(json.dumps({
         "status": payload["status"],
