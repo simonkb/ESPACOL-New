@@ -95,6 +95,10 @@ job=""
 while [[ $# -gt 0 ]]; do
   if [[ "$1" == "-j" ]]; then job="$2"; shift 2; else shift; fi
 done
+if [[ -f "${FAKE_STATE_DIR}/${job}.queue_error" ]]; then
+  cat "${FAKE_STATE_DIR}/${job}.queue_error" >&2
+  exit 1
+fi
 [[ -f "${FAKE_STATE_DIR}/${job}.queue" ]] && cat "${FAKE_STATE_DIR}/${job}.queue"
 exit 0
 """,
@@ -266,6 +270,34 @@ def test_all_completed_jobs_are_not_reused_as_afterok_dependencies(
     assert isinstance(output, Path)
     record = json.loads(Path(f"{output}.SUBMISSION.json").read_text(encoding="utf-8"))
     assert record["dependency_expression"] is None
+
+
+def test_purged_squeue_job_falls_back_to_exact_completed_sacct_record(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    state_dir = fixture["state"]
+    assert isinstance(state_dir, Path)
+    (state_dir / "101.queue_error").write_text(
+        "slurm_load_jobs error: Invalid job id specified\n", encoding="utf-8"
+    )
+    _set_accounting_states(
+        state_dir, {job: "COMPLETED" for job in range(101, 108)}
+    )
+
+    result = _launch(fixture)
+    assert result.returncode == 0, result.stderr
+    assert "consulting sacct" in result.stderr
+    assert "Invalid job id specified" in result.stderr
+    sbatch = Path(fixture["sbatch_log"]).read_text(encoding="utf-8")
+    assert "--dependency=" not in sbatch
+    output = fixture["output"]
+    assert isinstance(output, Path)
+    record = json.loads(Path(f"{output}.SUBMISSION.json").read_text(encoding="utf-8"))
+    assert record["upstreams"][0]["job_id"] == "101"
+    assert record["upstreams"][0]["scheduler_state"] == "COMPLETED"
+    assert record["upstreams"][0]["state_class"] == "completed"
+    assert record["upstreams"][0]["included_in_afterok"] is False
 
 
 def test_completed_job_without_nonempty_artifact_aborts_before_submission(

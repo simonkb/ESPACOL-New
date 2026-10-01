@@ -81,9 +81,15 @@ state_class() {
 query_job() {
   local job="$1"
   local queue_output accounting_output raw_state normalized classification
-  queue_output="$(squeue -h -j "${job}" -o '%T')" || {
-    echo "squeue failed while inspecting job ${job}." >&2; return 90;
-  }
+  # Slurm returns a non-zero status ("Invalid job id specified") once a job
+  # ages out of squeue, even while its durable allocation record remains in
+  # sacct. Treat that exactly like an empty queue lookup and fall through to
+  # the exact JobIDRaw accounting check below. A real scheduler outage still
+  # fails closed unless sacct can independently establish the job state.
+  if ! queue_output="$(squeue -h -j "${job}" -o '%T' 2>&1)"; then
+    echo "squeue has no usable record for job ${job}; consulting sacct: ${queue_output}" >&2
+    queue_output=""
+  fi
   if [[ -n "${queue_output//[[:space:]]/}" ]]; then
     normalized=""
     while IFS= read -r raw_state; do
