@@ -3,11 +3,10 @@
 # Submit with --dependency=afterok:<aggregate-job>[:<aggregate-job>...], or run
 # independently when every referenced aggregate manifest already exists.
 #SBATCH --job-name=origin_oof_stats
-#SBATCH --partition=gpu
+#SBATCH --partition=prod
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:1
 #SBATCH --mem=64G
 #SBATCH --time=0-12:00:00
 #SBATCH --output=/dpc/kuin0170/ESPACOL-New/origin_oof_intervention_logs/statistics_%j.out

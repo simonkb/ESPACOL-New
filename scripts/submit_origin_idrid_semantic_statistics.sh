@@ -2,11 +2,10 @@
 # Postprocess an already completed IDRiD semantic audit.  No model is loaded.
 # May be submitted independently now, or with --dependency=afterok:<semantic-job>.
 #SBATCH --job-name=org_idrid_stats
-#SBATCH --partition=gpu
+#SBATCH --partition=prod
 #SBATCH --account=kuin0170
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=02:00:00
