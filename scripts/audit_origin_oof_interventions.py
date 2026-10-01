@@ -362,6 +362,7 @@ def audit_fold(
     }
     seen_indices: list[int] = []
     strata: dict[str, int] = {}
+    eligible_boundary_count = 0
     maximum_reconstruction_error = 0.0
     maximum_decoder_error = 0.0
     try:
@@ -420,6 +421,12 @@ def audit_fold(
                         "patient_id": patient_id,
                         "cluster_id": patient_id or image_key,
                     }
+                    predicted_grade = int(predictions[row_index])
+                    eligible_boundaries = {
+                        boundary
+                        for boundary in range(cfg.n_classes - 1)
+                        if label > boundary and predicted_grade > boundary
+                    }
                     result = audit_image_ledger(
                         rate_maps={name: value[row_index] for name, value in local_maps.items()},
                         valid_masks={name: value[row_index] for name, value in valid_masks.items()},
@@ -430,7 +437,9 @@ def audit_fold(
                         config=audit_config,
                         baseline_total_rates=total_rates[row_index],
                         baseline_probabilities=probabilities[row_index],
+                        curve_eligible_boundaries=eligible_boundaries,
                     )
+                    eligible_boundary_count += len(eligible_boundaries)
                     for record in result["image_rows"]:
                         image_writer.write(record)
                     for record in result["curve_rows"]:
@@ -473,6 +482,12 @@ def audit_fold(
             "scope": "every_locked_outer_fold_image_exact_stored_ledger_interventions",
             "n_images": len(outer_items),
             "n_boundaries": cfg.n_classes - 1,
+            "n_image_boundaries": len(outer_items) * (cfg.n_classes - 1),
+            "n_curve_eligible_image_boundaries": eligible_boundary_count,
+            "curve_eligibility_rule": (
+                "true_grade > boundary and class_map_prediction > boundary; "
+                "fixed before interventions and independent of intervention outcomes"
+            ),
             "decision_rule": "class_map",
             "split_signature": provenance["split_manifest"]["signature"],
             "cv_protocol_checksum_sha256": provenance["cv_protocol"]["content_checksum_sha256"],
@@ -494,6 +509,12 @@ def audit_fold(
             "diagnostics": {
                 "max_ledger_total_rate_reconstruction_abs_error": maximum_reconstruction_error,
                 "max_baseline_decoder_replay_probability_abs_error": maximum_decoder_error,
+                "selected_groups_per_eligible_image_boundary": len(
+                    audit_config.cell_budget_fractions
+                ) * (2 + len(audit_protocol["controls"]) * audit_config.random_repeats),
+                "decoded_intervention_rate_vectors_per_eligible_image_boundary": 2
+                * len(audit_config.cell_budget_fractions)
+                * (2 + len(audit_protocol["controls"]) * audit_config.random_repeats),
             },
             "artifacts": artifacts,
             "interpretation_scope": "exact_frozen_stored_ledger_intervention_not_causal_pixel_intervention",
