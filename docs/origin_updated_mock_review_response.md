@@ -66,6 +66,10 @@ removed rate mass; the latter is the outcome being audited.
 
 No model retraining is needed for the corrective audit.
 
+The checksum-sealed corrective audit was submitted as job `10301713` from
+immutable commit `4368421...`.  Its result remains pending and is not assumed
+favorable in this response.
+
 ## W2: intrinsic comparators and concrete auditing utility
 
 Do not launch another architecture search.  The requested comparisons are
@@ -91,9 +95,10 @@ must be narrowed.
 ## W3: supplement and artifacts
 
 Package job `10299968` was canceled because its immutable snapshot and input
-contract predated the corrective IDRiD-v2 audit.  A replacement package must be
-launched from the v2-aware commit and remain dependency-gated on IDRiD v2,
-Gates A/B, and the matched-baseline release.  The replacement is designed to
+contract predated the corrective IDRiD-v2 audit.  Replacement job `10301716`
+was launched from immutable v2-aware commit `4368421...` and is
+dependency-gated on IDRiD-v2 job `10301713`, Gates A/B, and the
+matched-baseline release.  The replacement is designed to
 bundle protocols, numerical and decoder audits, anonymous split memberships,
 privacy-safe matched-baseline predictions, continuation provenance, and
 aggregate intervention results.
