@@ -169,6 +169,7 @@ def aggregate_manifests(
     boundary_keys: set[tuple[str, int]] = set()
     summary_stats: dict[tuple[int, str, str, str, str], OnlineStats] = {}
     total_images_from_manifests = 0
+    total_eligible_boundaries = 0
     fold_records: list[dict[str, Any]] = []
     with (
         AtomicJsonlGzipWriter(output_paths["image_rows"]) as image_writer,
@@ -178,6 +179,8 @@ def aggregate_manifests(
         for manifest_path, manifest in manifests:
             fold = int(manifest["fold"])
             total_images_from_manifests += int(manifest["n_images"])
+            fold_eligible_boundaries = int(manifest["n_curve_eligible_image_boundaries"])
+            total_eligible_boundaries += fold_eligible_boundaries
             artifacts = manifest.get("artifacts")
             if not isinstance(artifacts, Mapping) or set(artifacts) != set(output_paths):
                 raise AssertionError(f"fold {fold} artifact set is incomplete")
@@ -189,8 +192,8 @@ def aggregate_manifests(
             budgets = manifest["audit_config"]["cell_budget_fractions"]
             expected_rows = {
                 "image_rows": int(manifest["n_images"]) * boundaries,
-                "curve_rows": int(manifest["n_images"]) * boundaries * len(METHODS) * len(budgets),
-                "summary_rows": int(manifest["n_images"]) * boundaries * len(METHODS),
+                "curve_rows": fold_eligible_boundaries * len(METHODS) * len(budgets),
+                "summary_rows": fold_eligible_boundaries * len(METHODS),
             }
             for name, expected in expected_rows.items():
                 if int(artifacts[name].get("rows", -1)) != expected:
@@ -198,6 +201,7 @@ def aggregate_manifests(
             observed = {name: 0 for name in output_paths}
             fold_images: set[str] = set()
             fold_image_paths: dict[str, str] = {}
+            observed_eligible_boundaries = 0
             for row in iter_jsonl_gzip(fold_paths["image_rows"]):
                 observed["image_rows"] += 1
                 if row.get("schema") != ROW_SCHEMA or row.get("row_type") != "image_boundary_census":
@@ -217,9 +221,12 @@ def aggregate_manifests(
                 if image_key in fold_image_paths and fold_image_paths[image_key] != recorded_path:
                     raise AssertionError("image census rows disagree on image path")
                 fold_image_paths[image_key] = recorded_path
+                observed_eligible_boundaries += int(bool(row.get("curve_eligible")))
                 image_writer.write(row)
             if len(fold_images) != int(manifest["n_images"]):
                 raise AssertionError(f"fold {fold} image census coverage is incomplete")
+            if observed_eligible_boundaries != fold_eligible_boundaries:
+                raise AssertionError(f"fold {fold} curve-eligibility count changed")
             for image_key in fold_images:
                 if image_key in image_keys:
                     raise AssertionError("duplicate image key across outer folds")
@@ -276,6 +283,7 @@ def aggregate_manifests(
                 {
                     "fold": fold,
                     "n_images": int(manifest["n_images"]),
+                    "n_curve_eligible_image_boundaries": fold_eligible_boundaries,
                     "split_signature": manifest["split_signature"],
                     "manifest_path": str(manifest_path.resolve()),
                     "manifest_sha256": file_sha256(manifest_path),
@@ -303,6 +311,8 @@ def aggregate_manifests(
         "schema": "origin-oof-intervention-strata-v1",
         "dataset": dataset,
         "n_images": expected_n_images,
+        "n_image_boundaries": len(boundary_keys),
+        "n_curve_eligible_image_boundaries": total_eligible_boundaries,
         "bootstrap_guidance": (
             "Use OOF_BOOTSTRAP_IMAGE_BOUNDARY_SUMMARIES.jsonl.gz; resample cluster_id "
             "for EyePACS and image_key for APTOS, preserving paired methods within an image."

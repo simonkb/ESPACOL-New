@@ -693,6 +693,93 @@ def audit_image_ledger(
         else:
             entropy = 0.0
             entropy_normalized = 0.0
+        scale_mass = {
+            scale: float(vectors[scales == index, boundary].sum(dtype=np.float64))
+            for index, scale in enumerate(scale_names)
+        }
+        expected_range = float(full["expected"][0] - prior["expected"][0])
+        posterior_tv_range = 0.5 * float(
+            np.abs(full["probabilities"][0] - prior["probabilities"][0]).sum()
+        )
+        map_range = int(full["map"][0]) - int(prior["map"][0])
+        true_boundary_positive = int(true_grade) > boundary
+        predicted_boundary_positive = predicted_grade > boundary
+        curve_eligible = (
+            True
+            if curve_eligible_boundaries is None
+            else boundary in curve_eligible_boundaries
+        )
+        image_row: dict[str, Any] = {
+            "schema": ROW_SCHEMA,
+            "row_type": "image_boundary_census",
+            **common_identity,
+            "boundary": boundary,
+            "true_boundary_positive": true_boundary_positive,
+            "predicted_boundary_positive": predicted_boundary_positive,
+            "curve_eligible": curve_eligible,
+            "curve_eligibility_rule": CURVE_ELIGIBILITY_RULE,
+            "curve_exclusion_reason": (
+                None
+                if curve_eligible
+                else (
+                    "true_and_predicted_boundary_not_positive"
+                    if not true_boundary_positive and not predicted_boundary_positive
+                    else "true_boundary_not_positive"
+                    if not true_boundary_positive
+                    else "predicted_boundary_not_positive"
+                )
+            ),
+            "valid_cell_count": len(vectors),
+            "full_class_probabilities": full["probabilities"][0].tolist(),
+            "prior_class_probabilities": prior["probabilities"][0].tolist(),
+            "full_tail_probability": float(full["tails"][0, boundary]),
+            "prior_tail_probability": float(prior["tails"][0, boundary]),
+            "locally_attributable_tail_range": float(
+                full["tails"][0, boundary] - prior["tails"][0, boundary]
+            ),
+            "tail_range_near_zero": bool(
+                abs(float(full["tails"][0, boundary] - prior["tails"][0, boundary]))
+                <= config.denominator_epsilon
+            ),
+            "full_expected_grade": float(full["expected"][0]),
+            "prior_expected_grade": float(prior["expected"][0]),
+            "locally_attributable_expected_grade_range": expected_range,
+            "expected_grade_range_near_zero": bool(
+                abs(expected_range) <= config.denominator_epsilon
+            ),
+            "locally_attributable_posterior_tv_range": posterior_tv_range,
+            "posterior_tv_range_near_zero": bool(
+                abs(posterior_tv_range) <= config.denominator_epsilon
+            ),
+            "full_map_grade": int(full["map"][0]),
+            "prior_map_grade": int(prior["map"][0]),
+            "locally_attributable_map_grade_range": map_range,
+            "map_grade_range_near_zero": bool(
+                abs(map_range) <= config.denominator_epsilon
+            ),
+            "local_target_boundary_mass": local_mass,
+            "target_mass_hhi": (
+                None if raw_local_mass <= config.denominator_epsilon
+                else float(score_square_sum / (raw_local_mass * raw_local_mass))
+            ),
+            "target_mass_effective_support": effective_support,
+            "target_mass_entropy": entropy,
+            "target_mass_entropy_normalized": entropy_normalized,
+            "scale_target_mass": scale_mass,
+            "scale_target_mass_json": _json_compact(scale_mass),
+            "scale_geometry": scale_geometry,
+            "scale_geometry_json": _json_compact(scale_geometry),
+            "ledger_total_rate_reconstruction_max_abs_error": reconstruction_error,
+            "baseline_decoder_replay_max_abs_probability_error": probability_error,
+        }
+        if not curve_eligible:
+            for name, _, _, _ in _THRESHOLD_SPECS:
+                image_row[f"{name}_cell_count"] = None
+                image_row[f"{name}_cell_fraction"] = None
+                image_row[f"{name}_nominal_stride_area_fraction"] = None
+                image_row[f"{name}_target_mass_fraction"] = None
+            image_rows.append(image_row)
+            continue
         budget_ks = [_budget_index(value, len(vectors)) for value in config.cell_budget_fractions]
         references: list[dict[str, Any]] = []
         for budget_index, (budget, k) in enumerate(zip(config.cell_budget_fractions, budget_ks)):
@@ -979,75 +1066,7 @@ def audit_image_ledger(
                         else float(left) / float(right)
                     )
         curve_rows.extend(boundary_rows)
-
-        scale_mass = {
-            scale: float(vectors[scales == index, boundary].sum(dtype=np.float64))
-            for index, scale in enumerate(scale_names)
-        }
-        expected_range = float(full["expected"][0] - prior["expected"][0])
-        posterior_tv_range = 0.5 * float(
-            np.abs(full["probabilities"][0] - prior["probabilities"][0]).sum()
-        )
-        map_range = int(full["map"][0]) - int(prior["map"][0])
-        image_row: dict[str, Any] = {
-            "schema": ROW_SCHEMA,
-            "row_type": "image_boundary_census",
-            **common_identity,
-            "boundary": boundary,
-            "valid_cell_count": len(vectors),
-            "full_class_probabilities": full["probabilities"][0].tolist(),
-            "prior_class_probabilities": prior["probabilities"][0].tolist(),
-            "full_tail_probability": float(full["tails"][0, boundary]),
-            "prior_tail_probability": float(prior["tails"][0, boundary]),
-            "locally_attributable_tail_range": float(
-                full["tails"][0, boundary] - prior["tails"][0, boundary]
-            ),
-            "tail_range_near_zero": bool(
-                abs(float(full["tails"][0, boundary] - prior["tails"][0, boundary]))
-                <= config.denominator_epsilon
-            ),
-            "full_expected_grade": float(full["expected"][0]),
-            "prior_expected_grade": float(prior["expected"][0]),
-            "locally_attributable_expected_grade_range": expected_range,
-            "expected_grade_range_near_zero": bool(
-                abs(expected_range) <= config.denominator_epsilon
-            ),
-            "locally_attributable_posterior_tv_range": posterior_tv_range,
-            "posterior_tv_range_near_zero": bool(
-                abs(posterior_tv_range) <= config.denominator_epsilon
-            ),
-            "full_map_grade": int(full["map"][0]),
-            "prior_map_grade": int(prior["map"][0]),
-            "locally_attributable_map_grade_range": map_range,
-            "map_grade_range_near_zero": bool(
-                abs(map_range) <= config.denominator_epsilon
-            ),
-            "local_target_boundary_mass": local_mass,
-            "target_mass_hhi": (
-                None if raw_local_mass <= config.denominator_epsilon
-                else float(score_square_sum / (raw_local_mass * raw_local_mass))
-            ),
-            "target_mass_effective_support": effective_support,
-            "target_mass_entropy": entropy,
-            "target_mass_entropy_normalized": entropy_normalized,
-            "scale_target_mass": scale_mass,
-            "scale_target_mass_json": _json_compact(scale_mass),
-            "scale_geometry": scale_geometry,
-            "scale_geometry_json": _json_compact(scale_geometry),
-            "ledger_total_rate_reconstruction_max_abs_error": reconstruction_error,
-            "baseline_decoder_replay_max_abs_probability_error": probability_error,
-        }
-
-        threshold_specs = (
-            ("min_delete_map_change", "deletion", "map", 0.0),
-            ("min_delete_expected_drop_0p25", "deletion", "expected", 0.25),
-            ("min_retain_map_preservation", "retention", "map", 0.0),
-            *( (f"min_delete_tail_effect_{int(level * 100)}pct", "deletion", "tail", level)
-               for level in (0.5, 0.8, 0.9) ),
-            *( (f"min_retain_tail_effect_{int(level * 100)}pct", "retention", "tail", level)
-               for level in (0.5, 0.8, 0.9) ),
-        )
-        for name, mode, predicate, threshold in threshold_specs:
+        for name, mode, predicate, threshold in _THRESHOLD_SPECS:
             k = _minimal_prefix(
                 mode=mode,
                 prefix_rates=prefix_rates,
@@ -1092,6 +1111,9 @@ def audit_image_ledger(
             "baseline_decoder_replay_max_abs_probability_error": probability_error,
             "valid_cell_count": len(vectors),
             "num_boundaries": boundaries,
+            "eligible_boundary_count": sum(
+                bool(row["curve_eligible"]) for row in image_rows
+            ),
         },
     }
 

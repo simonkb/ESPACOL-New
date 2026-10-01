@@ -196,6 +196,37 @@ def test_zero_local_boundary_range_is_flagged_and_not_divided() -> None:
     assert curve["deletion_tail_normalized"] is None
 
 
+def test_ineligible_boundaries_remain_in_census_without_intervention_curves() -> None:
+    s4 = torch.tensor(
+        [[[0.2, 0.4, 0.1], [0.1, 0.3, 0.2]]], dtype=torch.float32
+    )
+    result = audit_image_ledger(
+        rate_maps={"s4": s4},
+        valid_masks={"s4": torch.ones(1, 2, dtype=torch.bool)},
+        prior_rates=torch.tensor([0.1, 0.1, 0.1]),
+        metadata={
+            "s4": SimpleNamespace(
+                output_stride=4, receptive_field=4, center_offset=2.0,
+                input_size=(4, 8),
+            )
+        },
+        identity={"image_key": "eligible"},
+        true_grade=2,
+        config=_config(),
+        curve_eligible_boundaries={1},
+    )
+    assert len(result["image_rows"]) == 3
+    assert [row["curve_eligible"] for row in result["image_rows"]] == [
+        False, True, False
+    ]
+    assert {row["boundary"] for row in result["curve_rows"]} == {1}
+    assert all(
+        row["min_delete_map_change_cell_count"] is None
+        for row in result["image_rows"]
+        if not row["curve_eligible"]
+    )
+
+
 def test_frozen_protocol_is_checksummed_and_has_production_repeats() -> None:
     path = Path("scripts/protocols/origin_oof_intervention_protocol.json")
     payload, config = load_audit_protocol(path)
@@ -229,6 +260,7 @@ def _write_fake_fold(
         "true_grade": fold,
         "predicted_grade": fold,
         "correct": True,
+        "curve_eligible": True,
         "cluster_id": image_key,
     }
     paths = {
@@ -272,6 +304,7 @@ def _write_fake_fold(
         "scope": "every_locked_outer_fold_image_exact_stored_ledger_interventions",
         "n_images": 1,
         "n_boundaries": 1,
+        "n_curve_eligible_image_boundaries": 1,
         "split_signature": f"split-{fold}",
         "audit_protocol_checksum_sha256": audit_checksum,
         "cv_protocol_checksum_sha256": cv_checksum,
