@@ -40,7 +40,11 @@ from models.origin_encoder import (
     OriginEncoderScale,
     OriginScaleMetadata,
 )
-from scripts.audit_origin_shortcut import _main_audit, _transform_parameter_hash
+from scripts.audit_origin_shortcut import (
+    _audit_console_summary,
+    _main_audit,
+    _transform_parameter_hash,
+)
 from scripts.origin_shortcut_comparator_common import (
     COMPARATOR_VARIANTS,
     PROTOCOL_CORE_SHA256,
@@ -418,6 +422,29 @@ def test_pooled_comparator_reports_behavior_without_fabricated_local_ledger() ->
     assert not result["internal_pixel_effects"]["applicable"]
     assert len(result["internal_effect_records"]) == 0
     assert np.asarray(result["boundary_response_matrix"]).shape == (4, 4)
+
+
+def test_pooled_comparator_console_summary_preserves_non_applicability() -> None:
+    summary = _audit_console_summary(
+        {
+            "output": "/tmp/shortcut_audit.json",
+            "arm": "shortcut",
+            "family": "localized",
+            "samples": 733,
+            "localization": {
+                "applicable": False,
+                "reason": "pooled comparator exposes no spatial prediction ledger",
+            },
+            "internal_pixel_effects": {
+                "applicable": False,
+                "reason": "pooled comparator has no exact stored-ledger intervention",
+            },
+        }
+    )
+    assert summary["localization_applicable"] is False
+    assert summary["macro_auprc"] is None
+    assert summary["internal_effect_applicable"] is False
+    assert summary["internal_pixel_spearman"] is None
 
 
 def _perfect_localization_fixture(samples: int = 12):

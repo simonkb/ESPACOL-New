@@ -941,6 +941,42 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _audit_console_summary(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a total, schema-honest terminal summary.
+
+    Globally pooled comparators deliberately have no spatial prediction
+    ledger.  Their audit report therefore carries explicit non-applicability
+    records rather than fabricated localization/effect values.  Console
+    logging must preserve that contract instead of assuming those optional
+    metrics exist after the report has already been written.
+    """
+
+    localization = report.get("localization")
+    effects = report.get("internal_pixel_effects")
+    if not isinstance(localization, Mapping):
+        raise TypeError("audit report localization record is missing")
+    if not isinstance(effects, Mapping):
+        raise TypeError("audit report internal-effect record is missing")
+    localization_applicable = bool(
+        localization.get(
+            "localization_applicable", localization.get("applicable", True)
+        )
+    )
+    effects_applicable = bool(effects.get("applicable", True))
+    return {
+        "output": str(report["output"]),
+        "arm": str(report["arm"]),
+        "family": str(report["family"]),
+        "samples": int(report["samples"]),
+        "localization_applicable": localization_applicable,
+        "macro_auprc": json_ready(localization.get("macro_auprc")),
+        "internal_effect_applicable": effects_applicable,
+        "internal_pixel_spearman": json_ready(
+            effects.get("internal_pixel_spearman")
+        ),
+    }
+
+
 def main() -> None:
     args = build_parser().parse_args()
     prediction_artifact = args.output.with_name(
@@ -1224,16 +1260,15 @@ def main() -> None:
     _write_json_atomic(args.output, report)
     print(
         json.dumps(
-            {
-                "output": str(args.output),
-                "arm": arm,
-                "family": family,
-                "samples": len(indices),
-                "macro_auprc": json_ready(report["localization"]["macro_auprc"]),
-                "internal_pixel_spearman": json_ready(
-                    report["internal_pixel_effects"]["internal_pixel_spearman"]
-                ),
-            },
+            _audit_console_summary(
+                {
+                    **report,
+                    "output": str(args.output),
+                    "arm": arm,
+                    "family": family,
+                    "samples": len(indices),
+                }
+            ),
             sort_keys=True,
         )
     )
