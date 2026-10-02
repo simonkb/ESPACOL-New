@@ -15,6 +15,7 @@ ENV_PYTHON="${HOME}/.conda/envs/${ORIGIN_CONDA_ENV:-G}/bin/python"
 [[ -x "${ENV_PYTHON}" ]] || { echo "Missing ${ENV_PYTHON}." >&2; exit 3; }
 command -v sbatch >/dev/null || { echo "sbatch unavailable." >&2; exit 4; }
 command -v squeue >/dev/null || { echo "squeue unavailable." >&2; exit 5; }
+command -v scontrol >/dev/null || { echo "scontrol unavailable." >&2; exit 5; }
 
 SUITE_ROOT="$("${ENV_PYTHON}" -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$1")"
 PROTOCOL="${SUITE_ROOT}/PROTOCOL_V2.json"
@@ -69,12 +70,27 @@ ORIGINAL_AGGREGATE_JOB="${META[5]}"
 # Python gives the current directory precedence over PYTHONPATH, so an explicit
 # chdir is part of the fail-closed provenance contract.
 cd "${SNAPSHOT_ROOT}"
-"${ENV_PYTHON}" - "${PROTOCOL}" <<'PY'
+"${ENV_PYTHON}" - "${PROTOCOL}" "${SUITE_ROOT}" <<'PY'
 import json, pathlib, sys
-from scripts.origin_shortcut_comparator_common import PROTOCOL_CORE_SHA256
+from scripts.origin_shortcut_comparator_common import PROTOCOL_CORE_SHA256, task_at
 protocol = json.loads(pathlib.Path(sys.argv[1]).read_text())
 if protocol.get("protocol_core_sha256") != PROTOCOL_CORE_SHA256:
     raise SystemExit("protocol core mismatch against immutable launch snapshot")
+suite = pathlib.Path(sys.argv[2]).resolve()
+for task_id in range(27, 42):
+    task = task_at(task_id)
+    fold = (
+        suite / "workers" / task.model_variant / task.arm / task.family
+        / f"seed{task.training_seed}" / "fold0"
+    )
+    if fold.exists() and any(fold.iterdir()):
+        raise SystemExit(
+            f"original canceled task {task_id} has a non-empty fold directory: {fold}"
+        )
+for task_id in range(21, 42):
+    recovery = suite / "recovery" / f"task{task_id}.json"
+    if recovery.exists():
+        raise SystemExit(f"task {task_id} already has a recovery record: {recovery}")
 PY
 
 # Queueing must not expose workers to a mutable recovery checkout.  Seal the
@@ -103,12 +119,39 @@ fi
   echo "Sealed ORIGIN reference aggregate is missing." >&2; exit 14;
 }
 
-EXPORTS="ALL,ORIGIN_REPO_ROOT=${SNAPSHOT_ROOT},ORIGIN_RECOVERY_REPO_ROOT=${RECOVERY_ROOT},ORIGIN_RECOVERY_COMMIT=${RECOVERY_COMMIT},ORIGIN_LAUNCH_COMMIT=${LAUNCH_COMMIT},ORIGIN_ORIGINAL_WORKER_JOB=${ORIGINAL_WORKER_JOB},ORIGIN_SHORTCUT_COMPARATOR_ROOT=${SUITE_ROOT},ORIGIN_SHORTCUT_COMPARATOR_PROTOCOL=${PROTOCOL},ORIGIN_SHORTCUT_REFERENCE_ROOT=${REFERENCE_ROOT},ORIGIN_DATA_ROOT=${DATA_ROOT}"
-POOLED_ORIGINAL_ELEMENTS=()
-for task_id in $(seq 21 41); do
-  POOLED_ORIGINAL_ELEMENTS+=("${ORIGINAL_WORKER_JOB}_${task_id}")
+# Tasks 27..41 were canceled while only represented by the parent array's
+# compressed queue expression.  This cluster creates no individual Slurm
+# object for those canceled-before-start elements, so depending on nonexistent
+# JOB_TASK ids can remain pending forever.  Prove that state explicitly before
+# submitting fresh replacements; do not infer it merely from missing files.
+scontrol show job "${ORIGINAL_WORKER_JOB}" >/dev/null 2>&1 || {
+  echo "Original comparator parent array is not reachable: ${ORIGINAL_WORKER_JOB}." >&2
+  exit 15
+}
+ORIGINAL_ARRAY_SQUEUE_ROWS="$(squeue -h -r -j "${ORIGINAL_WORKER_JOB}" -o '%F|%K|%T')"
+ORIGIN_RECOVERY_SQUEUE_ROWS="${ORIGINAL_ARRAY_SQUEUE_ROWS}" \
+"${ENV_PYTHON}" - "${ORIGINAL_WORKER_JOB}" <<'PY'
+import os, sys
+job = sys.argv[1]
+for line in os.environ["ORIGIN_RECOVERY_SQUEUE_ROWS"].splitlines():
+    fields = line.strip().split("|", 2)
+    if len(fields) != 3 or fields[0] != job or not fields[1].isdigit():
+        raise SystemExit(f"unexpected expanded squeue row: {line!r}")
+    task_id = int(fields[1])
+    if 27 <= task_id <= 41:
+        raise SystemExit(
+            f"original task {task_id} still exists in expanded squeue: {line}"
+        )
+PY
+for task_id in $(seq 27 41); do
+  if scontrol show job "${ORIGINAL_WORKER_JOB}_${task_id}" >/dev/null 2>&1; then
+    echo "Original task ${ORIGINAL_WORKER_JOB}_${task_id} still has a Slurm object." >&2
+    exit 16
+  fi
 done
-RUNNING_POOLED_DEPENDENCY="afterany:$(IFS=:; echo "${POOLED_ORIGINAL_ELEMENTS[*]}")"
+
+EXPORTS="ALL,ORIGIN_REPO_ROOT=${SNAPSHOT_ROOT},ORIGIN_RECOVERY_REPO_ROOT=${RECOVERY_ROOT},ORIGIN_RECOVERY_COMMIT=${RECOVERY_COMMIT},ORIGIN_LAUNCH_COMMIT=${LAUNCH_COMMIT},ORIGIN_ORIGINAL_WORKER_JOB=${ORIGINAL_WORKER_JOB},ORIGIN_SHORTCUT_COMPARATOR_ROOT=${SUITE_ROOT},ORIGIN_SHORTCUT_COMPARATOR_PROTOCOL=${PROTOCOL},ORIGIN_SHORTCUT_REFERENCE_ROOT=${REFERENCE_ROOT},ORIGIN_DATA_ROOT=${DATA_ROOT}"
+RUNNING_POOLED_DEPENDENCY="afterany:${ORIGINAL_WORKER_JOB}_23:${ORIGINAL_WORKER_JOB}_24:${ORIGINAL_WORKER_JOB}_25:${ORIGINAL_WORKER_JOB}_26"
 CONTINUATION_JOB="$(sbatch --parsable --array="21-41%${ORIGIN_SHORTCUT_POOLED_CONTINUATION_CONCURRENCY:-8}" \
   --dependency="${RUNNING_POOLED_DEPENDENCY}" --export="${EXPORTS}" \
   "${RECOVERY_ROOT}/scripts/submit_origin_shortcut_pooled_continuation_v2.sh" | cut -d';' -f1)"
@@ -123,10 +166,11 @@ ORIGIN_RECOVERY_COMMIT="${RECOVERY_COMMIT}" \
 ORIGIN_RECOVERY_ORIGINAL_COMMIT="${LAUNCH_COMMIT}" \
 ORIGIN_RECOVERY_WORKTREE="${RECOVERY_ROOT}" \
 ORIGIN_RECOVERY_ORIGINAL_WORKER="${ORIGINAL_WORKER_JOB}" \
+ORIGIN_RECOVERY_SQUEUE_ROWS="${ORIGINAL_ARRAY_SQUEUE_ROWS}" \
 ORIGIN_RECOVERY_WORKER="${CONTINUATION_JOB}" \
 ORIGIN_RECOVERY_AGGREGATE="${AGGREGATE_JOB}" \
 "${ENV_PYTHON}" - <<'PY'
-import json, os
+import hashlib, json, os
 from datetime import datetime, timezone
 from pathlib import Path
 from scripts.origin_shortcut_comparator_common import canonical_sha256
@@ -139,6 +183,24 @@ p = {
     "recovery_implementation_commit": os.environ["ORIGIN_RECOVERY_COMMIT"],
     "immutable_recovery_worktree": os.environ["ORIGIN_RECOVERY_WORKTREE"],
     "task_ids": list(range(21, 42)),
+    "expected_task_dispositions": {
+        **{str(task_id): "reused_complete_original_training" for task_id in range(21, 27)},
+        **{
+            str(task_id): "fresh_training_after_original_task_cancellation"
+            for task_id in range(27, 42)
+        },
+    },
+    "original_array_state_proof": {
+        "parent_array_reachable": True,
+        "expanded_squeue_checked": True,
+        "expanded_squeue_sha256": hashlib.sha256(
+            os.environ["ORIGIN_RECOVERY_SQUEUE_ROWS"].encode()
+        ).hexdigest(),
+        "individual_slurm_objects_absent": list(range(27, 42)),
+        "protocol_mapped_fold_directories_verified_empty": list(range(27, 42)),
+        "preexisting_recovery_records_absent": list(range(21, 42)),
+        "dependency_waits_for_original_task_ids": [23, 24, 25, 26],
+    },
     "jobs": {
         "original_comparator_array": os.environ["ORIGIN_RECOVERY_ORIGINAL_WORKER"],
         "pooled_continuation_array": os.environ["ORIGIN_RECOVERY_WORKER"],

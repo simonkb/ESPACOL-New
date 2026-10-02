@@ -128,13 +128,17 @@ BEST_PRESENT=0
 RESULT_PRESENT=0
 [[ -f "${FOLD_DIR}/best_learned.pth" ]] && BEST_PRESENT=1
 [[ -f "${FOLD_DIR}/result.json" ]] && RESULT_PRESENT=1
-if [[ "${BEST_PRESENT}" -eq 1 && "${RESULT_PRESENT}" -eq 1 ]]; then
+if [[ "${TASK_ID}" -le 26 ]]; then
+  if [[ "${BEST_PRESENT}" -ne 1 || "${RESULT_PRESENT}" -ne 1 ]]; then
+    echo "Original task ${TASK_ID} must reuse complete training; artifacts are missing." >&2
+    exit 10
+  fi
   echo "Reusing completed immutable-snapshot training artifacts."
   TRAINING_DISPOSITION="reused_complete_original_training"
 else
-  if [[ "${BEST_PRESENT}" -ne "${RESULT_PRESENT}" ]] || \
+  if [[ "${BEST_PRESENT}" -ne 0 || "${RESULT_PRESENT}" -ne 0 ]] || \
      [[ -n "$(find "${FOLD_DIR}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
-    echo "Unexpected partial task state; recovery never resumes or overwrites: ${FOLD_DIR}." >&2
+    echo "Canceled-before-start task ${TASK_ID} must have an empty fold directory: ${FOLD_DIR}." >&2
     exit 10
   fi
   TRAINING_DISPOSITION="fresh_training_after_original_task_cancellation"

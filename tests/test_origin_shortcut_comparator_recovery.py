@@ -236,6 +236,17 @@ def test_recovery_rejects_prediction_record_count_mismatch(tmp_path: Path) -> No
         )
 
 
+def test_recovery_disposition_is_bound_to_original_task_state(tmp_path: Path) -> None:
+    suite, protocol = _fixture(tmp_path, task_ids=(27,))
+    with pytest.raises(ValueError, match="disposition conflicts"):
+        validate_console_failure_artifacts(
+            suite_root=suite,
+            protocol_path=protocol,
+            task_ids=(27,),
+            training_disposition="reused_complete_original_training",
+        )
+
+
 def _train_args(path: Path) -> list[str]:
     text = path.read_text(encoding="utf-8")
     match = re.search(r"TRAIN_ARGS=\(\n(.*?)\n\)", text, flags=re.DOTALL)
@@ -258,9 +269,19 @@ def test_continuation_uses_exact_training_args_and_safe_dependencies() -> None:
     assert "validate_origin_shortcut_comparator_recovery.py" in worker_text
     assert 'for audit_family in localized border diffuse' in worker_text
     assert "--resume" not in worker_text
-    assert 'for task_id in $(seq 21 41)' in launcher_text
-    assert 'POOLED_ORIGINAL_ELEMENTS+=("${ORIGINAL_WORKER_JOB}_${task_id}")' in launcher_text
-    assert 'RUNNING_POOLED_DEPENDENCY="afterany:' in launcher_text
+    assert 'if [[ "${TASK_ID}" -le 26 ]]' in worker_text
+    assert "must reuse complete training" in worker_text
+    assert "must have an empty fold directory" in worker_text
+    assert 'scontrol show job "${ORIGINAL_WORKER_JOB}"' in launcher_text
+    assert "-o '%F|%K|%T'" in launcher_text
+    assert 'for task_id in $(seq 27 41)' in launcher_text
+    assert "protocol_mapped_fold_directories_verified_empty" in launcher_text
+    assert "preexisting_recovery_records_absent" in launcher_text
+    assert (
+        'RUNNING_POOLED_DEPENDENCY="afterany:${ORIGINAL_WORKER_JOB}_23:'
+        '${ORIGINAL_WORKER_JOB}_24:${ORIGINAL_WORKER_JOB}_25:'
+        '${ORIGINAL_WORKER_JOB}_26"'
+    ) in launcher_text
     assert '--dependency="${RUNNING_POOLED_DEPENDENCY}"' in launcher_text
     assert (
         '--dependency="afterok:${CONTINUATION_JOB},afterany:${ORIGINAL_WORKER_JOB}"'

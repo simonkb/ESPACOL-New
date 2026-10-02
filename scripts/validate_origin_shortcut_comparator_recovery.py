@@ -116,6 +116,20 @@ def validate_console_failure_artifacts(
     }
     if training_disposition not in allowed_dispositions:
         raise ValueError(f"invalid training disposition: {training_disposition}")
+    if training_disposition != "read_only_existing_artifacts":
+        expected_dispositions = {
+            (
+                "reused_complete_original_training"
+                if task_id <= 26
+                else "fresh_training_after_original_task_cancellation"
+            )
+            for task_id in requested
+        }
+        if expected_dispositions != {training_disposition}:
+            raise ValueError(
+                "training disposition conflicts with frozen original-task state: "
+                f"tasks={requested}, disposition={training_disposition}"
+            )
     if int(audits_created) < 0:
         raise ValueError("audits_created must be non-negative")
     for label, job_id in (
