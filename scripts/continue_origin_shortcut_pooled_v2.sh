@@ -5,8 +5,8 @@
 set -euo pipefail
 [[ $# -eq 1 ]] || { echo "Usage: $0 SUITE_ROOT" >&2; exit 64; }
 
-RECOVERY_ROOT="$(git rev-parse --show-toplevel)"
-cd "${RECOVERY_ROOT}"
+SOURCE_ROOT="$(git rev-parse --show-toplevel)"
+cd "${SOURCE_ROOT}"
 RECOVERY_COMMIT="$(git rev-parse HEAD)"
 [[ -z "$(git status --porcelain --untracked-files=no)" ]] || {
   echo "Commit tracked recovery changes before continuation." >&2; exit 2;
@@ -31,19 +31,19 @@ SUBMISSION="${SUITE_ROOT}/SUBMISSION.json"
 
 mapfile -t META < <("${ENV_PYTHON}" - "${PROTOCOL}" "${SUBMISSION}" "${SUITE_ROOT}" <<'PY'
 import hashlib, json, pathlib, sys
-from scripts.origin_shortcut_comparator_common import PROTOCOL_CORE_SHA256, canonical_sha256
 protocol_path, submission_path, expected_root = map(pathlib.Path, sys.argv[1:])
 protocol = json.loads(protocol_path.read_text())
 recorded = protocol.pop("content_checksum_sha256")
-if recorded != canonical_sha256(protocol):
+canonical = lambda value: hashlib.sha256(json.dumps(
+    value, sort_keys=True, separators=(",", ":"), allow_nan=False
+).encode()).hexdigest()
+if recorded != canonical(protocol):
     raise SystemExit("protocol checksum mismatch")
-if protocol.get("protocol_core_sha256") != PROTOCOL_CORE_SHA256:
-    raise SystemExit("protocol core mismatch")
 if pathlib.Path(protocol.get("suite_root", "")).resolve() != expected_root.resolve():
     raise SystemExit("suite root mismatch")
 submission = json.loads(submission_path.read_text())
 submitted_checksum = submission.pop("content_checksum_sha256")
-if submitted_checksum != canonical_sha256(submission):
+if submitted_checksum != canonical(submission):
     raise SystemExit("submission checksum mismatch")
 if submission.get("launch_commit") != protocol.get("launch_commit"):
     raise SystemExit("submission/protocol commit mismatch")
@@ -65,18 +65,50 @@ ORIGINAL_AGGREGATE_JOB="${META[5]}"
 
 [[ "$(git -C "${SNAPSHOT_ROOT}" rev-parse HEAD)" == "${LAUNCH_COMMIT}" ]] || exit 10
 [[ -z "$(git -C "${SNAPSHOT_ROOT}" status --porcelain --untracked-files=no)" ]] || exit 11
+# Import protocol semantics only from the original immutable launch snapshot.
+# Python gives the current directory precedence over PYTHONPATH, so an explicit
+# chdir is part of the fail-closed provenance contract.
+cd "${SNAPSHOT_ROOT}"
+"${ENV_PYTHON}" - "${PROTOCOL}" <<'PY'
+import json, pathlib, sys
+from scripts.origin_shortcut_comparator_common import PROTOCOL_CORE_SHA256
+protocol = json.loads(pathlib.Path(sys.argv[1]).read_text())
+if protocol.get("protocol_core_sha256") != PROTOCOL_CORE_SHA256:
+    raise SystemExit("protocol core mismatch against immutable launch snapshot")
+PY
+
+# Queueing must not expose workers to a mutable recovery checkout.  Seal the
+# recovery implementation in its own detached worktree at the exact commit
+# that is recorded in continuation provenance.
+RECOVERY_SHORT="${RECOVERY_COMMIT:0:12}"
+RECOVERY_ROOT="${ORIGIN_SHORTCUT_RECOVERY_WORKTREE:-${SOURCE_ROOT}-origin-shortcut-recovery-${RECOVERY_SHORT}}"
+if [[ -e "${RECOVERY_ROOT}" ]]; then
+  [[ -d "${RECOVERY_ROOT}" ]] || { echo "Recovery path is not a directory: ${RECOVERY_ROOT}" >&2; exit 12; }
+else
+  git -C "${SOURCE_ROOT}" worktree add --detach "${RECOVERY_ROOT}" "${RECOVERY_COMMIT}"
+fi
+[[ "$(git -C "${RECOVERY_ROOT}" rev-parse HEAD)" == "${RECOVERY_COMMIT}" ]] || {
+  echo "Detached recovery worktree commit mismatch: ${RECOVERY_ROOT}" >&2; exit 12;
+}
+[[ -z "$(git -C "${RECOVERY_ROOT}" status --porcelain --untracked-files=no)" ]] || {
+  echo "Detached recovery worktree contains tracked changes: ${RECOVERY_ROOT}" >&2; exit 12;
+}
 if [[ -n "$(squeue -h -j "${ORIGINAL_AGGREGATE_JOB}" -o '%i' 2>/dev/null)" ]]; then
   echo "Original blocked aggregate ${ORIGINAL_AGGREGATE_JOB} is still queued." >&2
   echo "Run: scancel ${ORIGINAL_AGGREGATE_JOB}" >&2
   echo "Then rerun this continuation launcher." >&2
-  exit 12
+  exit 13
 fi
 [[ -f "${REFERENCE_ROOT}/APTOS_SHORTCUT_PILOT_RESULTS.json" ]] || {
-  echo "Sealed ORIGIN reference aggregate is missing." >&2; exit 13;
+  echo "Sealed ORIGIN reference aggregate is missing." >&2; exit 14;
 }
 
-EXPORTS="ALL,ORIGIN_REPO_ROOT=${SNAPSHOT_ROOT},ORIGIN_RECOVERY_REPO_ROOT=${RECOVERY_ROOT},ORIGIN_RECOVERY_COMMIT=${RECOVERY_COMMIT},ORIGIN_LAUNCH_COMMIT=${LAUNCH_COMMIT},ORIGIN_SHORTCUT_COMPARATOR_ROOT=${SUITE_ROOT},ORIGIN_SHORTCUT_COMPARATOR_PROTOCOL=${PROTOCOL},ORIGIN_SHORTCUT_REFERENCE_ROOT=${REFERENCE_ROOT},ORIGIN_DATA_ROOT=${DATA_ROOT}"
-RUNNING_POOLED_DEPENDENCY="afterany:${ORIGINAL_WORKER_JOB}_23:${ORIGINAL_WORKER_JOB}_24:${ORIGINAL_WORKER_JOB}_25:${ORIGINAL_WORKER_JOB}_26"
+EXPORTS="ALL,ORIGIN_REPO_ROOT=${SNAPSHOT_ROOT},ORIGIN_RECOVERY_REPO_ROOT=${RECOVERY_ROOT},ORIGIN_RECOVERY_COMMIT=${RECOVERY_COMMIT},ORIGIN_LAUNCH_COMMIT=${LAUNCH_COMMIT},ORIGIN_ORIGINAL_WORKER_JOB=${ORIGINAL_WORKER_JOB},ORIGIN_SHORTCUT_COMPARATOR_ROOT=${SUITE_ROOT},ORIGIN_SHORTCUT_COMPARATOR_PROTOCOL=${PROTOCOL},ORIGIN_SHORTCUT_REFERENCE_ROOT=${REFERENCE_ROOT},ORIGIN_DATA_ROOT=${DATA_ROOT}"
+POOLED_ORIGINAL_ELEMENTS=()
+for task_id in $(seq 21 41); do
+  POOLED_ORIGINAL_ELEMENTS+=("${ORIGINAL_WORKER_JOB}_${task_id}")
+done
+RUNNING_POOLED_DEPENDENCY="afterany:$(IFS=:; echo "${POOLED_ORIGINAL_ELEMENTS[*]}")"
 CONTINUATION_JOB="$(sbatch --parsable --array="21-41%${ORIGIN_SHORTCUT_POOLED_CONTINUATION_CONCURRENCY:-8}" \
   --dependency="${RUNNING_POOLED_DEPENDENCY}" --export="${EXPORTS}" \
   "${RECOVERY_ROOT}/scripts/submit_origin_shortcut_pooled_continuation_v2.sh" | cut -d';' -f1)"
@@ -89,6 +121,8 @@ ORIGIN_RECOVERY_OUTPUT="${SUITE_ROOT}/POOLED_CONTINUATION_SUBMISSION.json" \
 ORIGIN_RECOVERY_PROTOCOL="${PROTOCOL}" \
 ORIGIN_RECOVERY_COMMIT="${RECOVERY_COMMIT}" \
 ORIGIN_RECOVERY_ORIGINAL_COMMIT="${LAUNCH_COMMIT}" \
+ORIGIN_RECOVERY_WORKTREE="${RECOVERY_ROOT}" \
+ORIGIN_RECOVERY_ORIGINAL_WORKER="${ORIGINAL_WORKER_JOB}" \
 ORIGIN_RECOVERY_WORKER="${CONTINUATION_JOB}" \
 ORIGIN_RECOVERY_AGGREGATE="${AGGREGATE_JOB}" \
 "${ENV_PYTHON}" - <<'PY'
@@ -103,8 +137,10 @@ p = {
     "protocol_modified": False,
     "original_launch_commit": os.environ["ORIGIN_RECOVERY_ORIGINAL_COMMIT"],
     "recovery_implementation_commit": os.environ["ORIGIN_RECOVERY_COMMIT"],
+    "immutable_recovery_worktree": os.environ["ORIGIN_RECOVERY_WORKTREE"],
     "task_ids": list(range(21, 42)),
     "jobs": {
+        "original_comparator_array": os.environ["ORIGIN_RECOVERY_ORIGINAL_WORKER"],
         "pooled_continuation_array": os.environ["ORIGIN_RECOVERY_WORKER"],
         "replacement_aggregate": os.environ["ORIGIN_RECOVERY_AGGREGATE"],
     },
@@ -119,4 +155,5 @@ echo "Pooled comparator continuation submitted without changing PROTOCOL_V2.json
 echo "  active pooled dependency:   ${RUNNING_POOLED_DEPENDENCY}"
 echo "  continuation array:         ${CONTINUATION_JOB} (tasks 21..41)"
 echo "  replacement aggregate:      ${AGGREGATE_JOB} (also waits afterany ${ORIGINAL_WORKER_JOB})"
+echo "  immutable recovery tree:    ${RECOVERY_ROOT}"
 echo "  suite root:                 ${SUITE_ROOT}"

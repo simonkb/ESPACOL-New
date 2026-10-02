@@ -30,6 +30,7 @@ SUITE_ROOT="${ORIGIN_SHORTCUT_COMPARATOR_ROOT:?suite root is required}"
 DATA_ROOT="${ORIGIN_DATA_ROOT:?data root is required}"
 PROTOCOL="${ORIGIN_SHORTCUT_COMPARATOR_PROTOCOL:?protocol is required}"
 LAUNCH_COMMIT="${ORIGIN_LAUNCH_COMMIT:?original launch commit is required}"
+ORIGINAL_WORKER_JOB="${ORIGIN_ORIGINAL_WORKER_JOB:?original comparator array id is required}"
 TASK_ID="${SLURM_ARRAY_TASK_ID:?array task id is required}"
 
 [[ "${TASK_ID}" =~ ^[0-9]+$ && "${TASK_ID}" -ge 21 && "${TASK_ID}" -le 41 ]] || {
@@ -123,18 +124,20 @@ TRAIN_ARGS=(
   --amp_growth_interval 2000 --amp_max_consecutive_skips 8 --skip_test
 )
 
-if [[ -f "${FOLD_DIR}/best_learned.pth" && -f "${FOLD_DIR}/result.json" ]]; then
+BEST_PRESENT=0
+RESULT_PRESENT=0
+[[ -f "${FOLD_DIR}/best_learned.pth" ]] && BEST_PRESENT=1
+[[ -f "${FOLD_DIR}/result.json" ]] && RESULT_PRESENT=1
+if [[ "${BEST_PRESENT}" -eq 1 && "${RESULT_PRESENT}" -eq 1 ]]; then
   echo "Reusing completed immutable-snapshot training artifacts."
-elif [[ -f "${FOLD_DIR}/last_learned.pth" && -f "${FOLD_DIR}/shortcut_protocol.json" ]]; then
-  printf 'resume_training_command:'; printf ' %q' python train_origin_shortcut.py "${TRAIN_ARGS[@]}" --resume; printf '\n'
-  python train_origin_shortcut.py "${TRAIN_ARGS[@]}" --resume
+  TRAINING_DISPOSITION="reused_complete_original_training"
 else
-  if [[ -d "${FOLD_DIR}" ]]; then
-    if [[ -n "$(find "${FOLD_DIR}" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
-      echo "Partial artifacts exist without a resumable checkpoint: ${FOLD_DIR}." >&2
-      exit 10
-    fi
+  if [[ "${BEST_PRESENT}" -ne "${RESULT_PRESENT}" ]] || \
+     [[ -n "$(find "${FOLD_DIR}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+    echo "Unexpected partial task state; recovery never resumes or overwrites: ${FOLD_DIR}." >&2
+    exit 10
   fi
+  TRAINING_DISPOSITION="fresh_training_after_original_task_cancellation"
   printf 'fresh_training_command:'; printf ' %q' python train_origin_shortcut.py "${TRAIN_ARGS[@]}"; printf '\n'
   python train_origin_shortcut.py "${TRAIN_ARGS[@]}"
 fi
@@ -144,6 +147,7 @@ CHECKPOINT="${FOLD_DIR}/best_learned.pth"
   echo "Pooled training artifacts are incomplete." >&2; exit 11;
 }
 
+AUDITS_CREATED=0
 run_or_reuse_historical_audit() {
   local audit_family="$1" output="$2"
   if [[ -f "${output}" ]]; then
@@ -168,6 +172,7 @@ run_or_reuse_historical_audit() {
   # non-applicability contracts before this worker can succeed.
   echo "historical_audit_exit_status=${status} family=${audit_family}"
   [[ -f "${output}" ]] || return 13
+  AUDITS_CREATED=$((AUDITS_CREATED + 1))
 }
 
 if [[ "${ARM}" == "clean" ]]; then
@@ -182,5 +187,10 @@ fi
 cd "${RECOVERY_ROOT}"
 python scripts/validate_origin_shortcut_comparator_recovery.py \
   --suite-root "${SUITE_ROOT}" --protocol "${PROTOCOL}" \
-  --task-ids "${TASK_ID}" --output "${RECOVERY_RECORD}"
+  --task-ids "${TASK_ID}" --output "${RECOVERY_RECORD}" \
+  --training-disposition "${TRAINING_DISPOSITION}" \
+  --audits-created "${AUDITS_CREATED}" \
+  --original-array-job "${ORIGINAL_WORKER_JOB}" \
+  --recovery-array-job "${SLURM_ARRAY_JOB_ID}" \
+  --recovery-implementation-commit "${RECOVERY_COMMIT}"
 echo "Pooled continuation task ${TASK_ID} completed and validated read-only."

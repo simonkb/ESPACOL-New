@@ -72,11 +72,18 @@ def _fixture(
             manifest = {
                 "record_type": "manifest",
                 "schema": "origin-ordinal-shortcut-predictions-v1",
+                "dataset": "aptos",
                 "model_variant": task.model_variant,
                 "shortcut_arm": task.arm,
                 "shortcut_family": family,
                 "training_seed": task.training_seed,
                 "fold": 0,
+                "split_seed": 42,
+                "checkpoint": str(checkpoint.resolve()),
+                "checkpoint_sha256": _sha(checkpoint),
+                "condition_prediction_records": 0,
+                "factorial_prediction_records": 0,
+                "internal_effect_records": 0,
             }
             prediction.write_text(
                 json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
@@ -84,6 +91,7 @@ def _fixture(
             )
             report = {
                 "schema": "origin-ordinal-shortcut-audit-v1",
+                "dataset": "aptos",
                 "checkpoint": str(checkpoint.resolve()),
                 "checkpoint_sha256": _sha(checkpoint),
                 "prediction_artifact": str(prediction.resolve()),
@@ -93,12 +101,16 @@ def _fixture(
                 "shortcut_family": family,
                 "training_seed": task.training_seed,
                 "fold": 0,
+                "split_seed": 42,
                 "complete_outer_fold": True,
                 "official_author_implementation": False,
                 "local_ledger_applicable": False,
                 "localization": {"applicable": False, "reason": "not applicable"},
                 "internal_pixel_effects": {"applicable": False, "reason": "not applicable"},
                 "sample_count": 733,
+                "condition_prediction_records": 0,
+                "factorial_prediction_records": 0,
+                "internal_effect_records": 0,
             }
             report["content_checksum_sha256"] = canonical_sha256(report)
             _write_json(fold / f"{stem}.json", report)
@@ -131,7 +143,8 @@ def test_console_failure_recovery_is_read_only_and_exactly_scoped(tmp_path: Path
     after = {path: _sha(path) for path in before}
     assert before == after
     assert payload["scientific_protocol_modified"] is False
-    assert payload["scientific_artifacts_modified"] is False
+    assert payload["validator_modified_scientific_artifacts"] is False
+    assert payload["recovery_execution"]["scientific_artifacts_created"] is False
     assert [item["task_id"] for item in payload["validated_tasks"]] == [21, 22]
 
     with pytest.raises(ValueError, match="sorted, unique subset"):
@@ -178,6 +191,51 @@ def test_clean_recovery_requires_and_validates_all_three_families(tmp_path: Path
     ]
 
 
+def test_recovery_rejects_wrong_checkpoint_and_prediction_paths(tmp_path: Path) -> None:
+    suite, protocol = _fixture(tmp_path, task_ids=(21,))
+    task = task_at(21)
+    fold = (
+        suite / "workers" / task.model_variant / task.arm / task.family
+        / f"seed{task.training_seed}" / "fold0"
+    )
+    audit = fold / "shortcut_audit.json"
+    payload = json.loads(audit.read_text())
+    alternate = fold / "alternate.pth"
+    alternate.write_bytes((fold / "best_learned.pth").read_bytes())
+    payload["checkpoint"] = str(alternate.resolve())
+    payload.pop("content_checksum_sha256")
+    payload["content_checksum_sha256"] = canonical_sha256(payload)
+    _write_json(audit, payload)
+    with pytest.raises(ValueError, match="checkpoint path mismatch"):
+        validate_console_failure_artifacts(
+            suite_root=suite, protocol_path=protocol, task_ids=(21,)
+        )
+
+
+def test_recovery_rejects_prediction_record_count_mismatch(tmp_path: Path) -> None:
+    suite, protocol = _fixture(tmp_path, task_ids=(21,))
+    task = task_at(21)
+    fold = (
+        suite / "workers" / task.model_variant / task.arm / task.family
+        / f"seed{task.training_seed}" / "fold0"
+    )
+    audit = fold / "shortcut_audit.json"
+    payload = json.loads(audit.read_text())
+    prediction = Path(payload["prediction_artifact"])
+    manifest = json.loads(prediction.read_text().splitlines()[0])
+    manifest["condition_prediction_records"] = 1
+    prediction.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    payload["prediction_artifact_sha256"] = _sha(prediction)
+    payload["condition_prediction_records"] = 1
+    payload.pop("content_checksum_sha256")
+    payload["content_checksum_sha256"] = canonical_sha256(payload)
+    _write_json(audit, payload)
+    with pytest.raises(ValueError, match="prediction count mismatch"):
+        validate_console_failure_artifacts(
+            suite_root=suite, protocol_path=protocol, task_ids=(21,)
+        )
+
+
 def _train_args(path: Path) -> list[str]:
     text = path.read_text(encoding="utf-8")
     match = re.search(r"TRAIN_ARGS=\(\n(.*?)\n\)", text, flags=re.DOTALL)
@@ -199,14 +257,16 @@ def test_continuation_uses_exact_training_args_and_safe_dependencies() -> None:
     assert "python scripts/audit_origin_shortcut.py" in worker_text
     assert "validate_origin_shortcut_comparator_recovery.py" in worker_text
     assert 'for audit_family in localized border diffuse' in worker_text
-    assert (
-        'RUNNING_POOLED_DEPENDENCY="afterany:${ORIGINAL_WORKER_JOB}_23:'
-        '${ORIGINAL_WORKER_JOB}_24:${ORIGINAL_WORKER_JOB}_25:'
-        '${ORIGINAL_WORKER_JOB}_26"'
-    ) in launcher_text
+    assert "--resume" not in worker_text
+    assert 'for task_id in $(seq 21 41)' in launcher_text
+    assert 'POOLED_ORIGINAL_ELEMENTS+=("${ORIGINAL_WORKER_JOB}_${task_id}")' in launcher_text
+    assert 'RUNNING_POOLED_DEPENDENCY="afterany:' in launcher_text
     assert '--dependency="${RUNNING_POOLED_DEPENDENCY}"' in launcher_text
     assert (
         '--dependency="afterok:${CONTINUATION_JOB},afterany:${ORIGINAL_WORKER_JOB}"'
         in launcher_text
     )
     assert '--array="21-41%' in launcher_text
+    assert "git -C \"${SOURCE_ROOT}\" worktree add --detach" in launcher_text
+    assert 'immutable_recovery_worktree' in launcher_text
+    assert 'cd "${SNAPSHOT_ROOT}"' in launcher_text

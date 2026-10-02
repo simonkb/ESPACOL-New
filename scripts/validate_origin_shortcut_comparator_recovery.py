@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from collections import Counter
 from typing import Any, Mapping, Sequence
 
 from scripts.aggregate_origin_shortcut_pilot import _read_audit
@@ -90,6 +91,11 @@ def validate_console_failure_artifacts(
     suite_root: Path,
     protocol_path: Path,
     task_ids: Sequence[int],
+    training_disposition: str = "read_only_existing_artifacts",
+    audits_created: int = 0,
+    original_array_job: str | None = None,
+    recovery_array_job: str | None = None,
+    recovery_implementation_commit: str | None = None,
 ) -> dict[str, Any]:
     requested = tuple(int(value) for value in task_ids)
     if (
@@ -103,6 +109,33 @@ def validate_console_failure_artifacts(
             f"observed {requested}"
         )
     protocol = _read_protocol(protocol_path.resolve(), suite_root.resolve())
+    allowed_dispositions = {
+        "read_only_existing_artifacts",
+        "reused_complete_original_training",
+        "fresh_training_after_original_task_cancellation",
+    }
+    if training_disposition not in allowed_dispositions:
+        raise ValueError(f"invalid training disposition: {training_disposition}")
+    if int(audits_created) < 0:
+        raise ValueError("audits_created must be non-negative")
+    for label, job_id in (
+        ("original array", original_array_job),
+        ("recovery array", recovery_array_job),
+    ):
+        if job_id is not None and (not str(job_id).isdigit()):
+            raise ValueError(f"{label} job id must be numeric")
+    if recovery_implementation_commit is not None:
+        if len(recovery_implementation_commit) != 40:
+            raise ValueError("recovery implementation commit must be a full SHA")
+        recovery_root = Path(__file__).resolve().parents[1]
+        observed_recovery_commit = subprocess.run(
+            ["git", "-C", str(recovery_root), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        if observed_recovery_commit != recovery_implementation_commit:
+            raise ValueError("active recovery implementation commit mismatch")
     if (suite_root / "COMPARATOR_SHORTCUT_RESULTS_V2.json").exists():
         raise FileExistsError("expanded comparator aggregate already exists")
 
@@ -120,6 +153,7 @@ def validate_console_failure_artifacts(
             / f"seed{task.training_seed}"
             / "fold0"
         )
+        expected_checkpoint = (fold_dir / "best_learned.pth").resolve()
         families = ("localized", "border", "diffuse") if task.arm == "clean" else (task.family,)
         audit_paths = (
             tuple(fold_dir / f"shortcut_audit_{family}.json" for family in families)
@@ -138,11 +172,13 @@ def validate_console_failure_artifacts(
             if audit_file_hash_before != audit_file_hash_after:
                 raise RuntimeError("read-only recovery changed an audit artifact")
             expected_identity = {
+                "dataset": "aptos",
                 "model_variant": task.model_variant,
                 "shortcut_arm": task.arm,
                 "shortcut_family": audit_family,
                 "training_seed": task.training_seed,
                 "fold": 0,
+                "split_seed": 42,
                 "complete_outer_fold": True,
                 "official_author_implementation": False,
             }
@@ -163,17 +199,50 @@ def validate_console_failure_artifacts(
                 raise ValueError("pooled intervention non-applicability is missing")
             if "macro_auprc" in localization or "internal_pixel_spearman" in effects:
                 raise ValueError("pooled report contains fabricated spatial metrics")
+            if int(report.get("sample_count", -1)) != 733:
+                raise ValueError("pooled recovery requires the complete 733-image outer fold")
+            checkpoint_path = Path(str(report["checkpoint"])).resolve()
+            if checkpoint_path != expected_checkpoint:
+                raise ValueError(
+                    f"task {task_id} checkpoint path mismatch: "
+                    f"expected {expected_checkpoint}, observed {checkpoint_path}"
+                )
+            expected_prediction_path = audit_path.with_name(
+                f"{audit_path.stem}_predictions.jsonl"
+            ).resolve()
             prediction_path = Path(str(report["prediction_artifact"])).resolve()
+            if prediction_path != expected_prediction_path:
+                raise ValueError(
+                    f"task {task_id} prediction path mismatch: "
+                    f"expected {expected_prediction_path}, observed {prediction_path}"
+                )
+            prediction_records: list[dict[str, Any]] = []
             with prediction_path.open(encoding="utf-8") as stream:
-                first = json.loads(next(stream))
+                for line_number, line in enumerate(stream, start=1):
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            f"invalid prediction JSONL at line {line_number}"
+                        ) from exc
+                    if not isinstance(record, dict):
+                        raise ValueError("prediction JSONL rows must be objects")
+                    prediction_records.append(record)
+            if not prediction_records:
+                raise ValueError("prediction artifact is empty")
+            first = prediction_records[0]
             manifest_identity = {
                 "record_type": "manifest",
                 "schema": "origin-ordinal-shortcut-predictions-v1",
+                "dataset": "aptos",
                 "model_variant": task.model_variant,
                 "shortcut_arm": task.arm,
                 "shortcut_family": audit_family,
                 "training_seed": task.training_seed,
                 "fold": 0,
+                "split_seed": 42,
+                "checkpoint": str(expected_checkpoint),
+                "checkpoint_sha256": report["checkpoint_sha256"],
             }
             manifest_mismatches = {
                 key: {"expected": expected, "observed": first.get(key)}
@@ -184,6 +253,41 @@ def validate_console_failure_artifacts(
                 raise ValueError(
                     f"task {task_id} prediction manifest mismatch: {manifest_mismatches}"
                 )
+            expected_count_fields = (
+                "condition_prediction_records",
+                "factorial_prediction_records",
+                "internal_effect_records",
+            )
+            record_type_to_field = {
+                "condition_prediction": "condition_prediction_records",
+                "factorial_prediction": "factorial_prediction_records",
+                "internal_pixel_effect": "internal_effect_records",
+            }
+            observed_types = Counter(
+                str(record.get("record_type"))
+                for record in prediction_records[1:]
+            )
+            unexpected_types = set(observed_types) - set(record_type_to_field)
+            if unexpected_types:
+                raise ValueError(
+                    f"unexpected prediction record types: {sorted(unexpected_types)}"
+                )
+            for record_type, count_field in record_type_to_field.items():
+                observed_count = observed_types[record_type]
+                manifest_count = first.get(count_field)
+                report_count = report.get(count_field)
+                if manifest_count != observed_count or report_count != observed_count:
+                    raise ValueError(
+                        f"prediction count mismatch for {count_field}: "
+                        f"JSONL={observed_count}, manifest={manifest_count}, "
+                        f"report={report_count}"
+                    )
+            if len(prediction_records) != 1 + sum(
+                int(first[field]) for field in expected_count_fields
+            ):
+                raise ValueError("prediction artifact row total is inconsistent")
+            if int(first["internal_effect_records"]) != 0:
+                raise ValueError("pooled comparator must not claim internal ledger effects")
             task_records.append(
                 {
                     "family": audit_family,
@@ -196,13 +300,22 @@ def validate_console_failure_artifacts(
                     "prediction_artifact_sha256": report[
                         "prediction_artifact_sha256"
                     ],
-                    "checkpoint": report["checkpoint"],
+                    "checkpoint": str(checkpoint_path),
                     "checkpoint_sha256": report["checkpoint_sha256"],
                     "sample_count": int(report["sample_count"]),
                 }
             )
         records.append(
             {"task_id": task_id, "task_key": task.key, "audits": task_records}
+        )
+
+    expected_audit_count = sum(
+        3 if task_at(task_id).arm == "clean" else 1 for task_id in requested
+    )
+    if int(audits_created) > expected_audit_count:
+        raise ValueError(
+            f"audits_created exceeds task audit census: {audits_created} > "
+            f"{expected_audit_count}"
         )
 
     payload: dict[str, Any] = {
@@ -214,7 +327,18 @@ def validate_console_failure_artifacts(
             "after audit and prediction artifacts were atomically written"
         ),
         "scientific_protocol_modified": False,
-        "scientific_artifacts_modified": False,
+        "validator_modified_scientific_artifacts": False,
+        "recovery_execution": {
+            "training_disposition": training_disposition,
+            "audits_created": int(audits_created),
+            "scientific_artifacts_created": bool(
+                training_disposition == "fresh_training_after_original_task_cancellation"
+                or int(audits_created) > 0
+            ),
+            "original_array_job": original_array_job,
+            "recovery_array_job": recovery_array_job,
+            "recovery_implementation_commit": recovery_implementation_commit,
+        },
         "suite_root": str(suite_root.resolve()),
         "protocol": str(protocol_path.resolve()),
         "protocol_file_sha256": _file_sha256(protocol_path),
@@ -247,6 +371,18 @@ def main() -> None:
     parser.add_argument("--protocol", required=True, type=Path)
     parser.add_argument("--task-ids", default="21,22")
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--training-disposition",
+        required=True,
+        choices=(
+            "reused_complete_original_training",
+            "fresh_training_after_original_task_cancellation",
+        ),
+    )
+    parser.add_argument("--audits-created", required=True, type=int)
+    parser.add_argument("--original-array-job", required=True)
+    parser.add_argument("--recovery-array-job", required=True)
+    parser.add_argument("--recovery-implementation-commit", required=True)
     args = parser.parse_args()
     task_ids = tuple(int(token) for token in args.task_ids.split(",") if token)
     if args.output.exists():
@@ -255,6 +391,11 @@ def main() -> None:
         suite_root=args.suite_root,
         protocol_path=args.protocol,
         task_ids=task_ids,
+        training_disposition=args.training_disposition,
+        audits_created=args.audits_created,
+        original_array_job=args.original_array_job,
+        recovery_array_job=args.recovery_array_job,
+        recovery_implementation_commit=args.recovery_implementation_commit,
     )
     _write_json_exclusive(args.output, payload)
     print(json.dumps({"output": str(args.output), "validated_tasks": list(task_ids)}))
